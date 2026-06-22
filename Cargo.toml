@@ -1,0 +1,12 @@
+[package]
+name = "bnknotes"
+version = "0.1.0"
+edition = "2021"
+
+# Deliberately zero dependencies. The Wayland wire protocol is spoken directly
+# over a UnixStream; glyph rasterization will FFI into the system FreeType.
+[dependencies]
+
+[profile.release]
+opt-level = 3
+lto = true

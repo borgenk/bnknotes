@@ -2,11 +2,14 @@
 //! xdg-shell surface stack, and runs the event loop.
 //!
 //! On top of the earlier single-line field, this drives a small but real
-//! multi-line editor. A keyboard (via libxkbcommon) inserts text and newlines
-//! and moves the cursor by grapheme cluster; Up/Down/Home/End navigate the
-//! visual lines a [`Layout`] pass computes; a held Shift turns motion into a
-//! selection, which a pointer can also drag out; the selection highlights behind
-//! the text and Backspace or typing replaces it. Ctrl shortcuts select-all,
+//! multi-line editor. A keyboard (via libxkbcommon) inserts text, newlines, and
+//! soft-tab indentation, and moves the cursor by grapheme cluster; Up/Down/
+//! Home/End and Page Up/Down navigate the visual lines a [`Layout`] pass
+//! computes, while Ctrl jumps by word (arrows) or to the document ends
+//! (Home/End) and deletes whole words (Backspace/Delete); a held Shift turns
+//! motion into a selection, which a pointer can also drag out; the selection
+//! highlights behind the text and Backspace or typing replaces it. Ctrl shortcuts
+//! select-all,
 //! copy, cut, paste (over wl_data_device), and undo/redo; a held key repeats on a
 //! timer. Content taller than the window scrolls (mouse wheel, or automatically
 //! to keep the caret in view), and the window honors compositor resizes by
@@ -51,6 +54,10 @@ const MARKER_COLOR: u32 = 0x006c_7086;
 const FONT_SIZE: u32 = 32;
 /// Inset of the text from the top-left corner (both axes).
 const MARGIN: i32 = 40;
+/// What the Tab key inserts: spaces (a "soft tab"), not a literal `'\t'`. This
+/// keeps the buffer free of tab characters and spares the renderer any tab-stop
+/// logic. Rendering literal tabs found in a *loaded* file is a separate concern.
+const SOFT_TAB: &str = "    ";
 /// The caret: a thin vertical bar at the cursor position.
 const CARET_COLOR: u32 = 0x00ff_ffff;
 const CARET_WIDTH: i32 = 2;
@@ -309,9 +316,10 @@ impl State {
         self.run_until(|s| s.configured)?;
 
         eprintln!(
-            "bnknotes: type to edit; Enter, arrows/Home/End, Shift selects, click/drag; \
-             Ctrl+A/C/X/V select-all/copy/cut/paste, Ctrl+Z/Y undo/redo, Ctrl+S save; \
-             held keys repeat; close to exit"
+            "bnknotes: type to edit; Enter, Tab, arrows/Home/End, PageUp/Down, \
+             Ctrl+arrows by word, Ctrl+Home/End to ends, Shift selects, click/drag; \
+             Ctrl+Backspace/Delete delete a word; Ctrl+A/C/X/V select-all/copy/cut/paste, \
+             Ctrl+Z/Y undo/redo, Ctrl+S save; held keys repeat; close to exit"
         );
         self.run_until(|s| s.closed)?;
         Ok(())
@@ -743,6 +751,17 @@ impl State {
                 self.goal_x = None;
                 true
             }
+            // Tab inserts a soft tab. Shift+Tab (back-tab/dedent) needs leading-
+            // whitespace tracking we do not have yet, so it is a no-op for now.
+            KeyAction::Tab => {
+                if extend {
+                    false
+                } else {
+                    self.text.insert_str(SOFT_TAB);
+                    self.goal_x = None;
+                    true
+                }
+            }
             KeyAction::Backspace => {
                 self.goal_x = None;
                 self.text.backspace()
@@ -750,6 +769,14 @@ impl State {
             KeyAction::Delete => {
                 self.goal_x = None;
                 self.text.delete_forward()
+            }
+            KeyAction::DeleteWordBack => {
+                self.goal_x = None;
+                self.text.delete_word_back()
+            }
+            KeyAction::DeleteWordForward => {
+                self.goal_x = None;
+                self.text.delete_word_forward()
             }
             KeyAction::Left => {
                 self.goal_x = None;
@@ -759,8 +786,18 @@ impl State {
                 self.goal_x = None;
                 self.text.move_right(extend)
             }
+            KeyAction::WordLeft => {
+                self.goal_x = None;
+                self.text.move_word_left(extend)
+            }
+            KeyAction::WordRight => {
+                self.goal_x = None;
+                self.text.move_word_right(extend)
+            }
             KeyAction::Up => self.move_vertical(-1, extend),
             KeyAction::Down => self.move_vertical(1, extend),
+            KeyAction::PageUp => self.move_page(-1, extend),
+            KeyAction::PageDown => self.move_page(1, extend),
             KeyAction::Home => {
                 self.goal_x = None;
                 self.move_line_edge(false, extend)
@@ -768,6 +805,14 @@ impl State {
             KeyAction::End => {
                 self.goal_x = None;
                 self.move_line_edge(true, extend)
+            }
+            KeyAction::DocStart => {
+                self.goal_x = None;
+                self.text.move_doc_start(extend)
+            }
+            KeyAction::DocEnd => {
+                self.goal_x = None;
+                self.text.move_doc_end(extend)
             }
             KeyAction::SelectAll => {
                 self.text.select_all();
@@ -881,6 +926,37 @@ impl State {
         let before_sel = self.text.selection();
         self.text.set_cursor(target, extend);
         self.text.cursor() != cursor || self.text.selection() != before_sel
+    }
+
+    /// Move the cursor one viewport height up (`dir = -1`) or down (`dir = 1`),
+    /// keeping the sticky goal column, like a run of Up/Down. The view follows
+    /// via the caret-reveal scroll in `after_edit`. Returns whether it moved.
+    fn move_page(&mut self, dir: i32, extend: bool) -> bool {
+        let layout = self.layout();
+        let cursor = self.text.cursor();
+        let (caret_x, _, _) = layout.caret(&self.fonts, self.text.text(), cursor);
+        let goal = self.goal_x.unwrap_or(caret_x as f32);
+        self.goal_x = Some(goal);
+        // Step a line at a time so each hop honors the goal column and the
+        // varying per-line heights; stop early at the first or last line.
+        let mut target = cursor;
+        for _ in 0..self.page_lines() {
+            let next = layout.offset_vertical(&self.fonts, self.text.text(), target, dir, goal);
+            if next == target {
+                break;
+            }
+            target = next;
+        }
+        let before_sel = self.text.selection();
+        self.text.set_cursor(target, extend);
+        self.text.cursor() != cursor || self.text.selection() != before_sel
+    }
+
+    /// How many visual lines make up a Page Up/Down jump: the window height in
+    /// body line-heights, less one row of overlap for continuity, at least one.
+    fn page_lines(&self) -> usize {
+        let line_height = self.fonts.metrics(FONT_SIZE).line_height.max(1);
+        (self.height as i32 / line_height - 1).max(1) as usize
     }
 
     fn on_pointer(&mut self, opcode: u16, r: &mut Reader) -> Result<()> {

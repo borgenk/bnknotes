@@ -19,14 +19,17 @@ const EVDEV_OFFSET: u32 = 8;
 
 mod keycode {
     pub const BACKSPACE: u32 = 14;
+    pub const TAB: u32 = 15;
     pub const ENTER: u32 = 28;
     pub const KP_ENTER: u32 = 96;
     pub const HOME: u32 = 102;
     pub const UP: u32 = 103;
+    pub const PAGEUP: u32 = 104;
     pub const LEFT: u32 = 105;
     pub const RIGHT: u32 = 106;
     pub const END: u32 = 107;
     pub const DOWN: u32 = 108;
+    pub const PAGEDOWN: u32 = 109;
     pub const DELETE: u32 = 111;
 }
 
@@ -66,21 +69,36 @@ extern "C" {
     fn xkb_keymap_key_repeats(keymap: *mut c_void, key: u32) -> c_int;
 }
 
-/// What a key press should do to the editor. The cursor-motion variants are the
-/// ones a held Shift turns into selection-extending moves; the editing variants
-/// ignore Shift.
+/// What a key press should do to the editor. The cursor-motion variants (Left,
+/// Right, Up, Down, Home, End, the word/document variants, and the page moves)
+/// are the ones a held Shift turns into selection-extending moves; the editing
+/// variants ignore Shift.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum KeyAction {
     Char(char),
     Enter,
+    /// Insert indentation (a soft tab); see the app's handling.
+    Tab,
     Backspace,
     Delete,
+    /// Delete to the previous/next word boundary (Ctrl+Backspace / Ctrl+Delete).
+    DeleteWordBack,
+    DeleteWordForward,
     Left,
     Right,
     Up,
     Down,
     Home,
     End,
+    /// Move one word left/right (Ctrl+Left / Ctrl+Right).
+    WordLeft,
+    WordRight,
+    /// Move to the very start/end of the buffer (Ctrl+Home / Ctrl+End).
+    DocStart,
+    DocEnd,
+    /// Move up/down one viewport height (Page Up / Page Down).
+    PageUp,
+    PageDown,
     SelectAll,
     Copy,
     Cut,
@@ -199,22 +217,67 @@ impl Xkb {
 
     /// Translate a Wayland (evdev) keycode into an editor action.
     pub fn action(&self, keycode: u32) -> KeyAction {
+        // The navigation and deletion keys do bigger jumps when Ctrl is held:
+        // Ctrl+Arrow moves by word, Ctrl+Home/End to the document ends, and
+        // Ctrl+Backspace/Delete remove a whole word.
+        let ctrl = self.ctrl_active();
         match keycode {
-            keycode::BACKSPACE => return KeyAction::Backspace,
-            keycode::DELETE => return KeyAction::Delete,
+            keycode::BACKSPACE => {
+                return if ctrl {
+                    KeyAction::DeleteWordBack
+                } else {
+                    KeyAction::Backspace
+                };
+            }
+            keycode::DELETE => {
+                return if ctrl {
+                    KeyAction::DeleteWordForward
+                } else {
+                    KeyAction::Delete
+                };
+            }
             keycode::ENTER | keycode::KP_ENTER => return KeyAction::Enter,
-            keycode::LEFT => return KeyAction::Left,
-            keycode::RIGHT => return KeyAction::Right,
+            // Ctrl+Tab falls through to the (empty) Ctrl handler so it does not
+            // insert; plain Tab inserts indentation.
+            keycode::TAB if !ctrl => return KeyAction::Tab,
+            keycode::LEFT => {
+                return if ctrl {
+                    KeyAction::WordLeft
+                } else {
+                    KeyAction::Left
+                }
+            }
+            keycode::RIGHT => {
+                return if ctrl {
+                    KeyAction::WordRight
+                } else {
+                    KeyAction::Right
+                };
+            }
             keycode::UP => return KeyAction::Up,
             keycode::DOWN => return KeyAction::Down,
-            keycode::HOME => return KeyAction::Home,
-            keycode::END => return KeyAction::End,
+            keycode::HOME => {
+                return if ctrl {
+                    KeyAction::DocStart
+                } else {
+                    KeyAction::Home
+                }
+            }
+            keycode::END => {
+                return if ctrl {
+                    KeyAction::DocEnd
+                } else {
+                    KeyAction::End
+                }
+            }
+            keycode::PAGEUP => return KeyAction::PageUp,
+            keycode::PAGEDOWN => return KeyAction::PageDown,
             _ => {}
         }
 
-        // Control combos: read the layout's keysym so the shortcut follows the
-        // letter, not the physical key, and never insert a control character.
-        if self.ctrl_active() {
+        // Other Control combos: read the layout's keysym so the shortcut follows
+        // the letter, not the physical key, and never insert a control character.
+        if ctrl {
             return self.ctrl_action(keycode);
         }
 
@@ -310,17 +373,22 @@ mod tests {
 
     #[test]
     fn special_keys_dispatch_without_a_keymap() {
+        // With no keymap there is no modifier state, so Ctrl reads as inactive
+        // and the navigation keys take their plain (non-word) meaning.
         let xkb = Xkb::new().expect("xkb context");
         assert_eq!(xkb.action(keycode::BACKSPACE), KeyAction::Backspace);
         assert_eq!(xkb.action(keycode::DELETE), KeyAction::Delete);
         assert_eq!(xkb.action(keycode::ENTER), KeyAction::Enter);
         assert_eq!(xkb.action(keycode::KP_ENTER), KeyAction::Enter);
+        assert_eq!(xkb.action(keycode::TAB), KeyAction::Tab);
         assert_eq!(xkb.action(keycode::LEFT), KeyAction::Left);
         assert_eq!(xkb.action(keycode::RIGHT), KeyAction::Right);
         assert_eq!(xkb.action(keycode::UP), KeyAction::Up);
         assert_eq!(xkb.action(keycode::DOWN), KeyAction::Down);
         assert_eq!(xkb.action(keycode::HOME), KeyAction::Home);
         assert_eq!(xkb.action(keycode::END), KeyAction::End);
+        assert_eq!(xkb.action(keycode::PAGEUP), KeyAction::PageUp);
+        assert_eq!(xkb.action(keycode::PAGEDOWN), KeyAction::PageDown);
     }
 
     #[test]

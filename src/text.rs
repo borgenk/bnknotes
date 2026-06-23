@@ -193,6 +193,46 @@ impl TextBuffer {
         true
     }
 
+    /// Delete the selection if there is one, else from the cursor back to the
+    /// previous word boundary (Ctrl+Backspace). Each word delete is its own undo
+    /// step. Returns whether anything changed.
+    pub fn delete_word_back(&mut self) -> bool {
+        if self.selection().is_some() {
+            self.checkpoint(Coalesce::None);
+            self.delete_selection();
+            self.touch();
+            return true;
+        }
+        let target = prev_word(&self.text, self.cursor);
+        if target == self.cursor {
+            return false;
+        }
+        self.checkpoint(Coalesce::None);
+        self.text.replace_range(target..self.cursor, "");
+        self.cursor = target;
+        self.touch();
+        true
+    }
+
+    /// Delete the selection if there is one, else from the cursor forward to the
+    /// next word boundary (Ctrl+Delete). Returns whether anything changed.
+    pub fn delete_word_forward(&mut self) -> bool {
+        if self.selection().is_some() {
+            self.checkpoint(Coalesce::None);
+            self.delete_selection();
+            self.touch();
+            return true;
+        }
+        let target = next_word(&self.text, self.cursor);
+        if target == self.cursor {
+            return false;
+        }
+        self.checkpoint(Coalesce::None);
+        self.text.replace_range(self.cursor..target, "");
+        self.touch();
+        true
+    }
+
     /// Select the whole buffer (anchor at the start, cursor at the end).
     pub fn select_all(&mut self) {
         self.group = Coalesce::None;
@@ -277,6 +317,42 @@ impl TextBuffer {
                 false
             }
         }
+    }
+
+    /// Move the cursor one word left (Ctrl+Left), to the start of the previous
+    /// word. With `extend`, grow the selection. Returns whether anything changed.
+    pub fn move_word_left(&mut self, extend: bool) -> bool {
+        let target = prev_word(&self.text, self.cursor);
+        self.move_to(target, extend)
+    }
+
+    /// Move the cursor one word right (Ctrl+Right), to the end of the next word.
+    /// With `extend`, grow the selection. Returns whether anything changed.
+    pub fn move_word_right(&mut self, extend: bool) -> bool {
+        let target = next_word(&self.text, self.cursor);
+        self.move_to(target, extend)
+    }
+
+    /// Move the cursor to the very start of the buffer (Ctrl+Home). With
+    /// `extend`, grow the selection. Returns whether anything changed.
+    pub fn move_doc_start(&mut self, extend: bool) -> bool {
+        self.move_to(0, extend)
+    }
+
+    /// Move the cursor to the very end of the buffer (Ctrl+End). With `extend`,
+    /// grow the selection. Returns whether anything changed.
+    pub fn move_doc_end(&mut self, extend: bool) -> bool {
+        self.move_to(self.text.len(), extend)
+    }
+
+    /// Move the cursor to `target` via [`set_cursor`](Self::set_cursor),
+    /// reporting whether the cursor or selection actually changed. The shared
+    /// body of the word- and document-motion keys.
+    fn move_to(&mut self, target: usize, extend: bool) -> bool {
+        let before_cursor = self.cursor;
+        let before_sel = self.selection();
+        self.set_cursor(target, extend);
+        self.cursor != before_cursor || self.selection() != before_sel
     }
 
     /// Place the cursor at `offset`, clamped into the buffer and snapped down to
@@ -380,6 +456,51 @@ impl TextBuffer {
 fn coalescable_insert(s: &str) -> bool {
     let mut chars = s.chars();
     matches!((chars.next(), chars.next()), (Some(c), None) if !c.is_whitespace())
+}
+
+/// Whether a grapheme `cluster` is part of a word, classified by its first
+/// scalar: letters, digits, and `_` are word characters; whitespace and
+/// punctuation alike are separators. This is the simple, predictable heuristic
+/// editors use for Ctrl+Arrow and Ctrl+Backspace, not full UAX #29 word
+/// segmentation.
+fn cluster_is_word(cluster: &str) -> bool {
+    cluster
+        .chars()
+        .next()
+        .is_some_and(|c| c.is_alphanumeric() || c == '_')
+}
+
+/// The byte offset one word forward from `pos`: skip any separators, then the
+/// run of word clusters, landing at the end of that word (or the buffer end).
+/// Working in whole grapheme clusters keeps the result on a cluster boundary, so
+/// word motion never splits one.
+fn next_word(text: &str, pos: usize) -> usize {
+    let clusters = grapheme::graphemes(&text[pos..]);
+    let mut k = 0;
+    while k < clusters.len() && !cluster_is_word(clusters[k].1) {
+        k += 1;
+    }
+    while k < clusters.len() && cluster_is_word(clusters[k].1) {
+        k += 1;
+    }
+    match clusters.get(k) {
+        Some(&(off, _)) => pos + off,
+        None => text.len(),
+    }
+}
+
+/// The byte offset one word back from `pos`: skip any separators, then the run
+/// of word clusters, landing at the start of that word (or the buffer start).
+fn prev_word(text: &str, pos: usize) -> usize {
+    let clusters = grapheme::graphemes(&text[..pos]);
+    let mut k = clusters.len();
+    while k > 0 && !cluster_is_word(clusters[k - 1].1) {
+        k -= 1;
+    }
+    while k > 0 && cluster_is_word(clusters[k - 1].1) {
+        k -= 1;
+    }
+    clusters.get(k).map_or(pos, |&(off, _)| off)
 }
 
 #[cfg(test)]
@@ -669,5 +790,114 @@ mod tests {
         // Redoing forward off the saved state dirties it once more.
         b.redo();
         assert!(b.is_modified());
+    }
+
+    #[test]
+    fn word_motion_steps_whole_words() {
+        let mut b = TextBuffer::new();
+        b.insert_str("foo bar baz"); // cursor at the end (11)
+        assert!(b.move_word_left(false));
+        assert_eq!(b.cursor, 8, "start of baz");
+        assert!(b.move_word_left(false));
+        assert_eq!(b.cursor, 4, "start of bar");
+        assert!(b.move_word_left(false));
+        assert_eq!(b.cursor, 0, "start of foo");
+        assert!(!b.move_word_left(false), "no move at the start");
+        assert!(b.move_word_right(false));
+        assert_eq!(b.cursor, 3, "end of foo");
+        assert!(b.move_word_right(false));
+        assert_eq!(b.cursor, 7, "end of bar");
+        assert!(b.move_word_right(false));
+        assert_eq!(b.cursor, 11, "end of baz");
+        assert!(!b.move_word_right(false), "no move at the end");
+    }
+
+    #[test]
+    fn punctuation_is_a_word_separator() {
+        let mut b = TextBuffer::new();
+        b.insert_str("foo.bar");
+        b.set_cursor(0, false);
+        b.move_word_right(false);
+        assert_eq!(b.cursor, 3, "stops at the dot, after foo");
+        b.move_word_right(false);
+        assert_eq!(b.cursor, 7, "skips the dot, lands after bar");
+    }
+
+    #[test]
+    fn word_motion_lands_on_cluster_boundaries() {
+        // "café x" with é as 'e' + combining acute (U+0301): the word run "café"
+        // ends at byte 6 (the space), never inside the two-scalar é cluster.
+        let mut b = TextBuffer::new();
+        b.insert_str("cafe\u{0301} x");
+        b.set_cursor(0, false);
+        b.move_word_right(false);
+        assert_eq!(b.cursor, 6, "lands at the space, not inside the é cluster");
+    }
+
+    #[test]
+    fn shift_word_motion_builds_a_selection() {
+        let mut b = TextBuffer::new();
+        b.insert_str("foo bar");
+        b.set_cursor(0, false);
+        assert!(b.move_word_right(true));
+        assert_eq!(b.selection(), Some((0, 3)), "Ctrl+Shift+Right selects foo");
+    }
+
+    #[test]
+    fn delete_word_back_removes_the_previous_word() {
+        let mut b = TextBuffer::new();
+        b.insert_str("foo bar"); // cursor at the end
+        assert!(b.delete_word_back());
+        assert_eq!(b.text(), "foo ");
+        assert_eq!(b.cursor, 4);
+        // And it undoes in one step.
+        assert!(b.undo());
+        assert_eq!(b.text(), "foo bar");
+    }
+
+    #[test]
+    fn delete_word_forward_removes_the_next_word() {
+        let mut b = TextBuffer::new();
+        b.insert_str("foo bar");
+        b.set_cursor(0, false);
+        assert!(b.delete_word_forward());
+        assert_eq!(b.text(), " bar");
+        assert_eq!(b.cursor, 0);
+    }
+
+    #[test]
+    fn word_delete_takes_the_selection_when_there_is_one() {
+        let mut b = TextBuffer::new();
+        b.insert_str("hello world");
+        b.set_cursor(0, false);
+        b.set_cursor(5, true); // select "hello"
+        assert!(b.delete_word_back());
+        assert_eq!(b.text(), " world", "the selection goes, not a word");
+    }
+
+    #[test]
+    fn word_delete_at_an_edge_is_a_noop() {
+        let mut b = TextBuffer::new();
+        b.insert_str("word");
+        b.set_cursor(0, false);
+        assert!(!b.delete_word_back(), "nothing before the start");
+        b.set_cursor(b.text().len(), false);
+        assert!(!b.delete_word_forward(), "nothing after the end");
+        assert_eq!(b.text(), "word");
+    }
+
+    #[test]
+    fn document_motion_jumps_to_the_ends() {
+        let mut b = TextBuffer::new();
+        b.insert_str("line one\nline two"); // cursor at the end
+        assert!(b.move_doc_start(false));
+        assert_eq!(b.cursor, 0);
+        assert!(!b.move_doc_start(false), "already at the start");
+        assert!(b.move_doc_end(false));
+        assert_eq!(b.cursor, b.text().len());
+        // Extending from the top selects the whole buffer.
+        b.set_cursor(0, false);
+        assert!(b.move_doc_end(true));
+        assert_eq!(b.selection(), Some((0, b.text().len())));
     }
 }

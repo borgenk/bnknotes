@@ -26,6 +26,7 @@
 //! the saved state.
 
 use crate::grapheme;
+use crate::rope::Rope;
 
 /// Cap on undo history, so a long session cannot grow the stacks without bound.
 const UNDO_CAP: usize = 500;
@@ -39,17 +40,18 @@ enum Coalesce {
     Delete,
 }
 
-/// A restorable editing state.
+/// A restorable editing state. Cloning the `Rope` is O(1) and shares the text
+/// with the live buffer, so checkpoints are cheap regardless of document size.
 #[derive(Clone)]
 struct Snapshot {
-    text: String,
+    text: Rope,
     cursor: usize,
     anchor: Option<usize>,
     version: u64,
 }
 
 pub struct TextBuffer {
-    text: String,
+    text: Rope,
     /// Byte offset of the cursor; always a grapheme cluster boundary.
     cursor: usize,
     /// The other end of the selection, if one is active. `None` means no
@@ -79,7 +81,7 @@ impl TextBuffer {
     /// the contents start out clean (not modified).
     pub fn from_text(text: String) -> Self {
         Self {
-            text,
+            text: Rope::from_str(&text),
             cursor: 0,
             anchor: None,
             undo: Vec::new(),
@@ -91,7 +93,16 @@ impl TextBuffer {
         }
     }
 
-    pub fn text(&self) -> &str {
+    /// The full buffer contents as an owned `String`. The rope is not
+    /// contiguous, so this materializes it; used for saving and in tests, not on
+    /// the per-frame path (which reads lines from [`rope`](Self::rope)).
+    pub fn text(&self) -> String {
+        self.text.to_string()
+    }
+
+    /// The backing rope, for the layout to read lines from without materializing
+    /// the whole document.
+    pub fn rope(&self) -> &Rope {
         &self.text
     }
 
@@ -134,8 +145,9 @@ impl TextBuffer {
     }
 
     /// The selected text, if any. Used by Copy/Cut.
-    pub fn selected_text(&self) -> Option<&str> {
-        self.selection().map(|(start, end)| &self.text[start..end])
+    pub fn selected_text(&self) -> Option<String> {
+        self.selection()
+            .map(|(start, end)| self.text.byte_slice(start..end))
     }
 
     /// Insert `s` at the cursor, first replacing any selection, and advance past
@@ -150,7 +162,7 @@ impl TextBuffer {
         };
         self.checkpoint(group);
         self.delete_selection();
-        self.text.insert_str(self.cursor, s);
+        self.text.insert(self.cursor, s);
         self.cursor += s.len();
         self.anchor = None;
         self.touch();
@@ -169,7 +181,7 @@ impl TextBuffer {
             return false;
         };
         self.checkpoint(Coalesce::Delete);
-        self.text.replace_range(prev..self.cursor, "");
+        self.text.remove(prev..self.cursor);
         self.cursor = prev;
         self.touch();
         true
@@ -188,7 +200,7 @@ impl TextBuffer {
             return false;
         };
         self.checkpoint(Coalesce::Delete);
-        self.text.replace_range(self.cursor..next, "");
+        self.text.remove(self.cursor..next);
         self.touch();
         true
     }
@@ -203,12 +215,12 @@ impl TextBuffer {
             self.touch();
             return true;
         }
-        let target = prev_word(&self.text, self.cursor);
+        let target = prev_word(&self.text.to_string(), self.cursor);
         if target == self.cursor {
             return false;
         }
         self.checkpoint(Coalesce::None);
-        self.text.replace_range(target..self.cursor, "");
+        self.text.remove(target..self.cursor);
         self.cursor = target;
         self.touch();
         true
@@ -223,12 +235,12 @@ impl TextBuffer {
             self.touch();
             return true;
         }
-        let target = next_word(&self.text, self.cursor);
+        let target = next_word(&self.text.to_string(), self.cursor);
         if target == self.cursor {
             return false;
         }
         self.checkpoint(Coalesce::None);
-        self.text.replace_range(self.cursor..target, "");
+        self.text.remove(self.cursor..target);
         self.touch();
         true
     }
@@ -242,14 +254,17 @@ impl TextBuffer {
     /// The word model matches the word-motion keys: a word is a run of
     /// alphanumerics and `_`; whitespace and punctuation are separators.
     pub fn select_word_at(&mut self, offset: usize) {
-        let (start, end) = word_range(&self.text, offset);
+        let (start, end) = word_range(&self.text.to_string(), offset);
         self.set_selection(start, end);
     }
 
     /// Select the whole logical line containing `offset`, including its trailing
-    /// newline if it has one, for a triple-click.
+    /// newline if it has one, for a triple-click. The rope's line index gives the
+    /// bounds directly: the line's start and the next line's start.
     pub fn select_line_at(&mut self, offset: usize) {
-        let (start, end) = line_range(&self.text, offset);
+        let line = self.text.byte_to_line(offset.min(self.text.len()));
+        let start = self.text.line_to_byte(line);
+        let end = self.text.line_to_byte(line + 1);
         self.set_selection(start, end);
     }
 
@@ -339,14 +354,14 @@ impl TextBuffer {
     /// Move the cursor one word left (Ctrl+Left), to the start of the previous
     /// word. With `extend`, grow the selection. Returns whether anything changed.
     pub fn move_word_left(&mut self, extend: bool) -> bool {
-        let target = prev_word(&self.text, self.cursor);
+        let target = prev_word(&self.text.to_string(), self.cursor);
         self.move_to(target, extend)
     }
 
     /// Move the cursor one word right (Ctrl+Right), to the end of the next word.
     /// With `extend`, grow the selection. Returns whether anything changed.
     pub fn move_word_right(&mut self, extend: bool) -> bool {
-        let target = next_word(&self.text, self.cursor);
+        let target = next_word(&self.text.to_string(), self.cursor);
         self.move_to(target, extend)
     }
 
@@ -431,39 +446,58 @@ impl TextBuffer {
         let Some((start, end)) = self.selection() else {
             return false;
         };
-        self.text.replace_range(start..end, "");
+        self.text.remove(start..end);
         self.cursor = start;
         self.anchor = None;
         true
     }
 
     /// Snap `offset` into `[0, len]` and back to the nearest grapheme cluster
-    /// boundary at or before it. `prev_boundary(offset + 1)` is the last boundary
-    /// at or before `offset`, which is the cluster start to land on.
+    /// boundary at or before it. A grapheme cluster never spans a `'\n'`, so the
+    /// search only needs the logical line `offset` falls on, materialized from
+    /// the rope rather than the whole document.
     fn snap(&self, offset: usize) -> usize {
-        let offset = offset.min(self.text.len());
-        if offset == 0 || offset == self.text.len() {
+        let len = self.text.len();
+        let offset = offset.min(len);
+        if offset == 0 || offset == len {
             return offset;
         }
-        grapheme::prev_boundary(&self.text, offset + 1)
+        let line = self.text.byte_to_line(offset);
+        let ls = self.text.line_to_byte(line);
+        if offset == ls {
+            return offset; // a line start is always a boundary
+        }
+        let le = self.text.line_to_byte(line + 1);
+        let s = self.text.byte_slice(ls..le);
+        ls + grapheme::prev_boundary(&s, offset - ls + 1)
     }
 
     /// Byte offset of the grapheme cluster boundary before the cursor, if any.
+    /// The preceding cluster lies on the line containing `cursor - 1` (a `'\n'`
+    /// is its own single-byte cluster), so only that line is materialized.
     fn prev_grapheme(&self) -> Option<usize> {
         if self.cursor == 0 {
-            None
-        } else {
-            Some(grapheme::prev_boundary(&self.text, self.cursor))
+            return None;
         }
+        let line = self.text.byte_to_line(self.cursor - 1);
+        let ls = self.text.line_to_byte(line);
+        let le = self.text.line_to_byte(line + 1);
+        let s = self.text.byte_slice(ls..le);
+        Some(ls + grapheme::prev_boundary(&s, self.cursor - ls))
     }
 
     /// Byte offset of the grapheme cluster boundary after the cursor, if any.
+    /// The cluster at the cursor lies entirely on its line, so only that line is
+    /// materialized.
     fn next_grapheme(&self) -> Option<usize> {
         if self.cursor == self.text.len() {
-            None
-        } else {
-            Some(grapheme::next_boundary(&self.text, self.cursor))
+            return None;
         }
+        let line = self.text.byte_to_line(self.cursor);
+        let ls = self.text.line_to_byte(line);
+        let le = self.text.line_to_byte(line + 1);
+        let s = self.text.byte_slice(ls..le);
+        Some(ls + grapheme::next_boundary(&s, self.cursor - ls))
     }
 }
 
@@ -550,18 +584,6 @@ fn word_range(text: &str, offset: usize) -> (usize, usize) {
         hi += 1;
     }
     (clusters[lo].0, clusters[hi].0 + clusters[hi].1.len())
-}
-
-/// The byte range of the logical line containing `offset`: from just after the
-/// previous newline (or the start) to just after the next newline (or the end),
-/// so the trailing newline is part of the line for triple-click selection.
-fn line_range(text: &str, offset: usize) -> (usize, usize) {
-    let offset = offset.min(text.len());
-    let start = text[..offset].rfind('\n').map_or(0, |i| i + 1);
-    let end = text[offset..]
-        .find('\n')
-        .map_or(text.len(), |i| offset + i + 1);
-    (start, end)
 }
 
 #[cfg(test)]
@@ -720,7 +742,7 @@ mod tests {
         b.insert_str("hello");
         b.select_all();
         assert_eq!(b.selection(), Some((0, 5)));
-        assert_eq!(b.selected_text(), Some("hello"));
+        assert_eq!(b.selected_text().as_deref(), Some("hello"));
         // Select-all on an empty buffer selects nothing.
         let mut empty = TextBuffer::new();
         empty.select_all();
@@ -968,7 +990,7 @@ mod tests {
         b.insert_str("foo bar baz");
         b.select_word_at(5); // inside "bar"
         assert_eq!(b.selection(), Some((4, 7)));
-        assert_eq!(b.selected_text(), Some("bar"));
+        assert_eq!(b.selected_text().as_deref(), Some("bar"));
     }
 
     #[test]
@@ -976,7 +998,7 @@ mod tests {
         let mut b = TextBuffer::new();
         b.insert_str("a   b");
         b.select_word_at(2); // inside the spaces
-        assert_eq!(b.selected_text(), Some("   "));
+        assert_eq!(b.selected_text().as_deref(), Some("   "));
     }
 
     #[test]
@@ -984,7 +1006,7 @@ mod tests {
         let mut b = TextBuffer::new();
         b.insert_str("foo bar");
         b.select_word_at(3); // the space starts here; the word is to the left
-        assert_eq!(b.selected_text(), Some("foo"));
+        assert_eq!(b.selected_text().as_deref(), Some("foo"));
     }
 
     #[test]
@@ -992,7 +1014,7 @@ mod tests {
         let mut b = TextBuffer::new();
         b.insert_str("hello");
         b.select_word_at(5);
-        assert_eq!(b.selected_text(), Some("hello"));
+        assert_eq!(b.selected_text().as_deref(), Some("hello"));
     }
 
     #[test]
@@ -1000,7 +1022,7 @@ mod tests {
         let mut b = TextBuffer::new();
         b.insert_str("first\nsecond\nthird");
         b.select_line_at(8); // inside "second"
-        assert_eq!(b.selected_text(), Some("second\n"));
+        assert_eq!(b.selected_text().as_deref(), Some("second\n"));
     }
 
     #[test]
@@ -1008,6 +1030,6 @@ mod tests {
         let mut b = TextBuffer::new();
         b.insert_str("first\nlast");
         b.select_line_at(8); // inside "last"
-        assert_eq!(b.selected_text(), Some("last"));
+        assert_eq!(b.selected_text().as_deref(), Some("last"));
     }
 }

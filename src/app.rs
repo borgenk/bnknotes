@@ -492,7 +492,7 @@ impl State {
                 return Ok(false);
             };
             let fonts = &self.fonts;
-            let text = self.text.text();
+            let rope = self.text.rope();
             let frame = &mut pool.data_mut()[offset..offset + frame_len];
             let mut canvas = Canvas::new(frame, width, height);
             canvas.fill(BACKGROUND);
@@ -500,36 +500,42 @@ impl State {
             // Everything is laid out in content space; the viewport scroll shifts
             // it up by `scroll_y`. The canvas clips whatever falls off-screen.
             if let Some((start, end)) = selection {
-                for rect in layout.selection_rects(fonts, text, start, end) {
+                for rect in layout.selection_rects(fonts, rope, start, end) {
                     canvas.fill_rect(rect.x, rect.y - scroll_y, rect.w, rect.h, SELECTION_COLOR);
                 }
             }
 
-            // The text, one visual line at a time, each at its own font size.
-            // A heading whose markers are hidden (the cursor has left the line)
-            // draws only the text past them, flush to the margin. When the
-            // markers are shown they are dimmed so the markup reads as syntax.
+            // The text, one visual line at a time, each at its own font size,
+            // materialized from the rope. A heading whose markers are hidden (the
+            // cursor has left the line) draws only the text past them, flush to
+            // the margin. When the markers are shown they are dimmed so the
+            // markup reads as syntax.
             for line in layout.lines() {
                 let face = fonts.face(line.size);
                 let baseline = line.baseline - scroll_y;
+                let slice = rope.byte_slice(line.start..line.end);
                 if line.hidden_prefix > 0 {
-                    let visible = &text[line.start + line.hidden_prefix..line.end];
-                    canvas.draw_text(face, MARGIN, baseline, visible, FOREGROUND);
+                    canvas.draw_text(
+                        face,
+                        MARGIN,
+                        baseline,
+                        &slice[line.hidden_prefix..],
+                        FOREGROUND,
+                    );
                     continue;
                 }
-                let slice = &text[line.start..line.end];
-                let marker = markdown::marker_len(slice);
+                let marker = markdown::marker_len(&slice);
                 if marker > 0 {
                     let pen =
                         canvas.draw_text(face, MARGIN, baseline, &slice[..marker], MARKER_COLOR);
                     canvas.draw_text(face, pen, baseline, &slice[marker..], FOREGROUND);
                 } else {
-                    canvas.draw_text(face, MARGIN, baseline, slice, FOREGROUND);
+                    canvas.draw_text(face, MARGIN, baseline, &slice, FOREGROUND);
                 }
             }
 
             // The caret.
-            let (cx, cy, ch) = layout.caret(fonts, text, cursor);
+            let (cx, cy, ch) = layout.caret(fonts, rope, cursor);
             canvas.fill_rect(cx, cy - scroll_y, CARET_WIDTH, ch, CARET_COLOR);
         }
 
@@ -922,7 +928,7 @@ impl State {
             eprintln!("bnknotes: no file to save to; start bnknotes with a path");
             return Ok(());
         };
-        let bytes = file::encode(self.text.text(), &self.format);
+        let bytes = file::encode(&self.text.text(), &self.format);
         file::save_atomic(&path, &bytes)?;
         self.text.mark_saved();
         self.refresh_title();
@@ -958,10 +964,10 @@ impl State {
     fn move_vertical(&mut self, dir: i32, extend: bool) -> bool {
         let layout = self.layout();
         let cursor = self.text.cursor();
-        let (caret_x, _, _) = layout.caret(&self.fonts, self.text.text(), cursor);
+        let (caret_x, _, _) = layout.caret(&self.fonts, self.text.rope(), cursor);
         let goal = self.goal_x.unwrap_or(caret_x as f32);
         self.goal_x = Some(goal);
-        let target = layout.offset_vertical(&self.fonts, self.text.text(), cursor, dir, goal);
+        let target = layout.offset_vertical(&self.fonts, self.text.rope(), cursor, dir, goal);
         let before_sel = self.text.selection();
         self.text.set_cursor(target, extend);
         self.text.cursor() != cursor || self.text.selection() != before_sel
@@ -984,14 +990,14 @@ impl State {
     fn move_page(&mut self, dir: i32, extend: bool) -> bool {
         let layout = self.layout();
         let cursor = self.text.cursor();
-        let (caret_x, _, _) = layout.caret(&self.fonts, self.text.text(), cursor);
+        let (caret_x, _, _) = layout.caret(&self.fonts, self.text.rope(), cursor);
         let goal = self.goal_x.unwrap_or(caret_x as f32);
         self.goal_x = Some(goal);
         // Step a line at a time so each hop honors the goal column and the
         // varying per-line heights; stop early at the first or last line.
         let mut target = cursor;
         for _ in 0..self.page_lines() {
-            let next = layout.offset_vertical(&self.fonts, self.text.text(), target, dir, goal);
+            let next = layout.offset_vertical(&self.fonts, self.text.rope(), target, dir, goal);
             if next == target {
                 break;
             }
@@ -1063,7 +1069,7 @@ impl State {
     /// content space by the scroll offset before hit-testing.
     fn place_cursor_at(&mut self, x: f32, y: f32, extend: bool) {
         let layout = self.layout();
-        let offset = layout.offset_at(&self.fonts, self.text.text(), x, y + self.scroll_y as f32);
+        let offset = layout.offset_at(&self.fonts, self.text.rope(), x, y + self.scroll_y as f32);
         let before = self.text.cursor();
         let before_sel = self.text.selection();
         self.text.set_cursor(offset, extend);
@@ -1146,7 +1152,7 @@ impl State {
         let layout = self.layout();
         layout.offset_at(
             &self.fonts,
-            self.text.text(),
+            self.text.rope(),
             self.pointer_x,
             self.pointer_y + self.scroll_y as f32,
         )
@@ -1427,7 +1433,7 @@ impl State {
     fn scroll_caret_into_view(&mut self) {
         let layout = self.layout();
         let (_, caret_top, caret_h) =
-            layout.caret(&self.fonts, self.text.text(), self.text.cursor());
+            layout.caret(&self.fonts, self.text.rope(), self.text.cursor());
         let content_height = self.content_height(&layout);
         let sy = scroll::reveal(
             self.scroll_y,
@@ -1453,7 +1459,7 @@ impl State {
         let active = self.text.selection().unwrap_or((cursor, cursor));
         Layout::build(
             &self.fonts,
-            self.text.text(),
+            self.text.rope(),
             MARGIN,
             MARGIN,
             wrap_width,

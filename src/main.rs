@@ -13,6 +13,7 @@ mod layout;
 mod markdown;
 mod protocol;
 mod render;
+mod rope;
 mod scroll;
 mod shm;
 mod text;

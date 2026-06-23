@@ -38,6 +38,7 @@ use crate::freetype::{Face, Fonts};
 use crate::grapheme;
 use crate::markdown;
 use crate::render;
+use crate::rope::Rope;
 
 /// Extra highlight width drawn past a line's text when the selection includes
 /// that line's trailing newline, hinting the break itself is selected.
@@ -93,7 +94,7 @@ impl Layout {
     /// rendering of the heading's first segment.
     pub fn build(
         fonts: &Fonts,
-        text: &str,
+        rope: &Rope,
         left: i32,
         top: i32,
         wrap_width: i32,
@@ -104,20 +105,30 @@ impl Layout {
         // `box_top` is the top of the current line's box; the baseline sits one
         // ascent below it, and the next box follows one line height down.
         let mut box_top = top;
-        let mut ls = 0usize;
-        loop {
-            let rel = text[ls..].find('\n');
-            let le = rel.map_or(text.len(), |r| ls + r);
-            let size = markdown::font_size(markdown::style_of(&text[ls..le]), body_size);
+        let n_lines = rope.len_lines();
+        for i in 0..n_lines {
+            let ls = rope.line_to_byte(i);
+            // Every logical line but the last ends in a '\n'; its content
+            // excludes that byte. The rope materializes just this line.
+            let has_newline = i + 1 < n_lines;
+            let le = if has_newline {
+                rope.line_to_byte(i + 1) - 1
+            } else {
+                rope.line_to_byte(i + 1)
+            };
+            let line = rope.byte_slice(ls..le);
+            let size = markdown::font_size(markdown::style_of(&line), body_size);
             let face = fonts.face(size);
             let metrics = fonts.metrics(size);
-            let segments = wrap_segments(face, text, ls, le, wrap_width);
+            // `wrap_segments` returns ranges relative to the line; offset them
+            // back to absolute buffer positions for the visual lines.
+            let segments = wrap_segments(face, &line, wrap_width);
             let last = segments.len() - 1;
             // Hide a heading's markers unless the active range touches its line.
             // The hidden bytes only ever sit on the first segment (the `#`s lead
             // the logical line); a touched line, or any non-heading line, hides
             // nothing.
-            let marker = markdown::marker_len(&text[ls..le]);
+            let marker = markdown::marker_len(&line);
             let revealed = active.0 <= le && active.1 >= ls;
             for (k, (start, end)) in segments.into_iter().enumerate() {
                 let hidden_prefix = if marker > 0 && !revealed && k == 0 {
@@ -126,20 +137,16 @@ impl Layout {
                     0
                 };
                 lines.push(VisualLine {
-                    start,
-                    end,
+                    start: ls + start,
+                    end: ls + end,
                     baseline: box_top + metrics.ascent,
                     // Only the final segment of a logical line that has a
                     // trailing '\n' is a hard break.
-                    hard: k == last && rel.is_some(),
+                    hard: k == last && has_newline,
                     size,
                     hidden_prefix,
                 });
                 box_top += metrics.line_height;
-            }
-            match rel {
-                Some(r) => ls = ls + r + 1,
-                None => break,
             }
         }
         Self {
@@ -170,13 +177,14 @@ impl Layout {
     /// sized to the metrics of the line it lands on. The caret only ever lands on
     /// a revealed line (the cursor's own line shows its markers), so `offset`
     /// sits at or past the displayed start; the clamp is defensive.
-    pub fn caret(&self, fonts: &Fonts, text: &str, offset: usize) -> (i32, i32, i32) {
+    pub fn caret(&self, fonts: &Fonts, rope: &Rope, offset: usize) -> (i32, i32, i32) {
         let line = self.line_for(offset);
         let face = fonts.face(line.size);
         let m = fonts.metrics(line.size);
         let display_start = line.start + line.hidden_prefix;
         let from = offset.max(display_start);
-        let x = self.left as f32 + render::text_advance(face, &text[display_start..from]);
+        let prefix = rope.byte_slice(display_start..from);
+        let x = self.left as f32 + render::text_advance(face, &prefix);
         (
             x.round() as i32,
             line.baseline - m.ascent,
@@ -185,9 +193,9 @@ impl Layout {
     }
 
     /// The byte offset nearest a click at window `(x, y)`.
-    pub fn offset_at(&self, fonts: &Fonts, text: &str, x: f32, y: f32) -> usize {
+    pub fn offset_at(&self, fonts: &Fonts, rope: &Rope, x: f32, y: f32) -> usize {
         let line = self.line_for_y(fonts, y);
-        self.hit_line(fonts, text, line, x)
+        self.hit_line(fonts, rope, line, x)
     }
 
     /// The byte offset reached by moving `dir` lines (-1 up, +1 down) from
@@ -195,7 +203,7 @@ impl Layout {
     pub fn offset_vertical(
         &self,
         fonts: &Fonts,
-        text: &str,
+        rope: &Rope,
         offset: usize,
         dir: i32,
         goal_x: f32,
@@ -205,7 +213,7 @@ impl Layout {
         if target < 0 || target as usize >= self.lines.len() {
             return offset;
         }
-        self.hit_line(fonts, text, &self.lines[target as usize], goal_x)
+        self.hit_line(fonts, rope, &self.lines[target as usize], goal_x)
     }
 
     /// The highlight rectangles covering the byte range `[start, end)`, one per
@@ -213,7 +221,7 @@ impl Layout {
     pub fn selection_rects(
         &self,
         fonts: &Fonts,
-        text: &str,
+        rope: &Rope,
         start: usize,
         end: usize,
     ) -> Vec<Rect> {
@@ -236,8 +244,10 @@ impl Layout {
             let display_start = line.start + line.hidden_prefix;
             let eff_start = sel_start.max(display_start);
             let eff_end = sel_end.max(display_start);
-            let x0 = self.left as f32 + render::text_advance(face, &text[display_start..eff_start]);
-            let x1 = self.left as f32 + render::text_advance(face, &text[display_start..eff_end]);
+            let x0 = self.left as f32
+                + render::text_advance(face, &rope.byte_slice(display_start..eff_start));
+            let x1 = self.left as f32
+                + render::text_advance(face, &rope.byte_slice(display_start..eff_end));
             let mut w = (x1 - x0).round() as i32;
             if newline_selected {
                 w += NEWLINE_PAD;
@@ -282,12 +292,12 @@ impl Layout {
     /// cluster boundary (a click in a cluster's left half lands before it). Hit
     /// testing walks the displayed text, so a click on a heading with hidden
     /// markers lands in the visible text, never inside the collapsed `#`s.
-    fn hit_line(&self, fonts: &Fonts, text: &str, line: &VisualLine, x: f32) -> usize {
+    fn hit_line(&self, fonts: &Fonts, rope: &Rope, line: &VisualLine, x: f32) -> usize {
         let face = fonts.face(line.size);
         let display_start = line.start + line.hidden_prefix;
-        let slice = &text[display_start..line.end];
+        let slice = rope.byte_slice(display_start..line.end);
         let mut acc = self.left as f32;
-        for (off, cluster) in grapheme::graphemes(slice) {
+        for (off, cluster) in grapheme::graphemes(&slice) {
             let w = render::text_advance(face, cluster);
             if x < acc + w / 2.0 {
                 return display_start + off;
@@ -307,30 +317,18 @@ impl Layout {
 /// returning the byte ranges of its visual segments. Breaks after the last space
 /// that fits; a word wider than `wrap_width` breaks at a grapheme boundary so
 /// every segment holds at least one cluster. `wrap_width <= 0` disables wrapping.
-fn wrap_segments(
-    face: &Face,
-    text: &str,
-    ls: usize,
-    le: usize,
-    wrap_width: i32,
-) -> Vec<(usize, usize)> {
-    if wrap_width <= 0 || ls == le {
-        return vec![(ls, le)];
+fn wrap_segments(face: &Face, line: &str, wrap_width: i32) -> Vec<(usize, usize)> {
+    if wrap_width <= 0 || line.is_empty() {
+        return vec![(0, line.len())];
     }
-    // Measure each cluster once: its absolute start, width, and whether it is a
-    // space (a wrap opportunity).
-    let clusters: Vec<(usize, f32, bool)> = grapheme::graphemes(&text[ls..le])
+    // Measure each cluster once: its offset within the line, width, and whether
+    // it is a space (a wrap opportunity).
+    let clusters: Vec<(usize, f32, bool)> = grapheme::graphemes(line)
         .into_iter()
-        .map(|(off, cluster)| {
-            (
-                ls + off,
-                render::text_advance(face, cluster),
-                cluster == " ",
-            )
-        })
+        .map(|(off, cluster)| (off, render::text_advance(face, cluster), cluster == " "))
         .collect();
     if clusters.is_empty() {
-        return vec![(ls, le)];
+        return vec![(0, line.len())];
     }
 
     let limit = wrap_width as f32;
@@ -356,7 +354,7 @@ fn wrap_segments(
             }
         }
         if j >= clusters.len() {
-            segments.push((seg_start, le));
+            segments.push((seg_start, line.len()));
             break;
         }
         // Break after the last space if there was one, else mid-word at j.
@@ -390,8 +388,13 @@ mod tests {
     /// Build with wrapping effectively disabled, at body size, with the whole
     /// buffer active so every heading is revealed.
     /// Reveal-specific tests build explicitly with a narrower active range.
-    fn layout(f: &Fonts, text: &str) -> Layout {
-        Layout::build(f, text, LEFT, TOP, 1_000_000, BODY, (0, text.len()))
+    fn layout(f: &Fonts, r: &Rope) -> Layout {
+        Layout::build(f, r, LEFT, TOP, 1_000_000, BODY, (0, r.len()))
+    }
+
+    /// A rope from a string literal, for the geometry tests.
+    fn rope(s: &str) -> Rope {
+        Rope::from_str(s)
     }
 
     /// A wrap width that fits "aaa " but not a following cluster, so "aaa bbb"
@@ -405,7 +408,7 @@ mod tests {
     fn splits_logical_lines_with_stacked_baselines() {
         let f = fonts();
         let m = f.metrics(BODY);
-        let l = layout(&f, "ab\ncd\n");
+        let l = layout(&f, &rope("ab\ncd\n"));
         let lines = l.lines();
         assert_eq!(lines.len(), 3, "trailing newline yields an empty last line");
         assert_eq!((lines[0].start, lines[0].end), (0, 2));
@@ -422,7 +425,7 @@ mod tests {
     #[test]
     fn empty_text_is_one_line() {
         let f = fonts();
-        let l = layout(&f, "");
+        let l = layout(&f, &rope(""));
         assert_eq!(l.lines().len(), 1);
         assert_eq!((l.lines()[0].start, l.lines()[0].end), (0, 0));
         assert!(!l.lines()[0].hard);
@@ -432,15 +435,16 @@ mod tests {
     fn caret_sits_at_the_left_margin_for_a_line_start() {
         let f = fonts();
         let m = f.metrics(BODY);
-        let l = layout(&f, "hello\nworld");
-        let (x0, top0, h) = l.caret(&f, "hello\nworld", 0);
+        let r = rope("hello\nworld");
+        let l = layout(&f, &r);
+        let (x0, top0, h) = l.caret(&f, &r, 0);
         assert_eq!(x0, LEFT, "first column is the left margin");
         assert_eq!(
             top0, TOP,
             "caret top is baseline - ascent, i.e. the box top"
         );
         assert_eq!(h, m.ascent + m.descent, "caret spans ascent + descent");
-        let (x1, top1, _) = l.caret(&f, "hello\nworld", 6);
+        let (x1, top1, _) = l.caret(&f, &r, 6);
         assert_eq!(x1, LEFT, "second line also starts at the margin");
         assert_eq!(top1, TOP + m.line_height, "and one line lower");
     }
@@ -448,11 +452,11 @@ mod tests {
     #[test]
     fn caret_advances_along_a_line() {
         let f = fonts();
-        let text = "mm";
-        let l = layout(&f, text);
-        let (x0, _, _) = l.caret(&f, text, 0);
-        let (x1, _, _) = l.caret(&f, text, 1);
-        let (x2, _, _) = l.caret(&f, text, 2);
+        let r = rope("mm");
+        let l = layout(&f, &r);
+        let (x0, _, _) = l.caret(&f, &r, 0);
+        let (x1, _, _) = l.caret(&f, &r, 1);
+        let (x2, _, _) = l.caret(&f, &r, 2);
         assert!(x1 > x0 && x2 > x1, "caret x grows with the column");
     }
 
@@ -460,36 +464,36 @@ mod tests {
     fn click_maps_to_the_clicked_line_and_column() {
         let f = fonts();
         let text = "abc\ndefg";
-        let l = layout(&f, text);
+        let r = rope(text);
+        let l = layout(&f, &r);
         let (y0, y1) = (l.lines()[0].baseline as f32, l.lines()[1].baseline as f32);
-        let off = l.offset_at(&f, text, 10_000.0, y1);
+        let off = l.offset_at(&f, &r, 10_000.0, y1);
         assert_eq!(off, text.len(), "past the last glyph of line two -> end");
-        let off = l.offset_at(&f, text, -100.0, y0);
+        let off = l.offset_at(&f, &r, -100.0, y0);
         assert_eq!(off, 0);
-        let off = l.offset_at(&f, text, -100.0, 9_000.0);
+        let off = l.offset_at(&f, &r, -100.0, 9_000.0);
         assert_eq!(off, 4, "start of the last line");
     }
 
     #[test]
     fn vertical_motion_changes_line_and_clamps() {
         let f = fonts();
-        let text = "abc\ndef\nghi";
-        let l = layout(&f, text);
-        let (x, _, _) = l.caret(&f, text, 5);
-        let up = l.offset_vertical(&f, text, 5, -1, x as f32);
+        let r = rope("abc\ndef\nghi");
+        let l = layout(&f, &r);
+        let (x, _, _) = l.caret(&f, &r, 5);
+        let up = l.offset_vertical(&f, &r, 5, -1, x as f32);
         assert_eq!(up, 1, "same column on the line above");
-        let down = l.offset_vertical(&f, text, 5, 1, x as f32);
+        let down = l.offset_vertical(&f, &r, 5, 1, x as f32);
         assert_eq!(down, 9, "same column on the line below");
-        assert_eq!(l.offset_vertical(&f, text, 1, -1, x as f32), 1);
+        assert_eq!(l.offset_vertical(&f, &r, 1, -1, x as f32), 1);
     }
 
     #[test]
     fn selection_on_one_line_is_one_rect() {
         let f = fonts();
         let m = f.metrics(BODY);
-        let text = "hello";
-        let l = layout(&f, text);
-        let rects = l.selection_rects(&f, text, 1, 4);
+        let l = layout(&f, &rope("hello"));
+        let rects = l.selection_rects(&f, &rope("hello"), 1, 4);
         assert_eq!(rects.len(), 1);
         assert!(rects[0].w > 0);
         assert_eq!(rects[0].h, m.ascent + m.descent);
@@ -499,9 +503,8 @@ mod tests {
     #[test]
     fn selection_across_hard_lines_is_one_rect_per_line() {
         let f = fonts();
-        let text = "ab\ncd\nef";
-        let l = layout(&f, text);
-        let rects = l.selection_rects(&f, text, 1, 7);
+        let l = layout(&f, &rope("ab\ncd\nef"));
+        let rects = l.selection_rects(&f, &rope("ab\ncd\nef"), 1, 7);
         assert_eq!(rects.len(), 3, "three lines touched");
         assert!(rects[0].w >= NEWLINE_PAD, "hard newline adds the pad");
     }
@@ -509,8 +512,8 @@ mod tests {
     #[test]
     fn long_line_soft_wraps_at_spaces() {
         let f = fonts();
-        let text = "aaa bbb";
-        let l = Layout::build(&f, text, 0, 0, tight_wrap(&f), BODY, (0, text.len()));
+        let r = rope("aaa bbb");
+        let l = Layout::build(&f, &r, 0, 0, tight_wrap(&f), BODY, (0, r.len()));
         let lines = l.lines();
         assert_eq!(lines.len(), 2, "wraps into two visual lines");
         assert_eq!(
@@ -533,8 +536,9 @@ mod tests {
     fn overlong_word_breaks_mid_word() {
         let f = fonts();
         let text = "mmmmmmmmmm"; // one word, no spaces
+        let r = rope(text);
         let wrap = (render::text_advance(f.face(BODY), "m") * 3.0) as i32;
-        let l = Layout::build(&f, text, 0, 0, wrap, BODY, (0, text.len()));
+        let l = Layout::build(&f, &r, 0, 0, wrap, BODY, (0, r.len()));
         let lines = l.lines();
         assert!(lines.len() >= 2, "an unbreakable word still wraps");
         assert!(
@@ -550,11 +554,11 @@ mod tests {
     fn caret_affinity_puts_a_soft_boundary_on_the_next_line() {
         let f = fonts();
         let m = f.metrics(BODY);
-        let text = "aaa bbb";
-        let l = Layout::build(&f, text, 0, 0, tight_wrap(&f), BODY, (0, text.len()));
+        let r = rope("aaa bbb");
+        let l = Layout::build(&f, &r, 0, 0, tight_wrap(&f), BODY, (0, r.len()));
         // Offset 4 is the soft-wrap boundary; the caret shows at the start of
         // the second visual line, not the end of the first.
-        let (x, top, _) = l.caret(&f, text, 4);
+        let (x, top, _) = l.caret(&f, &r, 4);
         assert_eq!(x, 0, "left margin of the wrapped row");
         assert_eq!(top, m.line_height, "second box top: one line height down");
     }
@@ -562,9 +566,9 @@ mod tests {
     #[test]
     fn selection_across_a_soft_wrap_has_no_newline_pad() {
         let f = fonts();
-        let text = "aaa bbb";
-        let l = Layout::build(&f, text, 0, 0, tight_wrap(&f), BODY, (0, text.len()));
-        let rects = l.selection_rects(&f, text, 0, 7);
+        let r = rope("aaa bbb");
+        let l = Layout::build(&f, &r, 0, 0, tight_wrap(&f), BODY, (0, r.len()));
+        let rects = l.selection_rects(&f, &r, 0, 7);
         assert_eq!(rects.len(), 2, "one rect per visual line");
         let line0_text_w = render::text_advance(f.face(BODY), "aaa ").round() as i32;
         assert!(
@@ -582,7 +586,7 @@ mod tests {
             h1.line_height > body.line_height,
             "the heading box is taller"
         );
-        let l = layout(&f, "# Title\nbody");
+        let l = layout(&f, &rope("# Title\nbody"));
         let lines = l.lines();
         assert_eq!(lines.len(), 2);
         assert_eq!(
@@ -601,9 +605,9 @@ mod tests {
         let f = fonts();
         let body = f.metrics(BODY);
         let h1 = f.metrics(h1_size());
-        let text = "# Title";
-        let l = layout(&f, text);
-        let (_, _, h) = l.caret(&f, text, 0);
+        let r = rope("# Title");
+        let l = layout(&f, &r);
+        let (_, _, h) = l.caret(&f, &r, 0);
         assert_eq!(h, h1.ascent + h1.descent);
         assert!(h > body.ascent + body.descent, "taller than a body caret");
     }
@@ -622,7 +626,15 @@ mod tests {
 
     /// Build "# Title\nbody" with the active range placed by `active`.
     fn heading_and_body(f: &Fonts, active: (usize, usize)) -> Layout {
-        Layout::build(f, "# Title\nbody", LEFT, TOP, 1_000_000, BODY, active)
+        Layout::build(
+            f,
+            &rope("# Title\nbody"),
+            LEFT,
+            TOP,
+            1_000_000,
+            BODY,
+            active,
+        )
     }
 
     #[test]
@@ -665,26 +677,26 @@ mod tests {
     #[test]
     fn hidden_markers_shift_clicks_into_the_visible_text() {
         let f = fonts();
-        let text = "# Title";
+        let r = rope("# Title");
         // No cursor on the line, so the markers hide.
-        let l = Layout::build(&f, text, LEFT, TOP, 1_000_000, BODY, (99, 99));
+        let l = Layout::build(&f, &r, LEFT, TOP, 1_000_000, BODY, (99, 99));
         assert_eq!(l.lines()[0].hidden_prefix, 2);
         // A click at the far left lands at the start of the visible text
         // ("Title", offset 2), never inside the collapsed "# ".
-        let off = l.offset_at(&f, text, -100.0, l.lines()[0].baseline as f32);
+        let off = l.offset_at(&f, &r, -100.0, l.lines()[0].baseline as f32);
         assert_eq!(off, 2, "click maps past the collapsed marker");
     }
 
     #[test]
     fn revealing_markers_shifts_the_heading_text_right_by_the_marker_width() {
         let f = fonts();
-        let text = "# Title";
-        let hidden = Layout::build(&f, text, LEFT, TOP, 1_000_000, BODY, (99, 99));
-        let shown = Layout::build(&f, text, LEFT, TOP, 1_000_000, BODY, (0, 0));
+        let r = rope("# Title");
+        let hidden = Layout::build(&f, &r, LEFT, TOP, 1_000_000, BODY, (99, 99));
+        let shown = Layout::build(&f, &r, LEFT, TOP, 1_000_000, BODY, (0, 0));
         // The first visible glyph is at byte offset 2 ("T") in both; collapsed it
         // sits at the margin, expanded it sits a marker-width to the right.
-        let (x_hidden, _, _) = hidden.caret(&f, text, 2);
-        let (x_shown, _, _) = shown.caret(&f, text, 2);
+        let (x_hidden, _, _) = hidden.caret(&f, &r, 2);
+        let (x_shown, _, _) = shown.caret(&f, &r, 2);
         assert_eq!(x_hidden, LEFT, "collapsed: visible text at the margin");
         let marker_w = render::text_advance(f.face(h1_size()), "# ").round() as i32;
         assert_eq!(x_shown - x_hidden, marker_w, "expanded by the marker width");
@@ -695,9 +707,9 @@ mod tests {
         // Wrapping uses the source text, so collapsing markers never reflows the
         // document: line count, baselines, and height are reveal-independent.
         let f = fonts();
-        let text = "# A longer heading that might wrap\nbody text below the heading";
-        let hidden = Layout::build(&f, text, LEFT, TOP, 200, BODY, (99, 99));
-        let shown = Layout::build(&f, text, LEFT, TOP, 200, BODY, (0, 0));
+        let r = rope("# A longer heading that might wrap\nbody text below the heading");
+        let hidden = Layout::build(&f, &r, LEFT, TOP, 200, BODY, (99, 99));
+        let shown = Layout::build(&f, &r, LEFT, TOP, 200, BODY, (0, 0));
         assert_eq!(hidden.lines().len(), shown.lines().len());
         for (h, s) in hidden.lines().iter().zip(shown.lines()) {
             assert_eq!(h.baseline, s.baseline, "baselines are reveal-independent");

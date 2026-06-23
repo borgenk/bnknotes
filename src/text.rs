@@ -235,14 +235,31 @@ impl TextBuffer {
 
     /// Select the whole buffer (anchor at the start, cursor at the end).
     pub fn select_all(&mut self) {
+        self.set_selection(0, self.text.len());
+    }
+
+    /// Select the word (or run of separators) at `offset`, for a double-click.
+    /// The word model matches the word-motion keys: a word is a run of
+    /// alphanumerics and `_`; whitespace and punctuation are separators.
+    pub fn select_word_at(&mut self, offset: usize) {
+        let (start, end) = word_range(&self.text, offset);
+        self.set_selection(start, end);
+    }
+
+    /// Select the whole logical line containing `offset`, including its trailing
+    /// newline if it has one, for a triple-click.
+    pub fn select_line_at(&mut self, offset: usize) {
+        let (start, end) = line_range(&self.text, offset);
+        self.set_selection(start, end);
+    }
+
+    /// Set the selection to the half-open range `[start, end)` with the cursor at
+    /// `end`. A collapsed range (`start == end`) leaves a bare cursor, no
+    /// selection. Breaks the coalescing group, like any cursor move.
+    fn set_selection(&mut self, start: usize, end: usize) {
         self.group = Coalesce::None;
-        if self.text.is_empty() {
-            self.anchor = None;
-            self.cursor = 0;
-        } else {
-            self.anchor = Some(0);
-            self.cursor = self.text.len();
-        }
+        self.anchor = if start == end { None } else { Some(start) };
+        self.cursor = end;
     }
 
     /// Undo the most recent edit group. Returns whether anything changed.
@@ -501,6 +518,50 @@ fn prev_word(text: &str, pos: usize) -> usize {
         k -= 1;
     }
     clusters.get(k).map_or(pos, |&(off, _)| off)
+}
+
+/// The byte range of the word (or run of separators) at `offset`, for
+/// double-click selection: the maximal run of clusters sharing the clicked
+/// cluster's class (word vs separator). A click at a word's trailing edge, or at
+/// the buffer end, still selects the word to the left.
+fn word_range(text: &str, offset: usize) -> (usize, usize) {
+    let clusters = grapheme::graphemes(text);
+    let n = clusters.len();
+    if n == 0 {
+        return (0, 0);
+    }
+    // The clicked cluster is the one starting at `offset`; a click at the end
+    // falls on the last cluster. Prefer a word cluster just to the left over a
+    // separator under the click, so clicking a word's right edge selects it.
+    let mut i = clusters
+        .iter()
+        .position(|&(o, _)| o == offset)
+        .unwrap_or(n - 1);
+    if !cluster_is_word(clusters[i].1) && i > 0 && cluster_is_word(clusters[i - 1].1) {
+        i -= 1;
+    }
+    let class = cluster_is_word(clusters[i].1);
+    let mut lo = i;
+    while lo > 0 && cluster_is_word(clusters[lo - 1].1) == class {
+        lo -= 1;
+    }
+    let mut hi = i;
+    while hi + 1 < n && cluster_is_word(clusters[hi + 1].1) == class {
+        hi += 1;
+    }
+    (clusters[lo].0, clusters[hi].0 + clusters[hi].1.len())
+}
+
+/// The byte range of the logical line containing `offset`: from just after the
+/// previous newline (or the start) to just after the next newline (or the end),
+/// so the trailing newline is part of the line for triple-click selection.
+fn line_range(text: &str, offset: usize) -> (usize, usize) {
+    let offset = offset.min(text.len());
+    let start = text[..offset].rfind('\n').map_or(0, |i| i + 1);
+    let end = text[offset..]
+        .find('\n')
+        .map_or(text.len(), |i| offset + i + 1);
+    (start, end)
 }
 
 #[cfg(test)]
@@ -899,5 +960,54 @@ mod tests {
         b.set_cursor(0, false);
         assert!(b.move_doc_end(true));
         assert_eq!(b.selection(), Some((0, b.text().len())));
+    }
+
+    #[test]
+    fn double_click_selects_the_word_under_it() {
+        let mut b = TextBuffer::new();
+        b.insert_str("foo bar baz");
+        b.select_word_at(5); // inside "bar"
+        assert_eq!(b.selection(), Some((4, 7)));
+        assert_eq!(b.selected_text(), Some("bar"));
+    }
+
+    #[test]
+    fn double_click_on_whitespace_selects_the_run() {
+        let mut b = TextBuffer::new();
+        b.insert_str("a   b");
+        b.select_word_at(2); // inside the spaces
+        assert_eq!(b.selected_text(), Some("   "));
+    }
+
+    #[test]
+    fn double_click_at_a_word_edge_prefers_the_word() {
+        let mut b = TextBuffer::new();
+        b.insert_str("foo bar");
+        b.select_word_at(3); // the space starts here; the word is to the left
+        assert_eq!(b.selected_text(), Some("foo"));
+    }
+
+    #[test]
+    fn double_click_at_the_buffer_end_selects_the_last_word() {
+        let mut b = TextBuffer::new();
+        b.insert_str("hello");
+        b.select_word_at(5);
+        assert_eq!(b.selected_text(), Some("hello"));
+    }
+
+    #[test]
+    fn triple_click_selects_the_logical_line_with_its_newline() {
+        let mut b = TextBuffer::new();
+        b.insert_str("first\nsecond\nthird");
+        b.select_line_at(8); // inside "second"
+        assert_eq!(b.selected_text(), Some("second\n"));
+    }
+
+    #[test]
+    fn triple_click_on_the_last_line_has_no_newline() {
+        let mut b = TextBuffer::new();
+        b.insert_str("first\nlast");
+        b.select_line_at(8); // inside "last"
+        assert_eq!(b.selected_text(), Some("last"));
     }
 }

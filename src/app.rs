@@ -7,7 +7,9 @@
 //! Home/End and Page Up/Down navigate the visual lines a [`Layout`] pass
 //! computes, while Ctrl jumps by word (arrows) or to the document ends
 //! (Home/End) and deletes whole words (Backspace/Delete); a held Shift turns
-//! motion into a selection, which a pointer can also drag out; the selection
+//! motion into a selection, which a pointer can also drag out (double- and
+//! triple-click select a word or line, Shift+click extends, and a drag past an
+//! edge auto-scrolls), with an I-beam shown over the text; the selection
 //! highlights behind the text and Backspace or typing replaces it. Ctrl shortcuts
 //! select-all,
 //! copy, cut, paste (over wl_data_device), and undo/redo; a held key repeats on a
@@ -30,7 +32,8 @@ use crate::markdown;
 use crate::protocol::{
     self, wl_buffer, wl_callback, wl_compositor, wl_data_device, wl_data_device_manager,
     wl_data_offer, wl_data_source, wl_display, wl_keyboard, wl_pointer, wl_registry, wl_seat,
-    wl_shm, wl_shm_pool, wl_surface, xdg_surface, xdg_toplevel, xdg_wm_base,
+    wl_shm, wl_shm_pool, wl_surface, wp_cursor_shape_device_v1, wp_cursor_shape_manager_v1,
+    xdg_surface, xdg_toplevel, xdg_wm_base,
 };
 use crate::render::Canvas;
 use crate::scroll;
@@ -63,6 +66,20 @@ const CARET_COLOR: u32 = 0x00ff_ffff;
 const CARET_WIDTH: i32 = 2;
 /// Pixels scrolled per unit of wl_pointer.axis value (wheel/touchpad).
 const SCROLL_FACTOR: f32 = 2.0;
+
+/// Two clicks within this window, and within [`MULTI_CLICK_RADIUS`] pixels,
+/// count as a double-click (then triple, ...).
+const MULTI_CLICK_INTERVAL: Duration = Duration::from_millis(400);
+/// How far apart successive clicks may land yet still chain into a multi-click.
+const MULTI_CLICK_RADIUS: f32 = 5.0;
+
+/// While drag-selecting, a pointer this close to the top or bottom edge (in
+/// pixels) auto-scrolls the view so the selection can extend past what is shown.
+const AUTOSCROLL_MARGIN: i32 = 24;
+/// Pixels scrolled per auto-scroll tick, and how often a tick fires while the
+/// pointer is held in the edge zone.
+const AUTOSCROLL_STEP: i32 = 24;
+const AUTOSCROLL_INTERVAL: Duration = Duration::from_millis(16);
 
 /// Fallback auto-repeat timing if the compositor never sends repeat_info.
 const DEFAULT_REPEAT_DELAY_MS: u64 = 400;
@@ -125,12 +142,25 @@ struct State {
     pointer: u32,
     data_device_manager: Option<u32>,
     data_device: u32,
+    /// The cursor-shape manager (if the compositor offers it) and the shape
+    /// device we create for our pointer, used to show an I-beam over the text.
+    cursor_shape_manager: Option<u32>,
+    cursor_shape_device: u32,
 
     // Pointer state: latest position (surface-local pixels) and whether a left
     // button drag is currently extending a selection.
     pointer_x: f32,
     pointer_y: f32,
     selecting: bool,
+    /// Click chaining for double/triple-click: when the last left press fired,
+    /// where, and how many have chained so far (1 = single, 2 = double, ...).
+    last_click: Option<Instant>,
+    last_click_pos: (f32, f32),
+    click_count: u32,
+    /// Auto-scroll while drag-selecting at an edge: pixels per tick (0 = off,
+    /// sign = direction) and when the next tick is due.
+    autoscroll: i32,
+    autoscroll_at: Option<Instant>,
     /// Sticky x for vertical motion, so repeated Up/Down keep a column.
     goal_x: Option<f32>,
     /// How far the viewport is scrolled down the document, in pixels.
@@ -215,9 +245,16 @@ impl State {
             pointer: 0,
             data_device_manager: None,
             data_device: 0,
+            cursor_shape_manager: None,
+            cursor_shape_device: 0,
             pointer_x: 0.0,
             pointer_y: 0.0,
             selecting: false,
+            last_click: None,
+            last_click_pos: (0.0, 0.0),
+            click_count: 0,
+            autoscroll: 0,
+            autoscroll_at: None,
             goal_x: None,
             scroll_y: 0,
             repeat_delay: Duration::from_millis(DEFAULT_REPEAT_DELAY_MS),
@@ -317,7 +354,8 @@ impl State {
 
         eprintln!(
             "bnknotes: type to edit; Enter, Tab, arrows/Home/End, PageUp/Down, \
-             Ctrl+arrows by word, Ctrl+Home/End to ends, Shift selects, click/drag; \
+             Ctrl+arrows by word, Ctrl+Home/End to ends, Shift selects; \
+             click/drag, Shift+click extends, double/triple-click select word/line; \
              Ctrl+Backspace/Delete delete a word; Ctrl+A/C/X/V select-all/copy/cut/paste, \
              Ctrl+Z/Y undo/redo, Ctrl+S save; held keys repeat; close to exit"
         );
@@ -415,6 +453,7 @@ impl State {
                 self.handle(msg)?;
             }
             self.fire_repeats()?;
+            self.fire_autoscroll();
             if self.configured && self.dirty && self.render_frame()? {
                 self.dirty = false;
             }
@@ -422,7 +461,7 @@ impl State {
                 return Ok(());
             }
             self.conn.flush()?;
-            let timeout = self.repeat_timeout();
+            let timeout = self.next_wake();
             if let Fill::Bytes(0) = self.conn.fill(timeout)? {
                 return Err(Error::msg("compositor closed the connection"));
             }
@@ -598,6 +637,7 @@ impl State {
                 self.conn
                     .request(msg.object, wl_seat::GET_POINTER, &[Arg::NewId(pointer)]);
                 self.pointer = pointer;
+                self.init_cursor_shape();
             }
             return Ok(());
         }
@@ -677,6 +717,16 @@ impl State {
                     id,
                 );
                 self.data_device_manager = Some(id);
+            }
+            protocol::IFACE_CURSOR_SHAPE_MANAGER => {
+                let id = self.alloc_id();
+                self.bind(
+                    name,
+                    interface,
+                    version.min(protocol::VERSION_CURSOR_SHAPE_MANAGER),
+                    id,
+                );
+                self.cursor_shape_manager = Some(id);
             }
             _ => {}
         }
@@ -962,18 +1012,22 @@ impl State {
     fn on_pointer(&mut self, opcode: u16, r: &mut Reader) -> Result<()> {
         match opcode {
             wl_pointer::EV_ENTER => {
-                let _serial = r.u32()?;
+                let serial = r.u32()?;
                 let _surface = r.u32()?;
                 self.pointer_x = r.fixed()?;
                 self.pointer_y = r.fixed()?;
+                // The whole surface is editable text, so show an I-beam.
+                self.set_cursor_shape(serial);
             }
             wl_pointer::EV_MOTION => {
                 let _time = r.u32()?;
                 self.pointer_x = r.fixed()?;
                 self.pointer_y = r.fixed()?;
                 if self.selecting {
-                    // Drag extends the selection from the press point.
+                    // Drag extends the selection from the press point, and arms
+                    // auto-scroll when the pointer sits at a vertical edge.
                     self.place_cursor_at(self.pointer_x, self.pointer_y, true);
+                    self.update_autoscroll();
                 }
             }
             wl_pointer::EV_BUTTON => {
@@ -984,10 +1038,10 @@ impl State {
                 if button == wl_pointer::BTN_LEFT {
                     if state == wl_pointer::BUTTON_STATE_PRESSED {
                         self.goal_x = None;
-                        self.place_cursor_at(self.pointer_x, self.pointer_y, false);
-                        self.selecting = true;
+                        self.on_left_press();
                     } else {
                         self.selecting = false;
+                        self.stop_autoscroll();
                     }
                 }
             }
@@ -1016,6 +1070,132 @@ impl State {
         if self.text.cursor() != before || self.text.selection() != before_sel {
             self.dirty = true;
         }
+    }
+
+    /// Create the cursor-shape device for our pointer, if the compositor offers
+    /// the manager. Without it the pointer just keeps the compositor's default.
+    fn init_cursor_shape(&mut self) {
+        let (Some(manager), true) = (self.cursor_shape_manager, self.pointer != 0) else {
+            return;
+        };
+        let device = self.alloc_id();
+        self.conn.request(
+            manager,
+            wp_cursor_shape_manager_v1::GET_POINTER,
+            &[Arg::NewId(device), Arg::Object(self.pointer)],
+        );
+        self.cursor_shape_device = device;
+    }
+
+    /// Ask the compositor to draw the I-beam (`text`) shape for the pointer.
+    /// `serial` must be the pointer `enter` event's serial. A no-op when the
+    /// compositor gave us no cursor-shape device.
+    fn set_cursor_shape(&mut self, serial: u32) {
+        if self.cursor_shape_device == 0 {
+            return;
+        }
+        self.conn.request(
+            self.cursor_shape_device,
+            wp_cursor_shape_device_v1::SET_SHAPE,
+            &[
+                Arg::Uint(serial),
+                Arg::Uint(wp_cursor_shape_device_v1::SHAPE_TEXT),
+            ],
+        );
+    }
+
+    /// Handle a left-button press: chain it into the click count and act on it.
+    /// A single click places the cursor (extending the selection if Shift is
+    /// held) and starts a drag; a double-click selects the word under the
+    /// pointer; a triple (or more) selects the whole logical line.
+    fn on_left_press(&mut self) {
+        let now = Instant::now();
+        let (lx, ly) = self.last_click_pos;
+        let near = (self.pointer_x - lx).abs() <= MULTI_CLICK_RADIUS
+            && (self.pointer_y - ly).abs() <= MULTI_CLICK_RADIUS;
+        let chained = near
+            && self
+                .last_click
+                .is_some_and(|t| now.saturating_duration_since(t) <= MULTI_CLICK_INTERVAL);
+        self.click_count = if chained { self.click_count + 1 } else { 1 };
+        self.last_click = Some(now);
+        self.last_click_pos = (self.pointer_x, self.pointer_y);
+
+        match self.click_count {
+            1 => {
+                let extend = self.xkb.shift_active();
+                self.place_cursor_at(self.pointer_x, self.pointer_y, extend);
+                self.selecting = true;
+            }
+            2 => {
+                let offset = self.pointer_offset();
+                self.text.select_word_at(offset);
+                self.dirty = true;
+            }
+            _ => {
+                let offset = self.pointer_offset();
+                self.text.select_line_at(offset);
+                self.dirty = true;
+            }
+        }
+    }
+
+    /// The byte offset under the pointer, mapping its window position into
+    /// content space by the current scroll.
+    fn pointer_offset(&self) -> usize {
+        let layout = self.layout();
+        layout.offset_at(
+            &self.fonts,
+            self.text.text(),
+            self.pointer_x,
+            self.pointer_y + self.scroll_y as f32,
+        )
+    }
+
+    /// Arm or disarm drag auto-scroll from the pointer's distance to a vertical
+    /// edge: past the top scrolls up, past the bottom scrolls down, anywhere in
+    /// between turns it off.
+    fn update_autoscroll(&mut self) {
+        let y = self.pointer_y as i32;
+        let step = if y < AUTOSCROLL_MARGIN {
+            -AUTOSCROLL_STEP
+        } else if y > self.height as i32 - AUTOSCROLL_MARGIN {
+            AUTOSCROLL_STEP
+        } else {
+            0
+        };
+        if step == 0 {
+            self.stop_autoscroll();
+        } else {
+            self.autoscroll = step;
+            // Fire the first tick promptly; later ticks follow the interval.
+            self.autoscroll_at.get_or_insert_with(Instant::now);
+        }
+    }
+
+    fn stop_autoscroll(&mut self) {
+        self.autoscroll = 0;
+        self.autoscroll_at = None;
+    }
+
+    /// While drag-selecting with the pointer held in an edge zone, scroll a step
+    /// and re-extend the selection to the (stationary) pointer, on the auto-
+    /// scroll interval. A no-op when not auto-scrolling.
+    fn fire_autoscroll(&mut self) {
+        if self.autoscroll == 0 || !self.selecting {
+            self.stop_autoscroll();
+            return;
+        }
+        let Some(at) = self.autoscroll_at else {
+            return;
+        };
+        let now = Instant::now();
+        if at > now {
+            return;
+        }
+        self.scroll_by(self.autoscroll);
+        self.place_cursor_at(self.pointer_x, self.pointer_y, true);
+        self.autoscroll_at = Some(now + AUTOSCROLL_INTERVAL);
     }
 
     // --- Key repeat -------------------------------------------------------
@@ -1062,6 +1242,23 @@ impl State {
             at.saturating_duration_since(Instant::now())
                 .max(Duration::from_millis(1)),
         )
+    }
+
+    /// How long to block for input: the soonest of the next key-repeat and the
+    /// next auto-scroll tick, or `None` to wait indefinitely when neither is due.
+    fn next_wake(&self) -> Option<Duration> {
+        let autoscroll = if self.autoscroll != 0 && self.selecting {
+            self.autoscroll_at.map(|at| {
+                at.saturating_duration_since(Instant::now())
+                    .max(Duration::from_millis(1))
+            })
+        } else {
+            None
+        };
+        match (self.repeat_timeout(), autoscroll) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        }
     }
 
     // --- Clipboard --------------------------------------------------------

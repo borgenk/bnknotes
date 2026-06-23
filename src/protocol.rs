@@ -131,6 +131,19 @@ pub mod xdg_toplevel {
     pub const EV_CLOSE: u16 = 1;
 }
 
+pub mod wp_cursor_shape_manager_v1 {
+    /// Create a shape device for a `wl_pointer`: `new_id` then the pointer.
+    pub const GET_POINTER: u16 = 1;
+}
+
+pub mod wp_cursor_shape_device_v1 {
+    /// Set the pointer's shape: the `enter` event's `serial`, then a shape enum.
+    pub const SET_SHAPE: u16 = 1;
+    /// The `text` shape (an I-beam), for hovering over editable text. Present
+    /// since version 1 of the protocol.
+    pub const SHAPE_TEXT: u32 = 9;
+}
+
 // Interface names, as advertised by `wl_registry.global`, and the maximum
 // version we know how to drive.
 pub const IFACE_COMPOSITOR: &str = "wl_compositor";
@@ -138,9 +151,12 @@ pub const IFACE_SHM: &str = "wl_shm";
 pub const IFACE_WM_BASE: &str = "xdg_wm_base";
 pub const IFACE_SEAT: &str = "wl_seat";
 pub const IFACE_DATA_DEVICE_MANAGER: &str = "wl_data_device_manager";
+pub const IFACE_CURSOR_SHAPE_MANAGER: &str = "wp_cursor_shape_manager_v1";
 
 pub const VERSION_COMPOSITOR: u32 = 4;
 pub const VERSION_SHM: u32 = 1;
 pub const VERSION_WM_BASE: u32 = 1;
 pub const VERSION_SEAT: u32 = 5;
 pub const VERSION_DATA_DEVICE_MANAGER: u32 = 3;
+/// We only need the `text` shape, which exists in version 1.
+pub const VERSION_CURSOR_SHAPE_MANAGER: u32 = 1;

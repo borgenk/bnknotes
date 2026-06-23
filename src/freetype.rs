@@ -196,6 +196,16 @@ impl Glyph {
     }
 }
 
+/// Render-ready line metrics for a face at its current pixel size, rounded to
+/// whole pixels. Ascent and descent are both positive (pixels above and below
+/// the baseline); `line_height` is the baseline-to-baseline distance.
+#[derive(Clone, Copy, Debug)]
+pub struct Metrics {
+    pub ascent: i32,
+    pub descent: i32,
+    pub line_height: i32,
+}
+
 /// Owns the FreeType library, the face, and the font-file bytes the face
 /// borrows. FT_New_Memory_Face keeps a pointer into the bytes for the face's
 /// life; the Vec's heap buffer has a stable address across moves of this
@@ -359,6 +369,28 @@ impl Face {
         };
         unsafe { size.as_ref().metrics.height as f32 / 64.0 }
     }
+
+    /// Render-ready [`Metrics`] at the current pixel size: ascent and descent
+    /// rounded up to whole pixels, and the baseline-to-baseline line height
+    /// (falling back to ascent + descent if the font reports none).
+    pub fn metrics(&self) -> Metrics {
+        let (ascent, descent) = self.line_metrics();
+        let ascent = ascent.ceil() as i32;
+        let descent = (-descent).ceil() as i32;
+        let line_height = {
+            let h = self.line_height().ceil() as i32;
+            if h > 0 {
+                h
+            } else {
+                ascent + descent
+            }
+        };
+        Metrics {
+            ascent,
+            descent,
+            line_height,
+        }
+    }
 }
 
 impl Drop for Face {
@@ -370,6 +402,64 @@ impl Drop for Face {
             FT_Done_Face(self.face.as_ptr());
             FT_Done_FreeType(self.library.as_ptr());
         }
+    }
+}
+
+/// One opened face plus its cached metrics, keyed by the pixel size it renders.
+struct SizedFace {
+    size: u32,
+    face: Face,
+    metrics: Metrics,
+}
+
+/// A set of [`Face`]s at different pixel sizes, so a document can mix body text
+/// and larger headings. Each distinct size is opened once (the same font file,
+/// re-read per size); the first size opened is the fallback for any size that
+/// was not requested, so a lookup can never fail and never panics.
+pub struct Fonts {
+    sized: Vec<SizedFace>,
+}
+
+impl Fonts {
+    /// Open the default font at each of `sizes` (zeros and duplicates skipped).
+    /// At least one nonzero size is required; the first opened becomes the
+    /// fallback.
+    pub fn new(sizes: &[u32]) -> Result<Self> {
+        let mut sized: Vec<SizedFace> = Vec::new();
+        for &size in sizes {
+            if size == 0 || sized.iter().any(|s| s.size == size) {
+                continue;
+            }
+            let face = Face::open_default(size)?;
+            let metrics = face.metrics();
+            sized.push(SizedFace {
+                size,
+                face,
+                metrics,
+            });
+        }
+        if sized.is_empty() {
+            return Err(Error::msg("Fonts::new needs at least one nonzero size"));
+        }
+        Ok(Self { sized })
+    }
+
+    /// The entry for `size`, or the fallback (first opened) if `size` is unknown.
+    fn entry(&self, size: u32) -> &SizedFace {
+        self.sized
+            .iter()
+            .find(|s| s.size == size)
+            .unwrap_or(&self.sized[0])
+    }
+
+    /// The face rendering at `size`, or the fallback face if `size` was not opened.
+    pub fn face(&self, size: u32) -> &Face {
+        &self.entry(size).face
+    }
+
+    /// The metrics for `size`, or the fallback's metrics if `size` was not opened.
+    pub fn metrics(&self, size: u32) -> Metrics {
+        self.entry(size).metrics
     }
 }
 
@@ -444,5 +534,33 @@ mod tests {
         // Baseline-to-baseline spacing is at least the ink height (ascent above
         // the baseline plus the descent below it).
         assert!(height >= ascent - descent, "height {height} too small");
+    }
+
+    #[test]
+    fn metrics_are_positive_and_consistent() {
+        let m = open().metrics();
+        assert!(m.ascent > 0 && m.descent > 0);
+        assert!(m.line_height >= m.ascent + m.descent);
+    }
+
+    #[test]
+    fn fonts_scale_metrics_with_size() {
+        let fonts = Fonts::new(&[16, 32]).expect("a default font");
+        let small = fonts.metrics(16);
+        let large = fonts.metrics(32);
+        assert!(large.line_height > small.line_height, "32px is taller");
+    }
+
+    #[test]
+    fn fonts_fall_back_for_an_unopened_size() {
+        let fonts = Fonts::new(&[16]).expect("a default font");
+        // An unrequested size resolves to the only opened face, not a panic.
+        assert_eq!(fonts.metrics(99).line_height, fonts.metrics(16).line_height);
+    }
+
+    #[test]
+    fn fonts_reject_an_empty_size_set() {
+        assert!(Fonts::new(&[]).is_err());
+        assert!(Fonts::new(&[0]).is_err());
     }
 }

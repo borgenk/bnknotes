@@ -9,6 +9,7 @@ mod ffi;
 mod freetype;
 mod grapheme;
 mod layout;
+mod markdown;
 mod protocol;
 mod render;
 mod scroll;

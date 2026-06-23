@@ -21,9 +21,22 @@
 //! one byte offset shared by two visual lines; the cursor there is given to the
 //! later line (it shows at the start of the next row), while a cursor at a hard
 //! newline stays at the end of its line.
+//!
+//! Lines are not all the same height: each logical line is classified by
+//! [`crate::markdown`] and resolved to a pixel size, so headings render larger.
+//! Every visual line therefore carries its own `size`, and the geometry methods
+//! take a [`Fonts`] to look up the right face and metrics per line. Baselines
+//! stack by each line's own height rather than a single global line height.
+//!
+//! Headings also live-preview: a heading whose line the cursor has left hides
+//! its `#` markers (`VisualLine::hidden_prefix`), drawing only the text past
+//! them at the margin; the markers reappear when the cursor returns. Wrapping
+//! always measures the source text, so this collapse only shifts a heading's
+//! first segment horizontally, never reflowing the document.
 
-use crate::freetype::Face;
+use crate::freetype::{Face, Fonts};
 use crate::grapheme;
+use crate::markdown;
 use crate::render;
 
 /// Extra highlight width drawn past a line's text when the selection includes
@@ -31,7 +44,8 @@ use crate::render;
 const NEWLINE_PAD: i32 = 8;
 
 /// One on-screen line: the byte range of its text (excluding any trailing
-/// `'\n'`), the y of its baseline, and whether a hard newline follows it.
+/// `'\n'`), the y of its baseline, whether a hard newline follows it, the pixel
+/// size it renders at, and how many leading bytes are hidden.
 pub struct VisualLine {
     pub start: usize,
     pub end: usize,
@@ -39,6 +53,13 @@ pub struct VisualLine {
     /// True if a `'\n'` immediately follows `end` (a hard break); false for a
     /// soft wrap or the final line of the buffer.
     pub hard: bool,
+    /// The pixel size this line renders at; selects the face and metrics.
+    pub size: u32,
+    /// Leading bytes of `[start, end)` that are not drawn: the `#` markers of a
+    /// heading whose line the cursor has left (the live-preview collapse). `0`
+    /// when the markers are shown or there are none. The displayed text begins
+    /// at `start + hidden_prefix`, drawn flush to the left margin.
+    pub hidden_prefix: usize,
 }
 
 /// An axis-aligned rectangle in window pixels.
@@ -52,43 +73,69 @@ pub struct Rect {
 pub struct Layout {
     lines: Vec<VisualLine>,
     left: i32,
-    ascent: i32,
-    descent: i32,
+    /// Total height of the text block in pixels (the sum of every visual line's
+    /// line height), for the scroll extent.
+    text_height: i32,
 }
 
 impl Layout {
-    /// Lay `text` out with the first baseline at `top + ascent` and successive
-    /// baselines `line_height` apart. `left` is the text's left margin and
-    /// `wrap_width` the pixel width to wrap within (<= 0 disables wrapping).
-    #[allow(clippy::too_many_arguments)]
+    /// Lay `text` out within `wrap_width` pixels (<= 0 disables wrapping), with
+    /// the text block starting at `top` and inset by `left`. Each logical line
+    /// is classified by [`markdown`] and resolved to a pixel size from
+    /// `body_size`, so headings render larger; baselines stack by each line's
+    /// own metrics rather than one shared line height.
+    ///
+    /// `active` is the cursor/selection byte range (`(c, c)` for a bare cursor).
+    /// A heading whose logical line the active range does not touch has its `#`
+    /// markers hidden (the live-preview collapse); the markers reappear when the
+    /// range reaches the line. Wrapping always uses the *source* text, so reveal
+    /// state never changes line breaks or baselines, only the horizontal
+    /// rendering of the heading's first segment.
     pub fn build(
-        face: &Face,
+        fonts: &Fonts,
         text: &str,
         left: i32,
         top: i32,
-        ascent: i32,
-        descent: i32,
-        line_height: i32,
         wrap_width: i32,
+        body_size: u32,
+        active: (usize, usize),
     ) -> Self {
         let mut lines = Vec::new();
-        let mut baseline = top + ascent;
+        // `box_top` is the top of the current line's box; the baseline sits one
+        // ascent below it, and the next box follows one line height down.
+        let mut box_top = top;
         let mut ls = 0usize;
         loop {
             let rel = text[ls..].find('\n');
             let le = rel.map_or(text.len(), |r| ls + r);
+            let size = markdown::font_size(markdown::style_of(&text[ls..le]), body_size);
+            let face = fonts.face(size);
+            let metrics = fonts.metrics(size);
             let segments = wrap_segments(face, text, ls, le, wrap_width);
             let last = segments.len() - 1;
+            // Hide a heading's markers unless the active range touches its line.
+            // The hidden bytes only ever sit on the first segment (the `#`s lead
+            // the logical line); a touched line, or any non-heading line, hides
+            // nothing.
+            let marker = markdown::marker_len(&text[ls..le]);
+            let revealed = active.0 <= le && active.1 >= ls;
             for (k, (start, end)) in segments.into_iter().enumerate() {
+                let hidden_prefix = if marker > 0 && !revealed && k == 0 {
+                    marker
+                } else {
+                    0
+                };
                 lines.push(VisualLine {
                     start,
                     end,
-                    baseline,
+                    baseline: box_top + metrics.ascent,
                     // Only the final segment of a logical line that has a
                     // trailing '\n' is a hard break.
                     hard: k == last && rel.is_some(),
+                    size,
+                    hidden_prefix,
                 });
-                baseline += line_height;
+                box_top += metrics.line_height;
             }
             match rel {
                 Some(r) => ls = ls + r + 1,
@@ -98,13 +145,18 @@ impl Layout {
         Self {
             lines,
             left,
-            ascent,
-            descent,
+            text_height: box_top - top,
         }
     }
 
     pub fn lines(&self) -> &[VisualLine] {
         &self.lines
+    }
+
+    /// Total height of the laid-out text block in pixels, for sizing the
+    /// scrollable content.
+    pub fn text_height(&self) -> i32 {
+        self.text_height
     }
 
     /// The byte range `(start, end)` of the visual line containing `offset`,
@@ -114,28 +166,35 @@ impl Layout {
         (line.start, line.end)
     }
 
-    /// The caret rectangle (its x, top y, and height) for the cursor at `offset`.
-    pub fn caret(&self, face: &Face, text: &str, offset: usize) -> (i32, i32, i32) {
+    /// The caret rectangle (its x, top y, and height) for the cursor at `offset`,
+    /// sized to the metrics of the line it lands on. The caret only ever lands on
+    /// a revealed line (the cursor's own line shows its markers), so `offset`
+    /// sits at or past the displayed start; the clamp is defensive.
+    pub fn caret(&self, fonts: &Fonts, text: &str, offset: usize) -> (i32, i32, i32) {
         let line = self.line_for(offset);
-        let x = self.left as f32 + render::text_advance(face, &text[line.start..offset]);
+        let face = fonts.face(line.size);
+        let m = fonts.metrics(line.size);
+        let display_start = line.start + line.hidden_prefix;
+        let from = offset.max(display_start);
+        let x = self.left as f32 + render::text_advance(face, &text[display_start..from]);
         (
             x.round() as i32,
-            line.baseline - self.ascent,
-            self.ascent + self.descent,
+            line.baseline - m.ascent,
+            m.ascent + m.descent,
         )
     }
 
     /// The byte offset nearest a click at window `(x, y)`.
-    pub fn offset_at(&self, face: &Face, text: &str, x: f32, y: f32) -> usize {
-        let line = self.line_for_y(y);
-        self.hit_line(face, text, line, x)
+    pub fn offset_at(&self, fonts: &Fonts, text: &str, x: f32, y: f32) -> usize {
+        let line = self.line_for_y(fonts, y);
+        self.hit_line(fonts, text, line, x)
     }
 
     /// The byte offset reached by moving `dir` lines (-1 up, +1 down) from
     /// `offset`, aiming for window x `goal_x`. Clamps at the first and last line.
     pub fn offset_vertical(
         &self,
-        face: &Face,
+        fonts: &Fonts,
         text: &str,
         offset: usize,
         dir: i32,
@@ -146,14 +205,22 @@ impl Layout {
         if target < 0 || target as usize >= self.lines.len() {
             return offset;
         }
-        self.hit_line(face, text, &self.lines[target as usize], goal_x)
+        self.hit_line(fonts, text, &self.lines[target as usize], goal_x)
     }
 
     /// The highlight rectangles covering the byte range `[start, end)`, one per
-    /// visual line it touches.
-    pub fn selection_rects(&self, face: &Face, text: &str, start: usize, end: usize) -> Vec<Rect> {
+    /// visual line it touches, each sized to that line's metrics.
+    pub fn selection_rects(
+        &self,
+        fonts: &Fonts,
+        text: &str,
+        start: usize,
+        end: usize,
+    ) -> Vec<Rect> {
         let mut rects = Vec::new();
         for line in &self.lines {
+            let face = fonts.face(line.size);
+            let m = fonts.metrics(line.size);
             let sel_start = start.max(line.start);
             let sel_end = end.min(line.end);
             // A hard line's newline is selected when the range reaches past the
@@ -162,17 +229,24 @@ impl Layout {
             if sel_start >= sel_end && !newline_selected {
                 continue;
             }
-            let x0 = self.left as f32 + render::text_advance(face, &text[line.start..sel_start]);
-            let x1 = self.left as f32 + render::text_advance(face, &text[line.start..sel_end]);
+            // Measure from the displayed start, clamping any selected bytes that
+            // fall in a hidden marker to it (they occupy no width). In practice a
+            // line touched by the selection is revealed, so this only guards the
+            // boundary case.
+            let display_start = line.start + line.hidden_prefix;
+            let eff_start = sel_start.max(display_start);
+            let eff_end = sel_end.max(display_start);
+            let x0 = self.left as f32 + render::text_advance(face, &text[display_start..eff_start]);
+            let x1 = self.left as f32 + render::text_advance(face, &text[display_start..eff_end]);
             let mut w = (x1 - x0).round() as i32;
             if newline_selected {
                 w += NEWLINE_PAD;
             }
             rects.push(Rect {
                 x: x0.round() as i32,
-                y: line.baseline - self.ascent,
+                y: line.baseline - m.ascent,
                 w: w.max(1),
-                h: self.ascent + self.descent,
+                h: m.ascent + m.descent,
             });
         }
         rects
@@ -195,23 +269,28 @@ impl Layout {
     }
 
     /// The visual line whose vertical band contains `y`, clamped to the first or
-    /// last line for clicks above or below the text.
-    fn line_for_y(&self, y: f32) -> &VisualLine {
+    /// last line for clicks above or below the text. Each line's band reaches to
+    /// its own descent below the baseline.
+    fn line_for_y(&self, fonts: &Fonts, y: f32) -> &VisualLine {
         self.lines
             .iter()
-            .find(|l| y < (l.baseline + self.descent) as f32)
+            .find(|l| y < (l.baseline + fonts.metrics(l.size).descent) as f32)
             .unwrap_or_else(|| self.last_line())
     }
 
     /// The byte offset within `line` nearest window x `x`, snapped to a grapheme
-    /// cluster boundary (a click in a cluster's left half lands before it).
-    fn hit_line(&self, face: &Face, text: &str, line: &VisualLine, x: f32) -> usize {
-        let slice = &text[line.start..line.end];
+    /// cluster boundary (a click in a cluster's left half lands before it). Hit
+    /// testing walks the displayed text, so a click on a heading with hidden
+    /// markers lands in the visible text, never inside the collapsed `#`s.
+    fn hit_line(&self, fonts: &Fonts, text: &str, line: &VisualLine, x: f32) -> usize {
+        let face = fonts.face(line.size);
+        let display_start = line.start + line.hidden_prefix;
+        let slice = &text[display_start..line.end];
         let mut acc = self.left as f32;
         for (off, cluster) in grapheme::graphemes(slice) {
             let w = render::text_advance(face, cluster);
             if x < acc + w / 2.0 {
-                return line.start + off;
+                return display_start + off;
             }
             acc += w;
         }
@@ -294,40 +373,56 @@ fn wrap_segments(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::markdown::LineStyle;
 
-    fn face() -> Face {
-        Face::open_default(32).expect("a default font")
+    const BODY: u32 = 32;
+    const LEFT: i32 = 40;
+    const TOP: i32 = 10;
+
+    fn fonts() -> Fonts {
+        Fonts::new(&markdown::all_sizes(BODY)).expect("a default font")
     }
 
-    /// Build with round metrics and wrapping effectively disabled.
-    fn layout(text: &str) -> Layout {
-        Layout::build(&face(), text, 40, 10, 24, 6, 30, 1_000_000)
+    fn h1_size() -> u32 {
+        markdown::font_size(LineStyle::Heading(1), BODY)
+    }
+
+    /// Build with wrapping effectively disabled, at body size, with the whole
+    /// buffer active so every heading is revealed.
+    /// Reveal-specific tests build explicitly with a narrower active range.
+    fn layout(f: &Fonts, text: &str) -> Layout {
+        Layout::build(f, text, LEFT, TOP, 1_000_000, BODY, (0, text.len()))
     }
 
     /// A wrap width that fits "aaa " but not a following cluster, so "aaa bbb"
     /// splits deterministically into "aaa " and "bbb".
-    fn tight_wrap(f: &Face) -> i32 {
-        (render::text_advance(f, "aaa ") + render::text_advance(f, "b") / 2.0) as i32
+    fn tight_wrap(f: &Fonts) -> i32 {
+        let face = f.face(BODY);
+        (render::text_advance(face, "aaa ") + render::text_advance(face, "b") / 2.0) as i32
     }
 
     #[test]
     fn splits_logical_lines_with_stacked_baselines() {
-        let l = layout("ab\ncd\n");
+        let f = fonts();
+        let m = f.metrics(BODY);
+        let l = layout(&f, "ab\ncd\n");
         let lines = l.lines();
         assert_eq!(lines.len(), 3, "trailing newline yields an empty last line");
         assert_eq!((lines[0].start, lines[0].end), (0, 2));
         assert_eq!((lines[1].start, lines[1].end), (3, 5));
         assert_eq!((lines[2].start, lines[2].end), (6, 6));
-        assert_eq!(lines[0].baseline, 34);
-        assert_eq!(lines[1].baseline, 64);
-        assert_eq!(lines[2].baseline, 94);
+        // Uniform body text stacks one line height at a time.
+        assert_eq!(lines[0].baseline, TOP + m.ascent);
+        assert_eq!(lines[1].baseline, TOP + m.ascent + m.line_height);
+        assert_eq!(lines[2].baseline, TOP + m.ascent + 2 * m.line_height);
         // The first two are hard breaks; the empty last line is not.
         assert!(lines[0].hard && lines[1].hard && !lines[2].hard);
     }
 
     #[test]
     fn empty_text_is_one_line() {
-        let l = layout("");
+        let f = fonts();
+        let l = layout(&f, "");
         assert_eq!(l.lines().len(), 1);
         assert_eq!((l.lines()[0].start, l.lines()[0].end), (0, 0));
         assert!(!l.lines()[0].hard);
@@ -335,22 +430,26 @@ mod tests {
 
     #[test]
     fn caret_sits_at_the_left_margin_for_a_line_start() {
-        let f = face();
-        let l = layout("hello\nworld");
+        let f = fonts();
+        let m = f.metrics(BODY);
+        let l = layout(&f, "hello\nworld");
         let (x0, top0, h) = l.caret(&f, "hello\nworld", 0);
-        assert_eq!(x0, 40, "first column is the left margin");
-        assert_eq!(top0, 34 - 24, "caret top is baseline - ascent");
-        assert_eq!(h, 30, "caret spans ascent + descent");
+        assert_eq!(x0, LEFT, "first column is the left margin");
+        assert_eq!(
+            top0, TOP,
+            "caret top is baseline - ascent, i.e. the box top"
+        );
+        assert_eq!(h, m.ascent + m.descent, "caret spans ascent + descent");
         let (x1, top1, _) = l.caret(&f, "hello\nworld", 6);
-        assert_eq!(x1, 40, "second line also starts at the margin");
-        assert_eq!(top1, 64 - 24, "and one line lower");
+        assert_eq!(x1, LEFT, "second line also starts at the margin");
+        assert_eq!(top1, TOP + m.line_height, "and one line lower");
     }
 
     #[test]
     fn caret_advances_along_a_line() {
-        let f = face();
+        let f = fonts();
         let text = "mm";
-        let l = layout(text);
+        let l = layout(&f, text);
         let (x0, _, _) = l.caret(&f, text, 0);
         let (x1, _, _) = l.caret(&f, text, 1);
         let (x2, _, _) = l.caret(&f, text, 2);
@@ -359,12 +458,13 @@ mod tests {
 
     #[test]
     fn click_maps_to_the_clicked_line_and_column() {
-        let f = face();
+        let f = fonts();
         let text = "abc\ndefg";
-        let l = layout(text);
-        let off = l.offset_at(&f, text, 10_000.0, 64.0);
+        let l = layout(&f, text);
+        let (y0, y1) = (l.lines()[0].baseline as f32, l.lines()[1].baseline as f32);
+        let off = l.offset_at(&f, text, 10_000.0, y1);
         assert_eq!(off, text.len(), "past the last glyph of line two -> end");
-        let off = l.offset_at(&f, text, -100.0, 34.0);
+        let off = l.offset_at(&f, text, -100.0, y0);
         assert_eq!(off, 0);
         let off = l.offset_at(&f, text, -100.0, 9_000.0);
         assert_eq!(off, 4, "start of the last line");
@@ -372,9 +472,9 @@ mod tests {
 
     #[test]
     fn vertical_motion_changes_line_and_clamps() {
-        let f = face();
+        let f = fonts();
         let text = "abc\ndef\nghi";
-        let l = layout(text);
+        let l = layout(&f, text);
         let (x, _, _) = l.caret(&f, text, 5);
         let up = l.offset_vertical(&f, text, 5, -1, x as f32);
         assert_eq!(up, 1, "same column on the line above");
@@ -385,21 +485,22 @@ mod tests {
 
     #[test]
     fn selection_on_one_line_is_one_rect() {
-        let f = face();
+        let f = fonts();
+        let m = f.metrics(BODY);
         let text = "hello";
-        let l = layout(text);
+        let l = layout(&f, text);
         let rects = l.selection_rects(&f, text, 1, 4);
         assert_eq!(rects.len(), 1);
         assert!(rects[0].w > 0);
-        assert_eq!(rects[0].h, 30);
-        assert_eq!(rects[0].y, 34 - 24);
+        assert_eq!(rects[0].h, m.ascent + m.descent);
+        assert_eq!(rects[0].y, TOP);
     }
 
     #[test]
     fn selection_across_hard_lines_is_one_rect_per_line() {
-        let f = face();
+        let f = fonts();
         let text = "ab\ncd\nef";
-        let l = layout(text);
+        let l = layout(&f, text);
         let rects = l.selection_rects(&f, text, 1, 7);
         assert_eq!(rects.len(), 3, "three lines touched");
         assert!(rects[0].w >= NEWLINE_PAD, "hard newline adds the pad");
@@ -407,9 +508,9 @@ mod tests {
 
     #[test]
     fn long_line_soft_wraps_at_spaces() {
-        let f = face();
+        let f = fonts();
         let text = "aaa bbb";
-        let l = Layout::build(&f, text, 0, 0, 24, 6, 30, tight_wrap(&f));
+        let l = Layout::build(&f, text, 0, 0, tight_wrap(&f), BODY, (0, text.len()));
         let lines = l.lines();
         assert_eq!(lines.len(), 2, "wraps into two visual lines");
         assert_eq!(
@@ -430,10 +531,10 @@ mod tests {
 
     #[test]
     fn overlong_word_breaks_mid_word() {
-        let f = face();
+        let f = fonts();
         let text = "mmmmmmmmmm"; // one word, no spaces
-        let wrap = (render::text_advance(&f, "m") * 3.0) as i32;
-        let l = Layout::build(&f, text, 0, 0, 24, 6, 30, wrap);
+        let wrap = (render::text_advance(f.face(BODY), "m") * 3.0) as i32;
+        let l = Layout::build(&f, text, 0, 0, wrap, BODY, (0, text.len()));
         let lines = l.lines();
         assert!(lines.len() >= 2, "an unbreakable word still wraps");
         assert!(
@@ -447,27 +548,160 @@ mod tests {
 
     #[test]
     fn caret_affinity_puts_a_soft_boundary_on_the_next_line() {
-        let f = face();
+        let f = fonts();
+        let m = f.metrics(BODY);
         let text = "aaa bbb";
-        let l = Layout::build(&f, text, 0, 0, 24, 6, 30, tight_wrap(&f));
+        let l = Layout::build(&f, text, 0, 0, tight_wrap(&f), BODY, (0, text.len()));
         // Offset 4 is the soft-wrap boundary; the caret shows at the start of
         // the second visual line, not the end of the first.
         let (x, top, _) = l.caret(&f, text, 4);
         assert_eq!(x, 0, "left margin of the wrapped row");
-        assert_eq!(top, (24 + 30) - 24, "second baseline minus ascent");
+        assert_eq!(top, m.line_height, "second box top: one line height down");
     }
 
     #[test]
     fn selection_across_a_soft_wrap_has_no_newline_pad() {
-        let f = face();
+        let f = fonts();
         let text = "aaa bbb";
-        let l = Layout::build(&f, text, 0, 0, 24, 6, 30, tight_wrap(&f));
+        let l = Layout::build(&f, text, 0, 0, tight_wrap(&f), BODY, (0, text.len()));
         let rects = l.selection_rects(&f, text, 0, 7);
         assert_eq!(rects.len(), 2, "one rect per visual line");
-        let line0_text_w = render::text_advance(&f, "aaa ").round() as i32;
+        let line0_text_w = render::text_advance(f.face(BODY), "aaa ").round() as i32;
         assert!(
             (rects[0].w - line0_text_w).abs() <= 1,
             "a soft wrap adds no newline pad"
         );
+    }
+
+    #[test]
+    fn heading_line_renders_larger_and_pushes_the_body_down() {
+        let f = fonts();
+        let body = f.metrics(BODY);
+        let h1 = f.metrics(h1_size());
+        assert!(
+            h1.line_height > body.line_height,
+            "the heading box is taller"
+        );
+        let l = layout(&f, "# Title\nbody");
+        let lines = l.lines();
+        assert_eq!(lines.len(), 2);
+        assert_eq!(
+            lines[0].size,
+            h1_size(),
+            "the heading line uses the H1 size"
+        );
+        assert_eq!(lines[1].size, BODY, "the body line uses the body size");
+        // The body baseline clears the full heading box, not a body line height.
+        assert_eq!(lines[0].baseline, TOP + h1.ascent);
+        assert_eq!(lines[1].baseline, TOP + h1.line_height + body.ascent);
+    }
+
+    #[test]
+    fn caret_on_a_heading_spans_the_taller_box() {
+        let f = fonts();
+        let body = f.metrics(BODY);
+        let h1 = f.metrics(h1_size());
+        let text = "# Title";
+        let l = layout(&f, text);
+        let (_, _, h) = l.caret(&f, text, 0);
+        assert_eq!(h, h1.ascent + h1.descent);
+        assert!(h > body.ascent + body.descent, "taller than a body caret");
+    }
+
+    #[test]
+    fn heading_text_is_wider_per_character_than_body() {
+        // The same characters measure wider at the heading size, which is what
+        // lets clicks and the caret land correctly on a heading line.
+        let f = fonts();
+        let body_w = render::text_advance(f.face(BODY), "Title");
+        let h1_w = render::text_advance(f.face(h1_size()), "Title");
+        assert!(h1_w > body_w);
+    }
+
+    // --- marker-hiding live preview ---------------------------------------
+
+    /// Build "# Title\nbody" with the active range placed by `active`.
+    fn heading_and_body(f: &Fonts, active: (usize, usize)) -> Layout {
+        Layout::build(f, "# Title\nbody", LEFT, TOP, 1_000_000, BODY, active)
+    }
+
+    #[test]
+    fn markers_hide_when_the_cursor_is_off_the_heading_line() {
+        let f = fonts();
+        let body_off = "# Title\nbody".find("body").unwrap();
+        let l = heading_and_body(&f, (body_off, body_off));
+        assert_eq!(l.lines()[0].hidden_prefix, 2, "the '# ' marker collapses");
+        assert_eq!(l.lines()[1].hidden_prefix, 0, "body never hides anything");
+    }
+
+    #[test]
+    fn markers_show_while_the_cursor_edits_the_heading() {
+        let f = fonts();
+        // Cursor inside "Title".
+        let l = heading_and_body(&f, (4, 4));
+        assert_eq!(l.lines()[0].hidden_prefix, 0, "markers stay while editing");
+    }
+
+    #[test]
+    fn markers_show_at_the_very_end_of_the_heading_line() {
+        let f = fonts();
+        // Cursor at offset 7, right before the '\n': still on the heading line.
+        let l = heading_and_body(&f, (7, 7));
+        assert_eq!(l.lines()[0].hidden_prefix, 0);
+    }
+
+    #[test]
+    fn a_selection_touching_a_heading_reveals_it() {
+        let f = fonts();
+        // Select the whole buffer: the heading is within it, so it reveals.
+        let l = heading_and_body(&f, (0, "# Title\nbody".len()));
+        assert_eq!(
+            l.lines()[0].hidden_prefix,
+            0,
+            "a selected heading shows markers"
+        );
+    }
+
+    #[test]
+    fn hidden_markers_shift_clicks_into_the_visible_text() {
+        let f = fonts();
+        let text = "# Title";
+        // No cursor on the line, so the markers hide.
+        let l = Layout::build(&f, text, LEFT, TOP, 1_000_000, BODY, (99, 99));
+        assert_eq!(l.lines()[0].hidden_prefix, 2);
+        // A click at the far left lands at the start of the visible text
+        // ("Title", offset 2), never inside the collapsed "# ".
+        let off = l.offset_at(&f, text, -100.0, l.lines()[0].baseline as f32);
+        assert_eq!(off, 2, "click maps past the collapsed marker");
+    }
+
+    #[test]
+    fn revealing_markers_shifts_the_heading_text_right_by_the_marker_width() {
+        let f = fonts();
+        let text = "# Title";
+        let hidden = Layout::build(&f, text, LEFT, TOP, 1_000_000, BODY, (99, 99));
+        let shown = Layout::build(&f, text, LEFT, TOP, 1_000_000, BODY, (0, 0));
+        // The first visible glyph is at byte offset 2 ("T") in both; collapsed it
+        // sits at the margin, expanded it sits a marker-width to the right.
+        let (x_hidden, _, _) = hidden.caret(&f, text, 2);
+        let (x_shown, _, _) = shown.caret(&f, text, 2);
+        assert_eq!(x_hidden, LEFT, "collapsed: visible text at the margin");
+        let marker_w = render::text_advance(f.face(h1_size()), "# ").round() as i32;
+        assert_eq!(x_shown - x_hidden, marker_w, "expanded by the marker width");
+    }
+
+    #[test]
+    fn reveal_state_does_not_change_vertical_layout() {
+        // Wrapping uses the source text, so collapsing markers never reflows the
+        // document: line count, baselines, and height are reveal-independent.
+        let f = fonts();
+        let text = "# A longer heading that might wrap\nbody text below the heading";
+        let hidden = Layout::build(&f, text, LEFT, TOP, 200, BODY, (99, 99));
+        let shown = Layout::build(&f, text, LEFT, TOP, 200, BODY, (0, 0));
+        assert_eq!(hidden.lines().len(), shown.lines().len());
+        for (h, s) in hidden.lines().iter().zip(shown.lines()) {
+            assert_eq!(h.baseline, s.baseline, "baselines are reveal-independent");
+        }
+        assert_eq!(hidden.text_height(), shown.text_height());
     }
 }

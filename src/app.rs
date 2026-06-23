@@ -19,8 +19,9 @@ use std::time::{Duration, Instant};
 use crate::conn::{Connection, Fill};
 use crate::error::{Error, Result};
 use crate::ffi;
-use crate::freetype::Face;
+use crate::freetype::Fonts;
 use crate::layout::Layout;
+use crate::markdown;
 use crate::protocol::{
     self, wl_buffer, wl_callback, wl_compositor, wl_data_device, wl_data_device_manager,
     wl_data_offer, wl_data_source, wl_display, wl_keyboard, wl_pointer, wl_registry, wl_seat,
@@ -41,6 +42,10 @@ const INIT_HEIGHT: u32 = 600;
 const BACKGROUND: u32 = 0x001e_1e2e;
 const FOREGROUND: u32 = 0x00e0_e0e0;
 const SELECTION_COLOR: u32 = 0x0026_4f78;
+/// Dimmed color for markdown syntax markers (the `#`s of a heading), so they
+/// read as syntax rather than content.
+const MARKER_COLOR: u32 = 0x006c_7086;
+/// Body text pixel size; headings scale up from it (see [`markdown::font_size`]).
 const FONT_SIZE: u32 = 32;
 /// Inset of the text from the top-left corner (both axes).
 const MARGIN: i32 = 40;
@@ -66,12 +71,9 @@ pub fn run() -> Result<()> {
 
 struct State {
     conn: Connection,
-    face: Face,
-    /// Font ascent and descent in pixels (both positive) and the baseline-to-
-    /// baseline line height.
-    ascent: i32,
-    descent: i32,
-    line_height: i32,
+    /// The font opened at every size the styles need (body and heading sizes),
+    /// so each line can render at its own size.
+    fonts: Fonts,
     xkb: Xkb,
     text: TextBuffer,
 
@@ -149,25 +151,12 @@ struct State {
 impl State {
     fn new() -> Result<Self> {
         let conn = Connection::connect()?;
-        let face = Face::open_default(FONT_SIZE)?;
-        let (ascent, descent) = face.line_metrics();
-        let ascent = ascent.ceil() as i32;
-        let descent = (-descent).ceil() as i32;
-        // Fall back to the ink height if the font reports no line height.
-        let line_height = {
-            let h = face.line_height().ceil() as i32;
-            if h > 0 {
-                h
-            } else {
-                ascent + descent
-            }
-        };
+        // Open the font at every size the styles use, so headings can render
+        // larger than body text without re-opening mid-frame.
+        let fonts = Fonts::new(&markdown::all_sizes(FONT_SIZE))?;
         Ok(Self {
             conn,
-            face,
-            ascent,
-            descent,
-            line_height,
+            fonts,
             xkb: Xkb::new()?,
             text: TextBuffer::new(),
             width: INIT_WIDTH,
@@ -424,7 +413,7 @@ impl State {
             let Some(pool) = self.pool.as_mut() else {
                 return Ok(false);
             };
-            let face = &self.face;
+            let fonts = &self.fonts;
             let text = self.text.text();
             let frame = &mut pool.data_mut()[offset..offset + frame_len];
             let mut canvas = Canvas::new(frame, width, height);
@@ -433,24 +422,36 @@ impl State {
             // Everything is laid out in content space; the viewport scroll shifts
             // it up by `scroll_y`. The canvas clips whatever falls off-screen.
             if let Some((start, end)) = selection {
-                for rect in layout.selection_rects(face, text, start, end) {
+                for rect in layout.selection_rects(fonts, text, start, end) {
                     canvas.fill_rect(rect.x, rect.y - scroll_y, rect.w, rect.h, SELECTION_COLOR);
                 }
             }
 
-            // The text, one visual line at a time.
+            // The text, one visual line at a time, each at its own font size.
+            // A heading whose markers are hidden (the cursor has left the line)
+            // draws only the text past them, flush to the margin. When the
+            // markers are shown they are dimmed so the markup reads as syntax.
             for line in layout.lines() {
-                canvas.draw_text(
-                    face,
-                    MARGIN,
-                    line.baseline - scroll_y,
-                    &text[line.start..line.end],
-                    FOREGROUND,
-                );
+                let face = fonts.face(line.size);
+                let baseline = line.baseline - scroll_y;
+                if line.hidden_prefix > 0 {
+                    let visible = &text[line.start + line.hidden_prefix..line.end];
+                    canvas.draw_text(face, MARGIN, baseline, visible, FOREGROUND);
+                    continue;
+                }
+                let slice = &text[line.start..line.end];
+                let marker = markdown::marker_len(slice);
+                if marker > 0 {
+                    let pen =
+                        canvas.draw_text(face, MARGIN, baseline, &slice[..marker], MARKER_COLOR);
+                    canvas.draw_text(face, pen, baseline, &slice[marker..], FOREGROUND);
+                } else {
+                    canvas.draw_text(face, MARGIN, baseline, slice, FOREGROUND);
+                }
             }
 
             // The caret.
-            let (cx, cy, ch) = layout.caret(face, text, cursor);
+            let (cx, cy, ch) = layout.caret(fonts, text, cursor);
             canvas.fill_rect(cx, cy - scroll_y, CARET_WIDTH, ch, CARET_COLOR);
         }
 
@@ -775,10 +776,10 @@ impl State {
     fn move_vertical(&mut self, dir: i32, extend: bool) -> bool {
         let layout = self.layout();
         let cursor = self.text.cursor();
-        let (caret_x, _, _) = layout.caret(&self.face, self.text.text(), cursor);
+        let (caret_x, _, _) = layout.caret(&self.fonts, self.text.text(), cursor);
         let goal = self.goal_x.unwrap_or(caret_x as f32);
         self.goal_x = Some(goal);
-        let target = layout.offset_vertical(&self.face, self.text.text(), cursor, dir, goal);
+        let target = layout.offset_vertical(&self.fonts, self.text.text(), cursor, dir, goal);
         let before_sel = self.text.selection();
         self.text.set_cursor(target, extend);
         self.text.cursor() != cursor || self.text.selection() != before_sel
@@ -845,7 +846,7 @@ impl State {
     /// content space by the scroll offset before hit-testing.
     fn place_cursor_at(&mut self, x: f32, y: f32, extend: bool) {
         let layout = self.layout();
-        let offset = layout.offset_at(&self.face, self.text.text(), x, y + self.scroll_y as f32);
+        let offset = layout.offset_at(&self.fonts, self.text.text(), x, y + self.scroll_y as f32);
         let before = self.text.cursor();
         let before_sel = self.text.selection();
         self.text.set_cursor(offset, extend);
@@ -1045,10 +1046,10 @@ impl State {
         self.scroll_caret_into_view();
     }
 
-    /// Total document height in content pixels: a top and bottom margin plus a
-    /// line box per visual line.
+    /// Total document height in content pixels: the laid-out text block plus a
+    /// top and bottom margin.
     fn content_height(&self, layout: &Layout) -> i32 {
-        layout.lines().len() as i32 * self.line_height + 2 * MARGIN
+        layout.text_height() + 2 * MARGIN
     }
 
     /// Scroll the viewport by `delta` pixels (positive = down), clamped to the
@@ -1067,7 +1068,7 @@ impl State {
     fn scroll_caret_into_view(&mut self) {
         let layout = self.layout();
         let (_, caret_top, caret_h) =
-            layout.caret(&self.face, self.text.text(), self.text.cursor());
+            layout.caret(&self.fonts, self.text.text(), self.text.cursor());
         let content_height = self.content_height(&layout);
         let sy = scroll::reveal(
             self.scroll_y,
@@ -1083,19 +1084,22 @@ impl State {
         }
     }
 
-    /// Lay out the current text with the current metrics, wrapping to the
-    /// window width less a margin on each side.
+    /// Lay out the current text, wrapping to the window width less a margin on
+    /// each side. Per-line metrics come from the font set during the build. The
+    /// cursor (or selection) is passed in as the active range so a heading the
+    /// caret is editing keeps its `#` markers while the rest collapse them.
     fn layout(&self) -> Layout {
         let wrap_width = self.width as i32 - 2 * MARGIN;
+        let cursor = self.text.cursor();
+        let active = self.text.selection().unwrap_or((cursor, cursor));
         Layout::build(
-            &self.face,
+            &self.fonts,
             self.text.text(),
             MARGIN,
             MARGIN,
-            self.ascent,
-            self.descent,
-            self.line_height,
             wrap_width,
+            FONT_SIZE,
+            active,
         )
     }
 

@@ -87,6 +87,7 @@ pub enum KeyAction {
     Paste,
     Undo,
     Redo,
+    Save,
     None,
 }
 
@@ -264,6 +265,7 @@ impl Xkb {
         match sym {
             0x61 => KeyAction::SelectAll, // a
             0x63 => KeyAction::Copy,      // c
+            0x73 => KeyAction::Save,      // s
             0x78 => KeyAction::Cut,       // x
             0x76 => KeyAction::Paste,     // v
             // Ctrl+Z undoes; Ctrl+Shift+Z and Ctrl+Y redo.

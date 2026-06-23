@@ -14,11 +14,13 @@
 //! reads a frame we are still painting.
 
 use std::os::fd::AsRawFd;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use crate::conn::{Connection, Fill};
 use crate::error::{Error, Result};
 use crate::ffi;
+use crate::file::{self, FileFormat};
 use crate::freetype::Fonts;
 use crate::layout::Layout;
 use crate::markdown;
@@ -66,7 +68,22 @@ const REPEAT_CATCHUP_CAP: u32 = 16;
 const CLIPBOARD_MIMES: &[&str] = &["text/plain;charset=utf-8", "text/plain"];
 
 pub fn run() -> Result<()> {
-    State::new()?.bring_up()
+    // An optional path to open; everything after it is ignored for now.
+    let path = std::env::args_os().nth(1).map(PathBuf::from);
+    State::new(path)?.bring_up()
+}
+
+/// Read `path` into buffer text and its on-disk [`FileFormat`]. A path that does
+/// not exist yet is not an error: it opens an empty buffer that a later save
+/// creates, so `bnknotes new-note.md` works.
+fn load(path: &Path) -> Result<(String, FileFormat)> {
+    match std::fs::read(path) {
+        Ok(bytes) => file::decode(&bytes),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            Ok((String::new(), FileFormat::default()))
+        }
+        Err(e) => Err(e.into()),
+    }
 }
 
 struct State {
@@ -76,6 +93,12 @@ struct State {
     fonts: Fonts,
     xkb: Xkb,
     text: TextBuffer,
+    /// The file backing the buffer, if any, and the on-disk conventions to
+    /// reproduce when saving it.
+    path: Option<PathBuf>,
+    format: FileFormat,
+    /// The toplevel title last sent, so it is only re-set when it changes.
+    title: String,
 
     /// Current surface size in pixels.
     width: u32,
@@ -149,16 +172,28 @@ struct State {
 }
 
 impl State {
-    fn new() -> Result<Self> {
+    fn new(path: Option<PathBuf>) -> Result<Self> {
         let conn = Connection::connect()?;
         // Open the font at every size the styles use, so headings can render
         // larger than body text without re-opening mid-frame.
         let fonts = Fonts::new(&markdown::all_sizes(FONT_SIZE))?;
+        // Load the file (if one was named) before showing the window, so a read
+        // error surfaces as a clean startup failure instead of an empty editor.
+        let (text, format) = match &path {
+            Some(p) => {
+                let (contents, format) = load(p)?;
+                (TextBuffer::from_text(contents), format)
+            }
+            None => (TextBuffer::new(), FileFormat::default()),
+        };
         Ok(Self {
             conn,
             fonts,
             xkb: Xkb::new()?,
-            text: TextBuffer::new(),
+            text,
+            path,
+            format,
+            title: String::new(),
             width: INIT_WIDTH,
             height: INIT_HEIGHT,
             registry: 0,
@@ -252,11 +287,7 @@ impl State {
             xdg_surface::GET_TOPLEVEL,
             &[Arg::NewId(self.toplevel)],
         );
-        self.conn.request(
-            self.toplevel,
-            xdg_toplevel::SET_TITLE,
-            &[Arg::Str("bnknotes")],
-        );
+        self.refresh_title();
 
         // The data device drives the clipboard; skip it if the compositor has no
         // wl_data_device_manager (editing still works, just no copy/paste).
@@ -279,8 +310,8 @@ impl State {
 
         eprintln!(
             "bnknotes: type to edit; Enter, arrows/Home/End, Shift selects, click/drag; \
-             Ctrl+A/C/X/V select-all/copy/cut/paste, Ctrl+Z/Y undo/redo; held keys repeat; \
-             close to exit"
+             Ctrl+A/C/X/V select-all/copy/cut/paste, Ctrl+Z/Y undo/redo, Ctrl+S save; \
+             held keys repeat; close to exit"
         );
         self.run_until(|s| s.closed)?;
         Ok(())
@@ -763,13 +794,69 @@ impl State {
                 self.paste()?;
                 false
             }
+            // Saving touches the disk but not the buffer; a failure must not
+            // bring the editor down and lose the user's unsaved work, so it is
+            // reported and swallowed rather than propagated out of the loop.
+            KeyAction::Save => {
+                if let Err(e) = self.save() {
+                    eprintln!("bnknotes: save failed: {e}");
+                }
+                false
+            }
             KeyAction::None => false,
         };
         if changed {
-            self.dirty = true;
-            self.scroll_caret_into_view();
+            self.after_edit();
         }
         Ok(())
+    }
+
+    /// Common bookkeeping after a buffer edit: request a redraw, keep the caret
+    /// on screen, and refresh the title's modified indicator.
+    fn after_edit(&mut self) {
+        self.dirty = true;
+        self.scroll_caret_into_view();
+        self.refresh_title();
+    }
+
+    /// Write the buffer to its backing file, atomically and in the file's
+    /// original on-disk format. A buffer with no file (started without a path)
+    /// has nowhere to go yet, so it reports that and stays put.
+    fn save(&mut self) -> Result<()> {
+        let Some(path) = self.path.clone() else {
+            eprintln!("bnknotes: no file to save to; start bnknotes with a path");
+            return Ok(());
+        };
+        let bytes = file::encode(self.text.text(), &self.format);
+        file::save_atomic(&path, &bytes)?;
+        self.text.mark_saved();
+        self.refresh_title();
+        eprintln!("bnknotes: saved {}", path.display());
+        Ok(())
+    }
+
+    /// The toplevel title: the file's name (or just the app name for an unnamed
+    /// buffer), with a leading dot when there are unsaved changes.
+    fn window_title(&self) -> String {
+        let modified = if self.text.is_modified() { "• " } else { "" };
+        match self.path.as_ref().and_then(|p| p.file_name()) {
+            Some(name) => format!("{modified}{} - bnknotes", name.to_string_lossy()),
+            None => format!("{modified}bnknotes"),
+        }
+    }
+
+    /// Send the toplevel title only if it changed, so the modified indicator and
+    /// filename stay current without re-setting an identical string each frame.
+    fn refresh_title(&mut self) {
+        let desired = self.window_title();
+        if desired != self.title {
+            self.conn.request(
+                self.toplevel,
+                xdg_toplevel::SET_TITLE,
+                &[Arg::Str(&desired)],
+            );
+            self.title = desired;
+        }
     }
 
     /// Move the cursor `dir` lines (-1 up, +1 down), keeping a sticky goal x.
@@ -970,8 +1057,7 @@ impl State {
         let text = text.to_string();
         self.set_clipboard(text);
         if self.text.backspace() {
-            self.dirty = true;
-            self.scroll_caret_into_view();
+            self.after_edit();
         }
         Ok(())
     }

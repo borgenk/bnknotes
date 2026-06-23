@@ -6,6 +6,7 @@ mod app;
 mod conn;
 mod error;
 mod ffi;
+mod file;
 mod freetype;
 mod grapheme;
 mod layout;

@@ -18,6 +18,12 @@
 //! onto the undo stack. Consecutive edits of the same kind coalesce into one
 //! step, so typing a word, or a run of held-Backspace deletes, undoes in a
 //! single stroke; any cursor move breaks the run.
+//!
+//! Each distinct content state carries a monotonic version number, captured in
+//! its snapshot so undo/redo restore it too. [`TextBuffer::mark_saved`] records
+//! the version that is on disk, and [`TextBuffer::is_modified`] compares against
+//! it, so the buffer reads as clean again the moment an edit is undone back to
+//! the saved state.
 
 use crate::grapheme;
 
@@ -39,6 +45,7 @@ struct Snapshot {
     text: String,
     cursor: usize,
     anchor: Option<usize>,
+    version: u64,
 }
 
 pub struct TextBuffer {
@@ -52,22 +59,62 @@ pub struct TextBuffer {
     redo: Vec<Snapshot>,
     /// The coalescing group of the last edit; a cursor move resets it to `None`.
     group: Coalesce,
+    /// Monotonic version of the current contents, bumped on every content
+    /// change and restored from snapshots by undo/redo.
+    version: u64,
+    /// The next unused version number.
+    next_version: u64,
+    /// The version last written to disk, against which `is_modified` compares.
+    saved_version: u64,
 }
 
 impl TextBuffer {
+    /// An empty, unsaved buffer.
     pub fn new() -> Self {
+        Self::from_text(String::new())
+    }
+
+    /// A buffer initialized with `text` (e.g. a file just read from disk): the
+    /// cursor sits at the top, there is no undo history to walk back into, and
+    /// the contents start out clean (not modified).
+    pub fn from_text(text: String) -> Self {
         Self {
-            text: String::new(),
+            text,
             cursor: 0,
             anchor: None,
             undo: Vec::new(),
             redo: Vec::new(),
             group: Coalesce::None,
+            version: 0,
+            next_version: 1,
+            saved_version: 0,
         }
     }
 
     pub fn text(&self) -> &str {
         &self.text
+    }
+
+    /// Whether the contents differ from the last point marked saved.
+    pub fn is_modified(&self) -> bool {
+        self.version != self.saved_version
+    }
+
+    /// Record that the current contents are now on disk, so [`is_modified`]
+    /// reads clean until the next change. Also breaks the coalescing group, so
+    /// the next edit checkpoints the saved state and can be undone back to it.
+    ///
+    /// [`is_modified`]: Self::is_modified
+    pub fn mark_saved(&mut self) {
+        self.saved_version = self.version;
+        self.group = Coalesce::None;
+    }
+
+    /// Stamp the contents with a fresh version. Called after every change so
+    /// modified-tracking and undo can tell distinct states apart.
+    fn touch(&mut self) {
+        self.version = self.next_version;
+        self.next_version += 1;
     }
 
     /// Byte offset of the cursor (always a grapheme cluster boundary).
@@ -106,6 +153,7 @@ impl TextBuffer {
         self.text.insert_str(self.cursor, s);
         self.cursor += s.len();
         self.anchor = None;
+        self.touch();
     }
 
     /// Delete the selection if there is one, else the grapheme cluster before
@@ -114,6 +162,7 @@ impl TextBuffer {
         if self.selection().is_some() {
             self.checkpoint(Coalesce::None);
             self.delete_selection();
+            self.touch();
             return true;
         }
         let Some(prev) = self.prev_grapheme() else {
@@ -122,6 +171,7 @@ impl TextBuffer {
         self.checkpoint(Coalesce::Delete);
         self.text.replace_range(prev..self.cursor, "");
         self.cursor = prev;
+        self.touch();
         true
     }
 
@@ -131,6 +181,7 @@ impl TextBuffer {
         if self.selection().is_some() {
             self.checkpoint(Coalesce::None);
             self.delete_selection();
+            self.touch();
             return true;
         }
         let Some(next) = self.next_grapheme() else {
@@ -138,6 +189,7 @@ impl TextBuffer {
         };
         self.checkpoint(Coalesce::Delete);
         self.text.replace_range(self.cursor..next, "");
+        self.touch();
         true
     }
 
@@ -269,6 +321,7 @@ impl TextBuffer {
             text: self.text.clone(),
             cursor: self.cursor,
             anchor: self.anchor,
+            version: self.version,
         }
     }
 
@@ -276,6 +329,7 @@ impl TextBuffer {
         self.text = snapshot.text;
         self.cursor = snapshot.cursor;
         self.anchor = snapshot.anchor;
+        self.version = snapshot.version;
     }
 
     /// Delete the active selection, collapsing the cursor to its start. Returns
@@ -572,5 +626,48 @@ mod tests {
         }
         b.set_cursor(999, false);
         assert_eq!(b.cursor, 7, "past the end clamps to the buffer length");
+    }
+
+    #[test]
+    fn from_text_loads_clean_with_no_history() {
+        let mut b = TextBuffer::from_text("hello\nworld".to_string());
+        assert_eq!(b.text(), "hello\nworld");
+        assert_eq!(b.cursor, 0, "the cursor opens at the top of the file");
+        assert!(!b.is_modified(), "a freshly loaded file is not modified");
+        assert!(!b.undo(), "there is no history to undo into");
+    }
+
+    #[test]
+    fn editing_marks_modified_and_saving_clears_it() {
+        let mut b = TextBuffer::new();
+        assert!(!b.is_modified(), "an untouched buffer is clean");
+        b.insert_str("hi");
+        assert!(b.is_modified());
+        b.mark_saved();
+        assert!(!b.is_modified(), "saving clears the modified flag");
+        b.backspace();
+        assert!(b.is_modified(), "a later edit dirties it again");
+    }
+
+    #[test]
+    fn undoing_back_to_the_saved_state_is_not_modified() {
+        let mut b = TextBuffer::new();
+        b.insert_str("a");
+        b.mark_saved(); // clean at "a"
+        b.insert_str(" "); // whitespace breaks coalescing into its own step
+        b.insert_str("b");
+        assert_eq!(b.text(), "a b");
+        assert!(b.is_modified());
+        b.undo(); // remove "b"
+        assert!(b.is_modified(), "still past the saved state");
+        b.undo(); // remove " ", back to the saved "a"
+        assert_eq!(b.text(), "a");
+        assert!(
+            !b.is_modified(),
+            "undoing onto the saved contents reads clean"
+        );
+        // Redoing forward off the saved state dirties it once more.
+        b.redo();
+        assert!(b.is_modified());
     }
 }

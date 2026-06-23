@@ -111,6 +111,14 @@ impl TextBuffer {
         self.version != self.saved_version
     }
 
+    /// The current content version. Distinct contents always have distinct
+    /// versions (each edit takes a fresh number, and undo/redo restore the
+    /// version along with the text), so it is a sound cache key for anything
+    /// derived purely from the buffer contents, like the layout.
+    pub fn version(&self) -> u64 {
+        self.version
+    }
+
     /// Record that the current contents are now on disk, so [`is_modified`]
     /// reads clean until the next change. Also breaks the coalescing group, so
     /// the next edit checkpoints the saved state and can be undone back to it.

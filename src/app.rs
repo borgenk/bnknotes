@@ -166,6 +166,13 @@ struct State {
     /// How far the viewport is scrolled down the document, in pixels.
     scroll_y: i32,
 
+    /// Memoized layout, reused until its inputs change. The key is the content
+    /// version, the surface width, and the active (cursor/selection) range, the
+    /// only things the layout's geometry depends on; a scroll or idle redraw
+    /// reuses it instead of re-wrapping and re-measuring the whole document.
+    layout_cache: Option<Layout>,
+    layout_key: Option<(u64, u32, usize, usize)>,
+
     // Key auto-repeat. The compositor sends one press; the client repeats the
     // held key on a timer until it is released.
     repeat_delay: Duration,
@@ -257,6 +264,8 @@ impl State {
             autoscroll_at: None,
             goal_x: None,
             scroll_y: 0,
+            layout_cache: None,
+            layout_key: None,
             repeat_delay: Duration::from_millis(DEFAULT_REPEAT_DELAY_MS),
             repeat_interval: Some(Duration::from_secs(1) / DEFAULT_REPEAT_RATE),
             repeat_key: None,
@@ -510,9 +519,16 @@ impl State {
             // cursor has left the line) draws only the text past them, flush to
             // the margin. When the markers are shown they are dimmed so the
             // markup reads as syntax.
+            let view_h = height as i32;
             for line in layout.lines() {
-                let face = fonts.face(line.size);
+                let m = fonts.metrics(line.size);
                 let baseline = line.baseline - scroll_y;
+                // Skip lines fully above or below the viewport, so a frame only
+                // rasterizes what is on screen.
+                if baseline + m.descent <= 0 || baseline - m.ascent >= view_h {
+                    continue;
+                }
+                let face = fonts.face(line.size);
                 let slice = rope.byte_slice(line.start..line.end);
                 if line.hidden_prefix > 0 {
                     canvas.draw_text(
@@ -1148,7 +1164,7 @@ impl State {
 
     /// The byte offset under the pointer, mapping its window position into
     /// content space by the current scroll.
-    fn pointer_offset(&self) -> usize {
+    fn pointer_offset(&mut self) -> usize {
         let layout = self.layout();
         layout.offset_at(
             &self.fonts,
@@ -1453,19 +1469,41 @@ impl State {
     /// each side. Per-line metrics come from the font set during the build. The
     /// cursor (or selection) is passed in as the active range so a heading the
     /// caret is editing keeps its `#` markers while the rest collapse them.
-    fn layout(&self) -> Layout {
-        let wrap_width = self.width as i32 - 2 * MARGIN;
+    ///
+    /// The result is memoized on `(version, width, active)`: the geometry
+    /// depends on nothing else, so a scroll or idle redraw clones the cached
+    /// layout (a cheap copy) instead of re-wrapping and re-measuring every line.
+    /// Only an edit, cursor move, or resize misses the cache and rebuilds.
+    fn layout(&mut self) -> Layout {
         let cursor = self.text.cursor();
         let active = self.text.selection().unwrap_or((cursor, cursor));
-        Layout::build(
-            &self.fonts,
-            self.text.rope(),
-            MARGIN,
-            MARGIN,
-            wrap_width,
-            FONT_SIZE,
-            active,
-        )
+        let key = (self.text.version(), self.width, active.0, active.1);
+        if self.layout_key != Some(key) {
+            let wrap_width = self.width as i32 - 2 * MARGIN;
+            let layout = Layout::build(
+                &self.fonts,
+                self.text.rope(),
+                MARGIN,
+                MARGIN,
+                wrap_width,
+                FONT_SIZE,
+                active,
+            );
+            self.layout_cache = Some(layout);
+            self.layout_key = Some(key);
+        }
+        // Built above when missing, so the unwrap always holds.
+        self.layout_cache.clone().unwrap_or_else(|| {
+            Layout::build(
+                &self.fonts,
+                self.text.rope(),
+                MARGIN,
+                MARGIN,
+                self.width as i32 - 2 * MARGIN,
+                FONT_SIZE,
+                active,
+            )
+        })
     }
 
     fn bind(&mut self, name: u32, interface: &str, version: u32, id: u32) {

@@ -47,6 +47,7 @@ const NEWLINE_PAD: i32 = 8;
 /// One on-screen line: the byte range of its text (excluding any trailing
 /// `'\n'`), the y of its baseline, whether a hard newline follows it, the pixel
 /// size it renders at, and how many leading bytes are hidden.
+#[derive(Clone, Copy)]
 pub struct VisualLine {
     pub start: usize,
     pub end: usize,
@@ -71,6 +72,7 @@ pub struct Rect {
     pub h: i32,
 }
 
+#[derive(Clone)]
 pub struct Layout {
     lines: Vec<VisualLine>,
     left: i32,

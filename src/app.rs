@@ -35,7 +35,7 @@ use crate::protocol::{
     wl_shm, wl_shm_pool, wl_surface, wp_cursor_shape_device_v1, wp_cursor_shape_manager_v1,
     xdg_surface, xdg_toplevel, xdg_wm_base,
 };
-use crate::render::Canvas;
+use crate::render::{self, Canvas};
 use crate::scroll;
 use crate::shm::Pool;
 use crate::text::TextBuffer;
@@ -50,9 +50,13 @@ const INIT_HEIGHT: u32 = 600;
 const BACKGROUND: u32 = 0x001e_1e2e;
 const FOREGROUND: u32 = 0x00e0_e0e0;
 const SELECTION_COLOR: u32 = 0x0026_4f78;
-/// Dimmed color for markdown syntax markers (the `#`s of a heading), so they
-/// read as syntax rather than content.
+/// Dimmed color for markdown syntax markers (a heading's `#`s, a code span's
+/// backticks), so they read as syntax rather than content.
 const MARKER_COLOR: u32 = 0x006c_7086;
+/// Inline code: a tinted background panel and a distinct foreground, so a code
+/// span stands out from prose the way it does in a rendered document.
+const CODE_COLOR: u32 = 0x00f3_8ba8;
+const CODE_BG: u32 = 0x0031_3244;
 /// Body text pixel size; headings scale up from it (see [`markdown::font_size`]).
 const FONT_SIZE: u32 = 32;
 /// Inset of the text from the top-left corner (both axes).
@@ -526,10 +530,11 @@ impl State {
             }
 
             // The text, one visual line at a time, each at its own font size,
-            // materialized from the rope. A heading whose markers are hidden (the
-            // cursor has left the line) draws only the text past them, flush to
-            // the margin. When the markers are shown they are dimmed so the
-            // markup reads as syntax.
+            // materialized from the rope. A line is a sequence of inline runs:
+            // regular text, code spans (drawn on a tinted panel), and the
+            // delimiter markers, which are dimmed on the cursor's line and
+            // collapse to nothing (skipped) once it leaves, the live-preview
+            // reveal that `layout` bakes into each run's `visible` flag.
             let view_h = height as i32;
             for line in layout.lines() {
                 let m = fonts.metrics(line.size);
@@ -540,24 +545,30 @@ impl State {
                     continue;
                 }
                 let face = fonts.face(line.size);
-                let slice = rope.byte_slice(line.start..line.end);
-                if line.hidden_prefix > 0 {
-                    canvas.draw_text(
-                        face,
-                        MARGIN,
-                        baseline,
-                        &slice[line.hidden_prefix..],
-                        FOREGROUND,
-                    );
-                    continue;
-                }
-                let marker = markdown::marker_len(&slice);
-                if marker > 0 {
-                    let pen =
-                        canvas.draw_text(face, MARGIN, baseline, &slice[..marker], MARKER_COLOR);
-                    canvas.draw_text(face, pen, baseline, &slice[marker..], FOREGROUND);
-                } else {
-                    canvas.draw_text(face, MARGIN, baseline, &slice, FOREGROUND);
+                let mut pen = MARGIN;
+                for run in &line.runs {
+                    if !run.visible {
+                        continue;
+                    }
+                    let slice = rope.byte_slice(run.start..run.end);
+                    let color = match run.kind {
+                        markdown::SpanKind::Marker => MARKER_COLOR,
+                        markdown::SpanKind::Text(markdown::Emphasis::Code) => CODE_COLOR,
+                        markdown::SpanKind::Text(markdown::Emphasis::Regular) => FOREGROUND,
+                    };
+                    // A code span sits on a tinted panel; paint it before the
+                    // glyphs so they blend over it.
+                    if matches!(run.kind, markdown::SpanKind::Text(markdown::Emphasis::Code)) {
+                        let w = render::text_advance(face, &slice).round() as i32;
+                        canvas.fill_rect(
+                            pen,
+                            baseline - m.ascent,
+                            w,
+                            m.ascent + m.descent,
+                            CODE_BG,
+                        );
+                    }
+                    pen = canvas.draw_text(face, pen, baseline, &slice, color);
                 }
             }
 

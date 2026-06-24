@@ -1,15 +1,20 @@
-//! The first sliver of the markdown layer: classifying a logical line's block
-//! style so the editor can render markup inline rather than in a side preview.
+//! The markdown layer: classifying a logical line so the editor can render
+//! markup inline rather than in a side preview.
 //!
-//! Markdown is rendered as you type, and this is the start of it.
-//! Classification is per *logical* line (the text between two `'\n'`s).
-//! [`crate::layout`] resolves the style to a pixel size and stamps it onto every
-//! visual line the logical line wraps into, so a heading renders larger while
-//! sharing all the cursor and selection math.
+//! Markdown is rendered as you type, in two passes, both per *logical* line
+//! (the text between two `'\n'`s):
 //!
-//! Scope for now: ATX headings only (`# ` .. `###### `). Everything else is
-//! body text. Indented headings (CommonMark allows up to three leading spaces)
-//! are deliberately not recognized; notes are written at the left margin.
+//! - **Block style** ([`style_of`]): an ATX heading (`# ` .. `###### `) renders
+//!   larger. [`crate::layout`] resolves the style to a pixel size and stamps it
+//!   onto every visual line the logical line wraps into, sharing all the cursor
+//!   and selection math.
+//! - **Inline spans** ([`inline_spans`]): code spans and (later) emphasis style
+//!   interior runs of a line, with their delimiters hidden once the cursor
+//!   leaves the line.
+//!
+//! Scope for now: ATX headings and inline code. Indented headings (CommonMark
+//! allows up to three leading spaces) are deliberately not recognized; notes are
+//! written at the left margin.
 
 /// The block style of one logical line. A closed set, extended as more markup
 /// lands (lists, quotes, ...).
@@ -92,6 +97,138 @@ pub fn all_sizes(base: u32) -> Vec<u32> {
     sizes
 }
 
+// --- Inline spans -----------------------------------------------------------
+//
+// Within a logical line's content (past any block marker), markup like a code
+// span styles an interior run rather than the whole line. The scanner below
+// splits a content string into a contiguous list of [`Span`]s covering every
+// byte, so [`crate::layout`] can clip them to visual lines and hide the
+// delimiters once the cursor leaves the line, the same live-preview collapse
+// headings already use.
+//
+// Scope for now: code spans only (`` `code` ``). This is a deliberately
+// simplified reading of CommonMark: a run of N backticks opens a span that the
+// next run of exactly N backticks closes, and an unclosed run is literal text.
+// Backslash escapes and the one-space stripping CommonMark does inside a code
+// span are not handled; notes rarely need either.
+
+/// Inline emphasis of a text run, selecting the face and color it renders with.
+/// A closed set, extended as bold and italic land.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Emphasis {
+    /// Ordinary body text.
+    Regular,
+    /// An inline code span, drawn monospace on a tinted background.
+    Code,
+}
+
+/// What one inline span is: text to render with an [`Emphasis`], or a delimiter
+/// marker (a code span's backticks) that live-preview hides off the active line.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum SpanKind {
+    Text(Emphasis),
+    Marker,
+}
+
+/// One inline span: a byte range within the scanned content, and what it is.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Span {
+    pub start: usize,
+    pub end: usize,
+    pub kind: SpanKind,
+}
+
+/// Split `content` into a contiguous list of inline spans covering `[0, len)`,
+/// recognizing code spans. Text between and around code spans becomes
+/// `Text(Regular)` spans, so the result has no gaps. Empty input yields no spans.
+pub fn inline_spans(content: &str) -> Vec<Span> {
+    let bytes = content.as_bytes();
+    let mut spans = Vec::new();
+    // Start of the pending run of regular text not yet emitted.
+    let mut text_start = 0;
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] != b'`' {
+            i += 1;
+            continue;
+        }
+        // A run of `fence` backticks opens a code span only if a run of exactly
+        // the same length closes it later on the line.
+        let open = i;
+        let after_open = backtick_run_end(bytes, open);
+        let fence = after_open - open;
+        let Some((close, after_close)) = find_code_closer(bytes, after_open, fence) else {
+            // Unclosed: the backticks are literal text. Skip past them so a later
+            // run of the same length is not mistaken for this run's closer.
+            i = after_open;
+            continue;
+        };
+        if open > text_start {
+            spans.push(Span {
+                start: text_start,
+                end: open,
+                kind: SpanKind::Text(Emphasis::Regular),
+            });
+        }
+        spans.push(Span {
+            start: open,
+            end: after_open,
+            kind: SpanKind::Marker,
+        });
+        if close > after_open {
+            spans.push(Span {
+                start: after_open,
+                end: close,
+                kind: SpanKind::Text(Emphasis::Code),
+            });
+        }
+        spans.push(Span {
+            start: close,
+            end: after_close,
+            kind: SpanKind::Marker,
+        });
+        text_start = after_close;
+        i = after_close;
+    }
+    if text_start < bytes.len() {
+        spans.push(Span {
+            start: text_start,
+            end: bytes.len(),
+            kind: SpanKind::Text(Emphasis::Regular),
+        });
+    }
+    spans
+}
+
+/// The byte index just past the run of backticks starting at `start` (which must
+/// be a backtick).
+fn backtick_run_end(bytes: &[u8], start: usize) -> usize {
+    let mut i = start;
+    while i < bytes.len() && bytes[i] == b'`' {
+        i += 1;
+    }
+    i
+}
+
+/// Find the closing backtick run of exactly `fence` backticks at or after `from`,
+/// returning its `(start, end)`. Runs of a different length are not closers and
+/// are skipped over.
+fn find_code_closer(bytes: &[u8], from: usize, fence: usize) -> Option<(usize, usize)> {
+    let mut i = from;
+    while i < bytes.len() {
+        if bytes[i] != b'`' {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        i = backtick_run_end(bytes, start);
+        if i - start == fence {
+            return Some((start, i));
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -163,5 +300,104 @@ mod tests {
         seen.sort_unstable();
         seen.dedup();
         assert_eq!(seen.len(), sizes.len(), "no duplicate sizes");
+    }
+
+    // --- Inline spans -----------------------------------------------------
+
+    /// `(start, end, kind)` triples, terse enough to assert a whole span list.
+    fn spans(s: &str) -> Vec<(usize, usize, SpanKind)> {
+        inline_spans(s)
+            .into_iter()
+            .map(|sp| (sp.start, sp.end, sp.kind))
+            .collect()
+    }
+
+    #[test]
+    fn plain_text_is_one_regular_span() {
+        assert_eq!(
+            spans("hello"),
+            vec![(0, 5, SpanKind::Text(Emphasis::Regular))]
+        );
+    }
+
+    #[test]
+    fn empty_content_has_no_spans() {
+        assert!(inline_spans("").is_empty());
+    }
+
+    #[test]
+    fn a_code_span_splits_into_marker_code_marker() {
+        // "a `b` c": text, marker, code, marker, text.
+        assert_eq!(
+            spans("a `b` c"),
+            vec![
+                (0, 2, SpanKind::Text(Emphasis::Regular)),
+                (2, 3, SpanKind::Marker),
+                (3, 4, SpanKind::Text(Emphasis::Code)),
+                (4, 5, SpanKind::Marker),
+                (5, 7, SpanKind::Text(Emphasis::Regular)),
+            ]
+        );
+    }
+
+    #[test]
+    fn spans_tile_the_content_with_no_gaps() {
+        for input in ["`x`", "a`x`b", "plain", "`x` `y`", "``a`b``"] {
+            let sp = inline_spans(input);
+            assert_eq!(
+                sp.first().map(|s| s.start),
+                Some(0),
+                "{input:?} starts at 0"
+            );
+            assert_eq!(
+                sp.last().map(|s| s.end),
+                Some(input.len()),
+                "{input:?} reaches the end"
+            );
+            for pair in sp.windows(2) {
+                assert_eq!(pair[0].end, pair[1].start, "{input:?} has no gap");
+            }
+        }
+    }
+
+    #[test]
+    fn an_unclosed_backtick_is_literal_text() {
+        assert_eq!(
+            spans("a `b c"),
+            vec![(0, 6, SpanKind::Text(Emphasis::Regular))],
+            "no closer means the backtick is ordinary text"
+        );
+    }
+
+    #[test]
+    fn two_code_spans_on_a_line() {
+        let sp = spans("`a` `b`");
+        let markers = sp.iter().filter(|s| s.2 == SpanKind::Marker).count();
+        let code = sp
+            .iter()
+            .filter(|s| s.2 == SpanKind::Text(Emphasis::Code))
+            .count();
+        assert_eq!(markers, 4, "two pairs of backticks");
+        assert_eq!(code, 2, "two code runs");
+    }
+
+    #[test]
+    fn a_double_backtick_fence_holds_a_literal_backtick() {
+        // ``a`b`` : the inner single backtick is code content, not a closer.
+        assert_eq!(
+            spans("``a`b``"),
+            vec![
+                (0, 2, SpanKind::Marker),
+                (2, 5, SpanKind::Text(Emphasis::Code)),
+                (5, 7, SpanKind::Marker),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_lone_backtick_run_is_literal() {
+        // Adjacent backticks are one greedy fence, so a bare "``" has no closer
+        // and stays literal text rather than becoming an empty code span.
+        assert_eq!(spans("``"), vec![(0, 2, SpanKind::Text(Emphasis::Regular))]);
     }
 }

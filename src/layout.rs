@@ -28,11 +28,13 @@
 //! take a [`Fonts`] to look up the right face and metrics per line. Baselines
 //! stack by each line's own height rather than a single global line height.
 //!
-//! Headings also live-preview: a heading whose line the cursor has left hides
-//! its `#` markers (`VisualLine::hidden_prefix`), drawing only the text past
-//! them at the margin; the markers reappear when the cursor returns. Wrapping
-//! always measures the source text, so this collapse only shifts a heading's
-//! first segment horizontally, never reflowing the document.
+//! Each visual line is also split into inline [`Run`]s: stretches of text with
+//! one [`markdown::Emphasis`] (regular or code), and the markers that delimit
+//! them (a heading's `#`s, a code span's backticks). Markers live-preview: on a
+//! line the cursor has left they collapse (`Run::visible` is false, zero width),
+//! drawing only the styled text; they reappear when the cursor returns. Wrapping
+//! always measures the source text, so this collapse only shifts runs
+//! horizontally within a line, never reflowing the document.
 
 use crate::freetype::{Face, Fonts};
 use crate::grapheme;
@@ -46,8 +48,8 @@ const NEWLINE_PAD: i32 = 8;
 
 /// One on-screen line: the byte range of its text (excluding any trailing
 /// `'\n'`), the y of its baseline, whether a hard newline follows it, the pixel
-/// size it renders at, and how many leading bytes are hidden.
-#[derive(Clone, Copy)]
+/// size it renders at, and its inline runs.
+#[derive(Clone)]
 pub struct VisualLine {
     pub start: usize,
     pub end: usize,
@@ -57,11 +59,21 @@ pub struct VisualLine {
     pub hard: bool,
     /// The pixel size this line renders at; selects the face and metrics.
     pub size: u32,
-    /// Leading bytes of `[start, end)` that are not drawn: the `#` markers of a
-    /// heading whose line the cursor has left (the live-preview collapse). `0`
-    /// when the markers are shown or there are none. The displayed text begins
-    /// at `start + hidden_prefix`, drawn flush to the left margin.
-    pub hidden_prefix: usize,
+    /// The line's inline runs in display order, tiling `[start, end)` (an empty
+    /// line has none). Each is a styled stretch of text or a delimiter marker;
+    /// a hidden marker (`!visible`) is collapsed to zero width.
+    pub runs: Vec<Run>,
+}
+
+/// One inline run of a visual line: an absolute byte range, what it is, and
+/// whether it is drawn. A marker run is hidden (`visible == false`) on a line
+/// the cursor has left, the live-preview collapse; text runs are always visible.
+#[derive(Clone, Copy)]
+pub struct Run {
+    pub start: usize,
+    pub end: usize,
+    pub kind: markdown::SpanKind,
+    pub visible: bool,
 }
 
 /// An axis-aligned rectangle in window pixels.
@@ -126,18 +138,13 @@ impl Layout {
             // back to absolute buffer positions for the visual lines.
             let segments = wrap_segments(face, &line, wrap_width);
             let last = segments.len() - 1;
-            // Hide a heading's markers unless the active range touches its line.
-            // The hidden bytes only ever sit on the first segment (the `#`s lead
-            // the logical line); a touched line, or any non-heading line, hides
-            // nothing.
-            let marker = markdown::marker_len(&line);
+            // The line's inline spans (line-relative), and whether its markers
+            // are revealed: shown while the active range touches the line, hidden
+            // once the cursor leaves it. Wrapping measured the source text above,
+            // so clipping spans to each segment never disagrees with the breaks.
+            let spans = line_spans(&line);
             let revealed = active.0 <= le && active.1 >= ls;
             for (k, (start, end)) in segments.into_iter().enumerate() {
-                let hidden_prefix = if marker > 0 && !revealed && k == 0 {
-                    marker
-                } else {
-                    0
-                };
                 lines.push(VisualLine {
                     start: ls + start,
                     end: ls + end,
@@ -146,7 +153,7 @@ impl Layout {
                     // trailing '\n' is a hard break.
                     hard: k == last && has_newline,
                     size,
-                    hidden_prefix,
+                    runs: clip_runs(&spans, start, end, ls, revealed),
                 });
                 box_top += metrics.line_height;
             }
@@ -177,16 +184,12 @@ impl Layout {
 
     /// The caret rectangle (its x, top y, and height) for the cursor at `offset`,
     /// sized to the metrics of the line it lands on. The caret only ever lands on
-    /// a revealed line (the cursor's own line shows its markers), so `offset`
-    /// sits at or past the displayed start; the clamp is defensive.
+    /// a revealed line (the cursor's own line shows its markers), so its `offset`
+    /// never falls inside a hidden run.
     pub fn caret(&self, fonts: &Fonts, rope: &Rope, offset: usize) -> (i32, i32, i32) {
         let line = self.line_for(offset);
-        let face = fonts.face(line.size);
         let m = fonts.metrics(line.size);
-        let display_start = line.start + line.hidden_prefix;
-        let from = offset.max(display_start);
-        let prefix = rope.byte_slice(display_start..from);
-        let x = self.left as f32 + render::text_advance(face, &prefix);
+        let x = self.left as f32 + self.advance_to(fonts, rope, line, offset);
         (
             x.round() as i32,
             line.baseline - m.ascent,
@@ -229,7 +232,6 @@ impl Layout {
     ) -> Vec<Rect> {
         let mut rects = Vec::new();
         for line in &self.lines {
-            let face = fonts.face(line.size);
             let m = fonts.metrics(line.size);
             let sel_start = start.max(line.start);
             let sel_end = end.min(line.end);
@@ -239,17 +241,11 @@ impl Layout {
             if sel_start >= sel_end && !newline_selected {
                 continue;
             }
-            // Measure from the displayed start, clamping any selected bytes that
-            // fall in a hidden marker to it (they occupy no width). In practice a
-            // line touched by the selection is revealed, so this only guards the
-            // boundary case.
-            let display_start = line.start + line.hidden_prefix;
-            let eff_start = sel_start.max(display_start);
-            let eff_end = sel_end.max(display_start);
-            let x0 = self.left as f32
-                + render::text_advance(face, &rope.byte_slice(display_start..eff_start));
-            let x1 = self.left as f32
-                + render::text_advance(face, &rope.byte_slice(display_start..eff_end));
+            // Measure the run-walked advance to each end of the selection; bytes
+            // in a hidden marker collapse to the marker's edge, so a selection
+            // touching one (in practice a revealed line) measures sensibly.
+            let x0 = self.left as f32 + self.advance_to(fonts, rope, line, sel_start);
+            let x1 = self.left as f32 + self.advance_to(fonts, rope, line, sel_end);
             let mut w = (x1 - x0).round() as i32;
             if newline_selected {
                 w += NEWLINE_PAD;
@@ -292,27 +288,104 @@ impl Layout {
 
     /// The byte offset within `line` nearest window x `x`, snapped to a grapheme
     /// cluster boundary (a click in a cluster's left half lands before it). Hit
-    /// testing walks the displayed text, so a click on a heading with hidden
-    /// markers lands in the visible text, never inside the collapsed `#`s.
+    /// testing walks only the visible runs, so a click on a line with hidden
+    /// markers lands in the visible text, never inside a collapsed marker.
     fn hit_line(&self, fonts: &Fonts, rope: &Rope, line: &VisualLine, x: f32) -> usize {
         let face = fonts.face(line.size);
-        let display_start = line.start + line.hidden_prefix;
-        let slice = rope.byte_slice(display_start..line.end);
         let mut acc = self.left as f32;
-        for (off, cluster) in grapheme::graphemes(&slice) {
-            let w = render::text_advance(face, cluster);
-            if x < acc + w / 2.0 {
-                return display_start + off;
+        // Past every glyph: the end of the last visible run, or the line start
+        // for an empty line.
+        let mut last = line.start;
+        for run in &line.runs {
+            if !run.visible {
+                continue;
             }
-            acc += w;
+            let slice = rope.byte_slice(run.start..run.end);
+            for (off, cluster) in grapheme::graphemes(&slice) {
+                let w = render::text_advance(face, cluster);
+                if x < acc + w / 2.0 {
+                    return run.start + off;
+                }
+                acc += w;
+            }
+            last = run.end;
         }
-        line.end
+        last
+    }
+
+    /// Pen advance in pixels from the left margin to absolute byte `offset`,
+    /// summing the line's visible runs; a hidden (collapsed) marker contributes
+    /// nothing. An `offset` at or past the line's end measures the whole line.
+    fn advance_to(&self, fonts: &Fonts, rope: &Rope, line: &VisualLine, offset: usize) -> f32 {
+        let face = fonts.face(line.size);
+        let mut x = 0.0;
+        for run in &line.runs {
+            // Runs are ordered, so once a run starts at or past `offset` the rest
+            // do too; hidden runs add nothing.
+            if !run.visible || offset <= run.start {
+                continue;
+            }
+            let end = offset.min(run.end);
+            x += render::text_advance(face, &rope.byte_slice(run.start..end));
+        }
+        x
     }
 
     fn last_line(&self) -> &VisualLine {
         // build always pushes at least one line, so this never panics.
         &self.lines[self.lines.len() - 1]
     }
+}
+
+/// The full inline span list of a logical `line`, line-relative: a leading
+/// block marker (a heading's `#`s, if any) followed by the inline spans of the
+/// content past it, offset back over the marker. Tiles `[0, line.len())`.
+fn line_spans(line: &str) -> Vec<markdown::Span> {
+    let marker = markdown::marker_len(line);
+    let mut spans = Vec::new();
+    if marker > 0 {
+        spans.push(markdown::Span {
+            start: 0,
+            end: marker,
+            kind: markdown::SpanKind::Marker,
+        });
+    }
+    for mut span in markdown::inline_spans(&line[marker..]) {
+        span.start += marker;
+        span.end += marker;
+        spans.push(span);
+    }
+    spans
+}
+
+/// Clip line-relative `spans` to the visual segment `[seg_start, seg_end)`,
+/// offsetting to absolute by `ls`. A marker run is hidden unless `revealed`; a
+/// text run is always shown. Empty overlaps are dropped, so the runs tile the
+/// segment.
+fn clip_runs(
+    spans: &[markdown::Span],
+    seg_start: usize,
+    seg_end: usize,
+    ls: usize,
+    revealed: bool,
+) -> Vec<Run> {
+    let mut runs = Vec::new();
+    for span in spans {
+        let s = span.start.max(seg_start);
+        let e = span.end.min(seg_end);
+        if s >= e {
+            continue;
+        }
+        let is_marker = matches!(span.kind, markdown::SpanKind::Marker);
+        runs.push(Run {
+            start: ls + s,
+            end: ls + e,
+            kind: span.kind,
+            // A marker shows only on a revealed line; text always shows.
+            visible: !is_marker || revealed,
+        });
+    }
+    runs
 }
 
 /// Greedily word-wrap the logical line `text[ls..le]` to `wrap_width` pixels,
@@ -639,13 +712,30 @@ mod tests {
         )
     }
 
+    /// Whether `line`'s leading marker run is collapsed. Asserts the line starts
+    /// with a marker run, which every heading line in these tests does.
+    fn marker_hidden(line: &VisualLine) -> bool {
+        let run = line.runs.first().expect("a heading line has runs");
+        assert!(
+            matches!(run.kind, markdown::SpanKind::Marker),
+            "the first run is the heading marker"
+        );
+        !run.visible
+    }
+
     #[test]
     fn markers_hide_when_the_cursor_is_off_the_heading_line() {
         let f = fonts();
         let body_off = "# Title\nbody".find("body").unwrap();
         let l = heading_and_body(&f, (body_off, body_off));
-        assert_eq!(l.lines()[0].hidden_prefix, 2, "the '# ' marker collapses");
-        assert_eq!(l.lines()[1].hidden_prefix, 0, "body never hides anything");
+        assert!(marker_hidden(&l.lines()[0]), "the '# ' marker collapses");
+        assert!(
+            l.lines()[1]
+                .runs
+                .iter()
+                .all(|r| matches!(r.kind, markdown::SpanKind::Text(_))),
+            "body has no marker to hide"
+        );
     }
 
     #[test]
@@ -653,7 +743,7 @@ mod tests {
         let f = fonts();
         // Cursor inside "Title".
         let l = heading_and_body(&f, (4, 4));
-        assert_eq!(l.lines()[0].hidden_prefix, 0, "markers stay while editing");
+        assert!(!marker_hidden(&l.lines()[0]), "markers stay while editing");
     }
 
     #[test]
@@ -661,7 +751,7 @@ mod tests {
         let f = fonts();
         // Cursor at offset 7, right before the '\n': still on the heading line.
         let l = heading_and_body(&f, (7, 7));
-        assert_eq!(l.lines()[0].hidden_prefix, 0);
+        assert!(!marker_hidden(&l.lines()[0]));
     }
 
     #[test]
@@ -669,9 +759,8 @@ mod tests {
         let f = fonts();
         // Select the whole buffer: the heading is within it, so it reveals.
         let l = heading_and_body(&f, (0, "# Title\nbody".len()));
-        assert_eq!(
-            l.lines()[0].hidden_prefix,
-            0,
+        assert!(
+            !marker_hidden(&l.lines()[0]),
             "a selected heading shows markers"
         );
     }
@@ -682,7 +771,7 @@ mod tests {
         let r = rope("# Title");
         // No cursor on the line, so the markers hide.
         let l = Layout::build(&f, &r, LEFT, TOP, 1_000_000, BODY, (99, 99));
-        assert_eq!(l.lines()[0].hidden_prefix, 2);
+        assert!(marker_hidden(&l.lines()[0]));
         // A click at the far left lands at the start of the visible text
         // ("Title", offset 2), never inside the collapsed "# ".
         let off = l.offset_at(&f, &r, -100.0, l.lines()[0].baseline as f32);
@@ -717,5 +806,100 @@ mod tests {
             assert_eq!(h.baseline, s.baseline, "baselines are reveal-independent");
         }
         assert_eq!(hidden.text_height(), shown.text_height());
+    }
+
+    // --- inline code runs -------------------------------------------------
+
+    #[test]
+    fn a_code_span_becomes_marker_code_marker_runs() {
+        let f = fonts();
+        let r = rope("a `b` c");
+        // Cursor on the line: every run is shown.
+        let l = Layout::build(&f, &r, LEFT, TOP, 1_000_000, BODY, (0, 0));
+        let kinds: Vec<_> = l.lines()[0].runs.iter().map(|run| run.kind).collect();
+        assert_eq!(
+            kinds,
+            vec![
+                markdown::SpanKind::Text(markdown::Emphasis::Regular),
+                markdown::SpanKind::Marker,
+                markdown::SpanKind::Text(markdown::Emphasis::Code),
+                markdown::SpanKind::Marker,
+                markdown::SpanKind::Text(markdown::Emphasis::Regular),
+            ]
+        );
+        assert!(
+            l.lines()[0].runs.iter().all(|run| run.visible),
+            "all runs shown on the active line"
+        );
+    }
+
+    #[test]
+    fn code_markers_collapse_off_the_line() {
+        let f = fonts();
+        let src = "a `b` c\nx";
+        let r = rope(src);
+        // Cursor on the second line.
+        let off = src.find('x').unwrap();
+        let l = Layout::build(&f, &r, LEFT, TOP, 1_000_000, BODY, (off, off));
+        let line = &l.lines()[0];
+        assert!(
+            line.runs
+                .iter()
+                .filter(|run| matches!(run.kind, markdown::SpanKind::Marker))
+                .all(|run| !run.visible),
+            "the backticks collapse off the line"
+        );
+        assert!(
+            line.runs
+                .iter()
+                .filter(|run| matches!(
+                    run.kind,
+                    markdown::SpanKind::Text(markdown::Emphasis::Code)
+                ))
+                .all(|run| run.visible),
+            "the code text stays shown"
+        );
+    }
+
+    #[test]
+    fn clicks_never_land_inside_hidden_code_markers() {
+        let f = fonts();
+        let r = rope("a `b` c");
+        // Cursor off the line, so the backticks (offsets 2 and 4) collapse.
+        let l = Layout::build(&f, &r, LEFT, TOP, 1_000_000, BODY, (99, 99));
+        let y = l.lines()[0].baseline as f32;
+        let mut seen = std::collections::BTreeSet::new();
+        let mut x = (LEFT - 50) as f32;
+        while x < (LEFT + 600) as f32 {
+            seen.insert(l.offset_at(&f, &r, x, y));
+            x += 1.0;
+        }
+        assert!(
+            !seen.contains(&2) && !seen.contains(&4),
+            "a click never resolves to a collapsed backtick"
+        );
+        assert!(
+            seen.contains(&0) && seen.contains(&7),
+            "the line's ends stay reachable"
+        );
+    }
+
+    #[test]
+    fn hiding_a_code_marker_shifts_the_following_text_left() {
+        let f = fonts();
+        let r = rope("`b`");
+        let hidden = Layout::build(&f, &r, LEFT, TOP, 1_000_000, BODY, (99, 99));
+        let shown = Layout::build(&f, &r, LEFT, TOP, 1_000_000, BODY, (0, 0));
+        // Offset 1 is "b", just past the opening backtick. Collapsed it sits at
+        // the margin; shown it sits one backtick-width to the right.
+        let (x_hidden, _, _) = hidden.caret(&f, &r, 1);
+        let (x_shown, _, _) = shown.caret(&f, &r, 1);
+        assert_eq!(x_hidden, LEFT, "collapsed: code text at the margin");
+        let tick_w = render::text_advance(f.face(BODY), "`").round() as i32;
+        assert_eq!(
+            x_shown - x_hidden,
+            tick_w,
+            "shown: shifted by the backtick width"
+        );
     }
 }

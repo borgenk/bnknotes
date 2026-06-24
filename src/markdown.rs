@@ -8,13 +8,13 @@
 //!   larger. [`crate::layout`] resolves the style to a pixel size and stamps it
 //!   onto every visual line the logical line wraps into, sharing all the cursor
 //!   and selection math.
-//! - **Inline spans** ([`inline_spans`]): code spans and (later) emphasis style
-//!   interior runs of a line, with their delimiters hidden once the cursor
+//! - **Inline spans** ([`inline_spans`]): code spans and emphasis (`*`/`_`)
+//!   style interior runs of a line, with their delimiters hidden once the cursor
 //!   leaves the line.
 //!
-//! Scope for now: ATX headings and inline code. Indented headings (CommonMark
-//! allows up to three leading spaces) are deliberately not recognized; notes are
-//! written at the left margin.
+//! Scope for now: ATX headings, inline code, and bold/italic emphasis. Indented
+//! headings (CommonMark allows up to three leading spaces) are deliberately not
+//! recognized; notes are written at the left margin.
 
 /// The block style of one logical line. A closed set, extended as more markup
 /// lands (lists, quotes, ...).
@@ -100,26 +100,43 @@ pub fn all_sizes(base: u32) -> Vec<u32> {
 // --- Inline spans -----------------------------------------------------------
 //
 // Within a logical line's content (past any block marker), markup like a code
-// span styles an interior run rather than the whole line. The scanner below
-// splits a content string into a contiguous list of [`Span`]s covering every
-// byte, so [`crate::layout`] can clip them to visual lines and hide the
-// delimiters once the cursor leaves the line, the same live-preview collapse
-// headings already use.
+// span or emphasis styles an interior run rather than the whole line. The
+// scanner below splits a content string into a contiguous list of [`Span`]s
+// covering every byte, so [`crate::layout`] can clip them to visual lines and
+// hide the delimiters once the cursor leaves the line, the same live-preview
+// collapse headings already use.
 //
-// Scope for now: code spans only (`` `code` ``). This is a deliberately
-// simplified reading of CommonMark: a run of N backticks opens a span that the
-// next run of exactly N backticks closes, and an unclosed run is literal text.
-// Backslash escapes and the one-space stripping CommonMark does inside a code
-// span are not handled; notes rarely need either.
+// Two layers, in CommonMark's precedence order:
+//
+//   1. Code spans (`` `code` ``): a run of N backticks opens a span the next run
+//      of exactly N backticks closes; an unclosed run is literal. Delimiters
+//      inside a code span (a `*`, say) are inert.
+//   2. Emphasis (`*`/`_`, `**`/`__`, `***`/`___`): `*`/`_` runs outside code are
+//      paired opener-to-closer with a stack (innermost first) to mark italic,
+//      bold, or both. Whether a run can open or close follows a simplified
+//      reading of CommonMark's flanking rules (including the `_` intraword
+//      restriction, so `snake_case` stays literal).
+//
+// Deliberate simplifications: only single/double/triple delimiter runs emphasize
+// (longer runs stay literal), an opener matches only a closer of the same length
+// (no partial-run consumption), emphasis is single-line, and backslash escapes
+// and the one-space stripping inside code spans are not handled. Notes rarely
+// need the omitted cases.
 
 /// Inline emphasis of a text run, selecting the face and color it renders with.
-/// A closed set, extended as bold and italic land.
+/// A closed set; [`crate::freetype::FontStyle`] maps it to an actual face.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Emphasis {
     /// Ordinary body text.
     Regular,
     /// An inline code span, drawn monospace on a tinted background.
     Code,
+    /// `**bold**` / `__bold__`, drawn in the bold face.
+    Bold,
+    /// `*italic*` / `_italic_`, drawn in the italic face.
+    Italic,
+    /// `***both***`, drawn in the bold-italic face.
+    BoldItalic,
 }
 
 /// What one inline span is: text to render with an [`Emphasis`], or a delimiter
@@ -139,21 +156,27 @@ pub struct Span {
 }
 
 /// Split `content` into a contiguous list of inline spans covering `[0, len)`,
-/// recognizing code spans. Text between and around code spans becomes
-/// `Text(Regular)` spans, so the result has no gaps. Empty input yields no spans.
+/// recognizing code spans and `*`/`_` emphasis. Text between and around markup
+/// becomes `Text(..)` spans, so the result has no gaps. Empty input yields no
+/// spans.
 pub fn inline_spans(content: &str) -> Vec<Span> {
     let bytes = content.as_bytes();
-    let mut spans = Vec::new();
-    // Start of the pending run of regular text not yet emitted.
-    let mut text_start = 0;
+    let n = bytes.len();
+    if n == 0 {
+        return Vec::new();
+    }
+
+    // Code spans first, since they bind tighter than emphasis. Flag each fence and
+    // content byte; `in_code` marks every byte a `*`/`_` would be inert inside.
+    let mut is_code_marker = vec![false; n];
+    let mut is_code_content = vec![false; n];
+    let mut in_code = vec![false; n];
     let mut i = 0;
-    while i < bytes.len() {
+    while i < n {
         if bytes[i] != b'`' {
             i += 1;
             continue;
         }
-        // A run of `fence` backticks opens a code span only if a run of exactly
-        // the same length closes it later on the line.
         let open = i;
         let after_open = backtick_run_end(bytes, open);
         let fence = after_open - open;
@@ -163,41 +186,174 @@ pub fn inline_spans(content: &str) -> Vec<Span> {
             i = after_open;
             continue;
         };
-        if open > text_start {
-            spans.push(Span {
-                start: text_start,
-                end: open,
-                kind: SpanKind::Text(Emphasis::Regular),
-            });
+        for b in open..after_open {
+            is_code_marker[b] = true;
+            in_code[b] = true;
         }
-        spans.push(Span {
-            start: open,
-            end: after_open,
-            kind: SpanKind::Marker,
-        });
-        if close > after_open {
-            spans.push(Span {
-                start: after_open,
-                end: close,
-                kind: SpanKind::Text(Emphasis::Code),
-            });
+        for b in after_open..close {
+            is_code_content[b] = true;
+            in_code[b] = true;
         }
-        spans.push(Span {
-            start: close,
-            end: after_close,
-            kind: SpanKind::Marker,
-        });
-        text_start = after_close;
+        for b in close..after_close {
+            is_code_marker[b] = true;
+            in_code[b] = true;
+        }
         i = after_close;
     }
-    if text_start < bytes.len() {
-        spans.push(Span {
-            start: text_start,
-            end: bytes.len(),
-            kind: SpanKind::Text(Emphasis::Regular),
-        });
+
+    // Then emphasis. Pair `*`/`_` delimiter runs outside code, then flag the
+    // matched delimiters as markers and stamp bold/italic over the text between.
+    let delims = emphasis_delims(content, &in_code);
+    let mut is_em_marker = vec![false; n];
+    let mut is_bold = vec![false; n];
+    let mut is_italic = vec![false; n];
+    for (open, close) in match_delims(&delims) {
+        is_em_marker[delims[open].start..delims[open].end].fill(true);
+        is_em_marker[delims[close].start..delims[close].end].fill(true);
+        // A run of 1 is italic, 2 is bold, 3 is both.
+        let bold = delims[open].len != 1;
+        let italic = delims[open].len != 2;
+        for b in delims[open].end..delims[close].start {
+            is_bold[b] |= bold;
+            is_italic[b] |= italic;
+        }
     }
+
+    // Resolve each byte to a single kind, then coalesce equal neighbors so the
+    // spans tile the content with no gaps and no redundant splits.
+    let kind_at = |b: usize| -> SpanKind {
+        if is_code_marker[b] || is_em_marker[b] {
+            SpanKind::Marker
+        } else if is_code_content[b] {
+            SpanKind::Text(Emphasis::Code)
+        } else {
+            SpanKind::Text(match (is_bold[b], is_italic[b]) {
+                (true, true) => Emphasis::BoldItalic,
+                (true, false) => Emphasis::Bold,
+                (false, true) => Emphasis::Italic,
+                (false, false) => Emphasis::Regular,
+            })
+        }
+    };
+    let mut spans = Vec::new();
+    let mut start = 0;
+    let mut cur = kind_at(0);
+    for b in 1..n {
+        let kind = kind_at(b);
+        if kind != cur {
+            spans.push(Span {
+                start,
+                end: b,
+                kind: cur,
+            });
+            start = b;
+            cur = kind;
+        }
+    }
+    spans.push(Span {
+        start,
+        end: n,
+        kind: cur,
+    });
     spans
+}
+
+/// One maximal run of `*` or `_` lying outside any code span, with whether it can
+/// open and/or close emphasis under the (simplified) flanking rules.
+struct Delim {
+    start: usize,
+    end: usize,
+    ch: u8,
+    len: usize,
+    can_open: bool,
+    can_close: bool,
+}
+
+/// Collect the emphasis delimiter runs of `content`, skipping any byte flagged in
+/// `in_code`. Only single/double/triple runs are kept; longer runs stay literal.
+fn emphasis_delims(content: &str, in_code: &[bool]) -> Vec<Delim> {
+    let bytes = content.as_bytes();
+    let n = bytes.len();
+    let mut delims = Vec::new();
+    let mut i = 0;
+    while i < n {
+        let ch = bytes[i];
+        if in_code[i] || (ch != b'*' && ch != b'_') {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        let mut end = i;
+        while end < n && bytes[end] == ch && !in_code[end] {
+            end += 1;
+        }
+        let len = end - start;
+        if (1..=3).contains(&len) {
+            // Flanking is decided by the raw neighboring characters; `start` and
+            // `end` sit on char boundaries (the run is ASCII `*`/`_`).
+            let before = content[..start].chars().next_back();
+            let after = content[end..].chars().next();
+            let (can_open, can_close) = flanking(ch, before, after);
+            delims.push(Delim {
+                start,
+                end,
+                ch,
+                len,
+                can_open,
+                can_close,
+            });
+        }
+        i = end;
+    }
+    delims
+}
+
+/// Pair delimiter runs into `(opener, closer)` index tuples, matching the same
+/// character and length innermost-first with a stack. Unmatched runs are dropped
+/// (they stay literal text). A run that can both open and close prefers closing.
+fn match_delims(delims: &[Delim]) -> Vec<(usize, usize)> {
+    let mut pairs = Vec::new();
+    let mut open_stack: Vec<usize> = Vec::new();
+    for (idx, delim) in delims.iter().enumerate() {
+        if delim.can_close {
+            if let Some(pos) = open_stack
+                .iter()
+                .rposition(|&oi| delims[oi].ch == delim.ch && delims[oi].len == delim.len)
+            {
+                pairs.push((open_stack[pos], idx));
+                // Drop the opener and any unmatched openers nested inside it.
+                open_stack.truncate(pos);
+                continue;
+            }
+        }
+        if delim.can_open {
+            open_stack.push(idx);
+        }
+    }
+    pairs
+}
+
+/// Whether a delimiter run of `ch` can open and/or close emphasis, from the
+/// characters immediately before and after it: a simplified reading of
+/// CommonMark's left/right-flanking rules. A missing neighbor (the line edge)
+/// counts as whitespace. The `_` form keeps the intraword restriction so an
+/// underscore inside a word neither opens nor closes.
+fn flanking(ch: u8, before: Option<char>, after: Option<char>) -> (bool, bool) {
+    let before_ws = before.is_none_or(|c| c.is_whitespace());
+    let after_ws = after.is_none_or(|c| c.is_whitespace());
+    let before_punct = before.is_some_and(|c| c.is_ascii_punctuation());
+    let after_punct = after.is_some_and(|c| c.is_ascii_punctuation());
+
+    let left_flanking = !after_ws && (!after_punct || before_ws || before_punct);
+    let right_flanking = !before_ws && (!before_punct || after_ws || after_punct);
+    if ch == b'_' {
+        (
+            left_flanking && (!right_flanking || before_punct),
+            right_flanking && (!left_flanking || after_punct),
+        )
+    } else {
+        (left_flanking, right_flanking)
+    }
 }
 
 /// The byte index just past the run of backticks starting at `start` (which must
@@ -342,7 +498,22 @@ mod tests {
 
     #[test]
     fn spans_tile_the_content_with_no_gaps() {
-        for input in ["`x`", "a`x`b", "plain", "`x` `y`", "``a`b``"] {
+        for input in [
+            "`x`",
+            "a`x`b",
+            "plain",
+            "`x` `y`",
+            "``a`b``",
+            "*i*",
+            "**b**",
+            "***x***",
+            "_u_",
+            "a*b*c",
+            "**a *b* c**",
+            "*a `b` c*",
+            "foo_bar",
+            "*unclosed",
+        ] {
             let sp = inline_spans(input);
             assert_eq!(
                 sp.first().map(|s| s.start),
@@ -399,5 +570,136 @@ mod tests {
         // Adjacent backticks are one greedy fence, so a bare "``" has no closer
         // and stays literal text rather than becoming an empty code span.
         assert_eq!(spans("``"), vec![(0, 2, SpanKind::Text(Emphasis::Regular))]);
+    }
+
+    // --- Emphasis ---------------------------------------------------------
+
+    #[test]
+    fn single_run_is_italic_double_is_bold_triple_is_both() {
+        assert_eq!(
+            spans("*i*"),
+            vec![
+                (0, 1, SpanKind::Marker),
+                (1, 2, SpanKind::Text(Emphasis::Italic)),
+                (2, 3, SpanKind::Marker),
+            ]
+        );
+        assert_eq!(
+            spans("**b**"),
+            vec![
+                (0, 2, SpanKind::Marker),
+                (2, 3, SpanKind::Text(Emphasis::Bold)),
+                (3, 5, SpanKind::Marker),
+            ]
+        );
+        assert_eq!(
+            spans("***x***"),
+            vec![
+                (0, 3, SpanKind::Marker),
+                (3, 4, SpanKind::Text(Emphasis::BoldItalic)),
+                (4, 7, SpanKind::Marker),
+            ]
+        );
+    }
+
+    #[test]
+    fn underscores_emphasize_like_asterisks() {
+        assert_eq!(
+            spans("_u_"),
+            vec![
+                (0, 1, SpanKind::Marker),
+                (1, 2, SpanKind::Text(Emphasis::Italic)),
+                (2, 3, SpanKind::Marker),
+            ]
+        );
+        assert_eq!(
+            spans("__u__"),
+            vec![
+                (0, 2, SpanKind::Marker),
+                (2, 3, SpanKind::Text(Emphasis::Bold)),
+                (3, 5, SpanKind::Marker),
+            ]
+        );
+    }
+
+    #[test]
+    fn intraword_underscores_stay_literal_but_asterisks_emphasize() {
+        // `_` inside a word neither opens nor closes, so identifiers are safe.
+        assert_eq!(
+            spans("foo_bar_baz"),
+            vec![(0, 11, SpanKind::Text(Emphasis::Regular))]
+        );
+        // `*` has no intraword restriction, so it still italicizes mid-word.
+        assert_eq!(
+            spans("foo*bar*baz"),
+            vec![
+                (0, 3, SpanKind::Text(Emphasis::Regular)),
+                (3, 4, SpanKind::Marker),
+                (4, 7, SpanKind::Text(Emphasis::Italic)),
+                (7, 8, SpanKind::Marker),
+                (8, 11, SpanKind::Text(Emphasis::Regular)),
+            ]
+        );
+    }
+
+    #[test]
+    fn an_unmatched_or_mismatched_run_is_literal() {
+        assert_eq!(
+            spans("*unclosed"),
+            vec![(0, 9, SpanKind::Text(Emphasis::Regular))]
+        );
+        // A `**` opener and a `*` closer differ in length, so neither matches.
+        assert_eq!(
+            spans("**a*"),
+            vec![(0, 4, SpanKind::Text(Emphasis::Regular))]
+        );
+    }
+
+    #[test]
+    fn italic_nested_in_bold_is_bold_italic() {
+        // The inner `*b*` lies within the outer `**..**`, so "b" gains both.
+        assert_eq!(
+            spans("**a *b* c**"),
+            vec![
+                (0, 2, SpanKind::Marker),
+                (2, 4, SpanKind::Text(Emphasis::Bold)),
+                (4, 5, SpanKind::Marker),
+                (5, 6, SpanKind::Text(Emphasis::BoldItalic)),
+                (6, 7, SpanKind::Marker),
+                (7, 9, SpanKind::Text(Emphasis::Bold)),
+                (9, 11, SpanKind::Marker),
+            ]
+        );
+    }
+
+    #[test]
+    fn emphasis_wraps_an_inner_code_span() {
+        // Code binds tighter, so its backticks stay inert inside the italic, and
+        // the emphasis spans across it.
+        assert_eq!(
+            spans("*a `b` c*"),
+            vec![
+                (0, 1, SpanKind::Marker),
+                (1, 3, SpanKind::Text(Emphasis::Italic)),
+                (3, 4, SpanKind::Marker),
+                (4, 5, SpanKind::Text(Emphasis::Code)),
+                (5, 6, SpanKind::Marker),
+                (6, 8, SpanKind::Text(Emphasis::Italic)),
+                (8, 9, SpanKind::Marker),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_star_inside_a_code_span_is_inert() {
+        // The `*`s are code content, not emphasis delimiters.
+        assert_eq!(
+            spans("`a*b*c`"),
+            vec![
+                (0, 1, SpanKind::Marker),
+                (1, 6, SpanKind::Text(Emphasis::Code)),
+                (6, 7, SpanKind::Marker),
+            ]
+        );
     }
 }

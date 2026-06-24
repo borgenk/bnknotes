@@ -29,14 +29,15 @@
 //! stack by each line's own height rather than a single global line height.
 //!
 //! Each visual line is also split into inline [`Run`]s: stretches of text with
-//! one [`markdown::Emphasis`] (regular or code), and the markers that delimit
-//! them (a heading's `#`s, a code span's backticks). Markers live-preview: on a
+//! one [`markdown::Emphasis`] (regular, code, bold, italic), each measured and
+//! drawn in its own [`FontStyle`] face, and the markers that delimit them (a
+//! heading's `#`s, a code span's backticks, emphasis `*`/`_`). Markers live-preview: on a
 //! line the cursor has left they collapse (`Run::visible` is false, zero width),
 //! drawing only the styled text; they reappear when the cursor returns. Wrapping
 //! always measures the source text, so this collapse only shifts runs
 //! horizontally within a line, never reflowing the document.
 
-use crate::freetype::{Face, Fonts};
+use crate::freetype::{FontStyle, Fonts};
 use crate::grapheme;
 use crate::markdown;
 use crate::render;
@@ -74,6 +75,36 @@ pub struct Run {
     pub end: usize,
     pub kind: markdown::SpanKind,
     pub visible: bool,
+}
+
+impl Run {
+    /// The face style this run is measured and drawn in.
+    pub fn font_style(&self) -> FontStyle {
+        font_style(self.kind)
+    }
+}
+
+/// Map a span/run kind to the face style it renders in. Markers and inline code
+/// use the regular face (code is monospace already); only bold/italic emphasis
+/// selects a variant. The single source of truth for both measuring (layout) and
+/// drawing (the app render loop).
+fn font_style(kind: markdown::SpanKind) -> FontStyle {
+    match kind {
+        markdown::SpanKind::Text(markdown::Emphasis::Bold) => FontStyle::Bold,
+        markdown::SpanKind::Text(markdown::Emphasis::Italic) => FontStyle::Italic,
+        markdown::SpanKind::Text(markdown::Emphasis::BoldItalic) => FontStyle::BoldItalic,
+        _ => FontStyle::Regular,
+    }
+}
+
+/// The face style of the (line-relative) span covering byte `off`. `spans` tile
+/// `[0, len)` in order, so the first span ending past `off` is the one holding
+/// it; a byte past the end (never asked for in practice) falls back to regular.
+fn style_at(spans: &[markdown::Span], off: usize) -> FontStyle {
+    spans
+        .iter()
+        .find(|s| off < s.end)
+        .map_or(FontStyle::Regular, |s| font_style(s.kind))
 }
 
 /// An axis-aligned rectangle in window pixels.
@@ -132,18 +163,19 @@ impl Layout {
             };
             let line = rope.byte_slice(ls..le);
             let size = markdown::font_size(markdown::style_of(&line), body_size);
-            let face = fonts.face(size);
             let metrics = fonts.metrics(size);
-            // `wrap_segments` returns ranges relative to the line; offset them
-            // back to absolute buffer positions for the visual lines.
-            let segments = wrap_segments(face, &line, wrap_width);
-            let last = segments.len() - 1;
             // The line's inline spans (line-relative), and whether its markers
             // are revealed: shown while the active range touches the line, hidden
-            // once the cursor leaves it. Wrapping measured the source text above,
-            // so clipping spans to each segment never disagrees with the breaks.
+            // once the cursor leaves it.
             let spans = line_spans(&line);
             let revealed = active.0 <= le && active.1 >= ls;
+            // `wrap_segments` returns ranges relative to the line; offset them
+            // back to absolute buffer positions for the visual lines. It measures
+            // the source text (every run in its own face), so clipping spans to
+            // each segment never disagrees with the breaks, and reveal state,
+            // which only hides markers, never reflows the document.
+            let segments = wrap_segments(fonts, size, &line, &spans, wrap_width);
+            let last = segments.len() - 1;
             for (k, (start, end)) in segments.into_iter().enumerate() {
                 lines.push(VisualLine {
                     start: ls + start,
@@ -291,7 +323,6 @@ impl Layout {
     /// testing walks only the visible runs, so a click on a line with hidden
     /// markers lands in the visible text, never inside a collapsed marker.
     fn hit_line(&self, fonts: &Fonts, rope: &Rope, line: &VisualLine, x: f32) -> usize {
-        let face = fonts.face(line.size);
         let mut acc = self.left as f32;
         // Past every glyph: the end of the last visible run, or the line start
         // for an empty line.
@@ -300,6 +331,7 @@ impl Layout {
             if !run.visible {
                 continue;
             }
+            let face = fonts.face(line.size, run.font_style());
             let slice = rope.byte_slice(run.start..run.end);
             for (off, cluster) in grapheme::graphemes(&slice) {
                 let w = render::text_advance(face, cluster);
@@ -317,7 +349,6 @@ impl Layout {
     /// summing the line's visible runs; a hidden (collapsed) marker contributes
     /// nothing. An `offset` at or past the line's end measures the whole line.
     fn advance_to(&self, fonts: &Fonts, rope: &Rope, line: &VisualLine, offset: usize) -> f32 {
-        let face = fonts.face(line.size);
         let mut x = 0.0;
         for run in &line.runs {
             // Runs are ordered, so once a run starts at or past `offset` the rest
@@ -326,6 +357,7 @@ impl Layout {
                 continue;
             }
             let end = offset.min(run.end);
+            let face = fonts.face(line.size, run.font_style());
             x += render::text_advance(face, &rope.byte_slice(run.start..end));
         }
         x
@@ -388,19 +420,31 @@ fn clip_runs(
     runs
 }
 
-/// Greedily word-wrap the logical line `text[ls..le]` to `wrap_width` pixels,
-/// returning the byte ranges of its visual segments. Breaks after the last space
-/// that fits; a word wider than `wrap_width` breaks at a grapheme boundary so
-/// every segment holds at least one cluster. `wrap_width <= 0` disables wrapping.
-fn wrap_segments(face: &Face, line: &str, wrap_width: i32) -> Vec<(usize, usize)> {
+/// Greedily word-wrap the logical `line` to `wrap_width` pixels, returning the
+/// byte ranges of its visual segments. Breaks after the last space that fits; a
+/// word wider than `wrap_width` breaks at a grapheme boundary so every segment
+/// holds at least one cluster. `wrap_width <= 0` disables wrapping. Each cluster
+/// is measured in its run's face (per `spans` and `size`), so bold/italic widths
+/// wrap correctly; the source text is measured in full (markers included), so
+/// hiding markers later never reflows the line.
+fn wrap_segments(
+    fonts: &Fonts,
+    size: u32,
+    line: &str,
+    spans: &[markdown::Span],
+    wrap_width: i32,
+) -> Vec<(usize, usize)> {
     if wrap_width <= 0 || line.is_empty() {
         return vec![(0, line.len())];
     }
-    // Measure each cluster once: its offset within the line, width, and whether
-    // it is a space (a wrap opportunity).
+    // Measure each cluster once: its offset within the line, width in its run's
+    // face, and whether it is a space (a wrap opportunity).
     let clusters: Vec<(usize, f32, bool)> = grapheme::graphemes(line)
         .into_iter()
-        .map(|(off, cluster)| (off, render::text_advance(face, cluster), cluster == " "))
+        .map(|(off, cluster)| {
+            let face = fonts.face(size, style_at(spans, off));
+            (off, render::text_advance(face, cluster), cluster == " ")
+        })
         .collect();
     if clusters.is_empty() {
         return vec![(0, line.len())];
@@ -475,7 +519,7 @@ mod tests {
     /// A wrap width that fits "aaa " but not a following cluster, so "aaa bbb"
     /// splits deterministically into "aaa " and "bbb".
     fn tight_wrap(f: &Fonts) -> i32 {
-        let face = f.face(BODY);
+        let face = f.face(BODY, FontStyle::Regular);
         (render::text_advance(face, "aaa ") + render::text_advance(face, "b") / 2.0) as i32
     }
 
@@ -612,7 +656,7 @@ mod tests {
         let f = fonts();
         let text = "mmmmmmmmmm"; // one word, no spaces
         let r = rope(text);
-        let wrap = (render::text_advance(f.face(BODY), "m") * 3.0) as i32;
+        let wrap = (render::text_advance(f.face(BODY, FontStyle::Regular), "m") * 3.0) as i32;
         let l = Layout::build(&f, &r, 0, 0, wrap, BODY, (0, r.len()));
         let lines = l.lines();
         assert!(lines.len() >= 2, "an unbreakable word still wraps");
@@ -645,7 +689,8 @@ mod tests {
         let l = Layout::build(&f, &r, 0, 0, tight_wrap(&f), BODY, (0, r.len()));
         let rects = l.selection_rects(&f, &r, 0, 7);
         assert_eq!(rects.len(), 2, "one rect per visual line");
-        let line0_text_w = render::text_advance(f.face(BODY), "aaa ").round() as i32;
+        let line0_text_w =
+            render::text_advance(f.face(BODY, FontStyle::Regular), "aaa ").round() as i32;
         assert!(
             (rects[0].w - line0_text_w).abs() <= 1,
             "a soft wrap adds no newline pad"
@@ -692,8 +737,8 @@ mod tests {
         // The same characters measure wider at the heading size, which is what
         // lets clicks and the caret land correctly on a heading line.
         let f = fonts();
-        let body_w = render::text_advance(f.face(BODY), "Title");
-        let h1_w = render::text_advance(f.face(h1_size()), "Title");
+        let body_w = render::text_advance(f.face(BODY, FontStyle::Regular), "Title");
+        let h1_w = render::text_advance(f.face(h1_size(), FontStyle::Regular), "Title");
         assert!(h1_w > body_w);
     }
 
@@ -789,7 +834,8 @@ mod tests {
         let (x_hidden, _, _) = hidden.caret(&f, &r, 2);
         let (x_shown, _, _) = shown.caret(&f, &r, 2);
         assert_eq!(x_hidden, LEFT, "collapsed: visible text at the margin");
-        let marker_w = render::text_advance(f.face(h1_size()), "# ").round() as i32;
+        let marker_w =
+            render::text_advance(f.face(h1_size(), FontStyle::Regular), "# ").round() as i32;
         assert_eq!(x_shown - x_hidden, marker_w, "expanded by the marker width");
     }
 
@@ -895,11 +941,66 @@ mod tests {
         let (x_hidden, _, _) = hidden.caret(&f, &r, 1);
         let (x_shown, _, _) = shown.caret(&f, &r, 1);
         assert_eq!(x_hidden, LEFT, "collapsed: code text at the margin");
-        let tick_w = render::text_advance(f.face(BODY), "`").round() as i32;
+        let tick_w = render::text_advance(f.face(BODY, FontStyle::Regular), "`").round() as i32;
         assert_eq!(
             x_shown - x_hidden,
             tick_w,
             "shown: shifted by the backtick width"
+        );
+    }
+
+    // --- emphasis runs ----------------------------------------------------
+
+    #[test]
+    fn emphasis_composes_with_a_block_marker() {
+        // A heading whose text holds a bold span: the block `# ` marker and the
+        // inline `**` markers coexist, and `line_spans` offsets the inline runs
+        // past the block marker so the bold "b" lands at the right bytes.
+        let f = fonts();
+        let r = rope("# a **b** c");
+        let l = Layout::build(&f, &r, LEFT, TOP, 1_000_000, BODY, (0, 0));
+        let line = &l.lines()[0];
+        assert_eq!(line.size, h1_size(), "still an H1 line");
+        let runs: Vec<_> = line.runs.iter().map(|run| (run.start, run.kind)).collect();
+        assert_eq!(
+            runs,
+            vec![
+                (0, markdown::SpanKind::Marker),                            // "# "
+                (2, markdown::SpanKind::Text(markdown::Emphasis::Regular)), // "a "
+                (4, markdown::SpanKind::Marker),                            // "**"
+                (6, markdown::SpanKind::Text(markdown::Emphasis::Bold)),    // "b"
+                (7, markdown::SpanKind::Marker),                            // "**"
+                (9, markdown::SpanKind::Text(markdown::Emphasis::Regular)), // " c"
+            ]
+        );
+        assert!(line.runs.iter().all(|run| run.visible), "active: all shown");
+    }
+
+    #[test]
+    fn emphasis_markers_collapse_but_the_bold_text_stays() {
+        let f = fonts();
+        let src = "# a **b** c\nx";
+        let r = rope(src);
+        // Cursor on the second line, so the heading's markers hide.
+        let off = src.find('x').unwrap();
+        let l = Layout::build(&f, &r, LEFT, TOP, 1_000_000, BODY, (off, off));
+        let line = &l.lines()[0];
+        assert!(
+            line.runs
+                .iter()
+                .filter(|run| matches!(run.kind, markdown::SpanKind::Marker))
+                .all(|run| !run.visible),
+            "every marker (heading and emphasis) collapses off the line"
+        );
+        assert!(
+            line.runs
+                .iter()
+                .filter(|run| matches!(
+                    run.kind,
+                    markdown::SpanKind::Text(markdown::Emphasis::Bold)
+                ))
+                .all(|run| run.visible),
+            "the bold text stays shown"
         );
     }
 }

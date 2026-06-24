@@ -20,15 +20,75 @@ use core::ptr::{self, NonNull};
 
 use crate::error::{Error, Result};
 
-/// Monospace candidates, first match wins. A short hardcoded list keeps the
-/// editor runnable across machines without crates.
-const FONT_CANDIDATES: &[&str] = &[
-    "/usr/share/fonts/TTF/Hack-Regular.ttf",
-    "/usr/share/fonts/noto/NotoSansMono-Regular.ttf",
-    "/usr/share/fonts/Adwaita/AdwaitaMono-Regular.ttf",
-    "/usr/share/fonts/TTF/DejaVuSansMono.ttf",
-    "/usr/share/fonts/TTF/Roboto-Regular.ttf",
+/// A monospace family and the four style files the editor draws emphasis with.
+/// The first family whose `regular` file exists wins; a missing bold, italic, or
+/// bold-italic variant falls back to the regular face at render time, so a family
+/// that ships only some weights still renders (just without the slant or weight).
+/// A short list of hardcoded paths keeps the editor runnable across machines
+/// without crates.
+struct FontFamily {
+    regular: &'static str,
+    bold: &'static str,
+    italic: &'static str,
+    bold_italic: &'static str,
+}
+
+const FONT_FAMILIES: &[FontFamily] = &[
+    FontFamily {
+        regular: "/usr/share/fonts/TTF/Hack-Regular.ttf",
+        bold: "/usr/share/fonts/TTF/Hack-Bold.ttf",
+        italic: "/usr/share/fonts/TTF/Hack-Italic.ttf",
+        bold_italic: "/usr/share/fonts/TTF/Hack-BoldItalic.ttf",
+    },
+    FontFamily {
+        regular: "/usr/share/fonts/noto/NotoSansMono-Regular.ttf",
+        bold: "/usr/share/fonts/noto/NotoSansMono-Bold.ttf",
+        // Noto Sans Mono ships no italic; these paths simply will not exist, and
+        // the lookup falls back to the regular face.
+        italic: "/usr/share/fonts/noto/NotoSansMono-Italic.ttf",
+        bold_italic: "/usr/share/fonts/noto/NotoSansMono-BoldItalic.ttf",
+    },
+    FontFamily {
+        regular: "/usr/share/fonts/Adwaita/AdwaitaMono-Regular.ttf",
+        bold: "/usr/share/fonts/Adwaita/AdwaitaMono-Bold.ttf",
+        italic: "/usr/share/fonts/Adwaita/AdwaitaMono-Italic.ttf",
+        bold_italic: "/usr/share/fonts/Adwaita/AdwaitaMono-BoldItalic.ttf",
+    },
+    FontFamily {
+        regular: "/usr/share/fonts/TTF/DejaVuSansMono.ttf",
+        bold: "/usr/share/fonts/TTF/DejaVuSansMono-Bold.ttf",
+        // DejaVu calls its slanted styles Oblique rather than Italic.
+        italic: "/usr/share/fonts/TTF/DejaVuSansMono-Oblique.ttf",
+        bold_italic: "/usr/share/fonts/TTF/DejaVuSansMono-BoldOblique.ttf",
+    },
+    FontFamily {
+        regular: "/usr/share/fonts/TTF/Roboto-Regular.ttf",
+        bold: "/usr/share/fonts/TTF/Roboto-Bold.ttf",
+        italic: "/usr/share/fonts/TTF/Roboto-Italic.ttf",
+        bold_italic: "/usr/share/fonts/TTF/Roboto-BoldItalic.ttf",
+    },
 ];
+
+/// The first family whose regular face is installed on this machine.
+fn default_family() -> Result<&'static FontFamily> {
+    FONT_FAMILIES
+        .iter()
+        .find(|f| std::path::Path::new(f.regular).exists())
+        .ok_or_else(|| Error::msg("no usable font family found in the candidate list"))
+}
+
+/// Which variant of the font family a run renders in. Body text and syntax
+/// markers use [`FontStyle::Regular`]; emphasis selects a heavier or slanted
+/// file. Kept distinct from [`crate::markdown::Emphasis`] so this font layer
+/// stays independent of the markdown vocabulary: an inline code span is its own
+/// emphasis but still renders in the regular monospace face.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum FontStyle {
+    Regular,
+    Bold,
+    Italic,
+    BoldItalic,
+}
 
 // ---------------------------------------------------------------------------
 // FFI surface.
@@ -218,13 +278,12 @@ pub struct Face {
 }
 
 impl Face {
-    /// Open the first available default font at `pixel_size`.
+    /// Open the regular face of the first available font family at `pixel_size`.
+    /// A test-only convenience: production goes through [`Fonts`], which opens the
+    /// family's variants per size itself.
+    #[cfg(test)]
     pub fn open_default(pixel_size: u32) -> Result<Self> {
-        let path = FONT_CANDIDATES
-            .iter()
-            .find(|p| std::path::Path::new(p).exists())
-            .ok_or_else(|| Error::msg("no usable font found in the candidate list"))?;
-        let face = Self::from_path(path)?;
+        let face = Self::from_path(default_family()?.regular)?;
         face.set_pixel_size(pixel_size)?;
         Ok(face)
     }
@@ -405,36 +464,49 @@ impl Drop for Face {
     }
 }
 
-/// One opened face plus its cached metrics, keyed by the pixel size it renders.
-struct SizedFace {
+/// The faces for one pixel size: the regular face (always present) plus any
+/// bold/italic/bold-italic variants the family ships, and the cached line
+/// metrics. Metrics come from the regular face only, so emphasis selects a
+/// different glyph set without ever changing line height.
+struct SizedFaces {
     size: u32,
-    face: Face,
+    regular: Face,
+    bold: Option<Face>,
+    italic: Option<Face>,
+    bold_italic: Option<Face>,
     metrics: Metrics,
 }
 
-/// A set of [`Face`]s at different pixel sizes, so a document can mix body text
-/// and larger headings. Each distinct size is opened once (the same font file,
-/// re-read per size); the first size opened is the fallback for any size that
-/// was not requested, so a lookup can never fail and never panics.
+/// A set of [`Face`]s at different pixel sizes and styles, so a document can mix
+/// body text, larger headings, and inline emphasis. Each distinct size opens the
+/// family's regular face plus whatever variant files exist (the same files,
+/// re-read per size); the first size opened is the fallback for any size that was
+/// not requested, and a missing variant falls back to the regular face, so a
+/// lookup can never fail and never panics.
 pub struct Fonts {
-    sized: Vec<SizedFace>,
+    sized: Vec<SizedFaces>,
 }
 
 impl Fonts {
-    /// Open the default font at each of `sizes` (zeros and duplicates skipped).
-    /// At least one nonzero size is required; the first opened becomes the
-    /// fallback.
+    /// Open the default family at each of `sizes` (zeros and duplicates skipped),
+    /// loading every available style per size. At least one nonzero size is
+    /// required; the first opened becomes the fallback.
     pub fn new(sizes: &[u32]) -> Result<Self> {
-        let mut sized: Vec<SizedFace> = Vec::new();
+        let family = default_family()?;
+        let mut sized: Vec<SizedFaces> = Vec::new();
         for &size in sizes {
             if size == 0 || sized.iter().any(|s| s.size == size) {
                 continue;
             }
-            let face = Face::open_default(size)?;
-            let metrics = face.metrics();
-            sized.push(SizedFace {
+            let regular = Face::from_path(family.regular)?;
+            regular.set_pixel_size(size)?;
+            let metrics = regular.metrics();
+            sized.push(SizedFaces {
                 size,
-                face,
+                regular,
+                bold: open_variant(family.bold, size),
+                italic: open_variant(family.italic, size),
+                bold_italic: open_variant(family.bold_italic, size),
                 metrics,
             });
         }
@@ -445,22 +517,42 @@ impl Fonts {
     }
 
     /// The entry for `size`, or the fallback (first opened) if `size` is unknown.
-    fn entry(&self, size: u32) -> &SizedFace {
+    fn entry(&self, size: u32) -> &SizedFaces {
         self.sized
             .iter()
             .find(|s| s.size == size)
             .unwrap_or(&self.sized[0])
     }
 
-    /// The face rendering at `size`, or the fallback face if `size` was not opened.
-    pub fn face(&self, size: u32) -> &Face {
-        &self.entry(size).face
+    /// The face for `size` in `style`, falling back to the regular face when the
+    /// family lacks that variant and to the first opened size when `size` was not
+    /// opened. Never fails, never panics.
+    pub fn face(&self, size: u32, style: FontStyle) -> &Face {
+        let entry = self.entry(size);
+        match style {
+            FontStyle::Regular => &entry.regular,
+            FontStyle::Bold => entry.bold.as_ref().unwrap_or(&entry.regular),
+            FontStyle::Italic => entry.italic.as_ref().unwrap_or(&entry.regular),
+            FontStyle::BoldItalic => entry.bold_italic.as_ref().unwrap_or(&entry.regular),
+        }
     }
 
     /// The metrics for `size`, or the fallback's metrics if `size` was not opened.
     pub fn metrics(&self, size: u32) -> Metrics {
         self.entry(size).metrics
     }
+}
+
+/// Open a style variant at `size`, or `None` if the file is absent or fails to
+/// load, leaving the caller to fall back to the regular face. Keeps a family
+/// that ships only some weights from being a hard error.
+fn open_variant(path: &str, size: u32) -> Option<Face> {
+    if !std::path::Path::new(path).exists() {
+        return None;
+    }
+    let face = Face::from_path(path).ok()?;
+    face.set_pixel_size(size).ok()?;
+    Some(face)
 }
 
 /// Copy a FreeType bitmap into a tightly packed top-down coverage buffer of
@@ -556,6 +648,26 @@ mod tests {
         let fonts = Fonts::new(&[16]).expect("a default font");
         // An unrequested size resolves to the only opened face, not a panic.
         assert_eq!(fonts.metrics(99).line_height, fonts.metrics(16).line_height);
+    }
+
+    #[test]
+    fn face_resolves_every_style_without_panicking() {
+        let fonts = Fonts::new(&[16, 32]).expect("a default font");
+        // Every (size, style) pair resolves to a usable face: a present variant,
+        // or the regular face when the family lacks it, or the fallback size.
+        for &size in &[16, 32, 99] {
+            for style in [
+                FontStyle::Regular,
+                FontStyle::Bold,
+                FontStyle::Italic,
+                FontStyle::BoldItalic,
+            ] {
+                assert!(
+                    fonts.face(size, style).advance('m') > 0.0,
+                    "{style:?} at {size}px advances"
+                );
+            }
+        }
     }
 
     #[test]

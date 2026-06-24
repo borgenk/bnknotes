@@ -544,17 +544,20 @@ impl State {
                 if baseline + m.descent <= 0 || baseline - m.ascent >= view_h {
                     continue;
                 }
-                let face = fonts.face(line.size);
                 let mut pen = MARGIN;
                 for run in &line.runs {
                     if !run.visible {
                         continue;
                     }
+                    // Each run draws in its own face, so bold/italic emphasis is
+                    // carried by the glyphs, not color: only code and markers
+                    // recolor, the rest (regular and emphasized prose) is FG.
+                    let face = fonts.face(line.size, run.font_style());
                     let slice = rope.byte_slice(run.start..run.end);
                     let color = match run.kind {
                         markdown::SpanKind::Marker => MARKER_COLOR,
                         markdown::SpanKind::Text(markdown::Emphasis::Code) => CODE_COLOR,
-                        markdown::SpanKind::Text(markdown::Emphasis::Regular) => FOREGROUND,
+                        markdown::SpanKind::Text(_) => FOREGROUND,
                     };
                     // A code span sits on a tinted panel; paint it before the
                     // glyphs so they blend over it.

@@ -64,6 +64,9 @@ const SOFT_TAB: &str = "    ";
 /// The caret: a thin vertical bar at the cursor position.
 const CARET_COLOR: u32 = 0x00ff_ffff;
 const CARET_WIDTH: i32 = 2;
+/// How long the caret stays shown, then hidden, while idle. Activity resets it
+/// to shown, so it never blinks out mid-keystroke.
+const CARET_BLINK: Duration = Duration::from_millis(500);
 /// Pixels scrolled per unit of wl_pointer.axis value (wheel/touchpad).
 const SCROLL_FACTOR: f32 = 2.0;
 
@@ -165,6 +168,10 @@ struct State {
     goal_x: Option<f32>,
     /// How far the viewport is scrolled down the document, in pixels.
     scroll_y: i32,
+    /// Caret blink: whether the caret is currently shown, and when it next
+    /// toggles. Activity (`bump_caret`) resets it to shown.
+    caret_visible: bool,
+    caret_blink_at: Option<Instant>,
 
     /// Memoized layout, reused until its inputs change. The key is the content
     /// version, the surface width, and the active (cursor/selection) range, the
@@ -264,6 +271,8 @@ impl State {
             autoscroll_at: None,
             goal_x: None,
             scroll_y: 0,
+            caret_visible: true,
+            caret_blink_at: None,
             layout_cache: None,
             layout_key: None,
             repeat_delay: Duration::from_millis(DEFAULT_REPEAT_DELAY_MS),
@@ -463,6 +472,7 @@ impl State {
             }
             self.fire_repeats()?;
             self.fire_autoscroll();
+            self.fire_caret_blink();
             if self.configured && self.dirty && self.render_frame()? {
                 self.dirty = false;
             }
@@ -490,6 +500,7 @@ impl State {
         let height = self.height as usize;
         let selection = self.text.selection();
         let cursor = self.text.cursor();
+        let caret_visible = self.caret_visible;
         let layout = self.layout();
         // Keep the scroll offset valid for the current content and window size.
         let content_height = self.content_height(&layout);
@@ -550,9 +561,11 @@ impl State {
                 }
             }
 
-            // The caret.
-            let (cx, cy, ch) = layout.caret(fonts, rope, cursor);
-            canvas.fill_rect(cx, cy - scroll_y, CARET_WIDTH, ch, CARET_COLOR);
+            // The caret, drawn only on the visible half of its blink cycle.
+            if caret_visible {
+                let (cx, cy, ch) = layout.caret(fonts, rope, cursor);
+                canvas.fill_rect(cx, cy - scroll_y, CARET_WIDTH, ch, CARET_COLOR);
+            }
         }
 
         let buffer = self.buffers[idx];
@@ -932,6 +945,7 @@ impl State {
     /// on screen, and refresh the title's modified indicator.
     fn after_edit(&mut self) {
         self.dirty = true;
+        self.bump_caret();
         self.scroll_caret_into_view();
         self.refresh_title();
     }
@@ -1089,6 +1103,7 @@ impl State {
         let before = self.text.cursor();
         let before_sel = self.text.selection();
         self.text.set_cursor(offset, extend);
+        self.bump_caret();
         if self.text.cursor() != before || self.text.selection() != before_sel {
             self.dirty = true;
         }
@@ -1160,6 +1175,7 @@ impl State {
                 self.dirty = true;
             }
         }
+        self.bump_caret();
     }
 
     /// The byte offset under the pointer, mapping its window position into
@@ -1220,6 +1236,30 @@ impl State {
         self.autoscroll_at = Some(now + AUTOSCROLL_INTERVAL);
     }
 
+    // --- Caret blink ------------------------------------------------------
+
+    /// Toggle the caret if its blink interval has elapsed, requesting a redraw.
+    /// The first call just arms the timer.
+    fn fire_caret_blink(&mut self) {
+        let now = Instant::now();
+        match self.caret_blink_at {
+            None => self.caret_blink_at = Some(now + CARET_BLINK),
+            Some(at) if at <= now => {
+                self.caret_visible = !self.caret_visible;
+                self.caret_blink_at = Some(now + CARET_BLINK);
+                self.dirty = true;
+            }
+            Some(_) => {}
+        }
+    }
+
+    /// Show the caret and restart its blink cycle, called on any activity that
+    /// moves the caret, so it never blinks out mid-edit.
+    fn bump_caret(&mut self) {
+        self.caret_visible = true;
+        self.caret_blink_at = Some(Instant::now() + CARET_BLINK);
+    }
+
     // --- Key repeat -------------------------------------------------------
 
     /// Begin repeating `keycode` after the delay, if repeat is enabled and the
@@ -1266,21 +1306,23 @@ impl State {
         )
     }
 
-    /// How long to block for input: the soonest of the next key-repeat and the
-    /// next auto-scroll tick, or `None` to wait indefinitely when neither is due.
+    /// How long to block for input: the soonest of the next key-repeat, the next
+    /// auto-scroll tick, and the next caret blink, or `None` when none is due.
     fn next_wake(&self) -> Option<Duration> {
-        let autoscroll = if self.autoscroll != 0 && self.selecting {
-            self.autoscroll_at.map(|at| {
-                at.saturating_duration_since(Instant::now())
-                    .max(Duration::from_millis(1))
-            })
-        } else {
-            None
+        let now = Instant::now();
+        let until = |at: Instant| {
+            at.saturating_duration_since(now)
+                .max(Duration::from_millis(1))
         };
-        match (self.repeat_timeout(), autoscroll) {
-            (Some(a), Some(b)) => Some(a.min(b)),
-            (a, b) => a.or(b),
-        }
+        let autoscroll = (self.autoscroll != 0 && self.selecting)
+            .then_some(self.autoscroll_at)
+            .flatten()
+            .map(until);
+        let caret = self.caret_blink_at.map(until);
+        [self.repeat_timeout(), autoscroll, caret]
+            .into_iter()
+            .flatten()
+            .min()
     }
 
     // --- Clipboard --------------------------------------------------------

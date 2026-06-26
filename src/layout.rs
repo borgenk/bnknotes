@@ -31,11 +31,20 @@
 //! Each visual line is also split into inline [`Run`]s: stretches of text with
 //! one [`markdown::Emphasis`] (regular, code, bold, italic), each measured and
 //! drawn in its own [`FontStyle`] face, and the markers that delimit them (a
-//! heading's `#`s, a code span's backticks, emphasis `*`/`_`). Markers live-preview: on a
-//! line the cursor has left they collapse (`Run::visible` is false, zero width),
-//! drawing only the styled text; they reappear when the cursor returns. Wrapping
+//! heading's `#`s, a list/quote marker, a code span's backticks, emphasis
+//! `*`/`_`). Markers live-preview: on a line the cursor has left they collapse
+//! (`Run::visible` is false, zero width), drawing only the styled text; they
+//! reappear when the cursor returns. The exception is a list or quote block
+//! marker, which persists (it is the only sign the line is a list or quote). Wrapping
 //! always measures the source text, so this collapse only shifts runs
 //! horizontally within a line, never reflowing the document.
+//!
+//! A list or quote item also hangs its wrapped continuations under the text: each
+//! visual line past the first is inset by the marker's width (`VisualLine::indent`)
+//! so the column aligns. Once the cursor leaves the line the raw marker gives way
+//! to a [`Gutter`] decoration, a bullet point `•` for a list or a bar for a quote,
+//! always the same width as the source marker so the text never shifts; on the
+//! cursor's own line the raw, editable marker shows instead.
 
 use crate::freetype::{FontStyle, Fonts};
 use crate::grapheme;
@@ -64,6 +73,34 @@ pub struct VisualLine {
     /// line has none). Each is a styled stretch of text or a delimiter marker;
     /// a hidden marker (`!visible`) is collapsed to zero width.
     pub runs: Vec<Run>,
+    /// Pixels the line's content (its runs, caret, and selection) is inset past
+    /// `left`, for the hanging indent of a wrapped list or quote item: `0` on the
+    /// marker-bearing first line (whose marker run fills the gutter inline) and on
+    /// non-list lines; the marker's width on continuation lines, so wrapped text
+    /// aligns under the first line's text rather than under the marker.
+    pub indent: i32,
+    /// How this line's left gutter is decorated beyond its runs once the cursor
+    /// leaves it: a bullet glyph for a list, a bar for a quote. [`Gutter::None`]
+    /// on ordinary lines and on the cursor's own line (which shows its raw marker).
+    pub gutter: Gutter,
+}
+
+/// The live-preview decoration of a visual line's left gutter, chosen once the
+/// cursor leaves the line. On the cursor's own line the raw marker shows so it
+/// stays editable, so this is [`Gutter::None`] there. A decoration always occupies
+/// the same width as the source marker, so toggling it never shifts the text (the
+/// no-reflow invariant the whole module preserves).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Gutter {
+    /// No decoration: body and heading lines, ordered items (their number stays
+    /// put), and any list or quote line the cursor is currently on.
+    None,
+    /// Paint a bullet point `•` in place of a `-`/`+`/`*` marker's glyph.
+    Bullet,
+    /// Draw a blockquote bar down the gutter. `marker` is true on the first line,
+    /// where the bar stands in for the `>` marker (whose glyphs are not drawn),
+    /// and false on wrapped continuations, which have no marker run of their own.
+    QuoteBar { marker: bool },
 }
 
 /// One inline run of a visual line: an absolute byte range, what it is, and
@@ -162,21 +199,48 @@ impl Layout {
                 rope.line_to_byte(i + 1)
             };
             let line = rope.byte_slice(ls..le);
-            let size = markdown::font_size(markdown::style_of(&line), body_size);
+            let style = markdown::style_of(&line);
+            let size = markdown::font_size(style, body_size);
             let metrics = fonts.metrics(size);
             // The line's inline spans (line-relative), and whether its markers
             // are revealed: shown while the active range touches the line, hidden
-            // once the cursor leaves it.
+            // once the cursor leaves it. A list or quote block marker persists
+            // regardless (it is the only sign the line is a list or quote).
             let spans = line_spans(&line);
+            let block_marker = markdown::marker_len(&line);
+            let block_persists = markdown::block_marker_persists(style);
             let revealed = active.0 <= le && active.1 >= ls;
+            // A list or quote item hangs its wrapped continuations under the text:
+            // the inset is the marker's width, measured on the source marker in the
+            // regular face at this line's size, so it matches the width the marker
+            // run itself advances on the first line and the columns line up.
+            let block_indent = if block_persists && block_marker > 0 {
+                render::text_advance(fonts.face(size, FontStyle::Regular), &line[..block_marker])
+                    .round() as i32
+            } else {
+                0
+            };
             // `wrap_segments` returns ranges relative to the line; offset them
             // back to absolute buffer positions for the visual lines. It measures
             // the source text (every run in its own face), so clipping spans to
             // each segment never disagrees with the breaks, and reveal state,
             // which only hides markers, never reflows the document.
-            let segments = wrap_segments(fonts, size, &line, &spans, wrap_width);
+            let segments = wrap_segments(fonts, size, &line, &spans, wrap_width, block_indent);
             let last = segments.len() - 1;
             for (k, (start, end)) in segments.into_iter().enumerate() {
+                // The first segment carries the marker inline (indent 0); later
+                // ones inset under the text. The gutter decoration only applies
+                // once the cursor has left the line; on it the raw marker shows.
+                let indent = if k == 0 { 0 } else { block_indent };
+                let gutter = if revealed {
+                    Gutter::None
+                } else {
+                    match style {
+                        markdown::LineStyle::Bullet if k == 0 => Gutter::Bullet,
+                        markdown::LineStyle::Quote => Gutter::QuoteBar { marker: k == 0 },
+                        _ => Gutter::None,
+                    }
+                };
                 lines.push(VisualLine {
                     start: ls + start,
                     end: ls + end,
@@ -185,7 +249,17 @@ impl Layout {
                     // trailing '\n' is a hard break.
                     hard: k == last && has_newline,
                     size,
-                    runs: clip_runs(&spans, start, end, ls, revealed),
+                    runs: clip_runs(
+                        &spans,
+                        start,
+                        end,
+                        ls,
+                        revealed,
+                        block_marker,
+                        block_persists,
+                    ),
+                    indent,
+                    gutter,
                 });
                 box_top += metrics.line_height;
             }
@@ -221,7 +295,7 @@ impl Layout {
     pub fn caret(&self, fonts: &Fonts, rope: &Rope, offset: usize) -> (i32, i32, i32) {
         let line = self.line_for(offset);
         let m = fonts.metrics(line.size);
-        let x = self.left as f32 + self.advance_to(fonts, rope, line, offset);
+        let x = self.left as f32 + line.indent as f32 + self.advance_to(fonts, rope, line, offset);
         (
             x.round() as i32,
             line.baseline - m.ascent,
@@ -276,8 +350,11 @@ impl Layout {
             // Measure the run-walked advance to each end of the selection; bytes
             // in a hidden marker collapse to the marker's edge, so a selection
             // touching one (in practice a revealed line) measures sensibly.
-            let x0 = self.left as f32 + self.advance_to(fonts, rope, line, sel_start);
-            let x1 = self.left as f32 + self.advance_to(fonts, rope, line, sel_end);
+            let x0 = self.left as f32
+                + line.indent as f32
+                + self.advance_to(fonts, rope, line, sel_start);
+            let x1 =
+                self.left as f32 + line.indent as f32 + self.advance_to(fonts, rope, line, sel_end);
             let mut w = (x1 - x0).round() as i32;
             if newline_selected {
                 w += NEWLINE_PAD;
@@ -323,7 +400,7 @@ impl Layout {
     /// testing walks only the visible runs, so a click on a line with hidden
     /// markers lands in the visible text, never inside a collapsed marker.
     fn hit_line(&self, fonts: &Fonts, rope: &Rope, line: &VisualLine, x: f32) -> usize {
-        let mut acc = self.left as f32;
+        let mut acc = self.left as f32 + line.indent as f32;
         // Past every glyph: the end of the last visible run, or the line start
         // for an empty line.
         let mut last = line.start;
@@ -391,15 +468,18 @@ fn line_spans(line: &str) -> Vec<markdown::Span> {
 }
 
 /// Clip line-relative `spans` to the visual segment `[seg_start, seg_end)`,
-/// offsetting to absolute by `ls`. A marker run is hidden unless `revealed`; a
-/// text run is always shown. Empty overlaps are dropped, so the runs tile the
-/// segment.
+/// offsetting to absolute by `ls`. Text runs always show. A marker shows only on
+/// a revealed line, except the block marker (the leading `[0, block_marker)`
+/// bytes) when `block_persists`: a list bullet or quote `>` stays on screen even
+/// off the active line. Empty overlaps are dropped, so the runs tile the segment.
 fn clip_runs(
     spans: &[markdown::Span],
     seg_start: usize,
     seg_end: usize,
     ls: usize,
     revealed: bool,
+    block_marker: usize,
+    block_persists: bool,
 ) -> Vec<Run> {
     let mut runs = Vec::new();
     for span in spans {
@@ -409,12 +489,19 @@ fn clip_runs(
             continue;
         }
         let is_marker = matches!(span.kind, markdown::SpanKind::Marker);
+        // The block marker occupies the line's leading `[0, block_marker)` bytes;
+        // inline markers (code, emphasis) start past it.
+        let is_block_marker = is_marker && span.start < block_marker;
+        let visible = if is_block_marker {
+            revealed || block_persists
+        } else {
+            !is_marker || revealed
+        };
         runs.push(Run {
             start: ls + s,
             end: ls + e,
             kind: span.kind,
-            // A marker shows only on a revealed line; text always shows.
-            visible: !is_marker || revealed,
+            visible,
         });
     }
     runs
@@ -427,12 +514,18 @@ fn clip_runs(
 /// is measured in its run's face (per `spans` and `size`), so bold/italic widths
 /// wrap correctly; the source text is measured in full (markers included), so
 /// hiding markers later never reflows the line.
+///
+/// `block_indent` is the hanging indent of a list or quote item: the first
+/// segment uses the full `wrap_width` (its marker sits in that width), and every
+/// continuation is wrapped `block_indent` pixels narrower, since it renders inset
+/// by that much. So the text column is the same width on every line of the item.
 fn wrap_segments(
     fonts: &Fonts,
     size: u32,
     line: &str,
     spans: &[markdown::Span],
     wrap_width: i32,
+    block_indent: i32,
 ) -> Vec<(usize, usize)> {
     if wrap_width <= 0 || line.is_empty() {
         return vec![(0, line.len())];
@@ -450,10 +543,12 @@ fn wrap_segments(
         return vec![(0, line.len())];
     }
 
-    let limit = wrap_width as f32;
     let mut segments = Vec::new();
     let mut i = 0;
     while i < clusters.len() {
+        // The first segment gets the full width; continuations are narrower by
+        // the hanging indent, since they render inset by it.
+        let limit = (wrap_width - if segments.is_empty() { 0 } else { block_indent }).max(1) as f32;
         let seg_start = clusters[i].0;
         let mut width = 0.0;
         // Cluster index that would start the next segment if we break at the
@@ -1001,6 +1096,211 @@ mod tests {
                 ))
                 .all(|run| run.visible),
             "the bold text stays shown"
+        );
+    }
+
+    // --- lists & blockquotes ----------------------------------------------
+
+    #[test]
+    fn a_list_bullet_persists_when_the_cursor_leaves() {
+        let f = fonts();
+        let src = "- item\nx";
+        let r = rope(src);
+        // Cursor on the second line, so a heading would hide its marker.
+        let off = src.find('x').unwrap();
+        let l = Layout::build(&f, &r, LEFT, TOP, 1_000_000, BODY, (off, off));
+        let bullet = l.lines()[0].runs.first().expect("a bullet line has runs");
+        assert!(
+            matches!(bullet.kind, markdown::SpanKind::Marker),
+            "the line starts with the bullet marker"
+        );
+        assert!(
+            bullet.visible,
+            "the bullet stays on screen off the line (unlike a heading)"
+        );
+    }
+
+    #[test]
+    fn a_quote_marker_persists_while_its_inline_markers_still_hide() {
+        let f = fonts();
+        let src = "> a `b` c\nx";
+        let r = rope(src);
+        let off = src.find('x').unwrap();
+        let l = Layout::build(&f, &r, LEFT, TOP, 1_000_000, BODY, (off, off));
+        let runs = &l.lines()[0].runs;
+        let quote = runs.first().expect("a quote line has runs");
+        assert!(
+            matches!(quote.kind, markdown::SpanKind::Marker) && quote.visible,
+            "the quote '> ' persists"
+        );
+        // The code span's backticks (inline markers past the block marker) still
+        // collapse off the line.
+        let inline_markers: Vec<_> = runs
+            .iter()
+            .skip(1)
+            .filter(|run| matches!(run.kind, markdown::SpanKind::Marker))
+            .collect();
+        assert!(
+            !inline_markers.is_empty() && inline_markers.iter().all(|run| !run.visible),
+            "inline markers hide even though the block marker persists"
+        );
+    }
+
+    // --- hanging indent & gutter decoration -------------------------------
+
+    #[test]
+    fn body_lines_have_no_indent_or_gutter() {
+        let f = fonts();
+        let l = layout(&f, &rope("plain text\nmore"));
+        for line in l.lines() {
+            assert_eq!(line.indent, 0, "body text is flush to the margin");
+            assert_eq!(line.gutter, Gutter::None, "body text has no gutter");
+        }
+    }
+
+    /// A wrap width that fits `prefix` but not one more cluster, so a line whose
+    /// text begins with `prefix` breaks right after it.
+    fn wrap_after(f: &Fonts, prefix: &str) -> i32 {
+        let face = f.face(BODY, FontStyle::Regular);
+        (render::text_advance(face, prefix) + render::text_advance(face, "b") / 2.0) as i32
+    }
+
+    #[test]
+    fn a_wrapped_list_item_hangs_its_continuation_under_the_text() {
+        let f = fonts();
+        let marker_w = render::text_advance(f.face(BODY, FontStyle::Regular), "- ").round() as i32;
+        let src = "- aaaaa bbbbb";
+        let r = rope(src);
+        let l = Layout::build(
+            &f,
+            &r,
+            LEFT,
+            TOP,
+            wrap_after(&f, "- aaaaa "),
+            BODY,
+            (0, r.len()),
+        );
+        let lines = l.lines();
+        assert_eq!(
+            lines.len(),
+            2,
+            "the bullet item wraps into two visual lines"
+        );
+        assert_eq!(
+            lines[0].indent, 0,
+            "the marker line is flush; its marker fills the gutter"
+        );
+        assert_eq!(
+            lines[1].indent, marker_w,
+            "the continuation hangs under the text by the marker width"
+        );
+        // The caret at the start of the continuation sits at the indented column,
+        // not back at the margin.
+        let cont = src.find("bbbbb").unwrap();
+        let (x, _, _) = l.caret(&f, &r, cont);
+        assert_eq!(
+            x,
+            LEFT + marker_w,
+            "continuation text starts past the indent"
+        );
+    }
+
+    #[test]
+    fn a_bullet_shows_a_dot_off_its_line_and_a_raw_marker_on_it() {
+        let f = fonts();
+        let src = "- item\nx";
+        let r = rope(src);
+        let off = src.find('x').unwrap();
+        let away = Layout::build(&f, &r, LEFT, TOP, 1_000_000, BODY, (off, off));
+        assert_eq!(
+            away.lines()[0].gutter,
+            Gutter::Bullet,
+            "a bullet point stands in once the cursor leaves"
+        );
+        let on = Layout::build(&f, &r, LEFT, TOP, 1_000_000, BODY, (0, 0));
+        assert_eq!(
+            on.lines()[0].gutter,
+            Gutter::None,
+            "the raw '- ' shows while the cursor edits the line"
+        );
+    }
+
+    #[test]
+    fn a_quote_shows_a_bar_off_its_line_and_a_raw_marker_on_it() {
+        let f = fonts();
+        let src = "> quoted\nx";
+        let r = rope(src);
+        let off = src.find('x').unwrap();
+        let away = Layout::build(&f, &r, LEFT, TOP, 1_000_000, BODY, (off, off));
+        assert_eq!(
+            away.lines()[0].gutter,
+            Gutter::QuoteBar { marker: true },
+            "the bar stands in for the '>' off-line"
+        );
+        let on = Layout::build(&f, &r, LEFT, TOP, 1_000_000, BODY, (0, 0));
+        assert_eq!(
+            on.lines()[0].gutter,
+            Gutter::None,
+            "raw '> ' shows while editing"
+        );
+    }
+
+    #[test]
+    fn a_wrapped_quote_keeps_the_bar_without_a_second_marker() {
+        let f = fonts();
+        let marker_w = render::text_advance(f.face(BODY, FontStyle::Regular), "> ").round() as i32;
+        let src = "> aaaaa bbbbb\nx";
+        let r = rope(src);
+        let off = src.find('x').unwrap();
+        let l = Layout::build(
+            &f,
+            &r,
+            LEFT,
+            TOP,
+            wrap_after(&f, "> aaaaa "),
+            BODY,
+            (off, off),
+        );
+        let lines = l.lines();
+        assert!(
+            lines.len() >= 3,
+            "the quote wraps in two, then a plain line"
+        );
+        assert_eq!(lines[0].gutter, Gutter::QuoteBar { marker: true });
+        assert_eq!(
+            lines[1].gutter,
+            Gutter::QuoteBar { marker: false },
+            "the continuation keeps the bar but has no marker run of its own"
+        );
+        assert_eq!(lines[1].indent, marker_w, "and hangs under the text");
+    }
+
+    #[test]
+    fn an_ordered_item_keeps_a_plain_gutter_but_still_indents() {
+        let f = fonts();
+        let marker_w = render::text_advance(f.face(BODY, FontStyle::Regular), "1. ").round() as i32;
+        let r = rope("1. aaaaa bbbbb");
+        // Cursor off the line: the number must still show (never substituted).
+        let l = Layout::build(
+            &f,
+            &r,
+            LEFT,
+            TOP,
+            wrap_after(&f, "1. aaaaa "),
+            BODY,
+            (99, 99),
+        );
+        let lines = l.lines();
+        assert_eq!(lines.len(), 2);
+        assert_eq!(
+            lines[0].gutter,
+            Gutter::None,
+            "an ordered number is never replaced"
+        );
+        assert_eq!(lines[1].gutter, Gutter::None);
+        assert_eq!(
+            lines[1].indent, marker_w,
+            "but wrapped lines still hang-indent"
         );
     }
 }

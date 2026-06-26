@@ -27,7 +27,7 @@ use crate::error::{Error, Result};
 use crate::ffi;
 use crate::file::{self, FileFormat};
 use crate::freetype::Fonts;
-use crate::layout::Layout;
+use crate::layout::{Gutter, Layout};
 use crate::markdown;
 use crate::protocol::{
     self, wl_buffer, wl_callback, wl_compositor, wl_data_device, wl_data_device_manager,
@@ -57,6 +57,12 @@ const MARKER_COLOR: u32 = 0x006c_7086;
 /// span stands out from prose the way it does in a rendered document.
 const CODE_COLOR: u32 = 0x00f3_8ba8;
 const CODE_BG: u32 = 0x0031_3244;
+/// A blockquote's gutter bar, and the bullet a list item renders once the cursor
+/// leaves its line. The bar is drawn at the text margin, in the empty gutter to
+/// the left of the (indented) quote text.
+const QUOTE_BAR_COLOR: u32 = 0x0045_475a;
+const QUOTE_BAR_WIDTH: i32 = 3;
+const BULLET: &str = "•";
 /// Body text pixel size; headings scale up from it (see [`markdown::font_size`]).
 const FONT_SIZE: u32 = 32;
 /// Inset of the text from the top-left corner (both axes).
@@ -544,8 +550,20 @@ impl State {
                 if baseline + m.descent <= 0 || baseline - m.ascent >= view_h {
                     continue;
                 }
-                let mut pen = MARGIN;
-                for run in &line.runs {
+                // A blockquote draws a bar down its gutter, on every wrapped line.
+                if matches!(line.gutter, Gutter::QuoteBar { .. }) {
+                    canvas.fill_rect(
+                        MARGIN,
+                        baseline - m.ascent,
+                        QUOTE_BAR_WIDTH,
+                        m.line_height,
+                        QUOTE_BAR_COLOR,
+                    );
+                }
+                // Content is inset by the line's hanging indent (0 unless this is
+                // a wrapped list/quote continuation).
+                let mut pen = MARGIN + line.indent;
+                for (i, run) in line.runs.iter().enumerate() {
                     if !run.visible {
                         continue;
                     }
@@ -554,6 +572,25 @@ impl State {
                     // recolor, the rest (regular and emphasized prose) is FG.
                     let face = fonts.face(line.size, run.font_style());
                     let slice = rope.byte_slice(run.start..run.end);
+                    // The block marker (the first run on a list/quote line) gives
+                    // way to its gutter decoration once the cursor leaves: a bullet
+                    // glyph for a list, nothing for a quote (the bar above replaces
+                    // it). Either keeps the source width, so the text never shifts.
+                    if i == 0 && matches!(run.kind, markdown::SpanKind::Marker) {
+                        let advance = render::text_advance(face, &slice).round() as i32;
+                        match line.gutter {
+                            Gutter::Bullet => {
+                                canvas.draw_text(face, pen, baseline, BULLET, FOREGROUND);
+                                pen += advance;
+                                continue;
+                            }
+                            Gutter::QuoteBar { marker: true } => {
+                                pen += advance;
+                                continue;
+                            }
+                            _ => {}
+                        }
+                    }
                     let color = match run.kind {
                         markdown::SpanKind::Marker => MARKER_COLOR,
                         markdown::SpanKind::Text(markdown::Emphasis::Code) => CODE_COLOR,

@@ -5,25 +5,35 @@
 //! (the text between two `'\n'`s):
 //!
 //! - **Block style** ([`style_of`]): an ATX heading (`# ` .. `###### `) renders
-//!   larger. [`crate::layout`] resolves the style to a pixel size and stamps it
-//!   onto every visual line the logical line wraps into, sharing all the cursor
-//!   and selection math.
+//!   larger; a bullet (`- `), ordered (`1. `), or quote (`> `) line carries a
+//!   leading marker. [`crate::layout`] resolves the style to a pixel size and a
+//!   marker length and stamps them onto every visual line the logical line wraps
+//!   into, sharing all the cursor and selection math. A heading hides its marker
+//!   once the cursor leaves; a list or quote marker persists (see
+//!   [`block_marker_persists`]).
 //! - **Inline spans** ([`inline_spans`]): code spans and emphasis (`*`/`_`)
 //!   style interior runs of a line, with their delimiters hidden once the cursor
 //!   leaves the line.
 //!
-//! Scope for now: ATX headings, inline code, and bold/italic emphasis. Indented
-//! headings (CommonMark allows up to three leading spaces) are deliberately not
-//! recognized; notes are written at the left margin.
+//! Scope for now: ATX headings, bullet/ordered/quote lines, inline code, and
+//! bold/italic emphasis. Indented block markers (CommonMark allows up to three
+//! leading spaces) are deliberately not recognized; notes are written at the left
+//! margin.
 
 /// The block style of one logical line. A closed set, extended as more markup
-/// lands (lists, quotes, ...).
+/// lands.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum LineStyle {
     /// Ordinary paragraph text.
     Body,
     /// An ATX heading of the given level, 1..=6.
     Heading(u8),
+    /// A bullet list item (`-`, `+`, or `*` then a space).
+    Bullet,
+    /// An ordered list item (`1.` or `1)` then a space).
+    Ordered,
+    /// A blockquote (`>` then an optional space).
+    Quote,
 }
 
 /// The ATX heading level of `line`, or `None` if it is not a heading. A heading
@@ -45,21 +55,48 @@ pub fn heading_level(line: &str) -> Option<u8> {
     }
 }
 
-/// The block style of `line`.
+/// The block style of `line`. Headings win first (a `#` line is never a list),
+/// then quotes, bullets, and ordered items; everything else is body text.
 pub fn style_of(line: &str) -> LineStyle {
-    match heading_level(line) {
-        Some(level) => LineStyle::Heading(level),
-        None => LineStyle::Body,
+    if let Some(level) = heading_level(line) {
+        LineStyle::Heading(level)
+    } else if quote_marker(line).is_some() {
+        LineStyle::Quote
+    } else if bullet_marker(line).is_some() {
+        LineStyle::Bullet
+    } else if ordered_marker(line).is_some() {
+        LineStyle::Ordered
+    } else {
+        LineStyle::Body
     }
 }
 
-/// Byte length of a heading's marker prefix: the run of `'#'` plus the single
-/// separating space if one is present. `0` for a non-heading line. Used to draw
-/// the markers in a distinct color so the markup reads as syntax.
+/// Byte length of `line`'s block marker prefix (the syntax drawn in a distinct
+/// color so it reads as markup): a heading's `#`s plus a space, a list bullet or
+/// number plus a space, or a quote `>` plus an optional space. `0` for body text.
 pub fn marker_len(line: &str) -> usize {
-    if heading_level(line).is_none() {
-        return 0;
+    match style_of(line) {
+        LineStyle::Body => 0,
+        LineStyle::Heading(_) => heading_marker_len(line),
+        LineStyle::Bullet => bullet_marker(line).unwrap_or(0),
+        LineStyle::Ordered => ordered_marker(line).unwrap_or(0),
+        LineStyle::Quote => quote_marker(line).unwrap_or(0),
     }
+}
+
+/// Whether `style`'s block marker stays visible once the cursor leaves the line.
+/// A heading hides its `#`s (the large text reads cleaner bare), but a list
+/// bullet or quote `>` is the only thing marking the line as a list or quote, so
+/// it persists; otherwise the line would read as an ordinary paragraph.
+pub fn block_marker_persists(style: LineStyle) -> bool {
+    matches!(
+        style,
+        LineStyle::Bullet | LineStyle::Ordered | LineStyle::Quote
+    )
+}
+
+/// Byte length of a heading's `#` run plus the single separating space if present.
+fn heading_marker_len(line: &str) -> usize {
     let hashes = line.bytes().take_while(|&b| b == b'#').count();
     match line.as_bytes().get(hashes) {
         Some(&b' ') => hashes + 1,
@@ -67,13 +104,50 @@ pub fn marker_len(line: &str) -> usize {
     }
 }
 
+/// Marker length if `line` is a bullet item: `-`, `+`, or `*` followed by a
+/// space. The space is required, so `*italic*` is not mistaken for a bullet and a
+/// bare `-` stays body text.
+fn bullet_marker(line: &str) -> Option<usize> {
+    let bytes = line.as_bytes();
+    match bytes.first() {
+        Some(b'-' | b'+' | b'*') if bytes.get(1) == Some(&b' ') => Some(2),
+        _ => None,
+    }
+}
+
+/// Marker length if `line` is an ordered item: one to nine digits, then `.` or
+/// `)`, then a required space (so `1.foo` and a bare `1.` stay body text).
+fn ordered_marker(line: &str) -> Option<usize> {
+    let bytes = line.as_bytes();
+    let digits = bytes.iter().take_while(|&&b| b.is_ascii_digit()).count();
+    if digits == 0 || digits > 9 {
+        return None;
+    }
+    match bytes.get(digits) {
+        Some(b'.' | b')') if bytes.get(digits + 1) == Some(&b' ') => Some(digits + 2),
+        _ => None,
+    }
+}
+
+/// Marker length if `line` is a blockquote: a leading `>`, plus a single space if
+/// one follows. Single level only (`>> nested` is read as one quote).
+fn quote_marker(line: &str) -> Option<usize> {
+    let bytes = line.as_bytes();
+    if bytes.first() != Some(&b'>') {
+        return None;
+    }
+    Some(if bytes.get(1) == Some(&b' ') { 2 } else { 1 })
+}
+
 /// The pixel size `style` renders at, scaled from the body `base`. Headings step
-/// down from H1 toward body size; H5 and H6 match body (they read as bold body
-/// text in most themes, and bold is not wired up yet). Scales are in tenths to
-/// stay in integer pixels without a float dependency on rounding.
+/// down from H1 toward body size; H5 and H6 match body. Lists and quotes are body
+/// size (they style via their marker and indentation, not size). Scales are in
+/// tenths to stay in integer pixels without a float dependency on rounding.
 pub fn font_size(style: LineStyle, base: u32) -> u32 {
     let tenths = match style {
-        LineStyle::Body => return base,
+        LineStyle::Body | LineStyle::Bullet | LineStyle::Ordered | LineStyle::Quote => {
+            return base;
+        }
         LineStyle::Heading(1) => 16,
         LineStyle::Heading(2) => 14,
         LineStyle::Heading(3) => 12,
@@ -456,6 +530,61 @@ mod tests {
         seen.sort_unstable();
         seen.dedup();
         assert_eq!(seen.len(), sizes.len(), "no duplicate sizes");
+    }
+
+    // --- Lists & blockquotes ----------------------------------------------
+
+    #[test]
+    fn recognizes_bullets_with_each_marker() {
+        for marker in ["- ", "+ ", "* "] {
+            let line = format!("{marker}item");
+            assert_eq!(style_of(&line), LineStyle::Bullet, "{line:?}");
+            assert_eq!(marker_len(&line), 2, "{line:?}");
+        }
+    }
+
+    #[test]
+    fn a_bullet_needs_its_space_so_emphasis_and_words_are_safe() {
+        // `*italic*` and a hyphenated word must not read as bullets.
+        assert_eq!(style_of("*italic*"), LineStyle::Body);
+        assert_eq!(style_of("-dash"), LineStyle::Body);
+        assert_eq!(style_of("-"), LineStyle::Body);
+        assert_eq!(marker_len("*italic*"), 0);
+    }
+
+    #[test]
+    fn recognizes_ordered_items_with_dot_or_paren() {
+        assert_eq!(style_of("1. first"), LineStyle::Ordered);
+        assert_eq!(marker_len("1. first"), 3);
+        assert_eq!(style_of("10) tenth"), LineStyle::Ordered);
+        assert_eq!(marker_len("10) tenth"), 4);
+        // No space, too many digits, or a bare number: body text.
+        assert_eq!(style_of("1.foo"), LineStyle::Body);
+        assert_eq!(style_of("1234567890. x"), LineStyle::Body);
+        assert_eq!(style_of("1."), LineStyle::Body);
+    }
+
+    #[test]
+    fn recognizes_quotes_with_optional_space() {
+        assert_eq!(style_of("> quoted"), LineStyle::Quote);
+        assert_eq!(marker_len("> quoted"), 2);
+        assert_eq!(style_of(">tight"), LineStyle::Quote);
+        assert_eq!(marker_len(">tight"), 1);
+        assert_eq!(style_of(">"), LineStyle::Quote);
+        assert_eq!(marker_len(">"), 1);
+    }
+
+    #[test]
+    fn headings_win_over_other_blocks_and_lists_persist() {
+        // A `#` line is a heading, not a list, and a heading hides its marker.
+        assert_eq!(style_of("# h"), LineStyle::Heading(1));
+        assert!(!block_marker_persists(LineStyle::Heading(1)));
+        assert!(!block_marker_persists(LineStyle::Body));
+        // Lists and quotes keep their markers on screen.
+        for style in [LineStyle::Bullet, LineStyle::Ordered, LineStyle::Quote] {
+            assert!(block_marker_persists(style), "{style:?} persists");
+            assert_eq!(font_size(style, 32), 32, "{style:?} is body size");
+        }
     }
 
     // --- Inline spans -----------------------------------------------------

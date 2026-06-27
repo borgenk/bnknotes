@@ -883,9 +883,8 @@ impl State {
                 true
             }
             KeyAction::Enter => {
-                self.text.insert_str("\n");
                 self.goal_x = None;
-                true
+                self.text.enter()
             }
             // Tab inserts a soft tab. Shift+Tab (back-tab/dedent) needs leading-
             // whitespace tracking we do not have yet, so it is a no-op for now.

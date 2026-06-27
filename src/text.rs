@@ -26,6 +26,7 @@
 //! the saved state.
 
 use crate::grapheme;
+use crate::markdown;
 use crate::rope::Rope;
 
 /// Cap on undo history, so a long session cannot grow the stacks without bound.
@@ -174,6 +175,63 @@ impl TextBuffer {
         self.cursor += s.len();
         self.anchor = None;
         self.touch();
+    }
+
+    /// Handle the Enter key, continuing a list or quote where one is in play.
+    /// On a bullet, ordered, or quote line a non-empty item starts a new one
+    /// with the same (or next) marker, splitting the line at the cursor; an
+    /// empty item instead has its marker removed, leaving a blank line, so a
+    /// second Enter ends the list. Anywhere else, with a selection, or with the
+    /// cursor before the marker, it inserts a plain newline. Always changes the
+    /// buffer, so it returns `true`.
+    pub fn enter(&mut self) -> bool {
+        if self.selection().is_some() {
+            self.insert_str("\n");
+            return true;
+        }
+        let line_idx = self.text.byte_to_line(self.cursor);
+        let ls = self.text.line_to_byte(line_idx);
+        // The line's content end, excluding its trailing '\n' if it has one.
+        let le = if line_idx + 1 < self.text.len_lines() {
+            self.text.line_to_byte(line_idx + 1) - 1
+        } else {
+            self.text.line_to_byte(line_idx + 1)
+        };
+        let line = self.text.byte_slice(ls..le);
+        let marker_len = markdown::marker_len(&line);
+        // Continue the list only while editing the item's content; with the
+        // cursor before or within the marker a plain newline is what is meant.
+        if marker_len == 0 || self.cursor < ls + marker_len {
+            self.insert_str("\n");
+            return true;
+        }
+        match markdown::next_item_marker(&line) {
+            Some(_) if line[marker_len..].trim().is_empty() => self.delete_range(ls, le),
+            Some(marker) => {
+                self.insert_str(&format!("\n{marker}"));
+                true
+            }
+            None => {
+                self.insert_str("\n");
+                true
+            }
+        }
+    }
+
+    /// Delete the byte range `[start, end)` as one undo step, leaving the cursor
+    /// at `start` and no selection. The bounds must be cluster boundaries (line
+    /// and marker edges, which callers pass, always are). A collapsed range is a
+    /// no-op returning `false`.
+    fn delete_range(&mut self, start: usize, end: usize) -> bool {
+        if start >= end {
+            return false;
+        }
+        self.checkpoint(Coalesce::None);
+        self.text.remove(start..end);
+        self.cursor = start;
+        self.anchor = None;
+        self.touch();
+        true
     }
 
     /// Delete the selection if there is one, else the grapheme cluster before
@@ -624,6 +682,111 @@ mod tests {
         b.insert_str("b");
         assert_eq!(b.text(), "a\nb");
         assert_eq!(b.cursor, 3);
+    }
+
+    // --- Enter / smart list continuation ----------------------------------
+
+    #[test]
+    fn enter_continues_a_bullet_with_the_same_marker() {
+        let mut b = TextBuffer::new();
+        b.insert_str("- foo");
+        assert!(b.enter());
+        assert_eq!(b.text(), "- foo\n- ");
+        assert_eq!(b.cursor(), 8);
+    }
+
+    #[test]
+    fn enter_on_an_empty_bullet_removes_the_marker() {
+        let mut b = TextBuffer::new();
+        b.insert_str("- ");
+        assert!(b.enter());
+        assert_eq!(b.text(), "", "an empty item clears its marker, no new line");
+        assert_eq!(b.cursor(), 0);
+    }
+
+    #[test]
+    fn enter_advances_an_ordered_item() {
+        let mut b = TextBuffer::new();
+        b.insert_str("1. a");
+        b.enter();
+        assert_eq!(b.text(), "1. a\n2. ");
+        assert_eq!(b.cursor(), 8);
+    }
+
+    #[test]
+    fn enter_on_an_empty_ordered_item_removes_the_marker() {
+        let mut b = TextBuffer::new();
+        b.insert_str("3) ");
+        b.enter();
+        assert_eq!(b.text(), "");
+        assert_eq!(b.cursor(), 0);
+    }
+
+    #[test]
+    fn enter_continues_a_blockquote() {
+        let mut b = TextBuffer::new();
+        b.insert_str("> q");
+        b.enter();
+        assert_eq!(b.text(), "> q\n> ");
+        assert_eq!(b.cursor(), 6);
+    }
+
+    #[test]
+    fn enter_in_the_middle_of_an_item_splits_and_prefixes() {
+        let mut b = TextBuffer::new();
+        b.insert_str("- ab");
+        b.move_left(false); // between 'a' and 'b'
+        b.enter();
+        assert_eq!(b.text(), "- a\n- b");
+        assert_eq!(b.cursor(), 6);
+    }
+
+    #[test]
+    fn enter_before_the_marker_inserts_a_plain_newline() {
+        let mut b = TextBuffer::new();
+        b.insert_str("- foo");
+        b.set_cursor(0, false);
+        b.enter();
+        assert_eq!(b.text(), "\n- foo", "no second marker is added");
+        assert_eq!(b.cursor(), 1);
+    }
+
+    #[test]
+    fn enter_off_a_list_inserts_a_plain_newline() {
+        let mut b = TextBuffer::new();
+        b.insert_str("plain");
+        b.enter();
+        assert_eq!(b.text(), "plain\n");
+        assert_eq!(b.cursor(), 6);
+    }
+
+    #[test]
+    fn enter_does_not_continue_a_heading() {
+        let mut b = TextBuffer::new();
+        b.insert_str("# h");
+        b.enter();
+        assert_eq!(b.text(), "# h\n");
+        assert_eq!(b.cursor(), 4);
+    }
+
+    #[test]
+    fn enter_replaces_a_selection_with_a_newline() {
+        let mut b = TextBuffer::new();
+        b.insert_str("- foo");
+        b.select_all();
+        b.enter();
+        assert_eq!(b.text(), "\n");
+        assert_eq!(b.cursor(), 1);
+    }
+
+    #[test]
+    fn enter_is_one_undo_step() {
+        let mut b = TextBuffer::new();
+        b.insert_str("- foo");
+        b.enter();
+        assert_eq!(b.text(), "- foo\n- ");
+        assert!(b.undo());
+        assert_eq!(b.text(), "- foo", "one undo reverts the whole continuation");
     }
 
     #[test]

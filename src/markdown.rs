@@ -95,6 +95,25 @@ pub fn block_marker_persists(style: LineStyle) -> bool {
     )
 }
 
+/// The marker that should open the next item when Enter is pressed on `line`,
+/// or `None` if `line` is not a continuable block (body, heading). A bullet or
+/// quote repeats its own marker verbatim; an ordered item advances the number,
+/// keeping its `.`/`)` delimiter and trailing space (`1. ` -> `2. `, `3) ` ->
+/// `4) `). The caller decides emptiness; this only builds the marker.
+pub fn next_item_marker(line: &str) -> Option<String> {
+    let marker = &line[..marker_len(line)];
+    match style_of(line) {
+        LineStyle::Bullet | LineStyle::Quote => Some(marker.to_string()),
+        LineStyle::Ordered => {
+            // The marker is <digits><'.'|')'><space>; bump the number, keep the rest.
+            let digits = marker.bytes().take_while(u8::is_ascii_digit).count();
+            let next = marker[..digits].parse::<u64>().ok()?.wrapping_add(1);
+            Some(format!("{next}{}", &marker[digits..]))
+        }
+        LineStyle::Body | LineStyle::Heading(_) => None,
+    }
+}
+
 /// Byte length of a heading's `#` run plus the single separating space if present.
 fn heading_marker_len(line: &str) -> usize {
     let hashes = line.bytes().take_while(|&b| b == b'#').count();
@@ -585,6 +604,24 @@ mod tests {
             assert!(block_marker_persists(style), "{style:?} persists");
             assert_eq!(font_size(style, 32), 32, "{style:?} is body size");
         }
+    }
+
+    #[test]
+    fn next_item_marker_repeats_a_bullet_or_quote_and_advances_a_number() {
+        assert_eq!(next_item_marker("- x").as_deref(), Some("- "));
+        assert_eq!(next_item_marker("+ x").as_deref(), Some("+ "));
+        assert_eq!(next_item_marker("* x").as_deref(), Some("* "));
+        assert_eq!(next_item_marker("1. a").as_deref(), Some("2. "));
+        assert_eq!(
+            next_item_marker("9) z").as_deref(),
+            Some("10) "),
+            "digit carry"
+        );
+        assert_eq!(next_item_marker("> q").as_deref(), Some("> "));
+        assert_eq!(next_item_marker(">tight").as_deref(), Some(">"));
+        // Headings and body never continue.
+        assert_eq!(next_item_marker("# h"), None);
+        assert_eq!(next_item_marker("plain"), None);
     }
 
     // --- Inline spans -----------------------------------------------------

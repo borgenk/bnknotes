@@ -1,10 +1,17 @@
 //! Keyboard translation backed by libxkbcommon (libxkbcommon.so.0).
 //!
 //! The compositor hands us an XKB keymap over wl_keyboard.keymap; we give it to
-//! libxkbcommon and let it own layout, dead keys, and modifier state. Each
-//! pressed key becomes a [`KeyAction`]: a few layout-independent special keys
-//! dispatch on the physical evdev keycode, and everything else asks xkb for the
-//! UTF-8 string the key produces under the current modifiers.
+//! libxkbcommon and let it own layout and modifier state. Each pressed key
+//! becomes a [`KeyAction`]: a few layout-independent special keys dispatch on
+//! the physical evdev keycode, and everything else asks xkb for the UTF-8 string
+//! the key produces under the current modifiers.
+//!
+//! Character input also runs through libxkbcommon's Compose machine (a compose
+//! table built from the user's locale), so dead keys and compose sequences
+//! resolve: on a Nordic layout `dead_grave` then Space yields `` ` ``, then `a`
+//! yields `à`, and so on. A key mid-sequence produces no input until the
+//! sequence completes; keys that are not part of one fall through to their own
+//! UTF-8.
 //!
 //! Trimmed to the actions this milestone needs (character input, Backspace,
 //! left/right).
@@ -40,6 +47,12 @@ const XKB_STATE_MODS_EFFECTIVE: u32 = 1 << 0;
 const XKB_MOD_NAME_SHIFT: &[u8] = b"Shift\0";
 const XKB_MOD_NAME_CTRL: &[u8] = b"Control\0";
 
+/// Compose-sequence status after feeding a keysym. The fourth state, "nothing"
+/// (`0`, the keysym is part of no sequence), is the catch-all in the match below.
+const XKB_COMPOSE_COMPOSING: c_int = 1;
+const XKB_COMPOSE_COMPOSED: c_int = 2;
+const XKB_COMPOSE_CANCELLED: c_int = 3;
+
 #[link(name = "xkbcommon")]
 #[allow(non_snake_case)]
 extern "C" {
@@ -67,6 +80,18 @@ extern "C" {
     fn xkb_state_mod_name_is_active(st: *mut c_void, name: *const c_char, type_: u32) -> c_int;
     fn xkb_state_key_get_one_sym(st: *mut c_void, key: u32) -> u32;
     fn xkb_keymap_key_repeats(keymap: *mut c_void, key: u32) -> c_int;
+    fn xkb_compose_table_new_from_locale(
+        ctx: *mut c_void,
+        locale: *const c_char,
+        flags: u32,
+    ) -> *mut c_void;
+    fn xkb_compose_table_unref(table: *mut c_void);
+    fn xkb_compose_state_new(table: *mut c_void, flags: u32) -> *mut c_void;
+    fn xkb_compose_state_unref(st: *mut c_void);
+    fn xkb_compose_state_reset(st: *mut c_void);
+    fn xkb_compose_state_feed(st: *mut c_void, keysym: u32) -> c_int;
+    fn xkb_compose_state_get_status(st: *mut c_void) -> c_int;
+    fn xkb_compose_state_get_utf8(st: *mut c_void, buf: *mut c_char, size: usize) -> c_int;
 }
 
 /// What a key press should do to the editor. The cursor-motion variants (Left,
@@ -116,6 +141,10 @@ pub struct Xkb {
     ctx: NonNull<c_void>,
     keymap: Option<NonNull<c_void>>,
     state: Option<NonNull<c_void>>,
+    /// The Compose state machine for dead keys and compose sequences, built from
+    /// the user's locale. `None` if the locale has no compose table, in which
+    /// case input falls back to each key's plain UTF-8 (no dead-key support).
+    compose: Option<NonNull<c_void>>,
 }
 
 impl Xkb {
@@ -123,11 +152,37 @@ impl Xkb {
         // SAFETY: xkb_context_new accepts any flags and returns null on failure.
         let ctx = unsafe { xkb_context_new(0) };
         let ctx = NonNull::new(ctx).ok_or_else(|| Error::msg("xkb_context_new returned null"))?;
+        let compose = Self::new_compose(ctx);
         Ok(Self {
             ctx,
             keymap: None,
             state: None,
+            compose,
         })
+    }
+
+    /// Build a Compose state from the user's locale (`$LC_ALL`, `$LC_CTYPE`, or
+    /// `$LANG`, defaulting to `C`). Returns `None` if no compose table is found,
+    /// which is not an error: input simply has no dead-key support then. The
+    /// table is released once the state holds its own reference.
+    fn new_compose(ctx: NonNull<c_void>) -> Option<NonNull<c_void>> {
+        let locale = std::env::var("LC_ALL")
+            .or_else(|_| std::env::var("LC_CTYPE"))
+            .or_else(|_| std::env::var("LANG"))
+            .unwrap_or_else(|_| "C".to_string());
+        let locale = std::ffi::CString::new(locale)
+            .or_else(|_| std::ffi::CString::new("C"))
+            .ok()?;
+        // SAFETY: ctx is valid; locale is a NUL-terminated string living across
+        // the call. Returns null when the locale has no compose table.
+        let table = unsafe { xkb_compose_table_new_from_locale(ctx.as_ptr(), locale.as_ptr(), 0) };
+        let table = NonNull::new(table)?;
+        // SAFETY: table is valid; state_new takes its own reference, so we drop
+        // ours immediately afterwards regardless of whether state_new succeeded.
+        let state = unsafe { xkb_compose_state_new(table.as_ptr(), 0) };
+        // SAFETY: table came from compose_table_new and is released exactly once.
+        unsafe { xkb_compose_table_unref(table.as_ptr()) };
+        NonNull::new(state)
     }
 
     /// Install the keymap the compositor sent (its raw, NUL-terminated bytes).
@@ -284,16 +339,46 @@ impl Xkb {
         let Some(state) = self.state else {
             return KeyAction::None;
         };
+        let key = keycode + EVDEV_OFFSET;
         let mut buf = [0u8; 16];
-        // SAFETY: state is valid; buf is writable and large enough for any
-        // single key's UTF-8 output.
-        let n = unsafe {
-            xkb_state_key_get_utf8(
-                state.as_ptr(),
-                keycode + EVDEV_OFFSET,
-                buf.as_mut_ptr() as *mut c_char,
-                buf.len(),
-            )
+        // Feed the key's keysym through the Compose machine first, so dead keys
+        // and compose sequences resolve. A key mid-sequence (or one that cancels
+        // an invalid sequence) produces no input; a completed sequence yields its
+        // composed text; a key that is part of no sequence falls through to its
+        // own UTF-8 (the common path for ordinary typing).
+        let n = match self.compose {
+            Some(compose) => {
+                // SAFETY: state and compose are valid; the sym lookup reads state,
+                // the feed advances compose.
+                let sym = unsafe { xkb_state_key_get_one_sym(state.as_ptr(), key) };
+                unsafe { xkb_compose_state_feed(compose.as_ptr(), sym) };
+                // SAFETY: compose is valid.
+                match unsafe { xkb_compose_state_get_status(compose.as_ptr()) } {
+                    XKB_COMPOSE_COMPOSING => return KeyAction::None,
+                    XKB_COMPOSE_CANCELLED => {
+                        // SAFETY: compose is valid; clear the abandoned sequence.
+                        unsafe { xkb_compose_state_reset(compose.as_ptr()) };
+                        return KeyAction::None;
+                    }
+                    XKB_COMPOSE_COMPOSED => {
+                        // SAFETY: compose is valid; buf is writable and sized for
+                        // one composed result.
+                        let n = unsafe {
+                            xkb_compose_state_get_utf8(
+                                compose.as_ptr(),
+                                buf.as_mut_ptr() as *mut c_char,
+                                buf.len(),
+                            )
+                        };
+                        // SAFETY: compose is valid; ready it for the next sequence.
+                        unsafe { xkb_compose_state_reset(compose.as_ptr()) };
+                        n
+                    }
+                    // XKB_COMPOSE_NOTHING, or any value a newer library returns.
+                    _ => self.key_utf8(state, key, &mut buf),
+                }
+            }
+            None => self.key_utf8(state, key, &mut buf),
         };
         if n <= 0 {
             return KeyAction::None;
@@ -303,12 +388,28 @@ impl Xkb {
         let Ok(s) = core::str::from_utf8(&buf[..n]) else {
             return KeyAction::None;
         };
-        // Only single, non-control scalars become input. Compose/dead-key
-        // sequences that yield multiple scalars are dropped for now.
+        // Only single, non-control scalars become input. Sequences (composed or
+        // raw) that yield multiple scalars are dropped for now.
         let mut chars = s.chars();
         match (chars.next(), chars.next()) {
             (Some(c), None) if (c as u32) >= 0x20 && c != '\x7f' => KeyAction::Char(c),
             _ => KeyAction::None,
+        }
+    }
+
+    /// The UTF-8 a key produces under the current modifiers, written into `buf`
+    /// and returning its byte length (snprintf-style: the required length, which
+    /// the caller clamps). The plain, non-compose path.
+    fn key_utf8(&self, state: NonNull<c_void>, key: u32, buf: &mut [u8]) -> c_int {
+        // SAFETY: state is valid; buf is writable and sized for any one key's
+        // UTF-8 output.
+        unsafe {
+            xkb_state_key_get_utf8(
+                state.as_ptr(),
+                key,
+                buf.as_mut_ptr() as *mut c_char,
+                buf.len(),
+            )
         }
     }
 
@@ -356,6 +457,9 @@ impl Drop for Xkb {
         // SAFETY: each pointer came from its matching xkb_*_new and is freed
         // exactly once; we hold the only references.
         unsafe {
+            if let Some(c) = self.compose.take() {
+                xkb_compose_state_unref(c.as_ptr());
+            }
             if let Some(s) = self.state.take() {
                 xkb_state_unref(s.as_ptr());
             }

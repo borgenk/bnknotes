@@ -98,8 +98,9 @@ const CARET_WIDTH: i32 = 2;
 /// How long the caret stays shown, then hidden, while idle. Activity resets it
 /// to shown, so it never blinks out mid-keystroke.
 const CARET_BLINK: Duration = Duration::from_millis(500);
-/// Pixels scrolled per unit of wl_pointer.axis value (wheel/touchpad).
-const SCROLL_FACTOR: f32 = 2.0;
+/// Pixels scrolled per unit of wl_pointer.axis value (wheel/touchpad). One wheel
+/// detent is ~15 axis units, so this lands a notch at roughly three body lines.
+const SCROLL_FACTOR: f32 = 4.0;
 
 /// Two clicks within this window, and within [`MULTI_CLICK_RADIUS`] pixels,
 /// count as a double-click (then triple, ...).
@@ -210,6 +211,10 @@ struct State {
     /// reuses it instead of re-wrapping and re-measuring the whole document.
     layout_cache: Option<Layout>,
     layout_key: Option<(u64, u32, usize, usize)>,
+    /// The laid-out document's pixel height plus top and bottom margins, refreshed
+    /// whenever the layout is rebuilt. Cached so the scroll path can clamp without
+    /// cloning the whole layout just to read its extent.
+    content_height: i32,
 
     // Key auto-repeat. The compositor sends one press; the client repeats the
     // held key on a timer until it is released.
@@ -306,6 +311,7 @@ impl State {
             caret_blink_at: None,
             layout_cache: None,
             layout_key: None,
+            content_height: 0,
             repeat_delay: Duration::from_millis(DEFAULT_REPEAT_DELAY_MS),
             repeat_interval: Some(Duration::from_secs(1) / DEFAULT_REPEAT_RATE),
             repeat_key: None,
@@ -534,8 +540,7 @@ impl State {
         let caret_visible = self.caret_visible;
         let layout = self.layout();
         // Keep the scroll offset valid for the current content and window size.
-        let content_height = self.content_height(&layout);
-        self.scroll_y = scroll::clamp(self.scroll_y, content_height, self.height as i32);
+        self.scroll_y = scroll::clamp(self.scroll_y, self.content_height, self.height as i32);
         let scroll_y = self.scroll_y;
 
         {
@@ -1620,18 +1625,16 @@ impl State {
         self.scroll_caret_into_view();
     }
 
-    /// Total document height in content pixels: the laid-out text block plus a
-    /// top and bottom margin.
-    fn content_height(&self, layout: &Layout) -> i32 {
-        layout.text_height() + 2 * MARGIN
-    }
-
     /// Scroll the viewport by `delta` pixels (positive = down), clamped to the
-    /// document.
+    /// document. The hottest input path (one call per wheel event), so it reads
+    /// the cached content height instead of cloning the layout.
     fn scroll_by(&mut self, delta: i32) {
-        let layout = self.layout();
-        let content_height = self.content_height(&layout);
-        let sy = scroll::clamp(self.scroll_y + delta, content_height, self.height as i32);
+        self.ensure_layout();
+        let sy = scroll::clamp(
+            self.scroll_y + delta,
+            self.content_height,
+            self.height as i32,
+        );
         if sy != self.scroll_y {
             self.scroll_y = sy;
             self.dirty = true;
@@ -1643,13 +1646,12 @@ impl State {
         let layout = self.layout();
         let (_, caret_top, caret_h) =
             layout.caret(&self.fonts, self.text.rope(), self.text.cursor());
-        let content_height = self.content_height(&layout);
         let sy = scroll::reveal(
             self.scroll_y,
             caret_top,
             caret_h,
             self.height as i32,
-            content_height,
+            self.content_height,
             MARGIN,
         );
         if sy != self.scroll_y {
@@ -1659,15 +1661,15 @@ impl State {
     }
 
     /// Lay out the current text, wrapping to the window width less a margin on
-    /// each side. Per-line metrics come from the font set during the build. The
-    /// cursor (or selection) is passed in as the active range so a heading the
-    /// caret is editing keeps its `#` markers while the rest collapse them.
+    /// each side, and cache the result with its content height. Per-line metrics
+    /// come from the font set during the build. The cursor (or selection) is the
+    /// active range, so a heading the caret is editing keeps its `#` markers while
+    /// the rest collapse them.
     ///
-    /// The result is memoized on `(version, width, active)`: the geometry
-    /// depends on nothing else, so a scroll or idle redraw clones the cached
-    /// layout (a cheap copy) instead of re-wrapping and re-measuring every line.
-    /// Only an edit, cursor move, or resize misses the cache and rebuilds.
-    fn layout(&mut self) -> Layout {
+    /// Memoized on `(version, width, active)`: the geometry depends on nothing
+    /// else, so a scroll or idle redraw is a no-op here and reuses the cache. Only
+    /// an edit, cursor move, or resize misses and rebuilds.
+    fn ensure_layout(&mut self) {
         let cursor = self.text.cursor();
         let active = self.text.selection().unwrap_or((cursor, cursor));
         let key = (self.text.version(), self.width, active.0, active.1);
@@ -1682,11 +1684,22 @@ impl State {
                 FONT_SIZE,
                 active,
             );
+            self.content_height = layout.text_height() + 2 * MARGIN;
             self.layout_cache = Some(layout);
             self.layout_key = Some(key);
         }
-        // Built above when missing, so the unwrap always holds.
+    }
+
+    /// The memoized layout, cloned for callers that read its geometry while also
+    /// mutating other `State` fields. The scroll path avoids the clone via
+    /// [`Self::ensure_layout`] and the cached [`Self::content_height`].
+    fn layout(&mut self) -> Layout {
+        self.ensure_layout();
+        // `ensure_layout` populates the cache; the rebuild branch is an
+        // unreachable guard that keeps this allocation-free path panic-free.
         self.layout_cache.clone().unwrap_or_else(|| {
+            let cursor = self.text.cursor();
+            let active = self.text.selection().unwrap_or((cursor, cursor));
             Layout::build(
                 &self.fonts,
                 self.text.rope(),

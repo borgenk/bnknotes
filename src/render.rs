@@ -116,23 +116,24 @@ impl<'a> Canvas<'a> {
     ) -> i32 {
         let mut pen = pen_x as f32;
         for ch in text.chars() {
-            let glyph = face.rasterize(ch);
-            let origin_x = pen.round() as i32 + glyph.left;
-            let origin_y = baseline - glyph.top;
-            for row in 0..glyph.rows {
-                for col in 0..glyph.width {
-                    let coverage = glyph.coverage[row * glyph.width + col];
-                    if coverage > 0 {
-                        self.blend(
-                            origin_x + col as i32,
-                            origin_y + row as i32,
-                            color,
-                            coverage,
-                        );
+            face.with_glyph(ch, |glyph| {
+                let origin_x = pen.round() as i32 + glyph.left;
+                let origin_y = baseline - glyph.top;
+                for row in 0..glyph.rows {
+                    for col in 0..glyph.width {
+                        let coverage = glyph.coverage[row * glyph.width + col];
+                        if coverage > 0 {
+                            self.blend(
+                                origin_x + col as i32,
+                                origin_y + row as i32,
+                                color,
+                                coverage,
+                            );
+                        }
                     }
                 }
-            }
-            pen += glyph.advance;
+                pen += glyph.advance;
+            });
         }
         pen.round() as i32
     }

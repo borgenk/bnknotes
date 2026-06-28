@@ -17,6 +17,8 @@
 
 use core::ffi::{c_char, c_int, c_long, c_short, c_uint, c_ulong, c_ushort, c_void};
 use core::ptr::{self, NonNull};
+use std::cell::RefCell;
+use std::collections::HashMap;
 
 use crate::error::{Error, Result};
 
@@ -297,6 +299,13 @@ pub struct Face {
     library: NonNull<c_void>,
     face: NonNull<FtFaceRec>,
     _data: Vec<u8>,
+    /// Rasterized glyphs cached by character. A face is opened at one fixed pixel
+    /// size and never resized, so a glyph's bitmap is stable for the face's life:
+    /// the first draw of a character rasterizes it through FreeType, every later
+    /// frame blits the cached coverage. Without this a scroll or caret blink re-runs
+    /// hinting and scan conversion for every glyph on screen, the dominant per-frame
+    /// cost. Interior mutability so drawing through a shared `&Face` can fill it.
+    glyphs: RefCell<HashMap<char, Glyph>>,
 }
 
 impl Face {
@@ -348,6 +357,7 @@ impl Face {
             library,
             face,
             _data: data,
+            glyphs: RefCell::new(HashMap::new()),
         })
     }
 
@@ -362,8 +372,22 @@ impl Face {
         Ok(())
     }
 
+    /// Run `f` over `ch`'s rasterized glyph, caching it on the face so the
+    /// FreeType render only happens the first time the character is drawn at this
+    /// size. The glyph is handed over by reference, never cloned: the coverage
+    /// buffer stays in the cache and the caller blits straight out of it.
+    pub fn with_glyph<R>(&self, ch: char, f: impl FnOnce(&Glyph) -> R) -> R {
+        let mut cache = self.glyphs.borrow_mut();
+        // `rasterize` reads only FreeType state, never the cache, so filling a
+        // miss while the cache is borrowed cannot reenter this borrow.
+        let glyph = cache.entry(ch).or_insert_with(|| self.rasterize(ch));
+        f(glyph)
+    }
+
     /// Rasterize a character at the current pixel size, copying the coverage
-    /// out. A load failure or glyphless character yields an empty glyph.
+    /// out. A load failure or glyphless character yields an empty glyph. The
+    /// render path goes through [`Self::with_glyph`], which caches the result;
+    /// this is the uncached primitive behind it.
     pub fn rasterize(&self, ch: char) -> Glyph {
         // SAFETY: face is valid; FT_Load_Char renders into the face's shared
         // glyph slot. No reference into that slot is held across this call.
@@ -636,6 +660,33 @@ mod tests {
             "A should have inked pixels"
         );
         assert!(g.advance > 0.0);
+    }
+
+    #[test]
+    fn with_glyph_matches_the_uncached_rasterization() {
+        let face = open();
+        let direct = face.rasterize('g');
+        // First access populates the cache; the handed-over glyph must match the
+        // uncached render byte for byte.
+        face.with_glyph('g', |cached| {
+            assert_eq!(cached.left, direct.left);
+            assert_eq!(cached.top, direct.top);
+            assert_eq!(cached.width, direct.width);
+            assert_eq!(cached.rows, direct.rows);
+            assert_eq!(cached.advance, direct.advance);
+            assert_eq!(cached.coverage, direct.coverage);
+        });
+    }
+
+    #[test]
+    fn with_glyph_reuses_the_cached_entry() {
+        let face = open();
+        // A second access returns the same coverage without re-rasterizing; the
+        // cache holds exactly one entry for the character.
+        let first = face.with_glyph('Q', |g| g.coverage.clone());
+        let second = face.with_glyph('Q', |g| g.coverage.clone());
+        assert_eq!(first, second);
+        assert_eq!(face.glyphs.borrow().len(), 1);
     }
 
     #[test]

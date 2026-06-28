@@ -71,6 +71,11 @@ const NEWLINE_PAD: i32 = 8;
 /// rather than butting against it.
 const CODE_PAD_X: i32 = 10;
 
+/// A small left indent for list items (bullet and ordered), so a list sits inset
+/// from the body margin. It applies to every visual line of the item; wrapped
+/// continuations add the marker's width on top for the hanging indent.
+const LIST_INDENT: i32 = 14;
+
 /// One on-screen line: the byte range of its text (excluding any trailing
 /// `'\n'`), the y of its baseline, whether a hard newline follows it, the pixel
 /// size it renders at, and its inline runs.
@@ -235,6 +240,10 @@ impl Layout {
         // `fence` holds the open fence's backtick count while inside a code block,
         // the one piece of state that carries across logical lines.
         let mut fence: Option<usize> = None;
+        // `list_depth` is the nesting depth of the most recent valid list item (or
+        // `None` outside a list), so an item is rendered as a list only when its
+        // parent, one level shallower, is present above it.
+        let mut list_depth: Option<usize> = None;
         let n_lines = rope.len_lines();
         for i in 0..n_lines {
             let ls = rope.line_to_byte(i);
@@ -259,6 +268,7 @@ impl Layout {
             // line carries `Body` as an inert style (its gutter is unused).
             let (style, size, spans, block_marker, block_persists, revealed, code_block) =
                 if let Some(open) = fence {
+                    list_depth = None;
                     let delimiter = markdown::closes_code_fence(&line, open);
                     if delimiter {
                         fence = None;
@@ -276,6 +286,7 @@ impl Layout {
                         true,
                     )
                 } else if let Some(open) = markdown::opens_code_fence(&line) {
+                    list_depth = None;
                     fence = Some(open);
                     let spans = code_block_spans(&line, true);
                     (
@@ -288,12 +299,14 @@ impl Layout {
                         true,
                     )
                 } else {
-                    let style = markdown::style_of(&line);
+                    // Resolve list nesting across lines: an item deeper than one
+                    // past the previous item has no parent and renders as body.
+                    let (style, marker) = resolve_list(&line, &mut list_depth);
                     (
                         style,
                         markdown::font_size(style, body_size),
-                        line_spans(&line),
-                        markdown::marker_len(&line),
+                        line_spans(&line, marker),
+                        marker,
                         markdown::block_marker_persists(style),
                         on_line,
                         false,
@@ -320,11 +333,22 @@ impl Layout {
             } else {
                 0
             };
-            // A code-block line insets its content by `CODE_PAD_X` on both sides so
-            // the tinted panel frames it: every segment shares the left inset (code
-            // has no marker gutter), and wrapping uses the narrower interior width.
-            let line_wrap = if code_block && wrap_width > 0 {
-                (wrap_width - 2 * CODE_PAD_X).max(1)
+            // A left inset shared by every segment of the line, and how much it
+            // narrows the wrap width: a code block pads both sides inside its
+            // panel; a list item shifts right by a small indent (one side only).
+            let is_list = matches!(
+                style,
+                markdown::LineStyle::Bullet | markdown::LineStyle::Ordered
+            );
+            let (seg_pad, wrap_reduce) = if code_block {
+                (CODE_PAD_X, 2 * CODE_PAD_X)
+            } else if is_list {
+                (LIST_INDENT, LIST_INDENT)
+            } else {
+                (0, 0)
+            };
+            let line_wrap = if wrap_width > 0 {
+                (wrap_width - wrap_reduce).max(1)
             } else {
                 wrap_width
             };
@@ -344,25 +368,18 @@ impl Layout {
             );
             let last = segments.len() - 1;
             for (k, (start, end)) in segments.into_iter().enumerate() {
-                // A code line insets every segment by the panel padding. Otherwise
-                // the first segment carries the marker inline (indent 0) and later
-                // ones inset under the text. The gutter decoration only applies
-                // once the cursor has left the line; on it the raw marker shows.
-                let indent = if code_block {
-                    CODE_PAD_X
-                } else if k == 0 {
-                    0
-                } else {
-                    block_indent
-                };
-                let gutter = if revealed {
-                    Gutter::None
-                } else {
-                    match style {
-                        markdown::LineStyle::Bullet if k == 0 => Gutter::Bullet,
-                        markdown::LineStyle::Quote => Gutter::QuoteBar { marker: k == 0 },
-                        _ => Gutter::None,
-                    }
+                // Every segment carries the shared left inset (`seg_pad`); wrapped
+                // continuations add the marker's width on top so their text hangs
+                // under the first line's text.
+                let indent = seg_pad + if k == 0 { 0 } else { block_indent };
+                // A bullet shows its dot decoration even on the cursor's own line,
+                // so a list stays a list while you edit it (the raw `- ` is the
+                // editable source beneath the dot). A quote still reveals its raw
+                // `> ` for editing, drawing the bar only once the cursor leaves.
+                let gutter = match style {
+                    markdown::LineStyle::Bullet if k == 0 => Gutter::Bullet,
+                    markdown::LineStyle::Quote if !revealed => Gutter::QuoteBar { marker: k == 0 },
+                    _ => Gutter::None,
                 };
                 lines.push(VisualLine {
                     start: ls + start,
@@ -618,11 +635,44 @@ impl Layout {
     }
 }
 
+/// Resolve a line's block style against the running list nesting `list_depth`
+/// (the depth of the most recent valid list item, or `None` outside a list),
+/// returning the effective style and its block-marker length. A list item nests
+/// by leading indentation ([`markdown::LIST_INDENT_SPACES`] per level); it only
+/// renders as a list item when its parent, one level shallower, is present above
+/// it, otherwise it falls back to plain body text (marker length `0`). Blank
+/// lines leave the nesting untouched; any other non-list line ends it.
+fn resolve_list(line: &str, list_depth: &mut Option<usize>) -> (markdown::LineStyle, usize) {
+    let style = markdown::style_of(line);
+    match style {
+        markdown::LineStyle::Bullet | markdown::LineStyle::Ordered => {
+            let depth = markdown::leading_indent(line) / markdown::LIST_INDENT_SPACES;
+            let allowed = list_depth.map_or(0, |d| d + 1);
+            if depth <= allowed {
+                *list_depth = Some(depth);
+                (style, markdown::marker_len(line))
+            } else {
+                // Over-nested: no parent one level up, so render as plain text.
+                *list_depth = None;
+                (markdown::LineStyle::Body, 0)
+            }
+        }
+        other => {
+            if !line.trim().is_empty() {
+                *list_depth = None;
+            }
+            (other, markdown::marker_len(line))
+        }
+    }
+}
+
 /// The full inline span list of a logical `line`, line-relative: a leading
-/// block marker (a heading's `#`s, if any) followed by the inline spans of the
-/// content past it, offset back over the marker. Tiles `[0, line.len())`.
-fn line_spans(line: &str) -> Vec<markdown::Span> {
-    let marker = markdown::marker_len(line);
+/// block marker of `marker` bytes (a heading's `#`s, a list `- `, etc., if any)
+/// followed by the inline spans of the content past it, offset back over the
+/// marker. Tiles `[0, line.len())`. `marker` is passed in (not recomputed) so a
+/// caller can suppress it, e.g. an over-nested list item that renders as plain
+/// body text gets `marker == 0`.
+fn line_spans(line: &str, marker: usize) -> Vec<markdown::Span> {
     let mut spans = Vec::new();
     if marker > 0 {
         spans.push(markdown::Span {
@@ -1364,12 +1414,13 @@ mod tests {
         let marker_w = render::text_advance(f.face(BODY, FontStyle::Regular), "- ").round() as i32;
         let src = "- aaaaa bbbbb";
         let r = rope(src);
+        // The list indent narrows the wrap, so widen by it to keep the split.
         let l = Layout::build(
             &f,
             &r,
             LEFT,
             TOP,
-            wrap_after(&f, "- aaaaa "),
+            wrap_after(&f, "- aaaaa ") + LIST_INDENT,
             BODY,
             (0, r.len()),
         );
@@ -1380,12 +1431,13 @@ mod tests {
             "the bullet item wraps into two visual lines"
         );
         assert_eq!(
-            lines[0].indent, 0,
-            "the marker line is flush; its marker fills the gutter"
+            lines[0].indent, LIST_INDENT,
+            "the marker line sits at the small list indent"
         );
         assert_eq!(
-            lines[1].indent, marker_w,
-            "the continuation hangs under the text by the marker width"
+            lines[1].indent,
+            LIST_INDENT + marker_w,
+            "the continuation hangs under the text, past indent and marker"
         );
         // The caret at the start of the continuation sits at the indented column,
         // not back at the margin.
@@ -1393,13 +1445,79 @@ mod tests {
         let (x, _, _) = l.caret(&f, &r, cont);
         assert_eq!(
             x,
-            LEFT + marker_w,
-            "continuation text starts past the indent"
+            LEFT + LIST_INDENT + marker_w,
+            "continuation text starts past the indent and marker"
         );
     }
 
     #[test]
-    fn a_bullet_shows_a_dot_off_its_line_and_a_raw_marker_on_it() {
+    fn a_nested_item_with_a_parent_is_a_list_item() {
+        let f = fonts();
+        // Child at depth 1 (two spaces) under a depth-0 parent.
+        let r = rope("- a\n  - b");
+        let l = layout(&f, &r);
+        let child = &l.lines()[1];
+        assert_eq!(
+            child.gutter,
+            Gutter::Bullet,
+            "a nested item with a parent renders as a bullet"
+        );
+        assert_eq!(child.indent, LIST_INDENT, "and carries the list indent");
+        let marker = child.runs.first().expect("a marker run");
+        assert!(matches!(marker.kind, markdown::SpanKind::Marker));
+        assert_eq!(
+            marker.end - marker.start,
+            4,
+            "the marker spans the indentation and the dash (`  - `)"
+        );
+    }
+
+    #[test]
+    fn an_over_nested_item_without_a_parent_renders_as_body() {
+        let f = fonts();
+        // Depth 2 (four spaces) right after a depth-0 item: no depth-1 parent.
+        let r = rope("- a\n    - b");
+        let l = layout(&f, &r);
+        let over = &l.lines()[1];
+        assert_eq!(over.gutter, Gutter::None, "no bullet without a parent");
+        assert_eq!(over.indent, 0, "and not given the list indent");
+        assert!(
+            over.runs
+                .iter()
+                .all(|run| matches!(run.kind, markdown::SpanKind::Text(_))),
+            "the whole line is plain body text, no marker"
+        );
+    }
+
+    #[test]
+    fn outdenting_a_nested_item_reparents_its_child() {
+        // Three items nested one inside the next: a (depth 0) > b (1) > c (2).
+        // Reverse-indent the middle item b. Its child c should come along, so c
+        // renders as a list item at one indent (under b), not orphaned into plain
+        // text by losing its depth-1 parent.
+        let f = fonts();
+        let mut buf = crate::text::TextBuffer::new();
+        buf.insert_str("- a\n  - b\n    - c");
+        buf.set_cursor(8, false); // on the middle item "  - b"
+        buf.nest_list_item(true); // Shift+Tab: outdent b
+        let l = Layout::build(&f, buf.rope(), LEFT, TOP, 1_000_000, BODY, (0, 0));
+        let third = &l.lines()[2];
+        assert_eq!(
+            third.gutter,
+            Gutter::Bullet,
+            "the third item still renders as a list item"
+        );
+        assert_eq!(third.indent, LIST_INDENT, "and carries the list indent");
+        let marker = third.runs.first().expect("a marker run");
+        assert_eq!(
+            marker.end - marker.start,
+            4,
+            "rendered at one indent (`  - `), reparented under b"
+        );
+    }
+
+    #[test]
+    fn a_bullet_shows_its_dot_on_and_off_its_line() {
         let f = fonts();
         let src = "- item\nx";
         let r = rope(src);
@@ -1413,8 +1531,8 @@ mod tests {
         let on = Layout::build(&f, &r, LEFT, TOP, 1_000_000, BODY, (0, 0));
         assert_eq!(
             on.lines()[0].gutter,
-            Gutter::None,
-            "the raw '- ' shows while the cursor edits the line"
+            Gutter::Bullet,
+            "and the dot stays while the cursor edits the line"
         );
     }
 
@@ -1479,7 +1597,7 @@ mod tests {
             &r,
             LEFT,
             TOP,
-            wrap_after(&f, "1. aaaaa "),
+            wrap_after(&f, "1. aaaaa ") + LIST_INDENT,
             BODY,
             (99, 99),
         );
@@ -1492,8 +1610,13 @@ mod tests {
         );
         assert_eq!(lines[1].gutter, Gutter::None);
         assert_eq!(
-            lines[1].indent, marker_w,
-            "but wrapped lines still hang-indent"
+            lines[0].indent, LIST_INDENT,
+            "the number sits at the small list indent"
+        );
+        assert_eq!(
+            lines[1].indent,
+            LIST_INDENT + marker_w,
+            "and wrapped lines still hang-indent past it"
         );
     }
 

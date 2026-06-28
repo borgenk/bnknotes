@@ -189,14 +189,7 @@ impl TextBuffer {
             self.insert_str("\n");
             return true;
         }
-        let line_idx = self.text.byte_to_line(self.cursor);
-        let ls = self.text.line_to_byte(line_idx);
-        // The line's content end, excluding its trailing '\n' if it has one.
-        let le = if line_idx + 1 < self.text.len_lines() {
-            self.text.line_to_byte(line_idx + 1) - 1
-        } else {
-            self.text.line_to_byte(line_idx + 1)
-        };
+        let (ls, le) = self.line_content_bounds(self.cursor);
         let line = self.text.byte_slice(ls..le);
         let marker_len = markdown::marker_len(&line);
         // Continue the list only while editing the item's content; with the
@@ -216,6 +209,118 @@ impl TextBuffer {
                 true
             }
         }
+    }
+
+    /// The content byte range `[ls, le)` of the logical line containing `byte`,
+    /// excluding any trailing `'\n'`.
+    fn line_content_bounds(&self, byte: usize) -> (usize, usize) {
+        let i = self.text.byte_to_line(byte);
+        let ls = self.text.line_to_byte(i);
+        let le = if i + 1 < self.text.len_lines() {
+            self.text.line_to_byte(i + 1) - 1
+        } else {
+            self.text.line_to_byte(i + 1)
+        };
+        (ls, le)
+    }
+
+    /// Whether the cursor's line is a list item (bullet or ordered, perhaps
+    /// indented), so Tab nests it rather than inserting a soft tab.
+    pub fn cursor_on_list_item(&self) -> bool {
+        let (ls, le) = self.line_content_bounds(self.cursor);
+        is_list(&self.text.byte_slice(ls..le))
+    }
+
+    /// Nest the cursor's list item one level deeper, or `outdent` it one level
+    /// shallower, by adding or removing one indentation unit of leading spaces.
+    /// Indenting is capped one level past the preceding item, so a nested item
+    /// always has a parent above it. The cursor rides with the text so the editing
+    /// position is preserved. Returns whether the buffer changed.
+    pub fn nest_list_item(&mut self, outdent: bool) -> bool {
+        let line_idx = self.text.byte_to_line(self.cursor);
+        let (ls, le) = self.line_content_bounds(self.cursor);
+        let line = self.text.byte_slice(ls..le);
+        if !is_list(&line) {
+            return false;
+        }
+        let unit = markdown::LIST_INDENT_SPACES;
+        let cur_indent = markdown::leading_indent(&line);
+        // The leading-space change applied to the item and its whole subtree.
+        let delta: i64 = if outdent {
+            let remove = cur_indent.min(unit);
+            if remove == 0 {
+                return false;
+            }
+            -(remove as i64)
+        } else {
+            // Cap one past the preceding item, so an item never nests without a
+            // parent above it.
+            let cap = self.prev_list_depth(line_idx).map_or(0, |d| d + 1);
+            if cur_indent / unit >= cap {
+                return false;
+            }
+            unit as i64
+        };
+        // The subtree: this line plus the following lines indented deeper than it
+        // (its nested descendants), so reparenting carries them along rather than
+        // orphaning a child whose parent just moved.
+        let starts = self.subtree_line_starts(line_idx, cur_indent);
+        self.checkpoint(Coalesce::None);
+        // Edit bottom-up so each line start stays valid as lower lines change.
+        for &start in starts.iter().rev() {
+            if delta > 0 {
+                self.text.insert(start, &" ".repeat(delta as usize));
+            } else {
+                self.text.remove(start..start + (-delta) as usize);
+            }
+        }
+        // Only the cursor's own line (at `ls`) shifts it; deeper lines come after.
+        self.cursor = (self.cursor as i64 + delta).max(ls as i64) as usize;
+        self.anchor = None;
+        self.touch();
+        true
+    }
+
+    /// The nesting depth of the nearest list item above line `line_idx`, skipping
+    /// blank lines; `None` if a non-list line (or the buffer top) comes first.
+    fn prev_list_depth(&self, line_idx: usize) -> Option<usize> {
+        let mut i = line_idx;
+        while i > 0 {
+            i -= 1;
+            let ls = self.text.line_to_byte(i);
+            let le = self.text.line_to_byte(i + 1) - 1;
+            let line = self.text.byte_slice(ls..le);
+            if line.trim().is_empty() {
+                continue;
+            }
+            return is_list(&line)
+                .then(|| markdown::leading_indent(&line) / markdown::LIST_INDENT_SPACES);
+        }
+        None
+    }
+
+    /// The line-start byte offsets of a list item's subtree: the line at
+    /// `line_idx`, then each following line indented deeper than `cur_indent` (its
+    /// descendants), stopping at the first line indented no deeper (a sibling or
+    /// ancestor) or the buffer end.
+    fn subtree_line_starts(&self, line_idx: usize, cur_indent: usize) -> Vec<usize> {
+        let n = self.text.len_lines();
+        let mut starts = vec![self.text.line_to_byte(line_idx)];
+        let mut i = line_idx + 1;
+        while i < n {
+            let ls = self.text.line_to_byte(i);
+            let le = if i + 1 < n {
+                self.text.line_to_byte(i + 1) - 1
+            } else {
+                self.text.line_to_byte(i + 1)
+            };
+            if markdown::leading_indent(&self.text.byte_slice(ls..le)) <= cur_indent {
+                break;
+            }
+            starts.push(ls);
+            i += 1;
+        }
+        starts
     }
 
     /// Delete the byte range `[start, end)` as one undo step, leaving the cursor
@@ -573,6 +678,15 @@ impl TextBuffer {
         let s = self.text.byte_slice(ls..le);
         Some(ls + grapheme::next_boundary(&s, self.cursor - ls))
     }
+}
+
+/// Whether `line` is a list item (bullet or ordered, perhaps indented), the
+/// lines Tab nests and `enter` continues.
+fn is_list(line: &str) -> bool {
+    matches!(
+        markdown::style_of(line),
+        markdown::LineStyle::Bullet | markdown::LineStyle::Ordered
+    )
 }
 
 /// Whether inserting `s` should coalesce with adjacent typing: a single
@@ -1210,6 +1324,53 @@ mod tests {
         b.insert_str("first\nlast");
         b.select_line_at(8); // inside "last"
         assert_eq!(b.selected_text().as_deref(), Some("last"));
+    }
+
+    #[test]
+    fn tab_nests_a_list_item_under_its_parent_and_caps_without_one() {
+        let mut b = TextBuffer::new();
+        b.insert_str("- a\n- b"); // cursor ends on the second item
+        assert!(b.cursor_on_list_item());
+        // Tab nests "- b" under "- a".
+        assert!(b.nest_list_item(false));
+        assert_eq!(b.text(), "- a\n  - b");
+        // Tab again is capped: a depth-2 child has no depth-1 parent.
+        assert!(!b.nest_list_item(false));
+        assert_eq!(b.text(), "- a\n  - b");
+        // Shift+Tab outdents it back to the top level.
+        assert!(b.nest_list_item(true));
+        assert_eq!(b.text(), "- a\n- b");
+        // Shift+Tab at depth 0 has nothing to remove.
+        assert!(!b.nest_list_item(true));
+    }
+
+    #[test]
+    fn nesting_cascades_to_descendants() {
+        let mut b = TextBuffer::new();
+        b.insert_str("- a\n  - b\n    - c"); // a > b > c, each one deeper
+        b.set_cursor(8, false); // on the middle item "  - b"
+                                // Outdenting b carries its child c along, so c stays nested under b.
+        b.nest_list_item(true);
+        assert_eq!(b.text(), "- a\n- b\n  - c");
+        // Indenting b again carries c back down: the subtree moves as a unit.
+        b.nest_list_item(false);
+        assert_eq!(b.text(), "- a\n  - b\n    - c");
+    }
+
+    #[test]
+    fn tab_keeps_the_cursor_with_the_text_and_is_a_no_op_off_a_list() {
+        let mut b = TextBuffer::new();
+        b.insert_str("- a\n- item");
+        let before = b.cursor();
+        b.nest_list_item(false); // inserts two spaces at the line start
+        assert_eq!(
+            b.cursor(),
+            before + 2,
+            "the cursor rides the inserted indent"
+        );
+        // A non-list line is not Tab-nestable.
+        b.insert_str("\n\nplain");
+        assert!(!b.cursor_on_list_item());
     }
 
     #[test]

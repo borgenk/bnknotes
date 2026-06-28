@@ -15,10 +15,10 @@
 //!   style interior runs of a line, with their delimiters hidden once the cursor
 //!   leaves the line.
 //!
-//! Scope for now: ATX headings, bullet/ordered/quote lines, thematic breaks
-//! (horizontal rules), inline code, and bold/italic emphasis. Indented block
-//! markers (CommonMark allows up to three leading spaces) are deliberately not
-//! recognized; notes are written at the left margin.
+//! Scope for now: ATX headings, bullet/ordered/quote lines (which may be indented
+//! for nesting, [`LIST_INDENT_SPACES`] per level), thematic breaks (horizontal
+//! rules), inline code, and bold/italic emphasis. Indented *headings* and quotes
+//! are still not recognized; only list items nest.
 
 /// The block style of one logical line. A closed set, extended as more markup
 /// lands.
@@ -134,12 +134,16 @@ pub fn block_marker_persists(style: LineStyle) -> bool {
 pub fn next_item_marker(line: &str) -> Option<String> {
     let marker = &line[..marker_len(line)];
     match style_of(line) {
+        // A bullet or quote repeats its marker verbatim, keeping any indentation.
         LineStyle::Bullet | LineStyle::Quote => Some(marker.to_string()),
         LineStyle::Ordered => {
-            // The marker is <digits><'.'|')'><space>; bump the number, keep the rest.
-            let digits = marker.bytes().take_while(u8::is_ascii_digit).count();
-            let next = marker[..digits].parse::<u64>().ok()?.wrapping_add(1);
-            Some(format!("{next}{}", &marker[digits..]))
+            // The marker is <indent><digits><'.'|')'><space>; bump the number,
+            // keep the indentation and delimiter so a nested item stays nested.
+            let indent = leading_indent(marker);
+            let rest = &marker[indent..];
+            let digits = rest.bytes().take_while(u8::is_ascii_digit).count();
+            let next = rest[..digits].parse::<u64>().ok()?.wrapping_add(1);
+            Some(format!("{}{next}{}", &marker[..indent], &rest[digits..]))
         }
         LineStyle::Body | LineStyle::Heading(_) | LineStyle::Rule => None,
     }
@@ -175,27 +179,42 @@ fn heading_marker_len(line: &str) -> usize {
     }
 }
 
-/// Marker length if `line` is a bullet item: `-`, `+`, or `*` followed by a
-/// space. The space is required, so `*italic*` is not mistaken for a bullet and a
-/// bare `-` stays body text.
+/// Spaces of leading indentation per list nesting level. A list item with this
+/// many leading spaces is one level deep, twice as many is two levels, and so on
+/// (see [`crate::layout`], which resolves a depth against its parent). Tab on a
+/// list item adds one unit; Shift+Tab removes one.
+pub const LIST_INDENT_SPACES: usize = 2;
+
+/// The count of leading spaces on `line` (its list indentation).
+pub fn leading_indent(line: &str) -> usize {
+    line.bytes().take_while(|&b| b == b' ').count()
+}
+
+/// Marker length if `line` is a bullet item: optional leading indentation (for
+/// nesting), then `-`, `+`, or `*` followed by a space. The returned length spans
+/// the indentation and the marker. The space is required, so `*italic*` is not
+/// mistaken for a bullet and a bare `-` stays body text.
 fn bullet_marker(line: &str) -> Option<usize> {
-    let bytes = line.as_bytes();
-    match bytes.first() {
-        Some(b'-' | b'+' | b'*') if bytes.get(1) == Some(&b' ') => Some(2),
+    let indent = leading_indent(line);
+    let rest = &line.as_bytes()[indent..];
+    match rest.first() {
+        Some(b'-' | b'+' | b'*') if rest.get(1) == Some(&b' ') => Some(indent + 2),
         _ => None,
     }
 }
 
-/// Marker length if `line` is an ordered item: one to nine digits, then `.` or
-/// `)`, then a required space (so `1.foo` and a bare `1.` stay body text).
+/// Marker length if `line` is an ordered item: optional leading indentation, one
+/// to nine digits, then `.` or `)`, then a required space (so `1.foo` and a bare
+/// `1.` stay body text). The length spans the indentation and the marker.
 fn ordered_marker(line: &str) -> Option<usize> {
-    let bytes = line.as_bytes();
+    let indent = leading_indent(line);
+    let bytes = &line.as_bytes()[indent..];
     let digits = bytes.iter().take_while(|&&b| b.is_ascii_digit()).count();
     if digits == 0 || digits > 9 {
         return None;
     }
     match bytes.get(digits) {
-        Some(b'.' | b')') if bytes.get(digits + 1) == Some(&b' ') => Some(digits + 2),
+        Some(b'.' | b')') if bytes.get(digits + 1) == Some(&b' ') => Some(indent + digits + 2),
         _ => None,
     }
 }
@@ -684,6 +703,32 @@ mod tests {
         // Headings and body never continue.
         assert_eq!(next_item_marker("# h"), None);
         assert_eq!(next_item_marker("plain"), None);
+    }
+
+    #[test]
+    fn recognizes_indented_list_items_for_nesting() {
+        // Leading spaces before a marker are nesting indentation; the marker
+        // length spans them.
+        assert_eq!(style_of("  - sub"), LineStyle::Bullet);
+        assert_eq!(marker_len("  - sub"), 4);
+        assert_eq!(leading_indent("  - sub"), 2);
+        assert_eq!(style_of("    1. deep"), LineStyle::Ordered);
+        assert_eq!(marker_len("    1. deep"), 7);
+        // A flat item is unchanged, and a bare indented word is still body.
+        assert_eq!(marker_len("- x"), 2);
+        assert_eq!(leading_indent("- x"), 0);
+        assert_eq!(style_of("    plain"), LineStyle::Body);
+    }
+
+    #[test]
+    fn next_item_marker_preserves_indentation() {
+        assert_eq!(next_item_marker("  - a").as_deref(), Some("  - "));
+        assert_eq!(next_item_marker("  1. a").as_deref(), Some("  2. "));
+        assert_eq!(
+            next_item_marker("    9) z").as_deref(),
+            Some("    10) "),
+            "indented ordered carries its indent and carries the digit"
+        );
     }
 
     #[test]

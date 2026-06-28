@@ -648,14 +648,20 @@ impl State {
                     let face = run_face(fonts, line.size, run.kind, line.heading.is_some());
                     let slice = rope.byte_slice(run.start..run.end);
                     // The block marker (the first run on a list/quote line) gives
-                    // way to its gutter decoration once the cursor leaves: a bullet
-                    // glyph for a list, nothing for a quote (the bar above replaces
-                    // it). Either keeps the source width, so the text never shifts.
+                    // way to its gutter decoration: a bullet glyph for a list,
+                    // nothing for a quote (the bar above replaces it). Either keeps
+                    // the source width, so the text never shifts.
                     if i == 0 && matches!(run.kind, markdown::SpanKind::Marker) {
                         let advance = render::text_advance(face, &slice).round() as i32;
                         match line.gutter {
                             Gutter::Bullet => {
-                                canvas.draw_text(face, pen, baseline, BULLET, FOREGROUND);
+                                // Draw the marker's leading indentation first, so a
+                                // nested item's dot sits at its depth, then the dot
+                                // in place of the dash.
+                                let indent = slice.len() - slice.trim_start().len();
+                                let dot_x = pen
+                                    + render::text_advance(face, &slice[..indent]).round() as i32;
+                                canvas.draw_text(face, dot_x, baseline, BULLET, FOREGROUND);
                                 pen += advance;
                                 continue;
                             }
@@ -960,14 +966,17 @@ impl State {
                 self.goal_x = None;
                 self.text.enter()
             }
-            // Tab inserts a soft tab. Shift+Tab (back-tab/dedent) needs leading-
-            // whitespace tracking we do not have yet, so it is a no-op for now.
+            // On a list item, Tab nests it one level deeper and Shift+Tab one
+            // shallower. Anywhere else, Tab inserts a soft tab and Shift+Tab is a
+            // no-op (there is nothing to dedent).
             KeyAction::Tab => {
-                if extend {
+                self.goal_x = None;
+                if self.text.cursor_on_list_item() {
+                    self.text.nest_list_item(extend)
+                } else if extend {
                     false
                 } else {
                     self.text.insert_str(SOFT_TAB);
-                    self.goal_x = None;
                     true
                 }
             }

@@ -11,6 +11,7 @@ mod freetype;
 mod grapheme;
 mod layout;
 mod markdown;
+mod perf;
 mod protocol;
 mod render;
 mod rope;
@@ -21,7 +22,15 @@ mod wire;
 mod xkb;
 
 fn main() {
-    if let Err(e) = app::run() {
+    // `--perf` runs the offline performance harness instead of opening a window;
+    // everything else launches the editor (with an optional file path).
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let result = if args.iter().any(|a| a == "--perf") {
+        perf::run(&args)
+    } else {
+        app::run()
+    };
+    if let Err(e) = result {
         eprintln!("bnknotes: {e}");
         std::process::exit(1);
     }

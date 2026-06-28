@@ -4,3 +4,6 @@ target/
 
 # Release output
 dist/
+
+# Perf harness: the committed baseline stays tracked; each run's latest does not.
+perf/latest.txt

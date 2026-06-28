@@ -106,6 +106,10 @@ pub struct VisualLine {
     /// app colors heading text by level, and the pixel `size` already carries the
     /// heading's scale.
     pub heading: Option<u8>,
+    /// True to draw a horizontal rule for this line: a thematic break (`---`)
+    /// whose cursor has left, so its raw markers are collapsed. While the cursor is
+    /// on the line this is false and the editable `---` shows instead.
+    pub rule: bool,
 }
 
 /// The live-preview decoration of a visual line's left gutter, chosen once the
@@ -302,6 +306,10 @@ impl Layout {
                 markdown::LineStyle::Heading(level) => Some(level),
                 _ => None,
             };
+            // A thematic break draws as a horizontal rule once the cursor leaves
+            // it; on the line itself the raw `---` shows (and `revealed` is true),
+            // matching how a heading reveals its `#`.
+            let rule = matches!(style, markdown::LineStyle::Rule) && !revealed;
             // A list or quote item hangs its wrapped continuations under the text:
             // the inset is the marker's width, measured on the source marker in the
             // regular face at this line's size, so it matches the width the marker
@@ -377,6 +385,7 @@ impl Layout {
                     gutter,
                     code_block,
                     heading,
+                    rule,
                 });
                 box_top += metrics.line_height;
             }
@@ -424,6 +433,15 @@ impl Layout {
     pub fn offset_at(&self, fonts: &Fonts, rope: &Rope, x: f32, y: f32) -> usize {
         let line = self.line_for_y(fonts, y);
         self.hit_line(fonts, rope, line, x)
+    }
+
+    /// If the visual line at content-space `y` is a rendered horizontal rule (a
+    /// thematic break whose cursor has left), its content byte range
+    /// `(start, end)`. A click there selects the whole rule rather than dropping a
+    /// caret between its `---` markers; `None` for any other line.
+    pub fn rule_at(&self, fonts: &Fonts, y: f32) -> Option<(usize, usize)> {
+        let line = self.line_for_y(fonts, y);
+        line.rule.then_some((line.start, line.end))
     }
 
     /// The byte offset reached by moving `dir` lines (-1 up, +1 down) from
@@ -1699,5 +1717,52 @@ mod tests {
             run_face(&f, size, text(markdown::Emphasis::Regular), false),
             f.face(size, FontStyle::Regular),
         ));
+    }
+
+    #[test]
+    fn a_thematic_break_draws_a_rule_off_its_line_and_dashes_on_it() {
+        let f = fonts();
+        let src = "a\n---\nb";
+        let r = rope(src);
+        // Cursor on "a": the rule line (line 1) is off-cursor, so it draws a rule
+        // and its raw `---` collapses.
+        let away = Layout::build(&f, &r, LEFT, TOP, 1_000_000, BODY, (0, 0));
+        let line = &away.lines()[1];
+        assert!(line.rule, "the rule draws when the cursor is elsewhere");
+        assert!(
+            line.runs.iter().all(|run| !run.visible),
+            "the raw --- is collapsed off the line"
+        );
+        // Cursor on the --- line: it shows the editable dashes, no rule.
+        let on_off = src.find("---").unwrap();
+        let on = Layout::build(&f, &r, LEFT, TOP, 1_000_000, BODY, (on_off, on_off));
+        let line = &on.lines()[1];
+        assert!(!line.rule, "no rule while the cursor edits the line");
+        assert!(
+            line.runs
+                .iter()
+                .any(|run| run.visible && matches!(run.kind, markdown::SpanKind::Marker)),
+            "the raw --- shows for editing"
+        );
+    }
+
+    #[test]
+    fn rule_at_reports_a_rendered_rule_for_a_click() {
+        let f = fonts();
+        let src = "a\n---\nb";
+        let r = rope(src);
+        // Cursor on "a": the rule line (line 1, bytes 2..5) is rendered.
+        let l = Layout::build(&f, &r, LEFT, TOP, 1_000_000, BODY, (0, 0));
+        assert_eq!(
+            l.rule_at(&f, l.lines()[1].baseline as f32),
+            Some((2, 5)),
+            "a click on the rendered rule yields its content range"
+        );
+        // A body line is never a click-selectable rule.
+        assert_eq!(l.rule_at(&f, l.lines()[0].baseline as f32), None);
+        // Once the cursor edits the rule it shows the raw ---, so a click there
+        // edits rather than reselecting.
+        let on = Layout::build(&f, &r, LEFT, TOP, 1_000_000, BODY, (2, 2));
+        assert_eq!(on.rule_at(&f, on.lines()[1].baseline as f32), None);
     }
 }

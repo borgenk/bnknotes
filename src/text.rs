@@ -334,6 +334,14 @@ impl TextBuffer {
         self.set_selection(start, end);
     }
 
+    /// Select the half-open byte range `[start, end)`, anchor at `start` and
+    /// cursor at `end`, for selecting a whole rendered element on a click (a
+    /// horizontal rule). `start`/`end` come from the layout's line bounds, so they
+    /// already sit on cluster boundaries.
+    pub fn select_range(&mut self, start: usize, end: usize) {
+        self.set_selection(start, end);
+    }
+
     /// Set the selection to the half-open range `[start, end)` with the cursor at
     /// `end`. A collapsed range (`start == end`) leaves a bare cursor, no
     /// selection. Breaks the coalescing group, like any cursor move.
@@ -1202,5 +1210,18 @@ mod tests {
         b.insert_str("first\nlast");
         b.select_line_at(8); // inside "last"
         assert_eq!(b.selected_text().as_deref(), Some("last"));
+    }
+
+    #[test]
+    fn select_range_anchors_at_start_and_puts_cursor_at_end() {
+        let mut b = TextBuffer::from_text("---\nx".to_string());
+        b.select_range(0, 3); // select the "---"
+        assert_eq!(b.selection(), Some((0, 3)));
+        assert_eq!(b.cursor(), 3, "cursor at the end of the range");
+        assert_eq!(b.selected_text().as_deref(), Some("---"));
+        // A collapsed range leaves a bare cursor, no selection.
+        b.select_range(2, 2);
+        assert_eq!(b.selection(), None);
+        assert_eq!(b.cursor(), 2);
     }
 }

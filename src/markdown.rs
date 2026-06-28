@@ -15,10 +15,10 @@
 //!   style interior runs of a line, with their delimiters hidden once the cursor
 //!   leaves the line.
 //!
-//! Scope for now: ATX headings, bullet/ordered/quote lines, inline code, and
-//! bold/italic emphasis. Indented block markers (CommonMark allows up to three
-//! leading spaces) are deliberately not recognized; notes are written at the left
-//! margin.
+//! Scope for now: ATX headings, bullet/ordered/quote lines, thematic breaks
+//! (horizontal rules), inline code, and bold/italic emphasis. Indented block
+//! markers (CommonMark allows up to three leading spaces) are deliberately not
+//! recognized; notes are written at the left margin.
 
 /// The block style of one logical line. A closed set, extended as more markup
 /// lands.
@@ -34,6 +34,9 @@ pub enum LineStyle {
     Ordered,
     /// A blockquote (`>` then an optional space).
     Quote,
+    /// A thematic break (horizontal rule): a line of `---`, `***`, `___`, or a
+    /// spaced variant. Drawn as a horizontal line once the cursor leaves it.
+    Rule,
 }
 
 /// The ATX heading level of `line`, or `None` if it is not a heading. A heading
@@ -60,6 +63,10 @@ pub fn heading_level(line: &str) -> Option<u8> {
 pub fn style_of(line: &str) -> LineStyle {
     if let Some(level) = heading_level(line) {
         LineStyle::Heading(level)
+    } else if is_thematic_break(line) {
+        // Checked before bullets so a spaced `- - -` or `* * *` reads as a rule,
+        // not a list item.
+        LineStyle::Rule
     } else if quote_marker(line).is_some() {
         LineStyle::Quote
     } else if bullet_marker(line).is_some() {
@@ -69,6 +76,28 @@ pub fn style_of(line: &str) -> LineStyle {
     } else {
         LineStyle::Body
     }
+}
+
+/// Whether `line` is a thematic break (horizontal rule): three or more of the
+/// same marker character (`-`, `*`, or `_`), separated only by spaces or tabs and
+/// nothing else, per CommonMark. So `---`, `***`, `___`, and `- - -` are rules,
+/// but `--` (too few), `-*-` (mixed), and `- item` (other text) are not.
+pub fn is_thematic_break(line: &str) -> bool {
+    let mut marker = None;
+    let mut count = 0u32;
+    for &b in line.as_bytes() {
+        match b {
+            b'-' | b'*' | b'_' => {
+                if *marker.get_or_insert(b) != b {
+                    return false;
+                }
+                count += 1;
+            }
+            b' ' | b'\t' => {}
+            _ => return false,
+        }
+    }
+    count >= 3
 }
 
 /// Byte length of `line`'s block marker prefix (the syntax drawn in a distinct
@@ -81,6 +110,8 @@ pub fn marker_len(line: &str) -> usize {
         LineStyle::Bullet => bullet_marker(line).unwrap_or(0),
         LineStyle::Ordered => ordered_marker(line).unwrap_or(0),
         LineStyle::Quote => quote_marker(line).unwrap_or(0),
+        // The whole rule is its marker: it collapses to the drawn line off-cursor.
+        LineStyle::Rule => line.len(),
     }
 }
 
@@ -110,7 +141,7 @@ pub fn next_item_marker(line: &str) -> Option<String> {
             let next = marker[..digits].parse::<u64>().ok()?.wrapping_add(1);
             Some(format!("{next}{}", &marker[digits..]))
         }
-        LineStyle::Body | LineStyle::Heading(_) => None,
+        LineStyle::Body | LineStyle::Heading(_) | LineStyle::Rule => None,
     }
 }
 
@@ -187,7 +218,11 @@ fn quote_marker(line: &str) -> Option<usize> {
 /// dependency on rounding.
 pub fn font_size(style: LineStyle, base: u32) -> u32 {
     let tenths = match style {
-        LineStyle::Body | LineStyle::Bullet | LineStyle::Ordered | LineStyle::Quote => {
+        LineStyle::Body
+        | LineStyle::Bullet
+        | LineStyle::Ordered
+        | LineStyle::Quote
+        | LineStyle::Rule => {
             return base;
         }
         LineStyle::Heading(1) => 17,
@@ -649,6 +684,41 @@ mod tests {
         // Headings and body never continue.
         assert_eq!(next_item_marker("# h"), None);
         assert_eq!(next_item_marker("plain"), None);
+    }
+
+    #[test]
+    fn recognizes_thematic_breaks() {
+        for line in [
+            "---",
+            "***",
+            "___",
+            "- - -",
+            "* * *",
+            "_ _ _",
+            "----------",
+            "*** ",
+        ] {
+            assert!(is_thematic_break(line), "{line:?} is a rule");
+            assert_eq!(style_of(line), LineStyle::Rule, "{line:?}");
+        }
+        // The whole line is the marker, so it collapses to the drawn rule off-line.
+        assert_eq!(marker_len("---"), 3);
+        assert_eq!(marker_len("- - -"), 5);
+        // A rule never continues on Enter and is body size.
+        assert_eq!(next_item_marker("---"), None);
+        assert_eq!(font_size(LineStyle::Rule, 32), 32);
+    }
+
+    #[test]
+    fn non_rules_are_not_thematic_breaks() {
+        for line in [
+            "--", "__", "**", "-x-", "-*-", "- item", "* list", "**bold**", "", "## h", "1. a",
+        ] {
+            assert!(!is_thematic_break(line), "{line:?} is not a rule");
+        }
+        // A spaced dash run is a rule, but a real bullet stays a bullet.
+        assert_eq!(style_of("- - -"), LineStyle::Rule);
+        assert_eq!(style_of("- item"), LineStyle::Bullet);
     }
 
     #[test]

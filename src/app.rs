@@ -80,6 +80,10 @@ const HEADING_COLORS: [u32; 6] = [
 const QUOTE_BAR_COLOR: u32 = 0x003f_444b;
 const QUOTE_BAR_WIDTH: i32 = 3;
 const BULLET: &str = "•";
+/// A thematic break (`---`) renders as a thin horizontal line across the content
+/// width once the cursor leaves it, in a muted line tone.
+const RULE_COLOR: u32 = 0x003f_444b;
+const RULE_THICKNESS: i32 = 2;
 /// Body text pixel size; headings scale up from it (see [`markdown::font_size`]).
 const FONT_SIZE: u32 = 14;
 /// Inset of the text from the top-left corner (both axes).
@@ -615,6 +619,20 @@ impl State {
                         QUOTE_BAR_WIDTH,
                         m.line_height,
                         QUOTE_BAR_COLOR,
+                    );
+                }
+                // A thematic break draws a horizontal line centered in its row; the
+                // raw `---` is collapsed (its runs are hidden), so nothing else
+                // paints on the line.
+                if line.rule {
+                    let mid = baseline - m.ascent + m.line_height / 2;
+                    let rule_w = (width as i32 - 2 * MARGIN).max(0);
+                    canvas.fill_rect(
+                        MARGIN,
+                        mid - RULE_THICKNESS / 2,
+                        rule_w,
+                        RULE_THICKNESS,
+                        RULE_COLOR,
                     );
                 }
                 // Content is inset by the line's hanging indent (0 unless this is
@@ -1263,6 +1281,22 @@ impl State {
         self.click_count = if chained { self.click_count + 1 } else { 1 };
         self.last_click = Some(now);
         self.last_click_pos = (self.pointer_x, self.pointer_y);
+
+        // A plain click on a rendered horizontal rule selects the whole rule line
+        // (cursor at its end) rather than dropping a caret between its `---`
+        // markers. Shift-click falls through so it can still extend a selection
+        // across one.
+        if !self.xkb.shift_active() {
+            let cy = self.pointer_y + self.scroll_y as f32;
+            let layout = self.layout();
+            if let Some((start, end)) = layout.rule_at(&self.fonts, cy) {
+                self.text.select_range(start, end);
+                self.selecting = false;
+                self.dirty = true;
+                self.bump_caret();
+                return;
+            }
+        }
 
         match self.click_count {
             1 => {

@@ -17,7 +17,7 @@
 
 use core::ffi::{c_char, c_int, c_long, c_short, c_uint, c_ulong, c_ushort, c_void};
 use core::ptr::{self, NonNull};
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 
 use crate::error::{Error, Result};
@@ -306,6 +306,49 @@ pub struct Face {
     /// hinting and scan conversion for every glyph on screen, the dominant per-frame
     /// cost. Interior mutability so drawing through a shared `&Face` can fill it.
     glyphs: RefCell<HashMap<char, Glyph>>,
+    /// Pen advances cached by character, the measure-only twin of `glyphs`. Layout
+    /// measures every character to wrap and size runs but rasterizes only the ones
+    /// on screen, and the advance is constant for a fixed-size face, so caching it
+    /// turns a per-character `FT_Load_Char` (hinting plus metrics) into a map hit.
+    /// Without this a full re-layout reloads every glyph's metrics through FreeType,
+    /// which dominates the rebuild a selection drag triggers each frame.
+    advances: RefCell<HashMap<char, f32>>,
+    /// Glyph-cache hit and miss tallies, bumped on every [`Self::with_glyph`].
+    /// Pure instrumentation (see [`CacheStats`]): a near-zero steady-state miss
+    /// rate is the evidence that the cache is doing its job rather than thrashing.
+    hits: Cell<u64>,
+    misses: Cell<u64>,
+}
+
+/// A snapshot of a glyph cache's hit and miss tallies. Summing these across every
+/// face turns "scrolling feels smooth" into a number: once the working set is
+/// cached, steady-state frames should add hits and almost no misses.
+#[derive(Clone, Copy, Default)]
+pub struct CacheStats {
+    pub hits: u64,
+    pub misses: u64,
+}
+
+impl CacheStats {
+    fn merge(self, other: Self) -> Self {
+        Self {
+            hits: self.hits + other.hits,
+            misses: self.misses + other.misses,
+        }
+    }
+
+    /// Total lookups (hits + misses).
+    pub fn lookups(self) -> u64 {
+        self.hits + self.misses
+    }
+
+    /// Fraction of lookups served from the cache, 0.0 when nothing was looked up.
+    pub fn hit_rate(self) -> f32 {
+        match self.lookups() {
+            0 => 0.0,
+            total => self.hits as f32 / total as f32,
+        }
+    }
 }
 
 impl Face {
@@ -358,6 +401,9 @@ impl Face {
             face,
             _data: data,
             glyphs: RefCell::new(HashMap::new()),
+            advances: RefCell::new(HashMap::new()),
+            hits: Cell::new(0),
+            misses: Cell::new(0),
         })
     }
 
@@ -377,11 +423,29 @@ impl Face {
     /// size. The glyph is handed over by reference, never cloned: the coverage
     /// buffer stays in the cache and the caller blits straight out of it.
     pub fn with_glyph<R>(&self, ch: char, f: impl FnOnce(&Glyph) -> R) -> R {
+        use std::collections::hash_map::Entry;
         let mut cache = self.glyphs.borrow_mut();
         // `rasterize` reads only FreeType state, never the cache, so filling a
         // miss while the cache is borrowed cannot reenter this borrow.
-        let glyph = cache.entry(ch).or_insert_with(|| self.rasterize(ch));
+        let glyph = match cache.entry(ch) {
+            Entry::Occupied(e) => {
+                self.hits.set(self.hits.get() + 1);
+                e.into_mut()
+            }
+            Entry::Vacant(e) => {
+                self.misses.set(self.misses.get() + 1);
+                e.insert(self.rasterize(ch))
+            }
+        };
         f(glyph)
+    }
+
+    /// This face's cumulative glyph-cache hit and miss counts.
+    pub fn cache_stats(&self) -> CacheStats {
+        CacheStats {
+            hits: self.hits.get(),
+            misses: self.misses.get(),
+        }
     }
 
     /// Rasterize a character at the current pixel size, copying the coverage
@@ -427,10 +491,23 @@ impl Face {
         }
     }
 
-    /// Pen advance of a character at the current pixel size, in pixels. Loads
-    /// metrics only (no rasterization), so it is cheap for measuring runs.
-    /// Zero on a load failure.
+    /// Pen advance of a character at the current pixel size, in pixels, cached on
+    /// the face. The first measurement loads the glyph's metrics through FreeType;
+    /// every later one is a map hit. Zero on a load failure.
     pub fn advance(&self, ch: char) -> f32 {
+        // `measure_advance` reads only FreeType state, never this cache, so filling
+        // a miss while the cache is borrowed cannot reenter this borrow.
+        *self
+            .advances
+            .borrow_mut()
+            .entry(ch)
+            .or_insert_with(|| self.measure_advance(ch))
+    }
+
+    /// Load a character's pen advance from FreeType, metrics only (no
+    /// rasterization), so measuring a run never pays for scan conversion. The
+    /// uncached primitive behind [`Self::advance`]. Zero on a load failure.
+    fn measure_advance(&self, ch: char) -> f32 {
         // SAFETY: face is valid; FT_LOAD_DEFAULT loads metrics into the glyph
         // slot without rendering. The advance is read out immediately.
         let err =
@@ -527,6 +604,18 @@ struct SizedFaces {
     metrics: Metrics,
 }
 
+impl SizedFaces {
+    /// Every face this size actually opened: the regular face plus whichever
+    /// variants and code face exist. Used to roll up cache stats across faces.
+    fn faces(&self) -> impl Iterator<Item = &Face> {
+        std::iter::once(&self.regular)
+            .chain(self.bold.as_ref())
+            .chain(self.italic.as_ref())
+            .chain(self.bold_italic.as_ref())
+            .chain(self.code.as_ref())
+    }
+}
+
 /// A set of [`Face`]s at different pixel sizes and styles, so a document can mix
 /// body text, larger headings, and inline emphasis. Each distinct size opens the
 /// family's regular face plus whatever variant files exist (the same files,
@@ -601,6 +690,16 @@ impl Fonts {
     /// The metrics for `size`, or the fallback's metrics if `size` was not opened.
     pub fn metrics(&self, size: u32) -> Metrics {
         self.entry(size).metrics
+    }
+
+    /// Glyph-cache hits and misses summed over every open face, for frame-loop
+    /// instrumentation.
+    pub fn cache_stats(&self) -> CacheStats {
+        self.sized
+            .iter()
+            .flat_map(SizedFaces::faces)
+            .map(Face::cache_stats)
+            .fold(CacheStats::default(), CacheStats::merge)
     }
 }
 
@@ -687,6 +786,50 @@ mod tests {
         let second = face.with_glyph('Q', |g| g.coverage.clone());
         assert_eq!(first, second);
         assert_eq!(face.glyphs.borrow().len(), 1);
+    }
+
+    #[test]
+    fn cache_stats_count_misses_then_hits() {
+        let face = open();
+        // A fresh face has touched nothing.
+        assert_eq!(face.cache_stats().lookups(), 0);
+        // First touch of a character is a miss (it rasterizes), every repeat a hit.
+        face.with_glyph('z', |_| {});
+        face.with_glyph('z', |_| {});
+        face.with_glyph('z', |_| {});
+        // A different character is another miss.
+        face.with_glyph('w', |_| {});
+        let stats = face.cache_stats();
+        assert_eq!(stats.misses, 2, "two distinct characters, two misses");
+        assert_eq!(stats.hits, 2, "two repeat lookups of 'z'");
+        assert!((stats.hit_rate() - 0.5).abs() < 1e-6, "2 hits of 4 lookups");
+    }
+
+    #[test]
+    fn fonts_cache_stats_sum_across_faces() {
+        let fonts = Fonts::new(&[16, 24]).expect("a default font should be available");
+        assert_eq!(fonts.cache_stats().lookups(), 0);
+        // Draw through two different sizes (hence different faces); the rolled-up
+        // tally must see both faces' lookups.
+        fonts.face(16, FontStyle::Regular).with_glyph('a', |_| {});
+        fonts.face(24, FontStyle::Regular).with_glyph('b', |_| {});
+        fonts.face(16, FontStyle::Regular).with_glyph('a', |_| {});
+        let stats = fonts.cache_stats();
+        assert_eq!(stats.misses, 2);
+        assert_eq!(stats.hits, 1);
+    }
+
+    #[test]
+    fn advance_is_cached_and_matches_the_uncached_measure() {
+        let face = open();
+        // A repeat lookup must return the same width and populate exactly one entry.
+        let direct = face.measure_advance('M');
+        let first = face.advance('M');
+        let second = face.advance('M');
+        assert_eq!(first, direct, "cached advance matches the raw measure");
+        assert_eq!(first, second);
+        assert!(first > 0.0);
+        assert_eq!(face.advances.borrow().len(), 1, "one cached character");
     }
 
     #[test]

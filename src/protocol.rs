@@ -28,6 +28,9 @@ pub mod wl_compositor {
 pub mod wl_surface {
     pub const ATTACH: u16 = 1;
     pub const DAMAGE: u16 = 2;
+    /// Request a one-shot `wl_callback` that fires `done` when the compositor is
+    /// ready for the next frame, pacing redraws to the refresh rate.
+    pub const FRAME: u16 = 3;
     pub const COMMIT: u16 = 6;
 }
 

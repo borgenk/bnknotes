@@ -85,9 +85,9 @@ const BULLET: &str = "•";
 const RULE_COLOR: u32 = 0x003f_444b;
 const RULE_THICKNESS: i32 = 2;
 /// Body text pixel size; headings scale up from it (see [`markdown::font_size`]).
-const FONT_SIZE: u32 = 14;
+pub(crate) const FONT_SIZE: u32 = 14;
 /// Inset of the text from the top-left corner (both axes).
-const MARGIN: i32 = 40;
+pub(crate) const MARGIN: i32 = 40;
 /// What the Tab key inserts: spaces (a "soft tab"), not a literal `'\t'`. This
 /// keeps the buffer free of tab characters and spares the renderer any tab-stop
 /// logic. Rendering literal tabs found in a *loaded* file is a separate concern.
@@ -187,6 +187,14 @@ struct State {
     pointer_x: f32,
     pointer_y: f32,
     selecting: bool,
+    /// While a drag is extending a selection, the active range used for marker
+    /// reveal is frozen to this (the press point), so dragging across the document
+    /// does not keep flipping headings/lists/code between rendered and raw markdown
+    /// under the pointer. The live selection still highlights; only the reveal is
+    /// pinned. Cleared on button release, when reveal catches up to the final
+    /// selection. Pinning it also keeps the layout cache key constant for the whole
+    /// drag, so no re-layout happens per motion event.
+    frozen_reveal: Option<(usize, usize)>,
     /// Click chaining for double/triple-click: when the last left press fired,
     /// where, and how many have chained so far (1 = single, 2 = double, ...).
     last_click: Option<Instant>,
@@ -256,6 +264,19 @@ struct State {
     closed: bool,
     /// The content changed and a frame should be drawn.
     dirty: bool,
+    /// The in-flight frame callback's id, or 0 when none is pending. Set when a
+    /// frame is committed, cleared when the compositor's `done` fires. While it is
+    /// nonzero the loop holds off redrawing, so input bursts, key repeat, and
+    /// caret blink coalesce into at most one frame per refresh (frame pacing).
+    frame_callback: u32,
+    /// When set (the `BNKNOTES_STATS` env var is present), each presented frame
+    /// prints its render time and the glyph-cache hit rate to stderr. Plain
+    /// instrumentation so an optimization can be measured rather than guessed at.
+    stats: bool,
+    /// Count of frames presented, for the stats line.
+    frame_count: u64,
+    /// When the previous frame was presented, for the inter-frame gap in stats.
+    last_present: Option<Instant>,
 }
 
 impl State {
@@ -300,6 +321,7 @@ impl State {
             pointer_x: 0.0,
             pointer_y: 0.0,
             selecting: false,
+            frozen_reveal: None,
             last_click: None,
             last_click_pos: (0.0, 0.0),
             click_count: 0,
@@ -335,6 +357,10 @@ impl State {
             configured: false,
             closed: false,
             dirty: true,
+            frame_callback: 0,
+            stats: std::env::var_os("BNKNOTES_STATS").is_some(),
+            frame_count: 0,
+            last_present: None,
         })
     }
 
@@ -510,7 +536,10 @@ impl State {
             self.fire_repeats()?;
             self.fire_autoscroll();
             self.fire_caret_blink();
-            if self.configured && self.dirty && self.render_frame()? {
+            // Pace to the compositor's clock: only draw when no frame callback is
+            // outstanding, so a burst of edits or held keys between refreshes
+            // collapses into a single repaint instead of racing both buffers.
+            if self.configured && self.dirty && self.frame_callback == 0 && self.render_frame()? {
                 self.dirty = false;
             }
             if done(self) {
@@ -531,6 +560,8 @@ impl State {
         let Some(idx) = (0..2).find(|&i| !self.busy[i]) else {
             return Ok(false);
         };
+        // Time the whole frame (layout reuse/rebuild plus paint) when stats are on.
+        let started = self.stats.then(Instant::now);
         let frame_len = self.frame_len;
         let offset = idx * frame_len;
         let width = self.width as usize;
@@ -547,163 +578,22 @@ impl State {
             let Some(pool) = self.pool.as_mut() else {
                 return Ok(false);
             };
-            let fonts = &self.fonts;
-            let rope = self.text.rope();
             let frame = &mut pool.data_mut()[offset..offset + frame_len];
             let mut canvas = Canvas::new(frame, width, height);
-            canvas.fill(BACKGROUND);
-            let view_h = height as i32;
-
-            // Block backgrounds paint first, beneath both the selection highlight
-            // and the text: a fenced code block sits on a full-width tinted panel,
-            // one line box tall so consecutive lines tile into a continuous block,
-            // and that panel must sit behind the selection rather than cover it
-            // (otherwise a selection inside the block would vanish). A collapsed
-            // fence row still paints, so an unfocused block keeps blank top and
-            // bottom rows that read as vertical padding. The block's first row
-            // rounds its top corners and its last row its bottom ones, so the whole
-            // panel reads as one softly rounded block.
-            let lines = layout.lines();
-            let panel_w = (width as i32 - 2 * MARGIN).max(0);
-            for (i, line) in lines.iter().enumerate() {
-                if !line.code_block {
-                    continue;
-                }
-                let m = fonts.metrics(line.size);
-                let top = line.baseline - scroll_y - m.ascent;
-                let h = m.line_height;
-                if top + h <= 0 || top >= view_h {
-                    continue;
-                }
-                let first = i == 0 || !lines[i - 1].code_block;
-                let last = i + 1 >= lines.len() || !lines[i + 1].code_block;
-                let corners = match (first, last) {
-                    (true, true) => render::RoundedCorners::Both,
-                    (true, false) => render::RoundedCorners::Top,
-                    (false, true) => render::RoundedCorners::Bottom,
-                    (false, false) => render::RoundedCorners::None,
-                };
-                canvas.fill_round_rect(MARGIN, top, panel_w, h, CODE_BG, CODE_RADIUS, corners);
-            }
-
-            // Inline code spans get their own tinted panel, also beneath the
-            // selection so a selection over inline code shows through (the glyphs
-            // still draw on top in the text loop). Block code is excluded here; its
-            // full-width panel above already covers it.
-            for rect in layout.code_rects(fonts, rope) {
-                canvas.fill_rect(rect.x, rect.y - scroll_y, rect.w, rect.h, CODE_BG);
-            }
-
-            // Everything is laid out in content space; the viewport scroll shifts
-            // it up by `scroll_y`. The canvas clips whatever falls off-screen.
-            if let Some((start, end)) = selection {
-                for rect in layout.selection_rects(fonts, rope, start, end) {
-                    canvas.fill_rect(rect.x, rect.y - scroll_y, rect.w, rect.h, SELECTION_COLOR);
-                }
-            }
-
-            // The text, one visual line at a time, each at its own font size,
-            // materialized from the rope. A line is a sequence of inline runs:
-            // regular text, code spans (drawn in the code face on a tinted panel),
-            // and the delimiter markers, which are dimmed on the cursor's line and
-            // collapse to nothing (skipped) once it leaves, the live-preview
-            // reveal that `layout` bakes into each run's `visible` flag.
-            for line in layout.lines() {
-                let m = fonts.metrics(line.size);
-                let baseline = line.baseline - scroll_y;
-                // Skip lines fully above or below the viewport, so a frame only
-                // rasterizes what is on screen.
-                if baseline + m.descent <= 0 || baseline - m.ascent >= view_h {
-                    continue;
-                }
-                // A blockquote draws a bar down its gutter, on every wrapped line.
-                if matches!(line.gutter, Gutter::QuoteBar { .. }) {
-                    canvas.fill_rect(
-                        MARGIN,
-                        baseline - m.ascent,
-                        QUOTE_BAR_WIDTH,
-                        m.line_height,
-                        QUOTE_BAR_COLOR,
-                    );
-                }
-                // A thematic break draws a horizontal line centered in its row; the
-                // raw `---` is collapsed (its runs are hidden), so nothing else
-                // paints on the line.
-                if line.rule {
-                    let mid = baseline - m.ascent + m.line_height / 2;
-                    let rule_w = (width as i32 - 2 * MARGIN).max(0);
-                    canvas.fill_rect(
-                        MARGIN,
-                        mid - RULE_THICKNESS / 2,
-                        rule_w,
-                        RULE_THICKNESS,
-                        RULE_COLOR,
-                    );
-                }
-                // Content is inset by the line's hanging indent (0 unless this is
-                // a wrapped list/quote continuation).
-                let mut pen = MARGIN + line.indent;
-                for (i, run) in line.runs.iter().enumerate() {
-                    if !run.visible {
-                        continue;
-                    }
-                    // Each run draws in its own face, so bold/italic emphasis is
-                    // carried by the glyphs, not color: only code and markers
-                    // recolor, the rest (regular and emphasized prose) is FG.
-                    let face = run_face(fonts, line.size, run.kind, line.heading.is_some());
-                    let slice = rope.byte_slice(run.start..run.end);
-                    // The block marker (the first run on a list/quote line) gives
-                    // way to its gutter decoration: a bullet glyph for a list,
-                    // nothing for a quote (the bar above replaces it). Either keeps
-                    // the source width, so the text never shifts.
-                    if i == 0 && matches!(run.kind, markdown::SpanKind::Marker) {
-                        let advance = render::text_advance(face, &slice).round() as i32;
-                        match line.gutter {
-                            Gutter::Bullet => {
-                                // Draw the marker's leading indentation first, so a
-                                // nested item's dot sits at its depth, then the dot
-                                // in place of the dash. The dot stands in for the
-                                // `- ` marker, so it takes the muted marker color
-                                // (MARKER_COLOR), not the brighter body FG.
-                                let indent = slice.len() - slice.trim_start().len();
-                                let dot_x = pen
-                                    + render::text_advance(face, &slice[..indent]).round() as i32;
-                                canvas.draw_text(face, dot_x, baseline, BULLET, MARKER_COLOR);
-                                pen += advance;
-                                continue;
-                            }
-                            Gutter::QuoteBar { marker: true } => {
-                                pen += advance;
-                                continue;
-                            }
-                            _ => {}
-                        }
-                    }
-                    let color = match run.kind {
-                        markdown::SpanKind::Marker => MARKER_COLOR,
-                        markdown::SpanKind::Text(markdown::Emphasis::Code) => CODE_COLOR,
-                        // Heading prose takes the level's color (the marker and any
-                        // inline code on the line keep their own); body prose is FG.
-                        markdown::SpanKind::Text(_) => match line.heading {
-                            Some(level) => HEADING_COLORS
-                                .get(level.saturating_sub(1) as usize)
-                                .copied()
-                                .unwrap_or(FOREGROUND),
-                            None => FOREGROUND,
-                        },
-                    };
-                    // Code backgrounds (inline panels and the full-width block
-                    // panel) are painted in the pre-pass above, beneath the
-                    // selection; here we only draw the glyphs over them.
-                    pen = canvas.draw_text(face, pen, baseline, &slice, color);
-                }
-            }
-
-            // The caret, drawn only on the visible half of its blink cycle.
-            if caret_visible {
-                let (cx, cy, ch) = layout.caret(fonts, rope, cursor);
-                canvas.fill_rect(cx, cy - scroll_y, CARET_WIDTH, ch, CARET_COLOR);
-            }
+            paint_document(
+                &mut canvas,
+                &self.fonts,
+                &layout,
+                self.text.rope(),
+                &PaintParams {
+                    width,
+                    height,
+                    scroll_y,
+                    selection,
+                    cursor,
+                    caret_visible,
+                },
+            );
         }
 
         let buffer = self.buffers[idx];
@@ -722,8 +612,35 @@ impl State {
                 Arg::Int(self.height as i32),
             ],
         );
+        // Arm a frame callback before committing, so the compositor tells us when
+        // the next frame is due. `run_until` won't draw again until its `done`
+        // clears `frame_callback`, which is what paces redraws to the refresh.
+        let callback = self.alloc_id();
+        self.conn
+            .request(self.surface, wl_surface::FRAME, &[Arg::NewId(callback)]);
+        self.frame_callback = callback;
         self.conn.request(self.surface, wl_surface::COMMIT, &[]);
         self.busy[idx] = true;
+
+        if let Some(started) = started {
+            let cache = self.fonts.cache_stats();
+            let gap = self
+                .last_present
+                .map(|t| started.duration_since(t).as_secs_f64() * 1000.0)
+                .unwrap_or(0.0);
+            eprintln!(
+                "[stats] frame {} {:.2}ms paint, {:.1}ms since last | glyphs hit {} miss {} ({:.1}% of {})",
+                self.frame_count,
+                started.elapsed().as_secs_f64() * 1000.0,
+                gap,
+                cache.hits,
+                cache.misses,
+                cache.hit_rate() * 100.0,
+                cache.lookups(),
+            );
+            self.last_present = Some(started);
+        }
+        self.frame_count += 1;
         Ok(true)
     }
 
@@ -755,6 +672,17 @@ impl State {
 
         if Some(msg.object) == self.pending_sync && msg.opcode == wl_callback::EV_DONE {
             self.pending_sync = None;
+            return Ok(());
+        }
+
+        // The frame callback fired: the compositor is ready for the next frame, so
+        // lift the pacing gate. The callback is one-shot; `render_frame` arms a
+        // fresh one each time it presents.
+        if self.frame_callback != 0
+            && msg.object == self.frame_callback
+            && msg.opcode == wl_callback::EV_DONE
+        {
+            self.frame_callback = 0;
             return Ok(());
         }
 
@@ -1218,6 +1146,10 @@ impl State {
                     } else {
                         self.selecting = false;
                         self.stop_autoscroll();
+                        // Drag over: let the reveal catch up to the final selection.
+                        if self.frozen_reveal.take().is_some() {
+                            self.dirty = true;
+                        }
                     }
                 }
             }
@@ -1238,7 +1170,12 @@ impl State {
     /// or drag position in surface-local pixels. The window y is shifted into
     /// content space by the scroll offset before hit-testing.
     fn place_cursor_at(&mut self, x: f32, y: f32, extend: bool) {
-        let layout = self.layout();
+        // Hit-test against the cached layout by reference; the hot drag path must
+        // not clone or rebuild it. The reveal pin keeps the cache valid throughout.
+        self.ensure_layout();
+        let Some(layout) = self.layout_cache.as_ref() else {
+            return;
+        };
         let offset = layout.offset_at(&self.fonts, self.text.rope(), x, y + self.scroll_y as f32);
         let before = self.text.cursor();
         let before_sel = self.text.selection();
@@ -1319,6 +1256,9 @@ impl State {
                 let extend = self.xkb.shift_active();
                 self.place_cursor_at(self.pointer_x, self.pointer_y, extend);
                 self.selecting = true;
+                // Pin marker reveal to the press point for the whole drag.
+                let c = self.text.cursor();
+                self.frozen_reveal = Some(self.text.selection().unwrap_or((c, c)));
             }
             2 => {
                 let offset = self.pointer_offset();
@@ -1337,13 +1277,11 @@ impl State {
     /// The byte offset under the pointer, mapping its window position into
     /// content space by the current scroll.
     fn pointer_offset(&mut self) -> usize {
-        let layout = self.layout();
-        layout.offset_at(
-            &self.fonts,
-            self.text.rope(),
-            self.pointer_x,
-            self.pointer_y + self.scroll_y as f32,
-        )
+        self.ensure_layout();
+        let (x, y) = (self.pointer_x, self.pointer_y + self.scroll_y as f32);
+        self.layout_cache.as_ref().map_or(0, |layout| {
+            layout.offset_at(&self.fonts, self.text.rope(), x, y)
+        })
     }
 
     /// Arm or disarm drag auto-scroll from the pointer's distance to a vertical
@@ -1660,18 +1598,32 @@ impl State {
         }
     }
 
+    /// The active range used for live-preview marker reveal: the live selection
+    /// (or the bare cursor when there is none), except while a drag is extending a
+    /// selection, when it is pinned to [`Self::frozen_reveal`] so the markdown
+    /// under the pointer does not flip between rendered and raw as the drag sweeps
+    /// across it. The highlight itself always tracks the live selection; only the
+    /// reveal is pinned.
+    fn reveal_range(&self) -> (usize, usize) {
+        let cursor = self.text.cursor();
+        match (self.selecting, self.frozen_reveal) {
+            (true, Some(range)) => range,
+            _ => self.text.selection().unwrap_or((cursor, cursor)),
+        }
+    }
+
     /// Lay out the current text, wrapping to the window width less a margin on
     /// each side, and cache the result with its content height. Per-line metrics
-    /// come from the font set during the build. The cursor (or selection) is the
-    /// active range, so a heading the caret is editing keeps its `#` markers while
-    /// the rest collapse them.
+    /// come from the font set during the build. The reveal range (see
+    /// [`Self::reveal_range`]) is the active range, so a heading the caret is
+    /// editing keeps its `#` markers while the rest collapse them.
     ///
     /// Memoized on `(version, width, active)`: the geometry depends on nothing
     /// else, so a scroll or idle redraw is a no-op here and reuses the cache. Only
-    /// an edit, cursor move, or resize misses and rebuilds.
+    /// an edit, cursor move, or resize misses and rebuilds. Pinning the reveal
+    /// during a drag keeps this key constant, so a drag never re-lays out.
     fn ensure_layout(&mut self) {
-        let cursor = self.text.cursor();
-        let active = self.text.selection().unwrap_or((cursor, cursor));
+        let active = self.reveal_range();
         let key = (self.text.version(), self.width, active.0, active.1);
         if self.layout_key != Some(key) {
             let wrap_width = self.width as i32 - 2 * MARGIN;
@@ -1697,9 +1649,8 @@ impl State {
         self.ensure_layout();
         // `ensure_layout` populates the cache; the rebuild branch is an
         // unreachable guard that keeps this allocation-free path panic-free.
+        let active = self.reveal_range();
         self.layout_cache.clone().unwrap_or_else(|| {
-            let cursor = self.text.cursor();
-            let active = self.text.selection().unwrap_or((cursor, cursor));
             Layout::build(
                 &self.fonts,
                 self.text.rope(),
@@ -1731,4 +1682,182 @@ impl State {
 /// Whether a clipboard MIME type carries text we can paste.
 fn is_text_mime(mime: &str) -> bool {
     mime.starts_with("text/") || mime == "UTF8_STRING"
+}
+
+/// The per-frame inputs [`paint_document`] needs beyond the layout itself: the
+/// surface size, the scroll offset, the live selection and cursor, and whether
+/// the caret is on this blink. Bundled so the paint signature stays readable and
+/// so the perf harness can drive a paint without a live surface.
+pub(crate) struct PaintParams {
+    pub width: usize,
+    pub height: usize,
+    pub scroll_y: i32,
+    pub selection: Option<(usize, usize)>,
+    pub cursor: usize,
+    pub caret_visible: bool,
+}
+
+/// Paint one frame of the document into `canvas`: background, code-block panels,
+/// inline-code panels, the selection highlight, the text (run by run, in each
+/// run's face and color, with markers collapsed or revealed as the layout
+/// decided), and the caret. Pure CPU work over the layout and rope, with no
+/// Wayland or `State` dependency, so [`State::render_frame`] and the perf harness
+/// share the exact same painter. Off-screen lines are skipped, so cost tracks the
+/// viewport, not the document.
+pub(crate) fn paint_document(
+    canvas: &mut Canvas,
+    fonts: &Fonts,
+    layout: &Layout,
+    rope: &crate::rope::Rope,
+    p: &PaintParams,
+) {
+    let (width, scroll_y) = (p.width, p.scroll_y);
+    let view_h = p.height as i32;
+    canvas.fill(BACKGROUND);
+
+    // Block backgrounds paint first, beneath both the selection highlight and the
+    // text: a fenced code block sits on a full-width tinted panel, one line box
+    // tall so consecutive lines tile into a continuous block, and that panel must
+    // sit behind the selection rather than cover it (otherwise a selection inside
+    // the block would vanish). A collapsed fence row still paints, so an unfocused
+    // block keeps blank top and bottom rows that read as vertical padding. The
+    // block's first row rounds its top corners and its last row its bottom ones, so
+    // the whole panel reads as one softly rounded block.
+    let lines = layout.lines();
+    let panel_w = (width as i32 - 2 * MARGIN).max(0);
+    for (i, line) in lines.iter().enumerate() {
+        if !line.code_block {
+            continue;
+        }
+        let m = fonts.metrics(line.size);
+        let top = line.baseline - scroll_y - m.ascent;
+        let h = m.line_height;
+        if top + h <= 0 || top >= view_h {
+            continue;
+        }
+        let first = i == 0 || !lines[i - 1].code_block;
+        let last = i + 1 >= lines.len() || !lines[i + 1].code_block;
+        let corners = match (first, last) {
+            (true, true) => render::RoundedCorners::Both,
+            (true, false) => render::RoundedCorners::Top,
+            (false, true) => render::RoundedCorners::Bottom,
+            (false, false) => render::RoundedCorners::None,
+        };
+        canvas.fill_round_rect(MARGIN, top, panel_w, h, CODE_BG, CODE_RADIUS, corners);
+    }
+
+    // Inline code spans get their own tinted panel, also beneath the selection so a
+    // selection over inline code shows through (the glyphs still draw on top in the
+    // text loop). Block code is excluded here; its full-width panel above covers it.
+    for rect in layout.code_rects(fonts, rope) {
+        canvas.fill_rect(rect.x, rect.y - scroll_y, rect.w, rect.h, CODE_BG);
+    }
+
+    // Everything is laid out in content space; the viewport scroll shifts it up by
+    // `scroll_y`. The canvas clips whatever falls off-screen.
+    if let Some((start, end)) = p.selection {
+        for rect in layout.selection_rects(fonts, rope, start, end) {
+            canvas.fill_rect(rect.x, rect.y - scroll_y, rect.w, rect.h, SELECTION_COLOR);
+        }
+    }
+
+    // The text, one visual line at a time, each at its own font size, materialized
+    // from the rope. A line is a sequence of inline runs: regular text, code spans
+    // (drawn in the code face on a tinted panel), and the delimiter markers, which
+    // are dimmed on the cursor's line and collapse to nothing (skipped) once it
+    // leaves, the live-preview reveal that `layout` bakes into each run's `visible`.
+    for line in layout.lines() {
+        let m = fonts.metrics(line.size);
+        let baseline = line.baseline - scroll_y;
+        // Skip lines fully above or below the viewport, so a frame only rasterizes
+        // what is on screen.
+        if baseline + m.descent <= 0 || baseline - m.ascent >= view_h {
+            continue;
+        }
+        // A blockquote draws a bar down its gutter, on every wrapped line.
+        if matches!(line.gutter, Gutter::QuoteBar { .. }) {
+            canvas.fill_rect(
+                MARGIN,
+                baseline - m.ascent,
+                QUOTE_BAR_WIDTH,
+                m.line_height,
+                QUOTE_BAR_COLOR,
+            );
+        }
+        // A thematic break draws a horizontal line centered in its row; the raw `---`
+        // is collapsed (its runs are hidden), so nothing else paints on the line.
+        if line.rule {
+            let mid = baseline - m.ascent + m.line_height / 2;
+            let rule_w = (width as i32 - 2 * MARGIN).max(0);
+            canvas.fill_rect(
+                MARGIN,
+                mid - RULE_THICKNESS / 2,
+                rule_w,
+                RULE_THICKNESS,
+                RULE_COLOR,
+            );
+        }
+        // Content is inset by the line's hanging indent (0 unless this is a wrapped
+        // list/quote continuation).
+        let mut pen = MARGIN + line.indent;
+        for (i, run) in line.runs.iter().enumerate() {
+            if !run.visible {
+                continue;
+            }
+            // Each run draws in its own face, so bold/italic emphasis is carried by
+            // the glyphs, not color: only code and markers recolor, the rest
+            // (regular and emphasized prose) is FG.
+            let face = run_face(fonts, line.size, run.kind, line.heading.is_some());
+            let slice = rope.byte_slice(run.start..run.end);
+            // The block marker (the first run on a list/quote line) gives way to its
+            // gutter decoration: a bullet glyph for a list, nothing for a quote (the
+            // bar above replaces it). Either keeps the source width, so text never
+            // shifts.
+            if i == 0 && matches!(run.kind, markdown::SpanKind::Marker) {
+                let advance = render::text_advance(face, &slice).round() as i32;
+                match line.gutter {
+                    Gutter::Bullet => {
+                        // Draw the marker's leading indentation first, so a nested
+                        // item's dot sits at its depth, then the dot in place of the
+                        // dash. The dot stands in for the `- ` marker, so it takes
+                        // the muted marker color (MARKER_COLOR), not the body FG.
+                        let indent = slice.len() - slice.trim_start().len();
+                        let dot_x =
+                            pen + render::text_advance(face, &slice[..indent]).round() as i32;
+                        canvas.draw_text(face, dot_x, baseline, BULLET, MARKER_COLOR);
+                        pen += advance;
+                        continue;
+                    }
+                    Gutter::QuoteBar { marker: true } => {
+                        pen += advance;
+                        continue;
+                    }
+                    _ => {}
+                }
+            }
+            let color = match run.kind {
+                markdown::SpanKind::Marker => MARKER_COLOR,
+                markdown::SpanKind::Text(markdown::Emphasis::Code) => CODE_COLOR,
+                // Heading prose takes the level's color (the marker and any inline
+                // code on the line keep their own); body prose is FG.
+                markdown::SpanKind::Text(_) => match line.heading {
+                    Some(level) => HEADING_COLORS
+                        .get(level.saturating_sub(1) as usize)
+                        .copied()
+                        .unwrap_or(FOREGROUND),
+                    None => FOREGROUND,
+                },
+            };
+            // Code backgrounds (inline panels and the full-width block panel) are
+            // painted in the pre-pass above, beneath the selection; here we only
+            // draw the glyphs over them.
+            pen = canvas.draw_text(face, pen, baseline, &slice, color);
+        }
+    }
+
+    // The caret, drawn only on the visible half of its blink cycle.
+    if p.caret_visible {
+        let (cx, cy, ch) = layout.caret(fonts, rope, p.cursor);
+        canvas.fill_rect(cx, cy - scroll_y, CARET_WIDTH, ch, CARET_COLOR);
+    }
 }

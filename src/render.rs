@@ -4,6 +4,26 @@
 
 use crate::freetype::Face;
 
+/// Which corners [`Canvas::fill_round_rect`] rounds. A fenced code block's panel
+/// is drawn row by row: its first row rounds the top, its last row the bottom, a
+/// single-row block both, and the rows between none.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum RoundedCorners {
+    None,
+    Top,
+    Bottom,
+    Both,
+}
+
+impl RoundedCorners {
+    fn top(self) -> bool {
+        matches!(self, Self::Top | Self::Both)
+    }
+    fn bottom(self) -> bool {
+        matches!(self, Self::Bottom | Self::Both)
+    }
+}
+
 pub struct Canvas<'a> {
     buf: &'a mut [u8],
     width: usize,
@@ -49,6 +69,40 @@ impl<'a> Canvas<'a> {
         }
     }
 
+    /// Fill a rectangle whose top and/or bottom corners are rounded with `radius`,
+    /// anti-aliased. A fenced code block's panel is drawn one row at a time, so the
+    /// block's first row rounds its top corners and its last row its bottom ones,
+    /// and a multi-row block reads as one rounded panel. Pixels outside a rounded
+    /// corner are left untouched, so the background shows through the curve. With
+    /// no rounded corner (or zero radius) this is a plain [`Self::fill_rect`].
+    // Positional geometry args, like `fill_rect`; a struct would not read clearer.
+    #[allow(clippy::too_many_arguments)]
+    pub fn fill_round_rect(
+        &mut self,
+        x: i32,
+        y: i32,
+        w: i32,
+        h: i32,
+        color: u32,
+        radius: i32,
+        corners: RoundedCorners,
+    ) {
+        let r = radius.clamp(0, (w / 2).min(h / 2));
+        let (round_top, round_bottom) = (corners.top(), corners.bottom());
+        if r == 0 || (!round_top && !round_bottom) {
+            self.fill_rect(x, y, w, h, color);
+            return;
+        }
+        for dy in 0..h {
+            for dx in 0..w {
+                let coverage = corner_coverage(dx, dy, w, h, r, round_top, round_bottom);
+                if coverage > 0 {
+                    self.blend(x + dx, y + dy, color, coverage);
+                }
+            }
+        }
+    }
+
     /// Lay out and draw `text` at `pen_x`, baseline `baseline`, in `color`.
     /// Glyphs are rasterized on demand; the pen advances by each glyph's
     /// advance. Returns the pen x after the last glyph.
@@ -90,6 +144,42 @@ impl<'a> Canvas<'a> {
 /// [`crate::layout`] uses this to place the caret and hit-test clicks.
 pub fn text_advance(face: &Face, text: &str) -> f32 {
     text.chars().map(|c| face.advance(c)).sum()
+}
+
+/// Coverage (0..=255) of pixel `(dx, dy)` within a `w`x`h` rounded rectangle
+/// whose top and/or bottom corners have radius `r`. Interior and straight-edge
+/// pixels are fully covered; a pixel inside an active corner square is shaded by
+/// how far its center falls within the corner's quarter-circle (centered `r` in
+/// from each rounded edge), which anti-aliases the curve.
+fn corner_coverage(
+    dx: i32,
+    dy: i32,
+    w: i32,
+    h: i32,
+    r: i32,
+    round_top: bool,
+    round_bottom: bool,
+) -> u8 {
+    let rf = r as f32;
+    // The center of the corner circle this pixel belongs to, if any; otherwise it
+    // is interior or on a straight edge and fully covered.
+    let (cx, cy) = if round_top && dx < r && dy < r {
+        (rf, rf)
+    } else if round_top && dx >= w - r && dy < r {
+        ((w - r) as f32, rf)
+    } else if round_bottom && dx < r && dy >= h - r {
+        (rf, (h - r) as f32)
+    } else if round_bottom && dx >= w - r && dy >= h - r {
+        ((w - r) as f32, (h - r) as f32)
+    } else {
+        return 255;
+    };
+    let ex = dx as f32 + 0.5 - cx;
+    let ey = dy as f32 + 0.5 - cy;
+    let dist = (ex * ex + ey * ey).sqrt();
+    // Coverage falls from 1 to 0 across the one-pixel band straddling the radius.
+    let coverage = (rf - dist + 0.5).clamp(0.0, 1.0);
+    (coverage * 255.0).round() as u8
 }
 
 /// Alpha-composite `fg` over `bg` with coverage `a` (0..=255), per channel.
@@ -160,6 +250,37 @@ mod tests {
         assert_eq!(px(1, 1), 0x00_ff_ff_ff, "inside");
         assert_eq!(px(2, 2), 0x00_ff_ff_ff, "inside, at the corner");
         assert_eq!(px(0, 1), 0, "left of the rect");
+    }
+
+    #[test]
+    fn round_rect_carves_only_the_requested_corners() {
+        let white = 0x00_ff_ff_ff;
+        let mut buf = vec![0u8; 4 * 100]; // 10x10, background 0
+        let mut canvas = Canvas::new(&mut buf, 10, 10);
+        // Round only the top corners.
+        canvas.fill_round_rect(0, 0, 10, 10, white, 3, RoundedCorners::Top);
+        let px = |x: usize, y: usize| {
+            let i = (y * 10 + x) * 4;
+            u32::from_ne_bytes(buf[i..i + 4].try_into().unwrap())
+        };
+        assert_eq!(px(5, 5), white, "the interior is fully filled");
+        assert_eq!(px(0, 0), 0, "the top-left corner is carved to background");
+        assert_eq!(px(9, 0), 0, "the top-right corner is carved");
+        assert_eq!(px(0, 9), white, "the bottom corners are left square");
+        assert_eq!(px(9, 9), white, "the bottom-right corner is left square");
+    }
+
+    #[test]
+    fn round_rect_with_no_rounded_corner_is_a_plain_fill() {
+        let white = 0x00_ff_ff_ff;
+        let mut buf = vec![0u8; 4 * 9]; // 3x3
+        let mut canvas = Canvas::new(&mut buf, 3, 3);
+        canvas.fill_round_rect(0, 0, 3, 3, white, 1, RoundedCorners::None);
+        assert!(
+            buf.chunks_exact(4)
+                .all(|p| u32::from_ne_bytes(p.try_into().unwrap()) == white),
+            "no rounded corner fills every pixel"
+        );
     }
 
     #[test]

@@ -27,7 +27,7 @@ use crate::error::{Error, Result};
 use crate::ffi;
 use crate::file::{self, FileFormat};
 use crate::freetype::Fonts;
-use crate::layout::{Gutter, Layout};
+use crate::layout::{run_face, Gutter, Layout};
 use crate::markdown;
 use crate::protocol::{
     self, wl_buffer, wl_callback, wl_compositor, wl_data_device, wl_data_device_manager,
@@ -46,25 +46,42 @@ use crate::xkb::{KeyAction, Xkb};
 const INIT_WIDTH: u32 = 800;
 const INIT_HEIGHT: u32 = 600;
 
-/// Background, text, and selection colors (0x00RRGGBB), and the pixel size.
-const BACKGROUND: u32 = 0x001e_1e2e;
-const FOREGROUND: u32 = 0x00e0_e0e0;
-const SELECTION_COLOR: u32 = 0x0026_4f78;
+/// Background, text, and selection colors (0x00RRGGBB), and the pixel size: a
+/// dark palette on base hue ~212.
+const BACKGROUND: u32 = 0x001c_2127;
+const FOREGROUND: u32 = 0x00da_dada;
+/// The accent blue (`hsl(215,75%,70%)`) pre-blended for selection: the fill is
+/// opaque, so this is the accent at a set opacity, high enough to stay legible
+/// over the darker code panel.
+const SELECTION_COLOR: u32 = 0x0041_5776;
 /// Dimmed color for markdown syntax markers (a heading's `#`s, a code span's
 /// backticks), so they read as syntax rather than content.
-const MARKER_COLOR: u32 = 0x006c_7086;
+const MARKER_COLOR: u32 = 0x005d_6c7e;
 /// Inline code: a tinted background panel and a distinct foreground, so a code
 /// span stands out from prose the way it does in a rendered document.
 const CODE_COLOR: u32 = 0x00f3_8ba8;
-const CODE_BG: u32 = 0x0031_3244;
+const CODE_BG: u32 = 0x0028_2c34;
+/// Corner radius of a fenced code block's panel: a very subtle rounding, no border.
+const CODE_RADIUS: i32 = 4;
+/// Per-level heading text colors (H1..H6): H1/H2 read as normal text, then blue,
+/// yellow, red, and a muted gray for H6 (which is also smaller than body, so color
+/// is its main cue). Indexed by level minus one.
+const HEADING_COLORS: [u32; 6] = [
+    FOREGROUND,
+    FOREGROUND,
+    0x002e_80f2,
+    0x00e5_b567,
+    0x00e8_3e3e,
+    0x00bf_c6cf,
+];
 /// A blockquote's gutter bar, and the bullet a list item renders once the cursor
 /// leaves its line. The bar is drawn at the text margin, in the empty gutter to
 /// the left of the (indented) quote text.
-const QUOTE_BAR_COLOR: u32 = 0x0045_475a;
+const QUOTE_BAR_COLOR: u32 = 0x003f_444b;
 const QUOTE_BAR_WIDTH: i32 = 3;
 const BULLET: &str = "•";
 /// Body text pixel size; headings scale up from it (see [`markdown::font_size`]).
-const FONT_SIZE: u32 = 32;
+const FONT_SIZE: u32 = 14;
 /// Inset of the text from the top-left corner (both axes).
 const MARGIN: i32 = 40;
 /// What the Tab key inserts: spaces (a "soft tab"), not a literal `'\t'`. This
@@ -526,6 +543,47 @@ impl State {
             let frame = &mut pool.data_mut()[offset..offset + frame_len];
             let mut canvas = Canvas::new(frame, width, height);
             canvas.fill(BACKGROUND);
+            let view_h = height as i32;
+
+            // Block backgrounds paint first, beneath both the selection highlight
+            // and the text: a fenced code block sits on a full-width tinted panel,
+            // one line box tall so consecutive lines tile into a continuous block,
+            // and that panel must sit behind the selection rather than cover it
+            // (otherwise a selection inside the block would vanish). A collapsed
+            // fence row still paints, so an unfocused block keeps blank top and
+            // bottom rows that read as vertical padding. The block's first row
+            // rounds its top corners and its last row its bottom ones, so the whole
+            // panel reads as one softly rounded block.
+            let lines = layout.lines();
+            let panel_w = (width as i32 - 2 * MARGIN).max(0);
+            for (i, line) in lines.iter().enumerate() {
+                if !line.code_block {
+                    continue;
+                }
+                let m = fonts.metrics(line.size);
+                let top = line.baseline - scroll_y - m.ascent;
+                let h = m.line_height;
+                if top + h <= 0 || top >= view_h {
+                    continue;
+                }
+                let first = i == 0 || !lines[i - 1].code_block;
+                let last = i + 1 >= lines.len() || !lines[i + 1].code_block;
+                let corners = match (first, last) {
+                    (true, true) => render::RoundedCorners::Both,
+                    (true, false) => render::RoundedCorners::Top,
+                    (false, true) => render::RoundedCorners::Bottom,
+                    (false, false) => render::RoundedCorners::None,
+                };
+                canvas.fill_round_rect(MARGIN, top, panel_w, h, CODE_BG, CODE_RADIUS, corners);
+            }
+
+            // Inline code spans get their own tinted panel, also beneath the
+            // selection so a selection over inline code shows through (the glyphs
+            // still draw on top in the text loop). Block code is excluded here; its
+            // full-width panel above already covers it.
+            for rect in layout.code_rects(fonts, rope) {
+                canvas.fill_rect(rect.x, rect.y - scroll_y, rect.w, rect.h, CODE_BG);
+            }
 
             // Everything is laid out in content space; the viewport scroll shifts
             // it up by `scroll_y`. The canvas clips whatever falls off-screen.
@@ -537,11 +595,10 @@ impl State {
 
             // The text, one visual line at a time, each at its own font size,
             // materialized from the rope. A line is a sequence of inline runs:
-            // regular text, code spans (drawn on a tinted panel), and the
-            // delimiter markers, which are dimmed on the cursor's line and
+            // regular text, code spans (drawn in the code face on a tinted panel),
+            // and the delimiter markers, which are dimmed on the cursor's line and
             // collapse to nothing (skipped) once it leaves, the live-preview
             // reveal that `layout` bakes into each run's `visible` flag.
-            let view_h = height as i32;
             for line in layout.lines() {
                 let m = fonts.metrics(line.size);
                 let baseline = line.baseline - scroll_y;
@@ -570,7 +627,7 @@ impl State {
                     // Each run draws in its own face, so bold/italic emphasis is
                     // carried by the glyphs, not color: only code and markers
                     // recolor, the rest (regular and emphasized prose) is FG.
-                    let face = fonts.face(line.size, run.font_style());
+                    let face = run_face(fonts, line.size, run.kind, line.heading.is_some());
                     let slice = rope.byte_slice(run.start..run.end);
                     // The block marker (the first run on a list/quote line) gives
                     // way to its gutter decoration once the cursor leaves: a bullet
@@ -594,20 +651,19 @@ impl State {
                     let color = match run.kind {
                         markdown::SpanKind::Marker => MARKER_COLOR,
                         markdown::SpanKind::Text(markdown::Emphasis::Code) => CODE_COLOR,
-                        markdown::SpanKind::Text(_) => FOREGROUND,
+                        // Heading prose takes the level's color (the marker and any
+                        // inline code on the line keep their own); body prose is FG.
+                        markdown::SpanKind::Text(_) => match line.heading {
+                            Some(level) => HEADING_COLORS
+                                .get(level.saturating_sub(1) as usize)
+                                .copied()
+                                .unwrap_or(FOREGROUND),
+                            None => FOREGROUND,
+                        },
                     };
-                    // A code span sits on a tinted panel; paint it before the
-                    // glyphs so they blend over it.
-                    if matches!(run.kind, markdown::SpanKind::Text(markdown::Emphasis::Code)) {
-                        let w = render::text_advance(face, &slice).round() as i32;
-                        canvas.fill_rect(
-                            pen,
-                            baseline - m.ascent,
-                            w,
-                            m.ascent + m.descent,
-                            CODE_BG,
-                        );
-                    }
+                    // Code backgrounds (inline panels and the full-width block
+                    // panel) are painted in the pre-pass above, beneath the
+                    // selection; here we only draw the glyphs over them.
                     pen = canvas.draw_text(face, pen, baseline, &slice, color);
                 }
             }

@@ -114,6 +114,27 @@ pub fn next_item_marker(line: &str) -> Option<String> {
     }
 }
 
+/// If `line` opens a fenced code block, the number of backticks in its fence
+/// (at least three). The info string after the fence must contain no backtick,
+/// per CommonMark, so a one-line `` ``` x ``` `` is not taken for an opener. The
+/// fence's open/close pairing is stateful and lives in [`crate::layout`], which
+/// tracks it across lines; this only recognizes a single line in isolation.
+pub fn opens_code_fence(line: &str) -> Option<usize> {
+    let ticks = line.bytes().take_while(|&b| b == b'`').count();
+    if ticks < 3 || line[ticks..].contains('`') {
+        return None;
+    }
+    Some(ticks)
+}
+
+/// Whether `line` closes a fence opened with `open` backticks: a run of at least
+/// `open` backticks followed by only whitespace (a closing fence carries no info
+/// string).
+pub fn closes_code_fence(line: &str, open: usize) -> bool {
+    let ticks = line.bytes().take_while(|&b| b == b'`').count();
+    ticks >= open && line[ticks..].trim().is_empty()
+}
+
 /// Byte length of a heading's `#` run plus the single separating space if present.
 fn heading_marker_len(line: &str) -> usize {
     let hashes = line.bytes().take_while(|&b| b == b'#').count();
@@ -158,20 +179,24 @@ fn quote_marker(line: &str) -> Option<usize> {
     Some(if bytes.get(1) == Some(&b' ') { 2 } else { 1 })
 }
 
-/// The pixel size `style` renders at, scaled from the body `base`. Headings step
-/// down from H1 toward body size; H5 and H6 match body. Lists and quotes are body
-/// size (they style via their marker and indentation, not size). Scales are in
-/// tenths to stay in integer pixels without a float dependency on rounding.
+/// The pixel size `style` renders at, scaled from the body `base`. Heading scales
+/// step down from 1.7x at H1 to body size at H5, and H6 is slightly *smaller*
+/// than body (0.9x): per-level color, not size, marks the lower headings. Lists
+/// and quotes are body size (they style via their marker and indentation, not
+/// size). Scales are in tenths to stay in integer pixels without a float
+/// dependency on rounding.
 pub fn font_size(style: LineStyle, base: u32) -> u32 {
     let tenths = match style {
         LineStyle::Body | LineStyle::Bullet | LineStyle::Ordered | LineStyle::Quote => {
             return base;
         }
-        LineStyle::Heading(1) => 16,
-        LineStyle::Heading(2) => 14,
+        LineStyle::Heading(1) => 17,
+        LineStyle::Heading(2) => 15,
         LineStyle::Heading(3) => 12,
         LineStyle::Heading(4) => 11,
-        // H5, H6, and any out-of-range level fall back to body size.
+        LineStyle::Heading(5) => 10,
+        LineStyle::Heading(6) => 9,
+        // Any out-of-range level falls back to body size.
         _ => 10,
     };
     (base * tenths + 5) / 10
@@ -531,14 +556,16 @@ mod tests {
     }
 
     #[test]
-    fn font_size_steps_down_to_body() {
+    fn font_size_steps_down_with_a_subbody_h6() {
         let base = 32;
         assert_eq!(font_size(LineStyle::Body, base), base);
         let h1 = font_size(LineStyle::Heading(1), base);
         let h2 = font_size(LineStyle::Heading(2), base);
         let h3 = font_size(LineStyle::Heading(3), base);
         assert!(h1 > h2 && h2 > h3 && h3 > base);
-        assert_eq!(font_size(LineStyle::Heading(6), base), base);
+        // H5 matches body; H6 is smaller (the theme marks low headings by color).
+        assert_eq!(font_size(LineStyle::Heading(5), base), base);
+        assert!(font_size(LineStyle::Heading(6), base) < base);
     }
 
     #[test]
@@ -622,6 +649,29 @@ mod tests {
         // Headings and body never continue.
         assert_eq!(next_item_marker("# h"), None);
         assert_eq!(next_item_marker("plain"), None);
+    }
+
+    #[test]
+    fn recognizes_code_fence_openers_and_closers() {
+        // Three or more backticks open; an info string (language) is allowed.
+        assert_eq!(opens_code_fence("```"), Some(3));
+        assert_eq!(opens_code_fence("```rust"), Some(3));
+        assert_eq!(opens_code_fence("````"), Some(4));
+        // Fewer than three, or an info string holding a backtick, is not an opener
+        // (so a one-line `` ``` x ``` `` is left to the inline pass).
+        assert_eq!(opens_code_fence("``"), None);
+        assert_eq!(opens_code_fence("``` x ```"), None);
+        assert_eq!(opens_code_fence("not a fence"), None);
+        // A closer is bare backticks (>= the opener), only whitespace after.
+        assert!(closes_code_fence("```", 3));
+        assert!(closes_code_fence("````", 3), "a longer fence still closes");
+        assert!(closes_code_fence("```   ", 3), "trailing space is allowed");
+        assert!(!closes_code_fence("``", 3), "too few backticks");
+        assert!(
+            !closes_code_fence("```rust", 3),
+            "a closer carries no info string"
+        );
+        assert!(!closes_code_fence("```", 4), "must match the opener length");
     }
 
     // --- Inline spans -----------------------------------------------------

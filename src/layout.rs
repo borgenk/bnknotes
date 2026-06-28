@@ -45,8 +45,17 @@
 //! to a [`Gutter`] decoration, a bullet point `•` for a list or a bar for a quote,
 //! always the same width as the source marker so the text never shifts; on the
 //! cursor's own line the raw, editable marker shows instead.
+//!
+//! Fenced code blocks are the one construct whose classification crosses line
+//! boundaries: a ``` line opens a block and a later ``` closes it, and every line
+//! between is code, not markdown. So `build` carries a fence flag down the loop,
+//! and a line inside a fence (`VisualLine::code_block`) skips the inline pass
+//! entirely, rendering in the distinct code face on a full-width padded panel.
+//! The ``` fence lines hide their backticks off the cursor's line, like a heading
+//! hides its `#`, so an unfocused block reads without visible fences; the panel
+//! still draws those rows, leaving blank top and bottom padding.
 
-use crate::freetype::{FontStyle, Fonts};
+use crate::freetype::{Face, FontStyle, Fonts};
 use crate::grapheme;
 use crate::markdown;
 use crate::render;
@@ -55,6 +64,12 @@ use crate::rope::Rope;
 /// Extra highlight width drawn past a line's text when the selection includes
 /// that line's trailing newline, hinting the break itself is selected.
 const NEWLINE_PAD: i32 = 8;
+
+/// Horizontal padding inside a fenced code block's panel: the code text (and the
+/// ``` fences) is inset this many pixels from the panel's left edge, and wrapping
+/// keeps the same gap on the right, so the tinted background frames the code
+/// rather than butting against it.
+const CODE_PAD_X: i32 = 10;
 
 /// One on-screen line: the byte range of its text (excluding any trailing
 /// `'\n'`), the y of its baseline, whether a hard newline follows it, the pixel
@@ -83,6 +98,14 @@ pub struct VisualLine {
     /// leaves it: a bullet glyph for a list, a bar for a quote. [`Gutter::None`]
     /// on ordinary lines and on the cursor's own line (which shows its raw marker).
     pub gutter: Gutter,
+    /// True for a line inside a fenced code block (the ``` fences and the code
+    /// between them). It is drawn on a full-width tinted panel and its text is
+    /// not parsed as inline markdown.
+    pub code_block: bool,
+    /// The ATX heading level (1..=6) if this line is a heading, else `None`. The
+    /// app colors heading text by level, and the pixel `size` already carries the
+    /// heading's scale.
+    pub heading: Option<u8>,
 }
 
 /// The live-preview decoration of a visual line's left gutter, chosen once the
@@ -114,17 +137,10 @@ pub struct Run {
     pub visible: bool,
 }
 
-impl Run {
-    /// The face style this run is measured and drawn in.
-    pub fn font_style(&self) -> FontStyle {
-        font_style(self.kind)
-    }
-}
-
-/// Map a span/run kind to the face style it renders in. Markers and inline code
-/// use the regular face (code is monospace already); only bold/italic emphasis
-/// selects a variant. The single source of truth for both measuring (layout) and
-/// drawing (the app render loop).
+/// Map a span/run kind to the face style it renders in within the prose family.
+/// Markers use the regular face; only bold/italic emphasis selects a variant.
+/// Code is not handled here (it draws in the separate code family, see
+/// [`run_face`]); a stray code kind falls back to regular.
 fn font_style(kind: markdown::SpanKind) -> FontStyle {
     match kind {
         markdown::SpanKind::Text(markdown::Emphasis::Bold) => FontStyle::Bold,
@@ -134,14 +150,39 @@ fn font_style(kind: markdown::SpanKind) -> FontStyle {
     }
 }
 
-/// The face style of the (line-relative) span covering byte `off`. `spans` tile
-/// `[0, len)` in order, so the first span ending past `off` is the one holding
-/// it; a byte past the end (never asked for in practice) falls back to regular.
-fn style_at(spans: &[markdown::Span], off: usize) -> FontStyle {
+/// The face a run or span of `kind` is measured and drawn in: the distinct code
+/// family for an inline-code or fenced-code run, otherwise the prose family in
+/// the kind's emphasis style. On a heading line the prose text is emboldened (a
+/// heading renders bold), composing with any inline emphasis; the `#` marker and
+/// inline code keep their own face. The single source of truth so layout's
+/// measuring and the app's drawing pick the same face and never disagree on widths.
+pub(crate) fn run_face(fonts: &Fonts, size: u32, kind: markdown::SpanKind, heading: bool) -> &Face {
+    match kind {
+        markdown::SpanKind::Text(markdown::Emphasis::Code) => fonts.code_face(size),
+        markdown::SpanKind::Text(_) if heading => fonts.face(size, embolden(font_style(kind))),
+        other => fonts.face(size, font_style(other)),
+    }
+}
+
+/// Add weight to a prose style, so heading text renders bold and bold-italic
+/// heading text keeps its slant. Already-bold styles are unchanged.
+fn embolden(style: FontStyle) -> FontStyle {
+    match style {
+        FontStyle::Regular | FontStyle::Bold => FontStyle::Bold,
+        FontStyle::Italic | FontStyle::BoldItalic => FontStyle::BoldItalic,
+    }
+}
+
+/// The span kind covering byte `off`. `spans` tile `[0, len)` in order, so the
+/// first span ending past `off` is the one holding it; a byte past the end
+/// (never asked for in practice) falls back to regular text.
+fn kind_at(spans: &[markdown::Span], off: usize) -> markdown::SpanKind {
     spans
         .iter()
         .find(|s| off < s.end)
-        .map_or(FontStyle::Regular, |s| font_style(s.kind))
+        .map_or(markdown::SpanKind::Text(markdown::Emphasis::Regular), |s| {
+            s.kind
+        })
 }
 
 /// An axis-aligned rectangle in window pixels.
@@ -187,6 +228,9 @@ impl Layout {
         // `box_top` is the top of the current line's box; the baseline sits one
         // ascent below it, and the next box follows one line height down.
         let mut box_top = top;
+        // `fence` holds the open fence's backtick count while inside a code block,
+        // the one piece of state that carries across logical lines.
+        let mut fence: Option<usize> = None;
         let n_lines = rope.len_lines();
         for i in 0..n_lines {
             let ls = rope.line_to_byte(i);
@@ -199,17 +243,65 @@ impl Layout {
                 rope.line_to_byte(i + 1)
             };
             let line = rope.byte_slice(ls..le);
-            let style = markdown::style_of(&line);
-            let size = markdown::font_size(style, body_size);
+            // Whether the cursor/selection touches this logical line: the same
+            // reveal test headings use, applied to fence lines too.
+            let on_line = active.0 <= le && active.1 >= ls;
+            // A line inside a fenced code block is code, not markdown: it skips the
+            // inline pass and renders as one code run. The ``` fence lines render
+            // their backticks as a marker that hides off the cursor's line, like a
+            // heading's `#`, so an unfocused block reads without fences (the panel
+            // still draws, leaving a blank padded row). The code lines between
+            // carry no markers, so their reveal flag is inert; keep it true. A code
+            // line carries `Body` as an inert style (its gutter is unused).
+            let (style, size, spans, block_marker, block_persists, revealed, code_block) =
+                if let Some(open) = fence {
+                    let delimiter = markdown::closes_code_fence(&line, open);
+                    if delimiter {
+                        fence = None;
+                    }
+                    let spans = code_block_spans(&line, delimiter);
+                    // Only a fence delimiter line has backticks to hide.
+                    let revealed = !delimiter || on_line;
+                    (
+                        markdown::LineStyle::Body,
+                        body_size,
+                        spans,
+                        0,
+                        false,
+                        revealed,
+                        true,
+                    )
+                } else if let Some(open) = markdown::opens_code_fence(&line) {
+                    fence = Some(open);
+                    let spans = code_block_spans(&line, true);
+                    (
+                        markdown::LineStyle::Body,
+                        body_size,
+                        spans,
+                        0,
+                        false,
+                        on_line,
+                        true,
+                    )
+                } else {
+                    let style = markdown::style_of(&line);
+                    (
+                        style,
+                        markdown::font_size(style, body_size),
+                        line_spans(&line),
+                        markdown::marker_len(&line),
+                        markdown::block_marker_persists(style),
+                        on_line,
+                        false,
+                    )
+                };
             let metrics = fonts.metrics(size);
-            // The line's inline spans (line-relative), and whether its markers
-            // are revealed: shown while the active range touches the line, hidden
-            // once the cursor leaves it. A list or quote block marker persists
-            // regardless (it is the only sign the line is a list or quote).
-            let spans = line_spans(&line);
-            let block_marker = markdown::marker_len(&line);
-            let block_persists = markdown::block_marker_persists(style);
-            let revealed = active.0 <= le && active.1 >= ls;
+            // Heading lines color their text by level (fence/code lines carry the
+            // inert `Body` style, so they are never headings here).
+            let heading = match style {
+                markdown::LineStyle::Heading(level) => Some(level),
+                _ => None,
+            };
             // A list or quote item hangs its wrapped continuations under the text:
             // the inset is the marker's width, measured on the source marker in the
             // regular face at this line's size, so it matches the width the marker
@@ -220,18 +312,41 @@ impl Layout {
             } else {
                 0
             };
+            // A code-block line insets its content by `CODE_PAD_X` on both sides so
+            // the tinted panel frames it: every segment shares the left inset (code
+            // has no marker gutter), and wrapping uses the narrower interior width.
+            let line_wrap = if code_block && wrap_width > 0 {
+                (wrap_width - 2 * CODE_PAD_X).max(1)
+            } else {
+                wrap_width
+            };
             // `wrap_segments` returns ranges relative to the line; offset them
             // back to absolute buffer positions for the visual lines. It measures
             // the source text (every run in its own face), so clipping spans to
             // each segment never disagrees with the breaks, and reveal state,
             // which only hides markers, never reflows the document.
-            let segments = wrap_segments(fonts, size, &line, &spans, wrap_width, block_indent);
+            let segments = wrap_segments(
+                fonts,
+                size,
+                &line,
+                &spans,
+                line_wrap,
+                block_indent,
+                heading.is_some(),
+            );
             let last = segments.len() - 1;
             for (k, (start, end)) in segments.into_iter().enumerate() {
-                // The first segment carries the marker inline (indent 0); later
+                // A code line insets every segment by the panel padding. Otherwise
+                // the first segment carries the marker inline (indent 0) and later
                 // ones inset under the text. The gutter decoration only applies
                 // once the cursor has left the line; on it the raw marker shows.
-                let indent = if k == 0 { 0 } else { block_indent };
+                let indent = if code_block {
+                    CODE_PAD_X
+                } else if k == 0 {
+                    0
+                } else {
+                    block_indent
+                };
                 let gutter = if revealed {
                     Gutter::None
                 } else {
@@ -260,6 +375,8 @@ impl Layout {
                     ),
                     indent,
                     gutter,
+                    code_block,
+                    heading,
                 });
                 box_top += metrics.line_height;
             }
@@ -369,6 +486,43 @@ impl Layout {
         rects
     }
 
+    /// The tinted-panel rectangles behind every visible inline code span, one per
+    /// run, each sized to its line's metrics. Fenced code blocks are excluded:
+    /// they have their own full-width panel. Like [`Self::selection_rects`], these
+    /// are background decorations the app paints beneath the selection and text, so
+    /// a selection over inline code still shows through. Positions are run-walked
+    /// the same way as the selection, so the two agree on a shared line.
+    pub fn code_rects(&self, fonts: &Fonts, rope: &Rope) -> Vec<Rect> {
+        let mut rects = Vec::new();
+        for line in &self.lines {
+            if line.code_block {
+                continue;
+            }
+            let m = fonts.metrics(line.size);
+            for run in &line.runs {
+                if !run.visible
+                    || !matches!(run.kind, markdown::SpanKind::Text(markdown::Emphasis::Code))
+                {
+                    continue;
+                }
+                let x0 = self.left as f32
+                    + line.indent as f32
+                    + self.advance_to(fonts, rope, line, run.start);
+                let w = render::text_advance(
+                    run_face(fonts, line.size, run.kind, line.heading.is_some()),
+                    &rope.byte_slice(run.start..run.end),
+                );
+                rects.push(Rect {
+                    x: x0.round() as i32,
+                    y: line.baseline - m.ascent,
+                    w: (w.round() as i32).max(1),
+                    h: m.ascent + m.descent,
+                });
+            }
+        }
+        rects
+    }
+
     /// The visual line containing `offset`. A cursor at a soft-wrap boundary is
     /// given to the later line; one at a hard newline stays on its line.
     fn line_for(&self, offset: usize) -> &VisualLine {
@@ -408,7 +562,7 @@ impl Layout {
             if !run.visible {
                 continue;
             }
-            let face = fonts.face(line.size, run.font_style());
+            let face = run_face(fonts, line.size, run.kind, line.heading.is_some());
             let slice = rope.byte_slice(run.start..run.end);
             for (off, cluster) in grapheme::graphemes(&slice) {
                 let w = render::text_advance(face, cluster);
@@ -434,7 +588,7 @@ impl Layout {
                 continue;
             }
             let end = offset.min(run.end);
-            let face = fonts.face(line.size, run.font_style());
+            let face = run_face(fonts, line.size, run.kind, line.heading.is_some());
             x += render::text_advance(face, &rope.byte_slice(run.start..end));
         }
         x
@@ -465,6 +619,26 @@ fn line_spans(line: &str) -> Vec<markdown::Span> {
         spans.push(span);
     }
     spans
+}
+
+/// The spans of a line inside a fenced code block: a whole-line code run, or, on
+/// a fence delimiter line (the opening or closing ```), a whole-line marker run
+/// so the fence and any info string read as dimmed syntax. No inline parsing
+/// happens inside a code block. An empty line has no runs (the panel still draws).
+fn code_block_spans(line: &str, delimiter: bool) -> Vec<markdown::Span> {
+    if line.is_empty() {
+        return Vec::new();
+    }
+    let kind = if delimiter {
+        markdown::SpanKind::Marker
+    } else {
+        markdown::SpanKind::Text(markdown::Emphasis::Code)
+    };
+    vec![markdown::Span {
+        start: 0,
+        end: line.len(),
+        kind,
+    }]
 }
 
 /// Clip line-relative `spans` to the visual segment `[seg_start, seg_end)`,
@@ -526,6 +700,7 @@ fn wrap_segments(
     spans: &[markdown::Span],
     wrap_width: i32,
     block_indent: i32,
+    heading: bool,
 ) -> Vec<(usize, usize)> {
     if wrap_width <= 0 || line.is_empty() {
         return vec![(0, line.len())];
@@ -535,7 +710,7 @@ fn wrap_segments(
     let clusters: Vec<(usize, f32, bool)> = grapheme::graphemes(line)
         .into_iter()
         .map(|(off, cluster)| {
-            let face = fonts.face(size, style_at(spans, off));
+            let face = run_face(fonts, size, kind_at(spans, off), heading);
             (off, render::text_advance(face, cluster), cluster == " ")
         })
         .collect();
@@ -1302,5 +1477,227 @@ mod tests {
             lines[1].indent, marker_w,
             "but wrapped lines still hang-indent"
         );
+    }
+
+    // --- Fenced code blocks -----------------------------------------------
+
+    /// The first run kind of each visual line, for terse fence assertions.
+    fn first_kinds(l: &Layout) -> Vec<Option<markdown::SpanKind>> {
+        l.lines()
+            .iter()
+            .map(|line| line.runs.first().map(|r| r.kind))
+            .collect()
+    }
+
+    #[test]
+    fn a_fenced_block_marks_its_lines_as_code() {
+        let f = fonts();
+        let r = rope("```rust\nfn x() {}\n```\nbody");
+        let l = layout(&f, &r);
+        let code: Vec<bool> = l.lines().iter().map(|line| line.code_block).collect();
+        assert_eq!(
+            code,
+            vec![true, true, true, false],
+            "the fence lines and the code between are a block; the body is not"
+        );
+        // The ``` fences read as markers; the code line is a code run.
+        assert_eq!(
+            first_kinds(&l),
+            vec![
+                Some(markdown::SpanKind::Marker),                         // ```rust
+                Some(markdown::SpanKind::Text(markdown::Emphasis::Code)), // fn x() {}
+                Some(markdown::SpanKind::Marker),                         // ```
+                Some(markdown::SpanKind::Text(markdown::Emphasis::Regular)), // body
+            ]
+        );
+    }
+
+    #[test]
+    fn markdown_inside_a_fence_is_literal() {
+        // A '#' line that would be an H1 is plain code inside a fence: body size,
+        // a single code run, no heading marker.
+        let f = fonts();
+        let r = rope("```\n# not a heading\n```");
+        let l = layout(&f, &r);
+        let inner = &l.lines()[1];
+        assert!(inner.code_block);
+        assert_eq!(inner.size, BODY, "no heading scaling inside a code block");
+        assert_eq!(inner.runs.len(), 1);
+        assert_eq!(
+            inner.runs[0].kind,
+            markdown::SpanKind::Text(markdown::Emphasis::Code),
+            "the '#' is code, not a heading marker"
+        );
+    }
+
+    #[test]
+    fn an_unclosed_fence_runs_to_the_end() {
+        let f = fonts();
+        let r = rope("```\n# H");
+        let l = layout(&f, &r);
+        assert!(
+            l.lines().iter().all(|line| line.code_block),
+            "with no closing fence every following line stays code"
+        );
+    }
+
+    #[test]
+    fn text_resumes_after_a_closed_fence() {
+        let f = fonts();
+        let r = rope("```\nx\n```\n# H");
+        let l = layout(&f, &r);
+        let last = l.lines().last().expect("a last line");
+        assert!(
+            !last.code_block,
+            "the heading after the fence is normal again"
+        );
+        assert_eq!(last.size, h1_size(), "and is scaled as an H1");
+    }
+
+    /// The first run of a line (its fence marker, for fence lines).
+    fn first_run(line: &VisualLine) -> &Run {
+        line.runs.first().expect("a fence line has a run")
+    }
+
+    #[test]
+    fn fence_backticks_hide_off_their_line_and_show_on_it() {
+        let f = fonts();
+        let src = "```rust\nfn x() {}\n```\nbody";
+        let r = rope(src);
+        // Cursor on the trailing body line: both fence lines are off-cursor.
+        let off = src.find("body").unwrap();
+        let away = Layout::build(&f, &r, LEFT, TOP, 1_000_000, BODY, (off, off));
+        let (open, close) = (first_run(&away.lines()[0]), first_run(&away.lines()[2]));
+        assert!(matches!(open.kind, markdown::SpanKind::Marker) && !open.visible);
+        assert!(
+            matches!(close.kind, markdown::SpanKind::Marker) && !close.visible,
+            "both ``` fences collapse when the cursor is outside the block"
+        );
+        // The code line between always shows, fence or no fence.
+        assert!(away.lines()[1].runs.iter().all(|run| run.visible));
+        // Cursor on the opening fence line reveals only that fence (per-line, like
+        // a heading): the closing fence on another line stays hidden.
+        let on = Layout::build(&f, &r, LEFT, TOP, 1_000_000, BODY, (0, 0));
+        assert!(
+            first_run(&on.lines()[0]).visible,
+            "the ``` shows on its line"
+        );
+        assert!(
+            !first_run(&on.lines()[2]).visible,
+            "the closing fence is on another line, still hidden"
+        );
+    }
+
+    #[test]
+    fn code_lines_inset_by_the_panel_padding() {
+        let f = fonts();
+        let r = rope("```\ncode here\n```");
+        let l = layout(&f, &r);
+        assert!(
+            l.lines().iter().all(|line| line.indent == CODE_PAD_X),
+            "every code-block line (fences and code) insets by the panel padding"
+        );
+        // A plain line carries no such inset.
+        assert_eq!(layout(&f, &rope("plain")).lines()[0].indent, 0);
+    }
+
+    #[test]
+    fn caret_on_a_code_line_starts_past_the_padding() {
+        let f = fonts();
+        let r = rope("```\nx\n```");
+        let code_start = "```\n".len();
+        let l = Layout::build(&f, &r, LEFT, TOP, 1_000_000, BODY, (code_start, code_start));
+        let (x, _, _) = l.caret(&f, &r, code_start);
+        assert_eq!(
+            x,
+            LEFT + CODE_PAD_X,
+            "code text begins past the left panel padding"
+        );
+    }
+
+    #[test]
+    fn a_selection_over_a_code_line_yields_a_padded_rect() {
+        // The selection rect for a code line sits at the padded column and has
+        // width, so the highlight is visible inside the panel (the app paints the
+        // panel beneath it). Regression guard for the selection-in-code-block fix.
+        let f = fonts();
+        let src = "```\nxyz\n```";
+        let r = rope(src);
+        let start = src.find("xyz").unwrap();
+        let l = Layout::build(&f, &r, LEFT, TOP, 1_000_000, BODY, (start, start + 3));
+        let rects = l.selection_rects(&f, &r, start, start + 3);
+        assert_eq!(rects.len(), 1, "one rect for the single code line");
+        assert_eq!(
+            rects[0].x,
+            LEFT + CODE_PAD_X,
+            "rect starts past the padding"
+        );
+        assert!(rects[0].w > 0, "and has positive width");
+    }
+
+    #[test]
+    fn inline_code_has_a_background_rect_but_a_fenced_block_does_not() {
+        let f = fonts();
+        // An inline code span yields one background panel, sitting past the line
+        // start (after "a " and the opening backtick) with real size.
+        let r = rope("a `b` c");
+        let l = Layout::build(&f, &r, LEFT, TOP, 1_000_000, BODY, (0, 0));
+        let rects = l.code_rects(&f, &r);
+        assert_eq!(rects.len(), 1, "one panel behind the inline code span");
+        assert!(rects[0].x > LEFT && rects[0].w > 0 && rects[0].h > 0);
+        // A fenced block has no inline rects: its full-width panel covers it.
+        let r2 = rope("```\ncode\n```");
+        let l2 = layout(&f, &r2);
+        assert!(
+            l2.code_rects(&f, &r2).is_empty(),
+            "block code uses the full-width panel, not per-run inline rects"
+        );
+    }
+
+    #[test]
+    fn heading_lines_carry_their_level_others_do_not() {
+        let f = fonts();
+        let r = rope("### h\nbody\n```\ncode\n```");
+        let l = layout(&f, &r);
+        let lines = l.lines();
+        assert_eq!(lines[0].heading, Some(3), "the ### line is an H3");
+        assert_eq!(lines[1].heading, None, "body has no heading level");
+        assert!(
+            lines[2..].iter().all(|ln| ln.heading.is_none()),
+            "fence and code lines are never headings"
+        );
+    }
+
+    #[test]
+    fn heading_text_routes_to_the_bold_face() {
+        // Monospace bold and regular share advances, so the bolding can't be seen
+        // in widths; assert the face routing directly. (Robust to a family that
+        // lacks a bold variant: face() then falls back, and both sides agree.)
+        let f = fonts();
+        let size = h1_size();
+        let text = |em| markdown::SpanKind::Text(em);
+        // On a heading: prose is bold, italic prose is bold-italic, already-bold
+        // stays bold, but the `#` marker is never emboldened.
+        assert!(std::ptr::eq(
+            run_face(&f, size, text(markdown::Emphasis::Regular), true),
+            f.face(size, FontStyle::Bold),
+        ));
+        assert!(std::ptr::eq(
+            run_face(&f, size, text(markdown::Emphasis::Italic), true),
+            f.face(size, FontStyle::BoldItalic),
+        ));
+        assert!(std::ptr::eq(
+            run_face(&f, size, text(markdown::Emphasis::Bold), true),
+            f.face(size, FontStyle::Bold),
+        ));
+        assert!(std::ptr::eq(
+            run_face(&f, size, markdown::SpanKind::Marker, true),
+            f.face(size, FontStyle::Regular),
+        ));
+        // Off a heading, prose stays regular.
+        assert!(std::ptr::eq(
+            run_face(&f, size, text(markdown::Emphasis::Regular), false),
+            f.face(size, FontStyle::Regular),
+        ));
     }
 }

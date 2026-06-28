@@ -77,6 +77,28 @@ fn default_family() -> Result<&'static FontFamily> {
         .ok_or_else(|| Error::msg("no usable font family found in the candidate list"))
 }
 
+/// Candidate regular faces for code: a monospace deliberately distinct from the
+/// prose family, so code blocks and inline code read in their own typeface. Only
+/// the regular face is ever needed (code never renders bold or italic), so this
+/// is a flat list of paths rather than full families.
+const CODE_FONT_FAMILIES: &[&str] = &[
+    "/usr/share/fonts/Adwaita/AdwaitaMono-Regular.ttf",
+    "/usr/share/fonts/noto/NotoSansMono-Regular.ttf",
+    "/usr/share/fonts/liberation/LiberationMono-Regular.ttf",
+    "/usr/share/fonts/TTF/DejaVuSansMono.ttf",
+    "/usr/share/fonts/gnu-free/FreeMono.otf",
+];
+
+/// The first installed code face whose path differs from the prose family's
+/// regular face, or `None` if none is available. A `None` leaves code sharing the
+/// prose face: still readable, just without the visual distinction.
+fn code_regular_path(prose: &FontFamily) -> Option<&'static str> {
+    CODE_FONT_FAMILIES
+        .iter()
+        .copied()
+        .find(|&p| p != prose.regular && std::path::Path::new(p).exists())
+}
+
 /// Which variant of the font family a run renders in. Body text and syntax
 /// markers use [`FontStyle::Regular`]; emphasis selects a heavier or slanted
 /// file. Kept distinct from [`crate::markdown::Emphasis`] so this font layer
@@ -465,15 +487,19 @@ impl Drop for Face {
 }
 
 /// The faces for one pixel size: the regular face (always present) plus any
-/// bold/italic/bold-italic variants the family ships, and the cached line
-/// metrics. Metrics come from the regular face only, so emphasis selects a
-/// different glyph set without ever changing line height.
+/// bold/italic/bold-italic variants the family ships, the distinct code face (if
+/// a separate code family is installed), and the cached line metrics. Metrics
+/// come from the regular face only, so emphasis or code selects a different glyph
+/// set without ever changing line height.
 struct SizedFaces {
     size: u32,
     regular: Face,
     bold: Option<Face>,
     italic: Option<Face>,
     bold_italic: Option<Face>,
+    /// The code family's regular face at this size, or `None` when no distinct
+    /// code family is installed (code then falls back to `regular`).
+    code: Option<Face>,
     metrics: Metrics,
 }
 
@@ -493,6 +519,7 @@ impl Fonts {
     /// required; the first opened becomes the fallback.
     pub fn new(sizes: &[u32]) -> Result<Self> {
         let family = default_family()?;
+        let code_path = code_regular_path(family);
         let mut sized: Vec<SizedFaces> = Vec::new();
         for &size in sizes {
             if size == 0 || sized.iter().any(|s| s.size == size) {
@@ -507,6 +534,7 @@ impl Fonts {
                 bold: open_variant(family.bold, size),
                 italic: open_variant(family.italic, size),
                 bold_italic: open_variant(family.bold_italic, size),
+                code: code_path.and_then(|p| open_variant(p, size)),
                 metrics,
             });
         }
@@ -535,6 +563,15 @@ impl Fonts {
             FontStyle::Italic => entry.italic.as_ref().unwrap_or(&entry.regular),
             FontStyle::BoldItalic => entry.bold_italic.as_ref().unwrap_or(&entry.regular),
         }
+    }
+
+    /// The code face for `size`: the distinct code family's regular face, or the
+    /// prose regular face when no code family is installed (or `size` was not
+    /// opened). Code never renders bold or italic, so there is only the one face.
+    /// Never fails, never panics.
+    pub fn code_face(&self, size: u32) -> &Face {
+        let entry = self.entry(size);
+        entry.code.as_ref().unwrap_or(&entry.regular)
     }
 
     /// The metrics for `size`, or the fallback's metrics if `size` was not opened.
@@ -674,5 +711,18 @@ mod tests {
     fn fonts_reject_an_empty_size_set() {
         assert!(Fonts::new(&[]).is_err());
         assert!(Fonts::new(&[0]).is_err());
+    }
+
+    #[test]
+    fn code_face_resolves_for_every_size_without_panicking() {
+        let fonts = Fonts::new(&[16, 32]).expect("a default font");
+        // The code face is usable at opened and unopened sizes: a distinct code
+        // family if installed, else the prose regular face. Never panics.
+        for &size in &[16, 32, 99] {
+            assert!(
+                fonts.code_face(size).advance('m') > 0.0,
+                "code face at {size}px advances"
+            );
+        }
     }
 }

@@ -657,11 +657,13 @@ impl State {
                             Gutter::Bullet => {
                                 // Draw the marker's leading indentation first, so a
                                 // nested item's dot sits at its depth, then the dot
-                                // in place of the dash.
+                                // in place of the dash. The dot stands in for the
+                                // `- ` marker, so it takes the muted marker color
+                                // (MARKER_COLOR), not the brighter body FG.
                                 let indent = slice.len() - slice.trim_start().len();
                                 let dot_x = pen
                                     + render::text_advance(face, &slice[..indent]).round() as i32;
-                                canvas.draw_text(face, dot_x, baseline, BULLET, FOREGROUND);
+                                canvas.draw_text(face, dot_x, baseline, BULLET, MARKER_COLOR);
                                 pen += advance;
                                 continue;
                             }

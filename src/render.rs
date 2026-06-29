@@ -137,6 +137,86 @@ impl<'a> Canvas<'a> {
         }
         pen.round() as i32
     }
+
+    /// Blit `src` (ARGB8888 `0xAARRGGBB`, exactly `w` x `h`, row-major) into the
+    /// rectangle at `(x, y)`, alpha-blended over what is already there. No scaling:
+    /// `src` is the display-size bitmap already (the image store caches the result
+    /// of [`resample_argb`]), so a redraw is a cheap per-pixel blend rather than a
+    /// resample every frame. A fully transparent pixel is skipped; pixels outside
+    /// the canvas are clipped by [`Self::blend`].
+    pub fn blit_argb(&mut self, x: i32, y: i32, w: i32, h: i32, src: &[u32]) {
+        // Guard against a buffer smaller than its claimed size (no OOB indexing).
+        if w <= 0 || h <= 0 || src.len() < (w * h) as usize {
+            return;
+        }
+        for dy in 0..h {
+            let row = (dy * w) as usize;
+            for dx in 0..w {
+                let argb = src[row + dx as usize];
+                let alpha = (argb >> 24) as u8;
+                if alpha != 0 {
+                    self.blend(x + dx, y + dy, argb & 0x00ff_ffff, alpha);
+                }
+            }
+        }
+    }
+}
+
+/// Bilinearly resample ARGB `src` (`src_w` x `src_h`) into a fresh `dst_w` x
+/// `dst_h` buffer. The image store caches the result per (image, display size), so
+/// this runs once when an image first appears (or is resized) rather than on every
+/// frame; [`Canvas::blit_argb`] then draws the cached bitmap cheaply. Returns an
+/// empty buffer for degenerate or malformed input.
+pub(crate) fn resample_argb(
+    src: &[u32],
+    src_w: u32,
+    src_h: u32,
+    dst_w: i32,
+    dst_h: i32,
+) -> Vec<u32> {
+    let (sw, sh) = (src_w as i32, src_h as i32);
+    if dst_w <= 0 || dst_h <= 0 || sw <= 0 || sh <= 0 || src.len() < (sw * sh) as usize {
+        return Vec::new();
+    }
+    let mut out = Vec::with_capacity((dst_w * dst_h) as usize);
+    for dy in 0..dst_h {
+        // Map each destination pixel center back into source space; the -0.5
+        // offsets sample at source pixel centers, so a 1:1 copy is exact.
+        let sy = (dy as f32 + 0.5) * sh as f32 / dst_h as f32 - 0.5;
+        for dx in 0..dst_w {
+            let sx = (dx as f32 + 0.5) * sw as f32 / dst_w as f32 - 0.5;
+            out.push(sample_bilinear(src, sw, sh, sx, sy));
+        }
+    }
+    out
+}
+
+/// Bilinearly sample the ARGB pixels `src` (`w` x `h`, row-major) at fractional
+/// `(fx, fy)`, clamping to the edges. Each channel, alpha included, is
+/// interpolated independently across the four nearest texels. Heavy downscaling
+/// aliases (this skips source pixels rather than averaging them); an area filter
+/// would be the polish if that ever shows.
+fn sample_bilinear(src: &[u32], w: i32, h: i32, fx: f32, fy: f32) -> u32 {
+    let (x0f, y0f) = (fx.floor(), fy.floor());
+    let (tx, ty) = (fx - x0f, fy - y0f);
+    let (xi, yi) = (x0f as i32, y0f as i32);
+    // Clamp each corner independently, so a coordinate past an edge folds both
+    // texels onto the edge pixel (no wrap, no out-of-range index).
+    let x0 = xi.clamp(0, w - 1);
+    let x1 = (xi + 1).clamp(0, w - 1);
+    let y0 = yi.clamp(0, h - 1);
+    let y1 = (yi + 1).clamp(0, h - 1);
+    let at = |x: i32, y: i32| src[(y * w + x) as usize];
+    let (c00, c10, c01, c11) = (at(x0, y0), at(x1, y0), at(x0, y1), at(x1, y1));
+    let mut out = 0u32;
+    for shift in [0, 8, 16, 24] {
+        let ch = |c: u32| ((c >> shift) & 0xff) as f32;
+        let top = ch(c00) + (ch(c10) - ch(c00)) * tx;
+        let bot = ch(c01) + (ch(c11) - ch(c01)) * tx;
+        let v = (top + (bot - top) * ty).round().clamp(0.0, 255.0) as u32;
+        out |= v << shift;
+    }
+    out
 }
 
 /// Total pen advance of `text` at the face's current pixel size, in pixels.
@@ -282,6 +362,73 @@ mod tests {
                 .all(|p| u32::from_ne_bytes(p.try_into().unwrap()) == white),
             "no rounded corner fills every pixel"
         );
+    }
+
+    /// Read back canvas pixel `(x, y)` as `0x00RRGGBB` (the x byte ignored).
+    fn px(buf: &[u8], w: usize, x: usize, y: usize) -> u32 {
+        let i = (y * w + x) * 4;
+        u32::from_ne_bytes(buf[i..i + 4].try_into().unwrap()) & 0x00ff_ffff
+    }
+
+    #[test]
+    fn resample_upscales_a_single_pixel_to_a_solid_block() {
+        // 1x1 red, scaled to 3x3, is nine reds (the cache stores this, blitted later).
+        let scaled = resample_argb(&[0xff_ff_00_00], 1, 1, 3, 3);
+        assert_eq!(scaled.len(), 9);
+        assert!(scaled.iter().all(|&p| p == 0xff_ff_00_00), "all red");
+    }
+
+    #[test]
+    fn resample_is_exact_at_one_to_one() {
+        let src = [0xff_11_22_33, 0xff_44_55_66, 0xff_77_88_99, 0xff_aa_bb_cc];
+        let out = resample_argb(&src, 2, 2, 2, 2);
+        assert_eq!(out, src, "a 1:1 resample copies the pixels exactly");
+    }
+
+    #[test]
+    fn resample_rejects_malformed_input() {
+        // Claims 2x2 but carries one pixel: empty result rather than reading OOB.
+        assert!(resample_argb(&[0xff_ff_00_00], 2, 2, 4, 4).is_empty());
+        assert!(
+            resample_argb(&[0xff_ff_00_00], 1, 1, 0, 4).is_empty(),
+            "zero dst"
+        );
+    }
+
+    #[test]
+    fn blit_argb_copies_alpha_blending_over_the_background() {
+        let mut buf = vec![0u8; 4 * 4]; // 2x2, black
+        let mut canvas = Canvas::new(&mut buf, 2, 2);
+        // Opaque red at (0,0), ~50% white at (1,1); the other two transparent.
+        let src = [0xff_ff_00_00, 0x00_00_00_00, 0x00_00_00_00, 0x80_ff_ff_ff];
+        canvas.blit_argb(0, 0, 2, 2, &src);
+        assert_eq!(px(&buf, 2, 0, 0), 0x00ff_0000, "opaque red copied");
+        assert_eq!(px(&buf, 2, 1, 0), 0, "transparent pixel skipped");
+        for shift in [16, 8, 0] {
+            let c = (px(&buf, 2, 1, 1) >> shift) & 0xff;
+            assert!((120..=136).contains(&c), "half white over black, got {c}");
+        }
+    }
+
+    #[test]
+    fn blit_argb_clips_outside_the_canvas() {
+        let mut buf = vec![0u8; 4 * 4]; // 2x2, black
+        let mut canvas = Canvas::new(&mut buf, 2, 2);
+        // A 2x2 source anchored at (1,1): only its top-left pixel lands in bounds.
+        let src = [0xff_ff_00_00, 0xff_ff_00_00, 0xff_ff_00_00, 0xff_ff_00_00];
+        canvas.blit_argb(1, 1, 2, 2, &src);
+        assert_eq!(px(&buf, 2, 0, 0), 0, "untouched");
+        assert_eq!(px(&buf, 2, 1, 1), 0x00ff_0000, "the one in-bounds pixel");
+    }
+
+    #[test]
+    fn blit_argb_ignores_a_short_buffer() {
+        let mut buf = vec![0u8; 4];
+        let mut canvas = Canvas::new(&mut buf, 1, 1);
+        canvas.fill(0x00_aa_bb_cc);
+        // Claims 2x2 but carries one pixel: refused rather than reading OOB.
+        canvas.blit_argb(0, 0, 2, 2, &[0xff_ff_00_00]);
+        assert_eq!(px(&buf, 1, 0, 0), 0x00_aa_bb_cc, "left untouched");
     }
 
     #[test]

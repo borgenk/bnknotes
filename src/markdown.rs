@@ -557,6 +557,83 @@ fn find_code_closer(bytes: &[u8], from: usize, fence: usize) -> Option<(usize, u
     None
 }
 
+// --- Block images -----------------------------------------------------------
+
+/// One image link `![alt](dest)` parsed from a line, as byte ranges into that
+/// line. See [`standalone_image`].
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct ImageLink {
+    /// Byte range of the alt text, between `![` and `]`.
+    pub alt: (usize, usize),
+    /// Byte range of the destination path: the bytes the editor resolves to a
+    /// file, with any `<...>` wrapper and `"title"` suffix already removed.
+    pub path: (usize, usize),
+}
+
+/// If `line` is, ignoring surrounding whitespace, a single image `![alt](dest)`
+/// and nothing else, the byte ranges of its alt text and destination path. Such a
+/// line renders its picture in place once the cursor leaves it (the same
+/// live-preview reveal a heading uses for its `#`); an image mixed with other text
+/// on the line (an inline image) is not matched and stays source for now.
+///
+/// `dest` may wrap its path in `<...>` (which lets the path hold spaces) and may
+/// carry a `"title"`/`'title'` after the path; both are stripped to leave the
+/// path. A path containing a literal `)` is not handled: the first `)` closes the
+/// link.
+pub fn standalone_image(line: &str) -> Option<ImageLink> {
+    let open = line.find("![")?;
+    // Only whitespace may precede the image, so this is a block on its own line.
+    if !line[..open].trim().is_empty() {
+        return None;
+    }
+    let alt_start = open + 2;
+    let alt_end = alt_start + line[alt_start..].find(']')?;
+    // A `(` must immediately follow the `]`.
+    if line.as_bytes().get(alt_end + 1) != Some(&b'(') {
+        return None;
+    }
+    let dest_start = alt_end + 2;
+    let dest_end = dest_start + line.get(dest_start..)?.find(')')?;
+    // Only whitespace may follow the closing `)`.
+    if !line[dest_end + 1..].trim().is_empty() {
+        return None;
+    }
+    let (path_start, path_end) = path_of_dest(line, dest_start, dest_end);
+    (path_start < path_end).then_some(ImageLink {
+        alt: (alt_start, alt_end),
+        path: (path_start, path_end),
+    })
+}
+
+/// The path's byte range within a link destination `line[start..end]`, dropping
+/// surrounding whitespace, an optional `<...>` wrapper, and a trailing
+/// `"title"`/`'title'`. A bare path keeps any interior spaces (more forgiving than
+/// CommonMark, which would need the `<...>` form), so local filenames with spaces
+/// just work.
+fn path_of_dest(line: &str, start: usize, end: usize) -> (usize, usize) {
+    let dest = &line[start..end];
+    let s = start + (dest.len() - dest.trim_start().len());
+    let e = s + line[s..end].trim_end().len();
+    // A <...> wrapper: the path is whatever sits inside, spaces and all.
+    if line.as_bytes().get(s) == Some(&b'<') && e > s + 1 && line.as_bytes()[e - 1] == b'>' {
+        return (s + 1, e - 1);
+    }
+    // Otherwise a "title"/'title' may trail the path after whitespace; the path
+    // ends at the whitespace that introduces the opening quote.
+    let inner = &line.as_bytes()[s..e];
+    for i in 0..inner.len() {
+        if (inner[i] == b' ' || inner[i] == b'\t')
+            && matches!(
+                line[s + i..e].trim_start().bytes().next(),
+                Some(b'"' | b'\'')
+            )
+        {
+            return (s, s + line[s..s + i].trim_end().len());
+        }
+    }
+    (s, e)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1032,5 +1109,54 @@ mod tests {
                 (6, 7, SpanKind::Marker),
             ]
         );
+    }
+
+    fn img(line: &str) -> Option<(&str, &str)> {
+        standalone_image(line).map(|l| (&line[l.alt.0..l.alt.1], &line[l.path.0..l.path.1]))
+    }
+
+    #[test]
+    fn recognizes_a_bare_standalone_image() {
+        assert_eq!(img("![a cat](cat.png)"), Some(("a cat", "cat.png")));
+        // Empty alt is fine.
+        assert_eq!(img("![](cat.png)"), Some(("", "cat.png")));
+    }
+
+    #[test]
+    fn allows_surrounding_whitespace_only() {
+        assert_eq!(img("   ![x](a.png)  "), Some(("x", "a.png")));
+    }
+
+    #[test]
+    fn an_image_mixed_with_text_is_not_a_block_image() {
+        // Leading or trailing prose means it is an inline image, left as source.
+        assert!(img("see ![x](a.png)").is_none());
+        assert!(img("![x](a.png) here").is_none());
+    }
+
+    #[test]
+    fn strips_a_title_keeping_the_path() {
+        assert_eq!(img(r#"![x](a.png "my cat")"#), Some(("x", "a.png")));
+        assert_eq!(img("![x](a.png 'my cat')"), Some(("x", "a.png")));
+    }
+
+    #[test]
+    fn angle_brackets_wrap_a_path_with_spaces() {
+        assert_eq!(img("![x](<my cat.png>)"), Some(("x", "my cat.png")));
+    }
+
+    #[test]
+    fn a_bare_path_keeps_interior_spaces() {
+        // More forgiving than CommonMark, which would require the <...> form.
+        assert_eq!(img("![x](my cat.png)"), Some(("x", "my cat.png")));
+    }
+
+    #[test]
+    fn rejects_malformed_or_empty_links() {
+        assert!(img("![x]").is_none(), "no destination");
+        assert!(img("![x] (a.png)").is_none(), "space between ] and (");
+        assert!(img("![x]()").is_none(), "empty destination");
+        assert!(img("plain text").is_none());
+        assert!(img("[x](a.png)").is_none(), "a link, not an image");
     }
 }

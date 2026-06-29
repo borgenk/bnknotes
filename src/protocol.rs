@@ -142,8 +142,11 @@ pub mod wp_cursor_shape_manager_v1 {
 pub mod wp_cursor_shape_device_v1 {
     /// Set the pointer's shape: the `enter` event's `serial`, then a shape enum.
     pub const SET_SHAPE: u16 = 1;
-    /// The `text` shape (an I-beam), for hovering over editable text. Present
-    /// since version 1 of the protocol.
+    /// Shape enums from the protocol (all present since version 1): the plain arrow
+    /// over a picture, a pointing hand over a clickable control, and the I-beam over
+    /// editable text.
+    pub const SHAPE_DEFAULT: u32 = 1;
+    pub const SHAPE_POINTER: u32 = 4;
     pub const SHAPE_TEXT: u32 = 9;
 }
 

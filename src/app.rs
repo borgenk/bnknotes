@@ -27,7 +27,8 @@ use crate::error::{Error, Result};
 use crate::ffi;
 use crate::file::{self, FileFormat};
 use crate::freetype::Fonts;
-use crate::layout::{run_face, Gutter, Layout};
+use crate::image::ImageStore;
+use crate::layout::{image_button_rect, run_face, Gutter, ImageUi, Layout, Rect};
 use crate::markdown;
 use crate::protocol::{
     self, wl_buffer, wl_callback, wl_compositor, wl_data_device, wl_data_device_manager,
@@ -63,6 +64,13 @@ const CODE_COLOR: u32 = 0x00f3_8ba8;
 const CODE_BG: u32 = 0x0028_2c34;
 /// Corner radius of a fenced code block's panel: a very subtle rounding, no border.
 const CODE_RADIUS: i32 = 4;
+/// A selected image's border (a bright accent so it reads as "selected") and its
+/// thickness; the corner button's panel and corner radius. The button glyph reuses
+/// [`FOREGROUND`].
+const IMAGE_BORDER_COLOR: u32 = 0x005a_9ce0;
+const IMAGE_BORDER_THICKNESS: i32 = 2;
+const IMAGE_BUTTON_BG: u32 = 0x0020_242b;
+const IMAGE_BUTTON_RADIUS: i32 = 4;
 /// Per-level heading text colors (H1..H6): H1/H2 read as normal text, then blue,
 /// yellow, red, and a muted gray for H6 (which is also smaller than body, so color
 /// is its main cue). Indexed by level minus one.
@@ -145,6 +153,12 @@ fn load(path: &Path) -> Result<(String, FileFormat)> {
     }
 }
 
+/// The inputs the laid-out geometry depends on, used to memoize it: content
+/// version, surface width, the active (cursor/selection) range, and the selected /
+/// raw-pinned image (by line-start offset). A scroll or idle redraw leaves all of
+/// these unchanged and reuses the cached layout.
+type LayoutKey = (u64, u32, usize, usize, Option<usize>, Option<usize>);
+
 struct State {
     conn: Connection,
     /// The font opened at every size the styles need (body and heading sizes),
@@ -156,6 +170,18 @@ struct State {
     /// reproduce when saving it.
     path: Option<PathBuf>,
     format: FileFormat,
+    /// Decoded inline images, keyed by their `![](path)` destination, with
+    /// relative paths resolved against the document's directory. Refreshed on each
+    /// layout rebuild and borrowed by the painter to blit the pictures.
+    images: ImageStore,
+    /// The image (by its logical line's start offset) the user has selected: it
+    /// draws a border and corner button, and `Ctrl+C` copies it. `None` when no
+    /// image is selected. Cleared by any keyboard action or a click off the image.
+    selected_image: Option<usize>,
+    /// The image (by line start) whose raw `![alt](path)` source is pinned open by
+    /// its corner button, shown above the picture even with the cursor away. The
+    /// cursor-on-line reveal is separate; this survives until cleared.
+    raw_image: Option<usize>,
     /// The toplevel title last sent, so it is only re-set when it changes.
     title: String,
 
@@ -178,9 +204,15 @@ struct State {
     data_device_manager: Option<u32>,
     data_device: u32,
     /// The cursor-shape manager (if the compositor offers it) and the shape
-    /// device we create for our pointer, used to show an I-beam over the text.
+    /// device we create for our pointer. The shape varies by what is under the
+    /// pointer: a hand over an image's button, the plain arrow over a picture, the
+    /// I-beam over text.
     cursor_shape_manager: Option<u32>,
     cursor_shape_device: u32,
+    /// The most recent pointer `enter` serial (cursor-shape requests need it) and
+    /// the shape currently set, so motion only re-requests when the shape changes.
+    pointer_serial: u32,
+    cursor_shape: u32,
 
     // Pointer state: latest position (surface-local pixels) and whether a left
     // button drag is currently extending a selection.
@@ -218,7 +250,7 @@ struct State {
     /// only things the layout's geometry depends on; a scroll or idle redraw
     /// reuses it instead of re-wrapping and re-measuring the whole document.
     layout_cache: Option<Layout>,
-    layout_key: Option<(u64, u32, usize, usize)>,
+    layout_key: Option<LayoutKey>,
     /// The laid-out document's pixel height plus top and bottom margins, refreshed
     /// whenever the layout is rebuilt. Cached so the scroll path can clamp without
     /// cloning the whole layout just to read its extent.
@@ -235,10 +267,13 @@ struct State {
     last_serial: u32,
 
     // Clipboard. When we own the selection, `clipboard_source` is our live
-    // wl_data_source and `clipboard_text` is what it serves. Incoming offers are
-    // tracked so a paste can request the right MIME type.
+    // wl_data_source; `clipboard_data` is the bytes it serves and `clipboard_mimes`
+    // the types it advertises (text for a text selection, `image/png`/`image/jpeg`
+    // for a copied image). Incoming offers are tracked so a paste can request the
+    // right MIME type.
     clipboard_source: u32,
-    clipboard_text: String,
+    clipboard_data: Vec<u8>,
+    clipboard_mimes: Vec<&'static str>,
     incoming_offer: u32,
     incoming_text_mime: Option<String>,
     selection_offer: u32,
@@ -294,6 +329,12 @@ impl State {
             }
             None => (TextBuffer::new(), FileFormat::default()),
         };
+        // Inline images resolve relative paths against the document's directory.
+        // An unsaved buffer has none, so only absolute paths resolve there.
+        let image_dir = path
+            .as_deref()
+            .and_then(Path::parent)
+            .map(Path::to_path_buf);
         Ok(Self {
             conn,
             fonts,
@@ -301,6 +342,9 @@ impl State {
             text,
             path,
             format,
+            images: ImageStore::new(image_dir),
+            selected_image: None,
+            raw_image: None,
             title: String::new(),
             width: INIT_WIDTH,
             height: INIT_HEIGHT,
@@ -318,6 +362,8 @@ impl State {
             data_device: 0,
             cursor_shape_manager: None,
             cursor_shape_device: 0,
+            pointer_serial: 0,
+            cursor_shape: 0,
             pointer_x: 0.0,
             pointer_y: 0.0,
             selecting: false,
@@ -340,7 +386,8 @@ impl State {
             repeat_at: None,
             last_serial: 0,
             clipboard_source: 0,
-            clipboard_text: String::new(),
+            clipboard_data: Vec::new(),
+            clipboard_mimes: Vec::new(),
             incoming_offer: 0,
             incoming_text_mime: None,
             selection_offer: 0,
@@ -585,6 +632,7 @@ impl State {
                 &self.fonts,
                 &layout,
                 self.text.rope(),
+                &self.images,
                 &PaintParams {
                     width,
                     height,
@@ -889,6 +937,18 @@ impl State {
     }
 
     fn apply_action(&mut self, action: KeyAction) -> Result<()> {
+        // Any keyboard action but Copy drops an image selection and its pinned raw
+        // source (using the keyboard means the user has left the image widget). A
+        // revealed source the caret sits in stays shown via the cursor-on-line
+        // reveal. Copy must see the selection to choose image-vs-text, so it is
+        // exempt. Repaint so the border and button disappear immediately.
+        if !matches!(action, KeyAction::Copy)
+            && (self.selected_image.is_some() || self.raw_image.is_some())
+        {
+            self.selected_image = None;
+            self.raw_image = None;
+            self.dirty = true;
+        }
         let extend = self.xkb.shift_active();
         let changed = match action {
             KeyAction::Char(c) => {
@@ -979,9 +1039,14 @@ impl State {
                 self.goal_x = None;
                 self.text.redo()
             }
-            // The clipboard actions manage their own redraw and may do I/O.
+            // The clipboard actions manage their own redraw and may do I/O. With an
+            // image selected, Copy puts the picture on the clipboard instead of text.
             KeyAction::Copy => {
-                self.copy_selection()?;
+                if self.selected_image.is_some() {
+                    self.copy_selected_image()?;
+                } else {
+                    self.copy_selection()?;
+                }
                 false
             }
             KeyAction::Cut => {
@@ -1120,8 +1185,11 @@ impl State {
                 let _surface = r.u32()?;
                 self.pointer_x = r.fixed()?;
                 self.pointer_y = r.fixed()?;
-                // The whole surface is editable text, so show an I-beam.
-                self.set_cursor_shape(serial);
+                self.pointer_serial = serial;
+                // The compositor resets the cursor on enter, so force a re-set by
+                // invalidating the remembered shape, then pick one for the position.
+                self.cursor_shape = 0;
+                self.update_cursor_shape();
             }
             wl_pointer::EV_MOTION => {
                 let _time = r.u32()?;
@@ -1132,6 +1200,9 @@ impl State {
                     // auto-scroll when the pointer sits at a vertical edge.
                     self.place_cursor_at(self.pointer_x, self.pointer_y, true);
                     self.update_autoscroll();
+                } else {
+                    // Match the pointer shape to whatever is now under it.
+                    self.update_cursor_shape();
                 }
             }
             wl_pointer::EV_BUTTON => {
@@ -1201,21 +1272,68 @@ impl State {
         self.cursor_shape_device = device;
     }
 
-    /// Ask the compositor to draw the I-beam (`text`) shape for the pointer.
-    /// `serial` must be the pointer `enter` event's serial. A no-op when the
-    /// compositor gave us no cursor-shape device.
-    fn set_cursor_shape(&mut self, serial: u32) {
+    /// Ask the compositor to draw `shape` for the pointer, using the latest `enter`
+    /// serial. A no-op when the compositor gave us no cursor-shape device.
+    fn set_cursor_shape(&mut self, shape: u32) {
         if self.cursor_shape_device == 0 {
             return;
         }
         self.conn.request(
             self.cursor_shape_device,
             wp_cursor_shape_device_v1::SET_SHAPE,
-            &[
-                Arg::Uint(serial),
-                Arg::Uint(wp_cursor_shape_device_v1::SHAPE_TEXT),
-            ],
+            &[Arg::Uint(self.pointer_serial), Arg::Uint(shape)],
         );
+    }
+
+    /// Pick and apply the pointer shape for its current position: a hand over a
+    /// selected image's button, the plain arrow over a picture, the I-beam over
+    /// text. Only re-requests when the shape changes, so it is cheap to call on
+    /// every motion event. Uses the cached layout (no clone).
+    fn update_cursor_shape(&mut self) {
+        use wp_cursor_shape_device_v1::{SHAPE_DEFAULT, SHAPE_POINTER, SHAPE_TEXT};
+        self.ensure_layout();
+        let (x, y) = (self.pointer_x, self.pointer_y + self.scroll_y as f32);
+        let shape = match self.layout_cache.as_ref() {
+            Some(layout) if layout.image_button_at(&self.fonts, x, y).is_some() => SHAPE_POINTER,
+            Some(layout) if layout.image_at(&self.fonts, x, y).is_some() => SHAPE_DEFAULT,
+            _ => SHAPE_TEXT,
+        };
+        if shape != self.cursor_shape {
+            self.cursor_shape = shape;
+            self.set_cursor_shape(shape);
+        }
+    }
+
+    /// Handle a left press that landed on an image's picture or its toggle button,
+    /// returning whether it was consumed (so the normal text-click path is skipped).
+    /// The button toggles the raw source; the picture selects the image (arming
+    /// `Ctrl+C` to copy it) without moving the text caret, so the source does not
+    /// auto-reveal.
+    fn on_image_press(&mut self) -> bool {
+        let (x, y) = (self.pointer_x, self.pointer_y + self.scroll_y as f32);
+        let layout = self.layout();
+        if let Some(ls) = layout.image_button_at(&self.fonts, x, y) {
+            self.raw_image = if self.raw_image == Some(ls) {
+                None
+            } else {
+                Some(ls)
+            };
+            self.dirty = true;
+            return true;
+        }
+        if let Some(ls) = layout.image_at(&self.fonts, x, y) {
+            self.selected_image = Some(ls);
+            self.raw_image = None;
+            // Collapse any text selection so a copy targets the image, and leave
+            // the caret where it is (off the image) so its source stays hidden.
+            let cursor = self.text.cursor();
+            self.text.set_cursor(cursor, false);
+            self.selecting = false;
+            self.frozen_reveal = None;
+            self.dirty = true;
+            return true;
+        }
+        false
     }
 
     /// Handle a left-button press: chain it into the click count and act on it.
@@ -1223,6 +1341,17 @@ impl State {
     /// held) and starts a drag; a double-click selects the word under the
     /// pointer; a triple (or more) selects the whole logical line.
     fn on_left_press(&mut self) {
+        // Image interactions take precedence over text: a click on a selected
+        // image's button toggles its raw source, a click on a picture selects it.
+        if self.on_image_press() {
+            return;
+        }
+        // Any other click deselects the image and unpins its raw source; if the
+        // click lands in a revealed source line, the cursor-on-line reveal keeps
+        // that source shown, otherwise it hides (matching "click away to dismiss").
+        self.selected_image = None;
+        self.raw_image = None;
+
         let now = Instant::now();
         let (lx, ly) = self.last_click_pos;
         let near = (self.pointer_x - lx).abs() <= MULTI_CLICK_RADIUS
@@ -1449,13 +1578,15 @@ impl State {
     fn on_data_source(&mut self, opcode: u16, r: &mut Reader) -> Result<()> {
         match opcode {
             wl_data_source::EV_SEND => {
-                // A target is pasting our data: write it to the supplied fd.
+                // A target is pasting our data: write it to the supplied fd. Every
+                // MIME we advertise maps to the same bytes (text encodings, or the
+                // one image type), so the requested MIME does not change what we send.
                 let _mime = r.string()?;
                 let fd = self
                     .conn
                     .take_fd()
                     .ok_or_else(|| Error::msg("data_source.send arrived without its fd"))?;
-                ffi::write_all(fd.as_raw_fd(), self.clipboard_text.as_bytes())?;
+                ffi::write_all(fd.as_raw_fd(), &self.clipboard_data)?;
             }
             wl_data_source::EV_CANCELLED => {
                 // Another selection replaced ours; tear the source down.
@@ -1464,7 +1595,8 @@ impl State {
                         .request(self.clipboard_source, wl_data_source::DESTROY, &[]);
                 }
                 self.clipboard_source = 0;
-                self.clipboard_text.clear();
+                self.clipboard_data.clear();
+                self.clipboard_mimes.clear();
             }
             _ => {}
         }
@@ -1474,8 +1606,7 @@ impl State {
     /// Put the current selection on the clipboard. No-op without a selection.
     fn copy_selection(&mut self) -> Result<()> {
         if let Some(text) = self.text.selected_text() {
-            let text = text.to_string();
-            self.set_clipboard(text);
+            self.set_clipboard(text.into_bytes(), CLIPBOARD_MIMES.to_vec());
         }
         Ok(())
     }
@@ -1485,16 +1616,48 @@ impl State {
         let Some(text) = self.text.selected_text() else {
             return Ok(());
         };
-        let text = text.to_string();
-        self.set_clipboard(text);
+        self.set_clipboard(text.into_bytes(), CLIPBOARD_MIMES.to_vec());
         if self.text.backspace() {
             self.after_edit();
         }
         Ok(())
     }
 
-    /// Become the clipboard owner with `text`, replacing any source we held.
-    fn set_clipboard(&mut self, text: String) {
+    /// Put the selected image's file bytes on the clipboard, advertised as its real
+    /// type (`image/png`/`image/jpeg`), so it can be pasted into other apps. No-op
+    /// if nothing is selected or the file can no longer be read.
+    fn copy_selected_image(&mut self) -> Result<()> {
+        let Some(ls) = self.selected_image else {
+            return Ok(());
+        };
+        let Some(raw) = self.image_path_at(ls) else {
+            return Ok(());
+        };
+        if let Some((bytes, mime)) = self.images.read_source(&raw) {
+            self.set_clipboard(bytes, vec![mime]);
+        }
+        Ok(())
+    }
+
+    /// The raw destination path of the image whose logical line starts at `ls`, or
+    /// `None` if that line is no longer a standalone image.
+    fn image_path_at(&self, ls: usize) -> Option<String> {
+        let rope = self.text.rope();
+        let line_idx = rope.byte_to_line(ls);
+        let n = rope.len_lines();
+        let le = if line_idx + 1 < n {
+            rope.line_to_byte(line_idx + 1) - 1
+        } else {
+            rope.line_to_byte(line_idx + 1)
+        };
+        let line = rope.byte_slice(ls..le);
+        let link = markdown::standalone_image(&line)?;
+        Some(line[link.path.0..link.path.1].to_string())
+    }
+
+    /// Become the clipboard owner serving `data` under `mimes`, replacing any
+    /// source we held.
+    fn set_clipboard(&mut self, data: Vec<u8>, mimes: Vec<&'static str>) {
         let (Some(manager), true) = (self.data_device_manager, self.data_device != 0) else {
             return;
         };
@@ -1508,7 +1671,7 @@ impl State {
             wl_data_device_manager::CREATE_DATA_SOURCE,
             &[Arg::NewId(source)],
         );
-        for mime in CLIPBOARD_MIMES {
+        for mime in &mimes {
             self.conn
                 .request(source, wl_data_source::OFFER, &[Arg::Str(mime)]);
         }
@@ -1518,17 +1681,19 @@ impl State {
             &[Arg::Object(source), Arg::Uint(self.last_serial)],
         );
         self.clipboard_source = source;
-        self.clipboard_text = text;
+        self.clipboard_data = data;
+        self.clipboard_mimes = mimes;
     }
 
     /// Insert the clipboard's text at the cursor.
     fn paste(&mut self) -> Result<()> {
-        // If we own the clipboard, insert our own text directly. Going through
-        // the compositor would deadlock: we'd block reading the pipe while also
-        // needing to service our own source's send event.
+        // If we own the clipboard, insert our own data directly. Going through the
+        // compositor would deadlock: we'd block reading the pipe while also needing
+        // to service our own source's send event. Only text pastes into the buffer;
+        // a copied image has no text representation, so pasting it here is a no-op.
         if self.clipboard_source != 0 {
-            if !self.clipboard_text.is_empty() {
-                let text = self.clipboard_text.clone();
+            if self.clipboard_mimes.iter().any(|m| is_text_mime(m)) {
+                let text = String::from_utf8_lossy(&self.clipboard_data).into_owned();
                 self.insert_clipboard(&text);
             }
             return Ok(());
@@ -1624,10 +1789,23 @@ impl State {
     /// during a drag keeps this key constant, so a drag never re-lays out.
     fn ensure_layout(&mut self) {
         let active = self.reveal_range();
-        let key = (self.text.version(), self.width, active.0, active.1);
+        // The layout depends on the image UI state too (selection draws a border,
+        // a pinned source stacks above the picture), so it is part of the cache key.
+        let key = (
+            self.text.version(),
+            self.width,
+            active.0,
+            active.1,
+            self.selected_image,
+            self.raw_image,
+        );
         if self.layout_key != Some(key) {
             let wrap_width = self.width as i32 - 2 * MARGIN;
-            let layout = Layout::build(
+            // Decode any newly referenced images before laying out, so an image
+            // line gets its real height on the first build (no second pass). A
+            // hit is free, so unchanged images cost only a cheap rescan.
+            self.scan_images();
+            let layout = Layout::build_with_images(
                 &self.fonts,
                 self.text.rope(),
                 MARGIN,
@@ -1635,10 +1813,41 @@ impl State {
                 wrap_width,
                 FONT_SIZE,
                 active,
+                &self.images,
+                self.image_ui(),
             );
             self.content_height = layout.text_height() + 2 * MARGIN;
             self.layout_cache = Some(layout);
             self.layout_key = Some(key);
+        }
+    }
+
+    /// The current per-image UI state, for the layout.
+    fn image_ui(&self) -> ImageUi {
+        ImageUi {
+            selected: self.selected_image,
+            raw: self.raw_image,
+        }
+    }
+
+    /// Ensure every standalone `![](path)` line in the buffer has had its image
+    /// decoded and cached, so [`Self::ensure_layout`] can size the image lines.
+    /// Runs only on a layout rebuild; a path already attempted is a cache hit.
+    fn scan_images(&mut self) {
+        let rope = self.text.rope();
+        let n = rope.len_lines();
+        for i in 0..n {
+            let ls = rope.line_to_byte(i);
+            let le = if i + 1 < n {
+                rope.line_to_byte(i + 1) - 1
+            } else {
+                rope.line_to_byte(i + 1)
+            };
+            let line = rope.byte_slice(ls..le);
+            if let Some(link) = markdown::standalone_image(&line) {
+                let raw = line[link.path.0..link.path.1].to_string();
+                self.images.ensure(&raw);
+            }
         }
     }
 
@@ -1650,8 +1859,9 @@ impl State {
         // `ensure_layout` populates the cache; the rebuild branch is an
         // unreachable guard that keeps this allocation-free path panic-free.
         let active = self.reveal_range();
+        let image_ui = self.image_ui();
         self.layout_cache.clone().unwrap_or_else(|| {
-            Layout::build(
+            Layout::build_with_images(
                 &self.fonts,
                 self.text.rope(),
                 MARGIN,
@@ -1659,6 +1869,8 @@ impl State {
                 self.width as i32 - 2 * MARGIN,
                 FONT_SIZE,
                 active,
+                &self.images,
+                image_ui,
             )
         })
     }
@@ -1709,6 +1921,7 @@ pub(crate) fn paint_document(
     fonts: &Fonts,
     layout: &Layout,
     rope: &crate::rope::Rope,
+    images: &ImageStore,
     p: &PaintParams,
 ) {
     let (width, scroll_y) = (p.width, p.scroll_y);
@@ -1769,6 +1982,35 @@ pub(crate) fn paint_document(
     for line in layout.lines() {
         let m = fonts.metrics(line.size);
         let baseline = line.baseline - scroll_y;
+        // An image line blits its decoded picture into its (taller-than-text) box,
+        // centered with the layout's vertical padding, and nothing else draws on the
+        // line. Cull on the full box height so a tall image straddling a viewport
+        // edge still paints. A picture that has not decoded leaves the box blank.
+        if let Some(img) = line.image {
+            let box_top = baseline - m.ascent;
+            if box_top < view_h && box_top + img.box_height() > 0 {
+                let x = MARGIN + line.indent;
+                let y = box_top + (img.box_height() - img.height) / 2;
+                let raw = rope.byte_slice(img.path_start..img.path_end);
+                // Blit the cached display-size bitmap (resampled once, not per
+                // frame). A no-op if the image is not decoded.
+                let _ = images.with_scaled(&raw, img.width as u32, img.height as u32, |bitmap| {
+                    canvas.blit_argb(x, y, img.width, img.height, bitmap);
+                });
+                // A selected image gets an accent border and a corner toggle button.
+                if img.selected {
+                    let rect = Rect {
+                        x,
+                        y,
+                        w: img.width,
+                        h: img.height,
+                    };
+                    draw_image_border(canvas, &rect);
+                    draw_image_button(canvas, fonts, &image_button_rect(&rect));
+                }
+            }
+            continue;
+        }
         // Skip lines fully above or below the viewport, so a frame only rasterizes
         // what is on screen.
         if baseline + m.descent <= 0 || baseline - m.ascent >= view_h {
@@ -1859,5 +2101,148 @@ pub(crate) fn paint_document(
     if p.caret_visible {
         let (cx, cy, ch) = layout.caret(fonts, rope, p.cursor);
         canvas.fill_rect(cx, cy - scroll_y, CARET_WIDTH, ch, CARET_COLOR);
+    }
+}
+
+/// Draw the accent border around a selected image's picture rect (`rect` already
+/// in screen space). Four thin fills, one per edge.
+fn draw_image_border(canvas: &mut Canvas, rect: &Rect) {
+    let t = IMAGE_BORDER_THICKNESS;
+    canvas.fill_rect(rect.x, rect.y, rect.w, t, IMAGE_BORDER_COLOR);
+    canvas.fill_rect(rect.x, rect.y + rect.h - t, rect.w, t, IMAGE_BORDER_COLOR);
+    canvas.fill_rect(rect.x, rect.y, t, rect.h, IMAGE_BORDER_COLOR);
+    canvas.fill_rect(rect.x + rect.w - t, rect.y, t, rect.h, IMAGE_BORDER_COLOR);
+}
+
+/// Draw the corner toggle button into `btn` (screen space): a rounded panel with a
+/// centered `</>` "source" glyph, so a selected image offers an obvious way to
+/// reveal its markdown.
+fn draw_image_button(canvas: &mut Canvas, fonts: &Fonts, btn: &Rect) {
+    canvas.fill_round_rect(
+        btn.x,
+        btn.y,
+        btn.w,
+        btn.h,
+        IMAGE_BUTTON_BG,
+        IMAGE_BUTTON_RADIUS,
+        render::RoundedCorners::Both,
+    );
+    // Center the glyph in both axes from the code-face metrics.
+    let face = fonts.code_face(FONT_SIZE);
+    let glyph = "</>";
+    let advance = render::text_advance(face, glyph).round() as i32;
+    let m = fonts.metrics(FONT_SIZE);
+    let x = btn.x + (btn.w - advance) / 2;
+    let baseline = btn.y + (btn.h - (m.ascent + m.descent)) / 2 + m.ascent;
+    canvas.draw_text(face, x, baseline, glyph, FOREGROUND);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::image::{Image, ImageStore};
+    use crate::rope::Rope;
+
+    fn paint_params(width: usize, height: usize) -> PaintParams {
+        PaintParams {
+            width,
+            height,
+            scroll_y: 0,
+            selection: None,
+            cursor: 0,
+            caret_visible: false,
+        }
+    }
+
+    /// Painting a *selected* image draws its accent border and its corner button
+    /// panel: end-to-end proof through `paint_document` that the selection chrome
+    /// reaches the canvas (the click that sets the selection is covered by the
+    /// layout hit-test tests).
+    #[test]
+    fn a_selected_image_paints_its_border_and_button() {
+        let fonts = Fonts::new(&markdown::all_sizes(FONT_SIZE)).expect("a default font");
+        let rope = Rope::from_str("![x](cat.png)");
+        // An opaque gray picture, distinct from the border/button colors.
+        let img = Image {
+            pixels: vec![0xff_80_80_80; 60 * 40],
+            width: 60,
+            height: 40,
+        };
+        let store = ImageStore::from_decoded(vec![("cat.png".to_string(), img)]);
+        let (w, h) = (800usize, 600usize);
+        let layout = Layout::build_with_images(
+            &fonts,
+            &rope,
+            MARGIN,
+            MARGIN,
+            w as i32 - 2 * MARGIN,
+            FONT_SIZE,
+            (99, 99), // cursor off the image: it renders as a picture
+            &store,
+            ImageUi {
+                selected: Some(0),
+                raw: None,
+            },
+        );
+        let mut buf = vec![0u8; w * h * 4];
+        let mut canvas = Canvas::new(&mut buf, w, h);
+        paint_document(
+            &mut canvas,
+            &fonts,
+            &layout,
+            &rope,
+            &store,
+            &paint_params(w, h),
+        );
+
+        let has = |color: u32| {
+            buf.chunks_exact(4)
+                .any(|p| u32::from_ne_bytes(p.try_into().unwrap()) & 0x00ff_ffff == color)
+        };
+        assert!(
+            has(IMAGE_BORDER_COLOR),
+            "the accent selection border is painted"
+        );
+        assert!(has(IMAGE_BUTTON_BG), "the corner button panel is painted");
+    }
+
+    /// An idle (unselected) image paints neither border nor button, so the chrome
+    /// only appears on selection.
+    #[test]
+    fn an_idle_image_has_no_selection_chrome() {
+        let fonts = Fonts::new(&markdown::all_sizes(FONT_SIZE)).expect("a default font");
+        let rope = Rope::from_str("![x](cat.png)");
+        let img = Image {
+            pixels: vec![0xff_80_80_80; 60 * 40],
+            width: 60,
+            height: 40,
+        };
+        let store = ImageStore::from_decoded(vec![("cat.png".to_string(), img)]);
+        let (w, h) = (800usize, 600usize);
+        let layout = Layout::build_with_images(
+            &fonts,
+            &rope,
+            MARGIN,
+            MARGIN,
+            w as i32 - 2 * MARGIN,
+            FONT_SIZE,
+            (99, 99),
+            &store,
+            ImageUi::default(),
+        );
+        let mut buf = vec![0u8; w * h * 4];
+        let mut canvas = Canvas::new(&mut buf, w, h);
+        paint_document(
+            &mut canvas,
+            &fonts,
+            &layout,
+            &rope,
+            &store,
+            &paint_params(w, h),
+        );
+        let border = buf
+            .chunks_exact(4)
+            .any(|p| u32::from_ne_bytes(p.try_into().unwrap()) & 0x00ff_ffff == IMAGE_BORDER_COLOR);
+        assert!(!border, "no border without selection");
     }
 }

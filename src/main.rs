@@ -9,6 +9,7 @@ mod ffi;
 mod file;
 mod freetype;
 mod grapheme;
+mod image;
 mod layout;
 mod markdown;
 mod perf;

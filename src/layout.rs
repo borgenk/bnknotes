@@ -57,6 +57,7 @@
 
 use crate::freetype::{Face, FontStyle, Fonts};
 use crate::grapheme;
+use crate::image::ImageStore;
 use crate::markdown;
 use crate::render;
 use crate::rope::Rope;
@@ -75,6 +76,18 @@ const CODE_PAD_X: i32 = 10;
 /// from the body margin. It applies to every visual line of the item; wrapped
 /// continuations add the marker's width on top for the hanging indent.
 const LIST_INDENT: i32 = 14;
+
+/// Vertical breathing room above and below a rendered block image, so it does not
+/// butt against the lines around it. Part of the image line's box height.
+const IMAGE_PAD_Y: i32 = 8;
+
+/// The selected-image toggle button: a rounded panel this wide and tall (wide
+/// enough for the `</>` glyph), inset this far from the picture's top-right corner.
+/// Shared by the painter (to draw it) and hit-testing (to catch clicks), so the
+/// two always agree.
+pub(crate) const IMAGE_BUTTON_W: i32 = 34;
+pub(crate) const IMAGE_BUTTON_H: i32 = 22;
+pub(crate) const IMAGE_BUTTON_MARGIN: i32 = 6;
 
 /// One on-screen line: the byte range of its text (excluding any trailing
 /// `'\n'`), the y of its baseline, whether a hard newline follows it, the pixel
@@ -115,6 +128,52 @@ pub struct VisualLine {
     /// whose cursor has left, so its raw markers are collapsed. While the cursor is
     /// on the line this is false and the editable `---` shows instead.
     pub rule: bool,
+    /// Set when this line renders a `![alt](path)` image as a picture box. The
+    /// picture always shows; its editable source, when revealed, is a separate
+    /// text line stacked *above* this one (see [`Layout::build_with_images`]). The
+    /// box is taller than a text line, so the few places that measure a line's
+    /// vertical extent consult this rather than the font metrics. A widget line is
+    /// never a keyboard caret target (the source line above it is).
+    pub image: Option<ImageBox>,
+}
+
+/// A block image laid out as a picture box for a logical line's `![alt](path)`.
+/// The path is kept as a byte range into the buffer (sliced at paint time to look
+/// the decoded image up in the [`ImageStore`]) rather than an owned string,
+/// matching how [`Run`] carries text. The size is already scaled to fit the
+/// content column, aspect preserved.
+#[derive(Clone, Copy)]
+pub struct ImageBox {
+    /// Byte range of the destination path within the buffer.
+    pub path_start: usize,
+    pub path_end: usize,
+    /// Display size in pixels (the painted rectangle, padding excluded).
+    pub width: i32,
+    pub height: i32,
+    /// True while the user has this image selected: the painter draws a border
+    /// and the corner toggle button, and `Ctrl+C` copies the image.
+    pub selected: bool,
+}
+
+impl ImageBox {
+    /// The full height of the image line's box: the image plus the vertical
+    /// padding above and below it. This is the line's baseline-to-next-box advance
+    /// and its clickable/cull height, standing in for a text line's line-height.
+    /// The painter centers the image in this box and culls on it.
+    pub(crate) fn box_height(&self) -> i32 {
+        self.height + 2 * IMAGE_PAD_Y
+    }
+}
+
+/// The per-image UI state the layout needs: which image (by its logical line's
+/// start offset) is selected, and which has its raw source pinned open by the
+/// corner button. Both are `None` by default (no image being interacted with).
+/// Offsets are valid for the document version being laid out; the app clears them
+/// on any edit, so they never go stale.
+#[derive(Clone, Copy, Default)]
+pub struct ImageUi {
+    pub selected: Option<usize>,
+    pub raw: Option<usize>,
 }
 
 /// The live-preview decoration of a visual line's left gutter, chosen once the
@@ -233,6 +292,41 @@ impl Layout {
         body_size: u32,
         active: (usize, usize),
     ) -> Self {
+        // No image store: any `![](...)` line lays out as its plain source text.
+        Self::build_with_images(
+            fonts,
+            rope,
+            left,
+            top,
+            wrap_width,
+            body_size,
+            active,
+            &ImageStore::new(None),
+            ImageUi::default(),
+        )
+    }
+
+    /// Like [`Self::build`], but resolves a standalone `![alt](path)` line to a
+    /// rendered picture via `images`, scaled to fit the content column (aspect
+    /// preserved, never upscaled). The picture always shows once decoded; its
+    /// editable `![alt](path)` source, when revealed, is laid out as a text line
+    /// *above* the picture, so editing happens with a live preview below. The
+    /// source is revealed when the cursor is on the line or `image_ui.raw` pins it
+    /// open (the corner button). A selected image (`image_ui.selected`) carries a
+    /// border and button. A missing or undecodable image falls back to plain
+    /// source, so a broken link stays visible and editable.
+    #[allow(clippy::too_many_arguments)]
+    pub fn build_with_images(
+        fonts: &Fonts,
+        rope: &Rope,
+        left: i32,
+        top: i32,
+        wrap_width: i32,
+        body_size: u32,
+        active: (usize, usize),
+        images: &ImageStore,
+        image_ui: ImageUi,
+    ) -> Self {
         let mut lines = Vec::new();
         // `box_top` is the top of the current line's box; the baseline sits one
         // ascent below it, and the next box follows one line height down.
@@ -259,6 +353,60 @@ impl Layout {
             // Whether the cursor/selection touches this logical line: the same
             // reveal test headings use, applied to fence lines too.
             let on_line = active.0 <= le && active.1 >= ls;
+            // A standalone `![alt](path)` line whose image has decoded renders as a
+            // picture box. The picture always shows; when its source is revealed
+            // (cursor on the line, or the corner button pinned it open) the editable
+            // `![alt](path)` is laid out as a text line *above* the picture, so you
+            // edit with a live preview below. Inside a code fence the syntax is
+            // literal, not an image; a missing or undecodable image falls through to
+            // plain source so a broken link stays visible and editable.
+            //
+            // `pending_image`, when set, is the widget to append after this line's
+            // source text (the reveal case). The no-reveal case pushes its widget
+            // and `continue`s, never reaching the text path.
+            let mut pending_image: Option<ImageBox> = None;
+            if fence.is_none() {
+                if let Some(link) = markdown::standalone_image(&line) {
+                    if let Some((iw, ih)) = images.dimensions(&line[link.path.0..link.path.1]) {
+                        list_depth = None;
+                        let column = if wrap_width > 0 {
+                            wrap_width
+                        } else {
+                            iw as i32
+                        };
+                        let (width, height) = fit_image(iw, ih, column);
+                        let image = ImageBox {
+                            path_start: ls + link.path.0,
+                            path_end: ls + link.path.1,
+                            width,
+                            height,
+                            selected: image_ui.selected == Some(ls),
+                        };
+                        if on_line || image_ui.raw == Some(ls) {
+                            // Source revealed: emit it (fall through), then the widget.
+                            pending_image = Some(image);
+                        } else {
+                            // Picture only: one widget line, no source text.
+                            lines.push(VisualLine {
+                                start: ls,
+                                end: le,
+                                baseline: box_top + fonts.metrics(body_size).ascent,
+                                hard: has_newline,
+                                size: body_size,
+                                runs: Vec::new(),
+                                indent: 0,
+                                gutter: Gutter::None,
+                                code_block: false,
+                                heading: None,
+                                rule: false,
+                                image: Some(image),
+                            });
+                            box_top += image.box_height();
+                            continue;
+                        }
+                    }
+                }
+            }
             // A line inside a fenced code block is code, not markdown: it skips the
             // inline pass and renders as one code run. The ``` fence lines render
             // their backticks as a marker that hides off the cursor's line, like a
@@ -312,6 +460,9 @@ impl Layout {
                         false,
                     )
                 };
+            // A revealed image's source always shows verbatim (its markers, if any,
+            // are not hidden), so the text above the picture reads as written.
+            let revealed = revealed || pending_image.is_some();
             let metrics = fonts.metrics(size);
             // Heading lines color their text by level (fence/code lines carry the
             // inert `Body` style, so they are never headings here).
@@ -403,8 +554,30 @@ impl Layout {
                     code_block,
                     heading,
                     rule,
+                    image: None,
                 });
                 box_top += metrics.line_height;
+            }
+            // The picture sits below its just-emitted source line(s) (the reveal
+            // case). It is a widget line: never a caret target, taller than text.
+            if let Some(image) = pending_image {
+                lines.push(VisualLine {
+                    start: ls,
+                    end: le,
+                    // The source line above owns the caret and the logical line's
+                    // newline; this widget carries neither.
+                    baseline: box_top + metrics.ascent,
+                    hard: false,
+                    size: body_size,
+                    runs: Vec::new(),
+                    indent: 0,
+                    gutter: Gutter::None,
+                    code_block: false,
+                    heading: None,
+                    rule: false,
+                    image: Some(image),
+                });
+                box_top += image.box_height();
             }
         }
         Self {
@@ -461,6 +634,40 @@ impl Layout {
         line.rule.then_some((line.start, line.end))
     }
 
+    /// The picture's rectangle in content space for an image `line` (the painter
+    /// blits here and draws the border/button around it). `None` for a non-image
+    /// line. The image is centered vertically in the line's box by [`IMAGE_PAD_Y`].
+    pub(crate) fn image_rect(&self, fonts: &Fonts, line: &VisualLine) -> Option<Rect> {
+        let img = line.image?;
+        let m = fonts.metrics(line.size);
+        Some(Rect {
+            x: self.left + line.indent,
+            y: line.baseline - m.ascent + IMAGE_PAD_Y,
+            w: img.width,
+            h: img.height,
+        })
+    }
+
+    /// The logical-line start of the image whose picture contains content-space
+    /// `(x, y)`, for selecting it on click. Callers should test [`Self::image_button_at`]
+    /// first, since the button overlays the picture's corner.
+    pub fn image_at(&self, fonts: &Fonts, x: f32, y: f32) -> Option<usize> {
+        self.lines.iter().find_map(|line| {
+            let rect = self.image_rect(fonts, line)?;
+            rect_contains(&rect, x, y).then_some(line.start)
+        })
+    }
+
+    /// The logical-line start of the selected image whose corner toggle button
+    /// contains content-space `(x, y)`. Only a selected image draws a button.
+    pub fn image_button_at(&self, fonts: &Fonts, x: f32, y: f32) -> Option<usize> {
+        self.lines.iter().find_map(|line| {
+            let img = line.image?;
+            let rect = self.image_rect(fonts, line)?;
+            (img.selected && rect_contains(&image_button_rect(&rect), x, y)).then_some(line.start)
+        })
+    }
+
     /// The byte offset reached by moving `dir` lines (-1 up, +1 down) from
     /// `offset`, aiming for window x `goal_x`. Clamps at the first and last line.
     pub fn offset_vertical(
@@ -472,7 +679,16 @@ impl Layout {
         goal_x: f32,
     ) -> usize {
         let idx = self.line_index_for(offset) as i32;
-        let target = idx + dir;
+        let mut target = idx + dir;
+        // Step over the picture half of a revealed image (its source line is the
+        // caret target). A picture-only line is not skipped, so the caret can land
+        // on it (at its start), revealing the source on the next build.
+        while target >= 0
+            && (target as usize) < self.lines.len()
+            && self.is_stacked_widget(target as usize)
+        {
+            target += dir;
+        }
         if target < 0 || target as usize >= self.lines.len() {
             return offset;
         }
@@ -489,7 +705,7 @@ impl Layout {
         end: usize,
     ) -> Vec<Rect> {
         let mut rects = Vec::new();
-        for line in &self.lines {
+        for (i, line) in self.lines.iter().enumerate() {
             let m = fonts.metrics(line.size);
             let sel_start = start.max(line.start);
             let sel_end = end.min(line.end);
@@ -497,6 +713,23 @@ impl Layout {
             // line's text into the break. Soft wraps have no newline to select.
             let newline_selected = line.hard && start <= line.end && end > line.end;
             if sel_start >= sel_end && !newline_selected {
+                continue;
+            }
+            // An image line has no text to run-walk. The picture is highlighted
+            // only when it is the sole representation of its logical line (a text
+            // selection spanning a picture-only image). When its editable source is
+            // stacked above it (the reveal), that source line already carries the
+            // highlight, so the picture is not boxed too: selecting the raw text
+            // must not read as selecting the image.
+            if let Some(img) = line.image {
+                if !self.is_stacked_widget(i) {
+                    rects.push(Rect {
+                        x: self.left + line.indent,
+                        y: line.baseline - m.ascent,
+                        w: img.width.max(1),
+                        h: img.box_height(),
+                    });
+                }
                 continue;
             }
             // Measure the run-walked advance to each end of the selection; bytes
@@ -559,18 +792,23 @@ impl Layout {
     }
 
     /// The visual line containing `offset`. A cursor at a soft-wrap boundary is
-    /// given to the later line; one at a hard newline stays on its line.
+    /// given to the later line; one at a hard newline stays on its line. Image
+    /// picture lines are skipped: they are never caret targets, so the caret lands
+    /// on the source text line (which a revealed image always has above its
+    /// picture). Falls back to the last text line for an offset at the document end.
     fn line_for(&self, offset: usize) -> &VisualLine {
         self.lines
             .iter()
+            .filter(|l| l.image.is_none())
             .find(|l| offset < l.end || (offset == l.end && l.hard))
-            .unwrap_or_else(|| self.last_line())
+            .unwrap_or_else(|| self.last_text_line())
     }
 
     fn line_index_for(&self, offset: usize) -> usize {
         self.lines
             .iter()
-            .position(|l| offset < l.end || (offset == l.end && l.hard))
+            .position(|l| l.image.is_none() && (offset < l.end || (offset == l.end && l.hard)))
+            .or_else(|| self.lines.iter().rposition(|l| l.image.is_none()))
             .unwrap_or(self.lines.len().saturating_sub(1))
     }
 
@@ -580,7 +818,16 @@ impl Layout {
     fn line_for_y(&self, fonts: &Fonts, y: f32) -> &VisualLine {
         self.lines
             .iter()
-            .find(|l| y < (l.baseline + fonts.metrics(l.size).descent) as f32)
+            .find(|l| {
+                let m = fonts.metrics(l.size);
+                let bottom = match l.image {
+                    // An image line's band spans its full (taller) box, so a click
+                    // anywhere on the picture lands on it and reveals its source.
+                    Some(img) => l.baseline - m.ascent + img.box_height(),
+                    None => l.baseline + m.descent,
+                };
+                y < bottom as f32
+            })
             .unwrap_or_else(|| self.last_line())
     }
 
@@ -633,6 +880,29 @@ impl Layout {
         // build always pushes at least one line, so this never panics.
         &self.lines[self.lines.len() - 1]
     }
+
+    /// The last caret-bearing (non-picture) line, the end-of-document fallback for
+    /// caret placement. Falls back to the very last line only in the degenerate
+    /// case of a document whose visual lines are all pictures.
+    fn last_text_line(&self) -> &VisualLine {
+        self.lines
+            .iter()
+            .rev()
+            .find(|l| l.image.is_none())
+            .unwrap_or_else(|| self.last_line())
+    }
+
+    /// Whether the visual line at `idx` is the picture half of a revealed image,
+    /// i.e. its editable source line sits immediately above it (same logical line,
+    /// so same `end`). Such a widget is stepped over by vertical caret motion; a
+    /// picture-only line (no source above) is not, so the caret can land on it and
+    /// reveal the source.
+    fn is_stacked_widget(&self, idx: usize) -> bool {
+        idx > 0
+            && self.lines[idx].image.is_some()
+            && self.lines[idx - 1].image.is_none()
+            && self.lines[idx - 1].end == self.lines[idx].end
+    }
 }
 
 /// Resolve a line's block style against the running list nesting `list_depth`
@@ -642,6 +912,42 @@ impl Layout {
 /// renders as a list item when its parent, one level shallower, is present above
 /// it, otherwise it falls back to plain body text (marker length `0`). Blank
 /// lines leave the nesting untouched; any other non-list line ends it.
+/// Display size for an image of intrinsic size `iw` x `ih` shown in a `column`
+/// of pixels: the intrinsic size when it already fits, otherwise scaled down to
+/// the column width with its aspect ratio preserved. Never upscaled (a small
+/// image keeps its size rather than blurring to fill the column). Integer math,
+/// in `i64` so the intermediate product cannot overflow.
+fn fit_image(iw: u32, ih: u32, column: i32) -> (i32, i32) {
+    let (iw, ih) = (iw.max(1) as i64, ih.max(1) as i64);
+    let column = column.max(1) as i64;
+    let (w, h) = if iw <= column {
+        (iw, ih)
+    } else {
+        (column, (ih * column / iw).max(1))
+    };
+    (w as i32, h as i32)
+}
+
+/// The toggle button's rectangle, inset into the top-right corner of a picture
+/// `image` rect. Shared by the painter and hit-testing so a click lands where the
+/// button is drawn.
+pub(crate) fn image_button_rect(image: &Rect) -> Rect {
+    Rect {
+        x: image.x + image.w - IMAGE_BUTTON_W - IMAGE_BUTTON_MARGIN,
+        y: image.y + IMAGE_BUTTON_MARGIN,
+        w: IMAGE_BUTTON_W,
+        h: IMAGE_BUTTON_H,
+    }
+}
+
+/// Whether content-space point `(x, y)` lies within `rect`.
+fn rect_contains(rect: &Rect, x: f32, y: f32) -> bool {
+    x >= rect.x as f32
+        && x < (rect.x + rect.w) as f32
+        && y >= rect.y as f32
+        && y < (rect.y + rect.h) as f32
+}
+
 fn resolve_list(line: &str, list_depth: &mut Option<usize>) -> (markdown::LineStyle, usize) {
     let style = markdown::style_of(line);
     match style {
@@ -1887,5 +2193,261 @@ mod tests {
         // edits rather than reselecting.
         let on = Layout::build(&f, &r, LEFT, TOP, 1_000_000, BODY, (2, 2));
         assert_eq!(on.rule_at(&f, on.lines()[1].baseline as f32), None);
+    }
+
+    /// A decoded image of the given size, pixels zeroed (layout only reads dims).
+    fn decoded(w: u32, h: u32) -> crate::image::Image {
+        crate::image::Image {
+            pixels: vec![0; (w * h) as usize],
+            width: w,
+            height: h,
+        }
+    }
+
+    fn store(path: &str, w: u32, h: u32) -> ImageStore {
+        ImageStore::from_decoded(vec![(path.to_string(), decoded(w, h))])
+    }
+
+    /// Build a layout over `r` with the image store `s` and UI state `ui`, at a
+    /// wide wrap so images show at intrinsic size.
+    fn layout_img(
+        f: &Fonts,
+        r: &Rope,
+        active: (usize, usize),
+        s: &ImageStore,
+        ui: ImageUi,
+    ) -> Layout {
+        Layout::build_with_images(f, r, LEFT, TOP, 1_000_000, BODY, active, s, ui)
+    }
+
+    #[test]
+    fn fit_image_caps_width_and_preserves_aspect() {
+        assert_eq!(
+            fit_image(100, 50, 1000),
+            (100, 50),
+            "fits the column: intrinsic"
+        );
+        assert_eq!(
+            fit_image(200, 100, 100),
+            (100, 50),
+            "too wide: scaled, aspect kept"
+        );
+        assert_eq!(fit_image(0, 0, 100), (1, 1), "degenerate dims clamp to 1");
+    }
+
+    #[test]
+    fn an_idle_image_is_a_picture_only() {
+        let f = fonts();
+        let r = rope("![cat](cat.png)\nafter");
+        let s = store("cat.png", 80, 40);
+        // Nothing selected, cursor on "after": just the picture, no source line.
+        let l = layout_img(&f, &r, (20, 20), &s, ImageUi::default());
+        let img = l.lines()[0].image.expect("first line renders as a picture");
+        assert_eq!((img.width, img.height), (80, 40));
+        assert!(!img.selected, "not selected by default");
+        assert_eq!(r.byte_slice(img.path_start..img.path_end), "cat.png");
+        assert!(
+            l.lines()[0].runs.is_empty(),
+            "no source text for an idle image"
+        );
+    }
+
+    #[test]
+    fn the_cursor_stacks_the_source_above_the_still_shown_picture() {
+        let f = fonts();
+        let r = rope("![cat](cat.png)\nafter");
+        let s = store("cat.png", 80, 40);
+        // Cursor on the image line: source text on top, picture still below it.
+        let l = layout_img(&f, &r, (0, 0), &s, ImageUi::default());
+        assert!(l.lines()[0].image.is_none(), "row 0 is the editable source");
+        assert!(
+            !l.lines()[0].runs.is_empty(),
+            "the raw markdown is laid out"
+        );
+        assert!(
+            l.lines()[1].image.is_some(),
+            "the picture still shows below it"
+        );
+    }
+
+    #[test]
+    fn the_button_pin_reveals_source_without_the_cursor() {
+        let f = fonts();
+        let r = rope("![cat](cat.png)\nafter");
+        let s = store("cat.png", 80, 40);
+        // Cursor on "after" (off the image), but the corner button pinned raw open.
+        let ui = ImageUi {
+            selected: Some(0),
+            raw: Some(0),
+        };
+        let l = layout_img(&f, &r, (20, 20), &s, ui);
+        assert!(
+            l.lines()[0].image.is_none(),
+            "source shows though the cursor is away"
+        );
+        assert!(
+            l.lines()[1].image.is_some(),
+            "picture below the pinned source"
+        );
+    }
+
+    #[test]
+    fn a_selected_image_carries_the_flag() {
+        let f = fonts();
+        let r = rope("![x](cat.png)");
+        let s = store("cat.png", 80, 80);
+        let idle = layout_img(&f, &r, (99, 99), &s, ImageUi::default());
+        assert!(!idle.lines()[0].image.unwrap().selected);
+        let sel = layout_img(
+            &f,
+            &r,
+            (99, 99),
+            &s,
+            ImageUi {
+                selected: Some(0),
+                raw: None,
+            },
+        );
+        assert!(
+            sel.lines()[0].image.unwrap().selected,
+            "the flag drives the border/button"
+        );
+    }
+
+    #[test]
+    fn a_missing_image_stays_plain_source() {
+        let f = fonts();
+        let r = rope("![x](gone.png)\nafter");
+        let s = ImageStore::from_decoded(vec![]); // nothing decoded
+        let l = layout_img(&f, &r, (20, 20), &s, ImageUi::default());
+        assert!(
+            l.lines().iter().all(|line| line.image.is_none()),
+            "an undecodable image is never a picture box, just editable source"
+        );
+        assert!(
+            !l.lines()[0].runs.is_empty(),
+            "the source is laid out as text"
+        );
+    }
+
+    #[test]
+    fn an_image_box_pushes_the_following_line_down() {
+        let f = fonts();
+        let r = rope("![x](cat.png)\nafter");
+        let s = store("cat.png", 40, 200); // a tall image
+        let l = layout_img(&f, &r, (20, 20), &s, ImageUi::default());
+        let img = l.lines()[0].image.unwrap();
+        let after = &l.lines()[1];
+        let m = f.metrics(BODY);
+        // "after" sits a full image-box height below the picture's top at TOP.
+        assert_eq!(after.baseline - m.ascent, TOP + img.box_height());
+    }
+
+    #[test]
+    fn image_at_hits_the_picture_and_button_only_when_selected() {
+        let f = fonts();
+        let r = rope("![x](cat.png)\nafter");
+        let s = store("cat.png", 80, 80);
+        let sel = layout_img(
+            &f,
+            &r,
+            (20, 20),
+            &s,
+            ImageUi {
+                selected: Some(0),
+                raw: None,
+            },
+        );
+        let rect = sel
+            .image_rect(&f, &sel.lines()[0])
+            .expect("the picture rect");
+        // A point inside the picture selects that image.
+        let inside = ((rect.x + 5) as f32, (rect.y + 5) as f32);
+        assert_eq!(sel.image_at(&f, inside.0, inside.1), Some(0));
+        // The corner button is hit only when the image is selected.
+        let btn = image_button_rect(&rect);
+        let bpt = ((btn.x + 1) as f32, (btn.y + 1) as f32);
+        assert_eq!(sel.image_button_at(&f, bpt.0, bpt.1), Some(0));
+        let idle = layout_img(&f, &r, (20, 20), &s, ImageUi::default());
+        assert_eq!(
+            idle.image_button_at(&f, bpt.0, bpt.1),
+            None,
+            "no button when idle"
+        );
+        // A point well below the picture hits nothing.
+        assert_eq!(
+            sel.image_at(&f, inside.0, (rect.y + rect.h + 500) as f32),
+            None
+        );
+    }
+
+    #[test]
+    fn vertical_motion_steps_over_a_revealed_picture() {
+        let f = fonts();
+        let r = rope("![x](cat.png)\nafter");
+        let s = store("cat.png", 80, 80);
+        // Source revealed (cursor on the image line): rows are [source, picture,
+        // after]. "![x](cat.png)" is 13 bytes, so "after" starts at byte 14.
+        let l = layout_img(&f, &r, (0, 0), &s, ImageUi::default());
+        // Down from the source skips the picture row and lands in "after" (>= 14).
+        assert!(
+            l.offset_vertical(&f, &r, 0, 1, 0.0) >= 14,
+            "down skips the picture"
+        );
+        // Up from "after" skips the picture and lands back in the source (<= 13).
+        assert!(
+            l.offset_vertical(&f, &r, 16, -1, 0.0) <= 13,
+            "up skips the picture"
+        );
+    }
+
+    #[test]
+    fn arrowing_onto_a_picture_only_image_lands_at_its_start() {
+        let f = fonts();
+        let r = rope("top\n![x](cat.png)");
+        let s = store("cat.png", 80, 80);
+        // Cursor on "top"; the image below is a picture-only row (not revealed).
+        let l = layout_img(&f, &r, (0, 0), &s, ImageUi::default());
+        // Down lands on the image's logical start (4), so the next build reveals it.
+        assert_eq!(l.offset_vertical(&f, &r, 0, 1, 0.0), 4);
+    }
+
+    #[test]
+    fn a_selection_over_an_image_covers_its_whole_box() {
+        let f = fonts();
+        let r = rope("![x](cat.png)\nafter");
+        let s = store("cat.png", 80, 60);
+        let l = layout_img(&f, &r, (20, 20), &s, ImageUi::default());
+        // Select from the document start into "after": the image row's rect spans
+        // the whole picture box, not a thin text-height strip.
+        let rects = l.selection_rects(&f, &r, 0, 18);
+        let img = l.lines()[0].image.unwrap();
+        assert!(
+            rects
+                .iter()
+                .any(|rc| rc.h == img.box_height() && rc.w == img.width),
+            "the image's selection rect matches its box"
+        );
+    }
+
+    #[test]
+    fn selecting_a_revealed_source_does_not_box_the_picture() {
+        let f = fonts();
+        let r = rope("![x](cat.png)\nafter");
+        let s = store("cat.png", 80, 60);
+        // Raw revealed (cursor on the image line): rows are [source, picture, after].
+        let l = layout_img(&f, &r, (0, 0), &s, ImageUi::default());
+        let picture = l.lines()[1].image.expect("row 1 is the picture");
+        // Select the source line. The picture row must not add its box: that would
+        // make highlighting the raw text look like selecting the image.
+        let rects = l.selection_rects(&f, &r, 0, 13);
+        assert!(
+            !rects.iter().any(|rc| rc.h == picture.box_height()),
+            "the stacked picture is not boxed by a text selection of its source"
+        );
+        assert!(
+            !rects.is_empty(),
+            "the source text itself is still highlighted"
+        );
     }
 }

@@ -22,7 +22,8 @@ use std::time::Instant;
 use crate::app::{paint_document, PaintParams, FONT_SIZE, MARGIN};
 use crate::error::{Error, Result};
 use crate::freetype::Fonts;
-use crate::layout::Layout;
+use crate::image::{Image, ImageStore};
+use crate::layout::{ImageUi, Layout};
 use crate::markdown;
 use crate::render::Canvas;
 use crate::rope::Rope;
@@ -95,6 +96,8 @@ fn measure() -> Result<Vec<Sample>> {
     let layout = Layout::build(&fonts, &rope, MARGIN, MARGIN, wrap, FONT_SIZE, (0, 0));
     let content_h = layout.text_height() + 2 * MARGIN;
     let mut buf = vec![0u8; WIDTH * HEIGHT * 4];
+    // The fixture has no images; an empty store satisfies the painter's signature.
+    let images = ImageStore::new(None);
 
     let mut out = Vec::new();
 
@@ -122,7 +125,14 @@ fn measure() -> Result<Vec<Sample>> {
         name: "paint_frame",
         ns: bench(100, || {
             let mut canvas = Canvas::new(&mut buf, WIDTH, HEIGHT);
-            paint_document(&mut canvas, &fonts, &layout, &rope, &params(0, None));
+            paint_document(
+                &mut canvas,
+                &fonts,
+                &layout,
+                &rope,
+                &images,
+                &params(0, None),
+            );
             buf[0]
         }),
     });
@@ -139,7 +149,14 @@ fn measure() -> Result<Vec<Sample>> {
             let sy = offsets[k % offsets.len()];
             k += 1;
             let mut canvas = Canvas::new(&mut buf, WIDTH, HEIGHT);
-            paint_document(&mut canvas, &fonts, &layout, &rope, &params(sy, None));
+            paint_document(
+                &mut canvas,
+                &fonts,
+                &layout,
+                &rope,
+                &images,
+                &params(sy, None),
+            );
             buf[0]
         }),
     });
@@ -161,7 +178,59 @@ fn measure() -> Result<Vec<Sample>> {
                 &fonts,
                 &layout,
                 &rope,
+                &images,
                 &params(0, Some((0, end))),
+            );
+            buf[0]
+        }),
+    });
+
+    // Paint a frame containing a decoded image, to guard the per-frame image blit.
+    // Bilinear resampling is cached at display size, so the steady cost is a plain
+    // blit of the cached bitmap; the warm-up paint below fills that cache first. A
+    // regression here would mean the resample leaked back into the per-frame path.
+    let image_rope = Rope::from_str("# Perf\n\n![pic](perf.png)\n\nbody text under the image\n");
+    let image_store = ImageStore::from_decoded(vec![(
+        "perf.png".to_string(),
+        Image {
+            pixels: vec![0xff_30_60_90; 400 * 300],
+            width: 400,
+            height: 300,
+        },
+    )]);
+    let image_layout = Layout::build_with_images(
+        &fonts,
+        &image_rope,
+        MARGIN,
+        MARGIN,
+        wrap,
+        FONT_SIZE,
+        (0, 0), // cursor on the heading: the image renders as a picture
+        &image_store,
+        ImageUi::default(),
+    );
+    {
+        let mut canvas = Canvas::new(&mut buf, WIDTH, HEIGHT);
+        paint_document(
+            &mut canvas,
+            &fonts,
+            &image_layout,
+            &image_rope,
+            &image_store,
+            &params(0, None),
+        );
+    }
+    out.push(Sample {
+        name: "image_paint",
+        ns: bench(100, || {
+            let mut canvas = Canvas::new(&mut buf, WIDTH, HEIGHT);
+            paint_document(
+                &mut canvas,
+                &fonts,
+                &image_layout,
+                &image_rope,
+                &image_store,
+                &params(0, None),
             );
             buf[0]
         }),

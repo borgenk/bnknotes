@@ -3,9 +3,18 @@ name = "bnknotes"
 version = "0.1.0"
 edition = "2021"
 
-# Deliberately zero dependencies. The Wayland wire protocol is spoken directly
-# over a UnixStream; glyph rasterization will FFI into the system FreeType.
+# Almost zero dependencies. The Wayland wire protocol is spoken directly over a
+# UnixStream and glyph rasterization FFIs into the system FreeType.
+#
+# The lone exception is image decoding (src/image.rs). Decoders parse hostile,
+# attacker-controlled bytes, exactly the place where an in-tree decoder (or
+# binding C libpng/libjpeg) trades away the memory safety we want, so we lean on the
+# pure-Rust, no-C zune decoders behind a single isolated module. default-features
+# is off to compile only the decode path.
 [dependencies]
+zune-core = { version = "0.5", default-features = false, features = ["std"] }
+zune-png = { version = "0.5", default-features = false, features = ["std"] }
+zune-jpeg = { version = "0.5", default-features = false, features = ["std"] }
 
 [profile.release]
 opt-level = 3

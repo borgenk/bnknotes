@@ -104,7 +104,10 @@ impl<'a> Canvas<'a> {
 
     /// Blend `color` over the pixel at (x, y) with `coverage` as the alpha
     /// (0 = transparent, 255 = opaque). Pixels outside the surface or the active
-    /// clip are skipped.
+    /// clip are skipped. This is the bounds-checked entry; the hot loops
+    /// ([`Self::draw_text`], [`Self::blit_argb`]) clip their span once against
+    /// [`Self::clamp_rect`] and then call [`Self::blend_at`] with no per-pixel
+    /// guard.
     pub fn blend(&mut self, x: i32, y: i32, color: u32, coverage: u8) {
         if x < 0 || y < 0 || !self.in_clip(x, y) {
             return;
@@ -113,7 +116,15 @@ impl<'a> Canvas<'a> {
         if x >= self.width || y >= self.height {
             return;
         }
-        let idx = (y * self.width + x) * 4;
+        self.blend_at((y * self.width + x) * 4, color, coverage);
+    }
+
+    /// Alpha-blend `color`/`coverage` into the pixel at byte index `idx`, with no
+    /// bounds or clip check: the caller guarantees `idx` is in range (the span
+    /// loops clip first). This is the inner write the [`blend`](Self::blend)
+    /// guards funnel into.
+    #[inline]
+    fn blend_at(&mut self, idx: usize, color: u32, coverage: u8) {
         let dst = &mut self.buf[idx..idx + 4];
         let bg = u32::from_ne_bytes([dst[0], dst[1], dst[2], dst[3]]);
         dst.copy_from_slice(&blend_over(bg, color, coverage).to_ne_bytes());
@@ -169,6 +180,11 @@ impl<'a> Canvas<'a> {
     /// Lay out and draw `text` at `pen_x`, baseline `baseline`, in `color`.
     /// Glyphs are rasterized on demand; the pen advances by each glyph's
     /// advance. Returns the pen x after the last glyph.
+    ///
+    /// Each glyph's bitmap is clipped once to the visible region (surface
+    /// intersected with any active clip) and the in-range pixels are blended with
+    /// no per-pixel bounds check, so a screenful of glyphs costs millions fewer
+    /// branches than guarding every pixel.
     pub fn draw_text(
         &mut self,
         face: &Face,
@@ -177,21 +193,25 @@ impl<'a> Canvas<'a> {
         text: &str,
         color: u32,
     ) -> i32 {
+        let (cx0, cy0, cx1, cy1) = self.clamp_rect(0, 0, self.width as i32, self.height as i32);
+        let width = self.width;
         let mut pen = pen_x as f32;
         for ch in text.chars() {
             face.with_glyph(ch, |glyph| {
                 let origin_x = pen.round() as i32 + glyph.left;
                 let origin_y = baseline - glyph.top;
-                for row in 0..glyph.rows {
-                    for col in 0..glyph.width {
-                        let coverage = glyph.coverage[row * glyph.width + col];
+                // The glyph's bitmap rectangle, clipped to the visible region.
+                let gx0 = origin_x.max(cx0);
+                let gy0 = origin_y.max(cy0);
+                let gx1 = (origin_x + glyph.width as i32).min(cx1);
+                let gy1 = (origin_y + glyph.rows as i32).min(cy1);
+                for y in gy0..gy1 {
+                    let cov_row = (y - origin_y) as usize * glyph.width;
+                    let px_row = y as usize * width;
+                    for x in gx0..gx1 {
+                        let coverage = glyph.coverage[cov_row + (x - origin_x) as usize];
                         if coverage > 0 {
-                            self.blend(
-                                origin_x + col as i32,
-                                origin_y + row as i32,
-                                color,
-                                coverage,
-                            );
+                            self.blend_at((px_row + x as usize) * 4, color, coverage);
                         }
                     }
                 }
@@ -212,13 +232,22 @@ impl<'a> Canvas<'a> {
         if w <= 0 || h <= 0 || src.len() < (w * h) as usize {
             return;
         }
-        for dy in 0..h {
-            let row = (dy * w) as usize;
-            for dx in 0..w {
-                let argb = src[row + dx as usize];
+        // Clip the destination rectangle to the visible region once, then blend the
+        // in-range pixels with no per-pixel bounds check.
+        let (cx0, cy0, cx1, cy1) = self.clamp_rect(0, 0, self.width as i32, self.height as i32);
+        let width = self.width;
+        let bx0 = x.max(cx0);
+        let by0 = y.max(cy0);
+        let bx1 = (x + w).min(cx1);
+        let by1 = (y + h).min(cy1);
+        for py in by0..by1 {
+            let src_row = ((py - y) * w) as usize;
+            let px_row = py as usize * width;
+            for px in bx0..bx1 {
+                let argb = src[src_row + (px - x) as usize];
                 let alpha = (argb >> 24) as u8;
                 if alpha != 0 {
-                    self.blend(x + dx, y + dy, argb & 0x00ff_ffff, alpha);
+                    self.blend_at((px_row + px as usize) * 4, argb & 0x00ff_ffff, alpha);
                 }
             }
         }

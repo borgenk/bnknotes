@@ -147,6 +147,13 @@ pub fn save_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
 fn write_then_rename(tmp: &Path, path: &Path, bytes: &[u8]) -> Result<()> {
     let mut file = File::create(tmp)?;
     file.write_all(bytes)?;
+    // Carry the target's permission bits onto the temp before it replaces it.
+    // `File::create` makes the temp 0644 (& umask), so without this a private
+    // 0600 note would silently become world-readable after the rename. A
+    // brand-new file (no existing target) keeps the default permissions.
+    if let Ok(meta) = std::fs::metadata(path) {
+        file.set_permissions(meta.permissions())?;
+    }
     // Flush the contents to disk before the rename publishes them, so the
     // renamed file is never an empty or truncated placeholder.
     file.sync_all()?;
@@ -157,6 +164,7 @@ fn write_then_rename(tmp: &Path, path: &Path, bytes: &[u8]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
 
     #[test]
@@ -256,6 +264,23 @@ mod tests {
             leftovers.is_empty(),
             "temp files left behind: {leftovers:?}"
         );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn save_atomic_preserves_an_existing_files_permissions() {
+        let dir = tmp_dir("save_perms");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("note.md");
+
+        // A private 0600 note must stay 0600 after a save, not revert to the
+        // temp file's default 0644.
+        save_atomic(&path, b"secret").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        save_atomic(&path, b"still secret").unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "permissions survive an atomic save");
 
         std::fs::remove_dir_all(&dir).ok();
     }

@@ -837,13 +837,12 @@ impl Layout {
     /// markers lands in the visible text, never inside a collapsed marker.
     fn hit_line(&self, fonts: &Fonts, rope: &Rope, line: &VisualLine, x: f32) -> usize {
         let mut acc = self.left as f32 + line.indent as f32;
-        // Past every glyph: the end of the last visible run, or the line start
-        // for an empty line.
-        let mut last = line.start;
+        let mut drew_text = false;
         for run in &line.runs {
             if !run.visible {
                 continue;
             }
+            drew_text = true;
             let face = run_face(fonts, line.size, run.kind, line.heading.is_some());
             let slice = rope.byte_slice(run.start..run.end);
             for (off, cluster) in grapheme::graphemes(&slice) {
@@ -853,9 +852,18 @@ impl Layout {
                 }
                 acc += w;
             }
-            last = run.end;
         }
-        last
+        // Past every glyph: a line that drew text ends at its logical end, which
+        // sits *after* any trailing collapsed marker (the closing `*` of `*word*`);
+        // the last visible run's end would land the caret before that hidden marker.
+        // A line with no visible glyphs (an empty line, or a picture row whose
+        // source is collapsed) instead lands at its start, so arrowing onto a
+        // picture reveals its source on the next build.
+        if drew_text {
+            line.end
+        } else {
+            line.start
+        }
     }
 
     /// Pen advance in pixels from the left margin to absolute byte `offset`,
@@ -878,6 +886,7 @@ impl Layout {
 
     fn last_line(&self) -> &VisualLine {
         // build always pushes at least one line, so this never panics.
+        debug_assert!(!self.lines.is_empty());
         &self.lines[self.lines.len() - 1]
     }
 
@@ -1572,6 +1581,19 @@ mod tests {
             seen.contains(&0) && seen.contains(&7),
             "the line's ends stay reachable"
         );
+    }
+
+    #[test]
+    fn clicking_past_a_trailing_collapsed_marker_lands_at_the_line_end() {
+        let f = fonts();
+        // With the cursor away, "`b`" renders as just "b"; its closing backtick
+        // is a hidden marker at the line's end.
+        let r = rope("`b`");
+        let l = Layout::build(&f, &r, LEFT, TOP, 1_000_000, BODY, (99, 99));
+        let y = l.lines()[0].baseline as f32;
+        // A click far to the right resolves to the line's logical end (3), after
+        // the collapsed backtick, not the end of the visible "b" (2).
+        assert_eq!(l.offset_at(&f, &r, 10_000.0, y), 3);
     }
 
     #[test]

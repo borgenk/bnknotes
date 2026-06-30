@@ -196,7 +196,13 @@ fn concat(l: Rc<Inner>, r: Rc<Inner>) -> Rc<Inner> {
 /// byte offset on a `char` boundary.
 fn split(node: &Rc<Inner>, at: usize) -> (Rc<Inner>, Rc<Inner>) {
     match &node.kind {
-        Kind::Leaf(s) => (leaf(s[..at].to_string()), leaf(s[at..].to_string())),
+        Kind::Leaf(s) => {
+            debug_assert!(
+                at <= s.len() && s.is_char_boundary(at),
+                "split off a char boundary"
+            );
+            (leaf(s[..at].to_string()), leaf(s[at..].to_string()))
+        }
         Kind::Branch(l, r) => {
             let lb = l.bytes;
             if at < lb {
@@ -295,7 +301,13 @@ fn write_node(node: &Inner, f: &mut fmt::Formatter<'_>) -> fmt::Result {
 /// node and `char`-aligned (leaf boundaries fall on `char` boundaries).
 fn append_range(node: &Inner, start: usize, end: usize, out: &mut String) {
     match &node.kind {
-        Kind::Leaf(s) => out.push_str(&s[start..end]),
+        Kind::Leaf(s) => {
+            debug_assert!(
+                start <= end && end <= s.len(),
+                "append_range within the leaf"
+            );
+            out.push_str(&s[start..end]);
+        }
         Kind::Branch(l, r) => {
             let lb = l.bytes;
             if start < lb {
@@ -337,7 +349,10 @@ fn line_start(node: &Inner, line: usize) -> usize {
 /// The number of newlines strictly before byte offset `byte` (within `node`).
 fn newlines_before(node: &Inner, byte: usize) -> usize {
     match &node.kind {
-        Kind::Leaf(s) => s.as_bytes()[..byte].iter().filter(|&&b| b == b'\n').count(),
+        Kind::Leaf(s) => {
+            debug_assert!(byte <= s.len(), "newlines_before within the leaf");
+            s.as_bytes()[..byte].iter().filter(|&&b| b == b'\n').count()
+        }
         Kind::Branch(l, r) => {
             if byte <= l.bytes {
                 newlines_before(l, byte)

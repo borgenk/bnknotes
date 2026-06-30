@@ -22,6 +22,11 @@ pub struct Connection {
     stream: UnixStream,
     out: Vec<u8>,
     in_buf: Vec<u8>,
+    /// How many bytes at the front of `in_buf` have already been consumed by
+    /// [`Connection::next_message`]. Each parsed message advances this cursor
+    /// (cheap) instead of draining the front (O(remaining) per message, O(N^2)
+    /// over a burst); the consumed prefix is compacted away once per [`fill`].
+    in_pos: usize,
     fds: VecDeque<OwnedFd>,
 }
 
@@ -44,6 +49,7 @@ impl Connection {
             stream,
             out: Vec::new(),
             in_buf: Vec::new(),
+            in_pos: 0,
             fds: VecDeque::new(),
         })
     }
@@ -84,6 +90,9 @@ impl Connection {
     /// clipboard transfer fd) are queued for [`take_fd`]. A `TimedOut` result
     /// lets the caller service key repeats while the socket is idle.
     pub fn fill(&mut self, timeout: Option<Duration>) -> Result<Fill> {
+        // Drop the messages consumed since the last fill in one shift, rather
+        // than draining the front per message in `next_message`.
+        self.compact();
         self.stream
             .set_read_timeout(timeout)
             .map_err(|e| Error::msg(format!("set_read_timeout: {e}")))?;
@@ -107,35 +116,37 @@ impl Connection {
 
     /// Pull one fully buffered message off the front of the stream, if present.
     pub fn next_message(&mut self) -> Result<Option<Message>> {
-        if self.in_buf.len() < 8 {
+        let buf = &self.in_buf[self.in_pos..];
+        if buf.len() < 8 {
             return Ok(None);
         }
-        let object = u32::from_ne_bytes([
-            self.in_buf[0],
-            self.in_buf[1],
-            self.in_buf[2],
-            self.in_buf[3],
-        ]);
-        let word = u32::from_ne_bytes([
-            self.in_buf[4],
-            self.in_buf[5],
-            self.in_buf[6],
-            self.in_buf[7],
-        ]);
+        let object = u32::from_ne_bytes([buf[0], buf[1], buf[2], buf[3]]);
+        let word = u32::from_ne_bytes([buf[4], buf[5], buf[6], buf[7]]);
         let size = (word >> 16) as usize;
         let opcode = (word & 0xffff) as u16;
         if size < 8 {
             return Err(Error::msg("malformed wayland message: size < 8"));
         }
-        if self.in_buf.len() < size {
+        if buf.len() < size {
             return Ok(None);
         }
-        let body = self.in_buf[8..size].to_vec();
-        self.in_buf.drain(0..size);
+        let body = buf[8..size].to_vec();
+        self.in_pos += size;
         Ok(Some(Message {
             object,
             opcode,
             body,
         }))
+    }
+
+    /// Discard the already-consumed prefix of the input buffer in a single shift.
+    /// Called once per [`Connection::fill`], so a burst of messages costs one
+    /// compaction instead of one front-drain per message.
+    fn compact(&mut self) {
+        if self.in_pos == 0 {
+            return;
+        }
+        self.in_buf.drain(..self.in_pos);
+        self.in_pos = 0;
     }
 }

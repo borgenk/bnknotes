@@ -25,6 +25,8 @@
 //! it, so the buffer reads as clean again the moment an edit is undone back to
 //! the saved state.
 
+use std::collections::VecDeque;
+
 use crate::grapheme;
 use crate::markdown;
 use crate::rope::Rope;
@@ -58,7 +60,9 @@ pub struct TextBuffer {
     /// The other end of the selection, if one is active. `None` means no
     /// selection; equal to `cursor` means a collapsed (empty) one.
     anchor: Option<usize>,
-    undo: Vec<Snapshot>,
+    /// Undo history, oldest at the front. A deque so trimming the oldest entry
+    /// once [`UNDO_CAP`] is reached is a cheap `pop_front`, not an O(cap) shift.
+    undo: VecDeque<Snapshot>,
     redo: Vec<Snapshot>,
     /// The coalescing group of the last edit; a cursor move resets it to `None`.
     group: Coalesce,
@@ -85,7 +89,7 @@ impl TextBuffer {
             text: Rope::from_str(&text),
             cursor: 0,
             anchor: None,
-            undo: Vec::new(),
+            undo: VecDeque::new(),
             redo: Vec::new(),
             group: Coalesce::None,
             version: 0,
@@ -386,7 +390,7 @@ impl TextBuffer {
             self.touch();
             return true;
         }
-        let target = prev_word(&self.text.to_string(), self.cursor);
+        let target = prev_word_rope(&self.text, self.cursor);
         if target == self.cursor {
             return false;
         }
@@ -406,7 +410,7 @@ impl TextBuffer {
             self.touch();
             return true;
         }
-        let target = next_word(&self.text.to_string(), self.cursor);
+        let target = next_word_rope(&self.text, self.cursor);
         if target == self.cursor {
             return false;
         }
@@ -425,7 +429,7 @@ impl TextBuffer {
     /// The word model matches the word-motion keys: a word is a run of
     /// alphanumerics and `_`; whitespace and punctuation are separators.
     pub fn select_word_at(&mut self, offset: usize) {
-        let (start, end) = word_range(&self.text.to_string(), offset);
+        let (start, end) = word_range_rope(&self.text, offset);
         self.set_selection(start, end);
     }
 
@@ -458,7 +462,7 @@ impl TextBuffer {
 
     /// Undo the most recent edit group. Returns whether anything changed.
     pub fn undo(&mut self) -> bool {
-        let Some(prev) = self.undo.pop() else {
+        let Some(prev) = self.undo.pop_back() else {
             return false;
         };
         self.redo.push(self.snapshot());
@@ -472,7 +476,7 @@ impl TextBuffer {
         let Some(next) = self.redo.pop() else {
             return false;
         };
-        self.undo.push(self.snapshot());
+        self.undo.push_back(self.snapshot());
         self.restore(next);
         self.group = Coalesce::None;
         true
@@ -533,14 +537,14 @@ impl TextBuffer {
     /// Move the cursor one word left (Ctrl+Left), to the start of the previous
     /// word. With `extend`, grow the selection. Returns whether anything changed.
     pub fn move_word_left(&mut self, extend: bool) -> bool {
-        let target = prev_word(&self.text.to_string(), self.cursor);
+        let target = prev_word_rope(&self.text, self.cursor);
         self.move_to(target, extend)
     }
 
     /// Move the cursor one word right (Ctrl+Right), to the end of the next word.
     /// With `extend`, grow the selection. Returns whether anything changed.
     pub fn move_word_right(&mut self, extend: bool) -> bool {
-        let target = next_word(&self.text.to_string(), self.cursor);
+        let target = next_word_rope(&self.text, self.cursor);
         self.move_to(target, extend)
     }
 
@@ -594,9 +598,9 @@ impl TextBuffer {
     fn checkpoint(&mut self, group: Coalesce) {
         let merge = group != Coalesce::None && group == self.group;
         if !merge {
-            self.undo.push(self.snapshot());
+            self.undo.push_back(self.snapshot());
             if self.undo.len() > UNDO_CAP {
-                self.undo.remove(0);
+                self.undo.pop_front();
             }
             self.redo.clear();
         }
@@ -709,69 +713,184 @@ fn cluster_is_word(cluster: &str) -> bool {
         .is_some_and(|c| c.is_alphanumeric() || c == '_')
 }
 
-/// The byte offset one word forward from `pos`: skip any separators, then the
-/// run of word clusters, landing at the end of that word (or the buffer end).
-/// Working in whole grapheme clusters keeps the result on a cluster boundary, so
-/// word motion never splits one.
-fn next_word(text: &str, pos: usize) -> usize {
-    let clusters = grapheme::graphemes(&text[pos..]);
-    let mut k = 0;
-    while k < clusters.len() && !cluster_is_word(clusters[k].1) {
-        k += 1;
-    }
-    while k < clusters.len() && cluster_is_word(clusters[k].1) {
-        k += 1;
-    }
-    match clusters.get(k) {
-        Some(&(off, _)) => pos + off,
-        None => text.len(),
-    }
+/// The grapheme clusters of the logical line `line` as `(absolute byte start,
+/// is_word)` pairs. Materializes only that one line of the rope (clusters never
+/// span a `'\n'`, so a line is a self-contained unit), so the word-motion
+/// scanners below read a bounded window outward from the cursor instead of the
+/// whole document.
+fn line_clusters(rope: &Rope, line: usize) -> Vec<(usize, bool)> {
+    let ls = rope.line_to_byte(line);
+    let le = rope.line_to_byte(line + 1);
+    let s = rope.byte_slice(ls..le);
+    grapheme::graphemes(&s)
+        .into_iter()
+        .map(|(off, c)| (ls + off, cluster_is_word(c)))
+        .collect()
 }
 
-/// The byte offset one word back from `pos`: skip any separators, then the run
-/// of word clusters, landing at the start of that word (or the buffer start).
-fn prev_word(text: &str, pos: usize) -> usize {
-    let clusters = grapheme::graphemes(&text[..pos]);
-    let mut k = clusters.len();
-    while k > 0 && !cluster_is_word(clusters[k - 1].1) {
-        k -= 1;
+/// The byte offset one word forward from `pos`: skip any separators, then the
+/// run of word clusters, landing at the end of that word (or the buffer end).
+/// Scans the rope a logical line at a time from the cursor outward (words and
+/// separator runs may cross blank lines), never materializing the whole document.
+fn next_word_rope(rope: &Rope, pos: usize) -> usize {
+    let len = rope.len();
+    if pos >= len {
+        return len;
     }
-    while k > 0 && cluster_is_word(clusters[k - 1].1) {
-        k -= 1;
+    let n_lines = rope.len_lines();
+    let mut line = rope.byte_to_line(pos);
+    // Two phases carried across lines: skip leading separators, then consume the
+    // word run, stopping at the first separator after it.
+    let mut in_word = false;
+    while line < n_lines {
+        for (abs, is_word) in line_clusters(rope, line) {
+            if abs < pos {
+                continue;
+            }
+            if in_word && !is_word {
+                return abs;
+            }
+            in_word |= is_word;
+        }
+        line += 1;
     }
-    clusters.get(k).map_or(pos, |&(off, _)| off)
+    len
+}
+
+/// The byte offset one word back from `pos`: skip any trailing separators, then
+/// the run of word clusters, landing at the start of that word (or the buffer
+/// start). Scans the rope backward a logical line at a time from the cursor.
+fn prev_word_rope(rope: &Rope, pos: usize) -> usize {
+    if pos == 0 {
+        return 0;
+    }
+    let mut line = rope.byte_to_line(pos - 1);
+    let mut in_word = false;
+    let mut start = 0;
+    loop {
+        for &(abs, is_word) in line_clusters(rope, line).iter().rev() {
+            if abs >= pos {
+                continue;
+            }
+            if in_word && !is_word {
+                return start;
+            }
+            if is_word {
+                in_word = true;
+                start = abs;
+            }
+        }
+        if line == 0 {
+            return if in_word { start } else { 0 };
+        }
+        line -= 1;
+    }
 }
 
 /// The byte range of the word (or run of separators) at `offset`, for
 /// double-click selection: the maximal run of clusters sharing the clicked
 /// cluster's class (word vs separator). A click at a word's trailing edge, or at
-/// the buffer end, still selects the word to the left.
-fn word_range(text: &str, offset: usize) -> (usize, usize) {
-    let clusters = grapheme::graphemes(text);
-    let n = clusters.len();
-    if n == 0 {
+/// the buffer end, still selects the word to the left. Scans the rope outward
+/// from the click instead of materializing the whole document.
+fn word_range_rope(rope: &Rope, offset: usize) -> (usize, usize) {
+    let len = rope.len();
+    if len == 0 {
         return (0, 0);
     }
-    // The clicked cluster is the one starting at `offset`; a click at the end
-    // falls on the last cluster. Prefer a word cluster just to the left over a
-    // separator under the click, so clicking a word's right edge selects it.
-    let mut i = clusters
-        .iter()
-        .position(|&(o, _)| o == offset)
-        .unwrap_or(n - 1);
-    if !cluster_is_word(clusters[i].1) && i > 0 && cluster_is_word(clusters[i - 1].1) {
-        i -= 1;
+    let offset = offset.min(len);
+    let (c_start, c_is_word, prev_is_word) = clicked_cluster(rope, offset);
+    // A separator under the click with a word immediately to its left selects
+    // that word (so a click on a word's trailing edge or the space after it still
+    // grabs the word): expand the word run that ends at the click.
+    if !c_is_word && prev_is_word == Some(true) {
+        return (class_run_start(rope, c_start, true), c_start);
     }
-    let class = cluster_is_word(clusters[i].1);
-    let mut lo = i;
-    while lo > 0 && cluster_is_word(clusters[lo - 1].1) == class {
-        lo -= 1;
+    let start = class_run_start(rope, c_start, c_is_word);
+    let end = class_run_end(rope, c_start, c_is_word);
+    (start, end)
+}
+
+/// The cluster a double-click at byte `offset` lands on: its start offset and
+/// class, plus the class of the cluster immediately to its left (for the
+/// word-to-the-left preference). A click at the buffer end falls on the last
+/// cluster; for a click at a line start the left neighbor is the previous line's
+/// terminating `'\n'`, a separator. Materializes only the click's logical line.
+fn clicked_cluster(rope: &Rope, offset: usize) -> (usize, bool, Option<bool>) {
+    let len = rope.len();
+    let probe = if offset >= len {
+        len.saturating_sub(1)
+    } else {
+        offset
+    };
+    let line = rope.byte_to_line(probe);
+    let clusters = line_clusters(rope, line);
+    let idx = if offset >= len {
+        clusters.len().saturating_sub(1)
+    } else {
+        clusters
+            .iter()
+            .position(|&(abs, _)| abs == offset)
+            .unwrap_or(clusters.len().saturating_sub(1))
+    };
+    let (c_start, c_is_word) = clusters
+        .get(idx)
+        .copied()
+        .unwrap_or((rope.line_to_byte(line), false));
+    let prev_is_word = if idx > 0 {
+        Some(clusters[idx - 1].1)
+    } else if line > 0 {
+        // The previous line's last cluster is its terminating '\n', a separator.
+        Some(false)
+    } else {
+        None
+    };
+    (c_start, c_is_word, prev_is_word)
+}
+
+/// The start byte offset of the maximal run of class `word` that contains the
+/// cluster beginning at `from`, scanning the rope backward line by line.
+fn class_run_start(rope: &Rope, from: usize, word: bool) -> usize {
+    if from == 0 {
+        return 0;
     }
-    let mut hi = i;
-    while hi + 1 < n && cluster_is_word(clusters[hi + 1].1) == class {
-        hi += 1;
+    let mut line = rope.byte_to_line(from - 1);
+    let mut start = from;
+    loop {
+        for &(abs, is_word) in line_clusters(rope, line).iter().rev() {
+            if abs >= from {
+                continue;
+            }
+            if is_word != word {
+                return start;
+            }
+            start = abs;
+        }
+        if line == 0 {
+            return start;
+        }
+        line -= 1;
     }
-    (clusters[lo].0, clusters[hi].0 + clusters[hi].1.len())
+}
+
+/// The end byte offset (exclusive) of the maximal run of class `word` that
+/// contains the cluster beginning at `from`, scanning the rope forward line by
+/// line.
+fn class_run_end(rope: &Rope, from: usize, word: bool) -> usize {
+    let len = rope.len();
+    let n_lines = rope.len_lines();
+    let mut line = rope.byte_to_line(from.min(len.saturating_sub(1)));
+    while line < n_lines {
+        for (abs, is_word) in line_clusters(rope, line) {
+            if abs < from {
+                continue;
+            }
+            if is_word != word {
+                return abs;
+            }
+        }
+        line += 1;
+    }
+    len
 }
 
 #[cfg(test)]
@@ -1186,6 +1305,36 @@ mod tests {
         assert!(b.move_word_right(false));
         assert_eq!(b.cursor, 11, "end of baz");
         assert!(!b.move_word_right(false), "no move at the end");
+    }
+
+    #[test]
+    fn word_motion_crosses_blank_lines_to_the_next_word() {
+        // The bounded line-by-line scanners must still cross a '\n' (and a blank
+        // line) when the separator run between two words spans them. "ab\n\ncd":
+        // ab = 0..2, '\n' = 2, '\n' = 3, cd = 4..6.
+        let mut b = TextBuffer::from_text("ab\n\ncd".to_string());
+        b.set_cursor(2, false); // end of "ab"
+        b.move_word_right(false);
+        assert_eq!(b.cursor, 6, "skips both newlines to the end of cd");
+        b.move_word_left(false);
+        assert_eq!(b.cursor, 4, "back across the blank line to the start of cd");
+        b.move_word_left(false);
+        assert_eq!(b.cursor, 0, "back to the start of ab");
+    }
+
+    #[test]
+    fn double_click_separator_run_spans_a_newline() {
+        // A separator run a double-click selects can cross a line break. In
+        // "a \n b" the space, '\n', and space form one run (bytes 1..4). Clicking
+        // the '\n' (offset 2) selects the whole run; clicking the space right
+        // after "a" would instead prefer the word "a" to its left.
+        let mut b = TextBuffer::from_text("a \n b".to_string());
+        b.select_word_at(2);
+        assert_eq!(
+            b.selection(),
+            Some((1, 4)),
+            "space, newline, space as one run"
+        );
     }
 
     #[test]

@@ -1,6 +1,7 @@
 //! A shared-memory pool: an anonymous memfd, mmapped writable, that the
-//! compositor reads pixels from. A single pool is sized to one
-//! full-window buffer.
+//! compositor reads pixels from. One pool holds both double-buffered frames
+//! (two full-window buffers, side by side); the editor paints whichever frame
+//! the compositor has released while the other is being scanned out.
 
 use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 

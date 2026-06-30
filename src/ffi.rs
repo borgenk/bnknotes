@@ -31,6 +31,9 @@ const SOL_SOCKET: c_int = 1;
 const SCM_RIGHTS: c_int = 1;
 const MSG_NOSIGNAL: c_int = 0x4000;
 const MSG_CMSG_CLOEXEC: c_int = 0x4000_0000;
+/// Set in `msg_flags` by `recvmsg` when the control buffer was too small to hold
+/// all the ancillary data, so some passed fds were dropped.
+const MSG_CTRUNC: c_int = 0x8;
 
 /// Open the pipe with both ends close-on-exec.
 const O_CLOEXEC: c_int = 0x8_0000;
@@ -202,6 +205,13 @@ const fn cmsg_len(data_len: usize) -> usize {
 /// once) and EINTR. The fds ride only on the first `sendmsg`, which is where
 /// the bytes that reference them begin.
 pub fn send_with_fds(sock: RawFd, bytes: &[u8], fds: &[RawFd]) -> Result<()> {
+    // The fds ride on the first segment's sendmsg; with no payload the send loop
+    // below never runs and they would be dropped. Wayland always pairs an fd
+    // with the (non-empty) request that references it, so assert rather than leak.
+    debug_assert!(
+        fds.is_empty() || !bytes.is_empty(),
+        "send_with_fds called with fds but no bytes; the fds would be dropped"
+    );
     let data_len = mem::size_of_val(fds);
     if cmsg_space(data_len) > CMSG_CAP {
         return Err(Error::msg("too many fds for one control message"));
@@ -301,6 +311,15 @@ pub fn recv_with_fds(sock: RawFd, buf: &mut [u8], out: &mut Vec<OwnedFd>) -> Res
                 return Ok(None);
             }
             return Err(Error::msg(format!("recvmsg failed: errno {e}")));
+        }
+        // A full control buffer means the kernel truncated the ancillary data and
+        // some passed fds were lost. CMSG_CAP holds far more than Wayland's 1-2
+        // fds, so this is unreachable; surface it rather than proceed with a
+        // half-received message if it ever fires.
+        if msg.msg_flags & MSG_CTRUNC != 0 {
+            return Err(Error::msg(
+                "recvmsg truncated ancillary data (too many fds)",
+            ));
         }
         parse_cmsgs(&cbuf, msg.msg_controllen, out);
         return Ok(Some(n as usize));

@@ -87,7 +87,10 @@ impl<'a> Canvas<'a> {
         radius: i32,
         corners: RoundedCorners,
     ) {
-        let r = radius.clamp(0, (w / 2).min(h / 2));
+        // `.max(0)` keeps the clamp's upper bound non-negative: a degenerate
+        // negative `w`/`h` would otherwise make `clamp(0, negative)` panic
+        // (min > max). Not reachable from the sole caller, but cheap to make safe.
+        let r = radius.clamp(0, (w / 2).min(h / 2).max(0));
         let (round_top, round_bottom) = (corners.top(), corners.bottom());
         if r == 0 || (!round_top && !round_bottom) {
             self.fill_rect(x, y, w, h, color);

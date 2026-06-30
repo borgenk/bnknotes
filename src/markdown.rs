@@ -58,24 +58,32 @@ pub fn heading_level(line: &str) -> Option<u8> {
     }
 }
 
-/// The block style of `line`. Headings win first (a `#` line is never a list),
-/// then quotes, bullets, and ordered items; everything else is body text.
-pub fn style_of(line: &str) -> LineStyle {
+/// The block style of `line` together with its block-marker length, classified
+/// in a single pass. Headings win first (a `#` line is never a list), then
+/// quotes, bullets, and ordered items; everything else is body text. The marker
+/// length falls straight out of the predicate that matched (each returns it), so
+/// a caller needing both does not run the predicates twice.
+pub fn classify(line: &str) -> (LineStyle, usize) {
     if let Some(level) = heading_level(line) {
-        LineStyle::Heading(level)
+        (LineStyle::Heading(level), heading_marker_len(line))
     } else if is_thematic_break(line) {
         // Checked before bullets so a spaced `- - -` or `* * *` reads as a rule,
-        // not a list item.
-        LineStyle::Rule
-    } else if quote_marker(line).is_some() {
-        LineStyle::Quote
-    } else if bullet_marker(line).is_some() {
-        LineStyle::Bullet
-    } else if ordered_marker(line).is_some() {
-        LineStyle::Ordered
+        // not a list item. The whole rule is its marker (collapses off-cursor).
+        (LineStyle::Rule, line.len())
+    } else if let Some(len) = quote_marker(line) {
+        (LineStyle::Quote, len)
+    } else if let Some(len) = bullet_marker(line) {
+        (LineStyle::Bullet, len)
+    } else if let Some(len) = ordered_marker(line) {
+        (LineStyle::Ordered, len)
     } else {
-        LineStyle::Body
+        (LineStyle::Body, 0)
     }
+}
+
+/// The block style of `line`. A thin projection of [`classify`].
+pub fn style_of(line: &str) -> LineStyle {
+    classify(line).0
 }
 
 /// Whether `line` is a thematic break (horizontal rule): three or more of the
@@ -104,15 +112,7 @@ pub fn is_thematic_break(line: &str) -> bool {
 /// color so it reads as markup): a heading's `#`s plus a space, a list bullet or
 /// number plus a space, or a quote `>` plus an optional space. `0` for body text.
 pub fn marker_len(line: &str) -> usize {
-    match style_of(line) {
-        LineStyle::Body => 0,
-        LineStyle::Heading(_) => heading_marker_len(line),
-        LineStyle::Bullet => bullet_marker(line).unwrap_or(0),
-        LineStyle::Ordered => ordered_marker(line).unwrap_or(0),
-        LineStyle::Quote => quote_marker(line).unwrap_or(0),
-        // The whole rule is its marker: it collapses to the drawn line off-cursor.
-        LineStyle::Rule => line.len(),
-    }
+    classify(line).1
 }
 
 /// Whether `style`'s block marker stays visible once the cursor leaves the line.
@@ -132,8 +132,9 @@ pub fn block_marker_persists(style: LineStyle) -> bool {
 /// keeping its `.`/`)` delimiter and trailing space (`1. ` -> `2. `, `3) ` ->
 /// `4) `). The caller decides emptiness; this only builds the marker.
 pub fn next_item_marker(line: &str) -> Option<String> {
-    let marker = &line[..marker_len(line)];
-    match style_of(line) {
+    let (style, marker_len) = classify(line);
+    let marker = &line[..marker_len];
+    match style {
         // A bullet or quote repeats its marker verbatim, keeping any indentation.
         LineStyle::Bullet | LineStyle::Quote => Some(marker.to_string()),
         LineStyle::Ordered => {

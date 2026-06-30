@@ -41,6 +41,13 @@ pub fn encode(buf: &mut Vec<u8>, object: u32, opcode: u16, args: &[Arg]) {
         encode_arg(buf, arg);
     }
     let size = (buf.len() - start) as u32;
+    // The size lives in the header's high 16 bits, so a request must be < 64 KiB.
+    // We never build one anywhere near that; assert the invariant rather than let
+    // `size << 16` silently truncate the length into the opcode bits.
+    debug_assert!(
+        size <= 0xffff,
+        "wayland request too large to encode: {size} bytes"
+    );
     let word = (size << 16) | u32::from(opcode);
     buf[start + 4..start + 8].copy_from_slice(&word.to_ne_bytes());
 }

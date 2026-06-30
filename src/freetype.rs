@@ -408,8 +408,11 @@ impl Face {
     }
 
     /// Select the pixel size FreeType renders and reports metrics at; width 0
-    /// matches it to the height.
-    pub fn set_pixel_size(&self, size: u32) -> Result<()> {
+    /// matches it to the height. Construction-only (private): the glyph and
+    /// advance caches key on `char` alone, so changing a face's size after it has
+    /// cached anything would serve stale-size glyphs. Every face is sized once,
+    /// at open time, and never resized.
+    fn set_pixel_size(&self, size: u32) -> Result<()> {
         // SAFETY: face is a valid FT_Face; the call only reads size arguments.
         let err = unsafe { FT_Set_Pixel_Sizes(self.face.as_ptr(), 0, size) };
         if err != 0 {
@@ -659,6 +662,9 @@ impl Fonts {
 
     /// The entry for `size`, or the fallback (first opened) if `size` is unknown.
     fn entry(&self, size: u32) -> &SizedFaces {
+        // `sized` is never empty (Fonts::new errors otherwise), so the `[0]`
+        // fallback for an unknown size cannot panic.
+        debug_assert!(!self.sized.is_empty());
         self.sized
             .iter()
             .find(|s| s.size == size)

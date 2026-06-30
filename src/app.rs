@@ -46,6 +46,10 @@ use crate::xkb::{KeyAction, Xkb};
 /// Initial window size; the compositor may resize us to whatever it likes.
 const INIT_WIDTH: u32 = 800;
 const INIT_HEIGHT: u32 = 600;
+/// Upper bound on either surface dimension, applied to a compositor-supplied
+/// configure size. Far beyond any real display (8K is 7680 wide), it just keeps a
+/// bogus or hostile size from blowing up the shm-pool arithmetic.
+const MAX_DIMENSION: u32 = 16384;
 
 /// Background, text, and selection colors (0x00RRGGBB), and the pixel size: a
 /// dark palette on base hue ~212.
@@ -134,6 +138,15 @@ const REPEAT_CATCHUP_CAP: u32 = 16;
 /// pasting. The charset variant is listed first as the preferred form.
 const CLIPBOARD_MIMES: &[&str] = &["text/plain;charset=utf-8", "text/plain"];
 
+/// First object id in Wayland's server-allocated range. Client-created ids stay
+/// below this; the free list only ever recycles client ids.
+const SERVER_ID_BASE: u32 = 0xff00_0000;
+
+/// Largest file the editor will open, as a guard against mapping a huge file into
+/// memory on startup. Generous for a text editor; a bigger file is a clean error,
+/// not an out-of-memory crash.
+const MAX_FILE_BYTES: u64 = 64 * 1024 * 1024;
+
 pub fn run() -> Result<()> {
     // An optional path to open; everything after it is ignored for now.
     let path = std::env::args_os().nth(1).map(PathBuf::from);
@@ -144,6 +157,18 @@ pub fn run() -> Result<()> {
 /// not exist yet is not an error: it opens an empty buffer that a later save
 /// creates, so `bnknotes new-note.md` works.
 fn load(path: &Path) -> Result<(String, FileFormat)> {
+    // Reject an oversized file up front (by its stat size) rather than reading it
+    // all into memory. A missing file is not an error here, so a stat failure
+    // falls through to the read, which maps NotFound to an empty buffer.
+    if let Ok(meta) = std::fs::metadata(path) {
+        if meta.len() > MAX_FILE_BYTES {
+            return Err(Error::msg(format!(
+                "file is {} bytes; refusing to open files larger than {} MiB",
+                meta.len(),
+                MAX_FILE_BYTES / (1024 * 1024)
+            )));
+        }
+    }
     match std::fs::read(path) {
         Ok(bytes) => file::decode(&bytes),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -154,10 +179,12 @@ fn load(path: &Path) -> Result<(String, FileFormat)> {
 }
 
 /// The inputs the laid-out geometry depends on, used to memoize it: content
-/// version, surface width, the active (cursor/selection) range, and the selected /
-/// raw-pinned image (by line-start offset). A scroll or idle redraw leaves all of
+/// version, surface width, body font size, the active range's logical line span
+/// (the marker reveal depends only on which lines the range touches, not the
+/// exact byte offsets), and the selected / raw-pinned image (by line-start
+/// offset). A scroll, idle redraw, or cursor move within one line leaves all of
 /// these unchanged and reuses the cached layout.
-type LayoutKey = (u64, u32, usize, usize, Option<usize>, Option<usize>);
+type LayoutKey = (u64, u32, u32, usize, usize, Option<usize>, Option<usize>);
 
 struct State {
     conn: Connection,
@@ -184,6 +211,10 @@ struct State {
     raw_image: Option<usize>,
     /// The toplevel title last sent, so it is only re-set when it changes.
     title: String,
+    /// The modified flag the current `title` reflects, so `refresh_title` can skip
+    /// the format!+compare on the common case (a cursor move leaves it unchanged).
+    /// `None` until the first title is sent.
+    title_modified: Option<bool>,
 
     /// Current surface size in pixels.
     width: u32,
@@ -244,6 +275,10 @@ struct State {
     /// toggles. Activity (`bump_caret`) resets it to shown.
     caret_visible: bool,
     caret_blink_at: Option<Instant>,
+    /// Whether the surface holds the keyboard focus (`wl_keyboard.enter` to
+    /// `leave`). The caret only blinks (and only wakes the loop on its timer)
+    /// while focused; an unfocused window hides the caret and stays idle.
+    focused: bool,
 
     /// Memoized layout, reused until its inputs change. The key is the content
     /// version, the surface width, and the active (cursor/selection) range, the
@@ -346,6 +381,7 @@ impl State {
             selected_image: None,
             raw_image: None,
             title: String::new(),
+            title_modified: None,
             width: INIT_WIDTH,
             height: INIT_HEIGHT,
             registry: 0,
@@ -377,6 +413,7 @@ impl State {
             scroll_y: 0,
             caret_visible: true,
             caret_blink_at: None,
+            focused: false,
             layout_cache: None,
             layout_key: None,
             content_height: 0,
@@ -496,9 +533,21 @@ impl State {
         let shm = self
             .shm
             .ok_or_else(|| Error::msg("creating buffers before wl_shm was bound"))?;
-        let stride = self.width * 4;
-        let frame_len = (stride * self.height) as usize;
+        // Compute the geometry in usize: a u32 `width * 4 * height` wraps near a
+        // ~46k-px square, which would size the pool too small and let the
+        // compositor read past the mapping. The configure path clamps dimensions
+        // to MAX_DIMENSION, so the only remaining bound is the wire's i32 pool-size
+        // argument, which a near-MAX_DIMENSION square could still exceed.
+        let width = self.width as usize;
+        let height = self.height as usize;
+        let stride = width * 4;
+        let frame_len = stride * height;
         let pool_size = frame_len * 2;
+        if pool_size > i32::MAX as usize {
+            return Err(Error::msg(
+                "requested window size is too large for an shm pool",
+            ));
+        }
         let pool = Pool::new(pool_size)?;
         self.frame_len = frame_len;
         let pool_id = self.alloc_id();
@@ -609,19 +658,30 @@ impl State {
         };
         // Time the whole frame (layout reuse/rebuild plus paint) when stats are on.
         let started = self.stats.then(Instant::now);
+        // Build (or reuse) the layout up front, then paint from the cache *by
+        // reference*: the painter borrows the cached layout alongside a mutable
+        // borrow of the disjoint `pool` field, so a presented frame never clones
+        // the whole document's visual lines.
+        self.ensure_layout();
+        // Keep the scroll offset valid for the current content and window size.
+        self.scroll_y = scroll::clamp(self.scroll_y, self.content_height, self.height as i32);
         let frame_len = self.frame_len;
         let offset = idx * frame_len;
         let width = self.width as usize;
         let height = self.height as usize;
-        let selection = self.text.selection();
-        let cursor = self.text.cursor();
-        let caret_visible = self.caret_visible;
-        let layout = self.layout();
-        // Keep the scroll offset valid for the current content and window size.
-        self.scroll_y = scroll::clamp(self.scroll_y, self.content_height, self.height as i32);
-        let scroll_y = self.scroll_y;
+        let params = PaintParams {
+            width,
+            height,
+            scroll_y: self.scroll_y,
+            selection: self.text.selection(),
+            cursor: self.text.cursor(),
+            caret_visible: self.caret_visible,
+        };
 
         {
+            let Some(layout) = self.layout_cache.as_ref() else {
+                return Ok(false);
+            };
             let Some(pool) = self.pool.as_mut() else {
                 return Ok(false);
             };
@@ -630,17 +690,10 @@ impl State {
             paint_document(
                 &mut canvas,
                 &self.fonts,
-                &layout,
+                layout,
                 self.text.rope(),
                 &self.images,
-                &PaintParams {
-                    width,
-                    height,
-                    scroll_y,
-                    selection,
-                    cursor,
-                    caret_visible,
-                },
+                &params,
             );
         }
 
@@ -707,7 +760,12 @@ impl State {
                 }
                 wl_display::EV_DELETE_ID => {
                     let id = r.u32()?;
-                    self.free_ids.push(id);
+                    // Only recycle ids from the client range. A server-range id
+                    // (>= 0xff000000) must never be handed back out as a fresh
+                    // object; the server allocates those itself.
+                    if id < SERVER_ID_BASE {
+                        self.free_ids.push(id);
+                    }
                 }
                 _ => {}
             }
@@ -755,9 +813,11 @@ impl State {
                     let w = r.u32()?;
                     let h = r.u32()?;
                     let _states = r.array()?;
-                    // A zero dimension means the compositor leaves it to us.
+                    // A zero dimension means the compositor leaves it to us. Clamp
+                    // to MAX_DIMENSION so the buffer geometry stays well inside the
+                    // shm-pool size arithmetic (see `create_buffers`).
                     if w > 0 && h > 0 {
-                        self.pending_size = Some((w, h));
+                        self.pending_size = Some((w.min(MAX_DIMENSION), h.min(MAX_DIMENSION)));
                     }
                 }
                 xdg_toplevel::EV_CLOSE => self.closed = true,
@@ -929,8 +989,22 @@ impl State {
                 };
                 self.repeat_delay = Duration::from_millis(u64::from(delay));
             }
-            wl_keyboard::EV_ENTER => self.last_serial = r.u32()?,
-            wl_keyboard::EV_LEAVE => self.stop_repeat(),
+            wl_keyboard::EV_ENTER => {
+                self.last_serial = r.u32()?;
+                // Regained keyboard focus: show the caret and resume its blink.
+                self.focused = true;
+                self.bump_caret();
+                self.dirty = true;
+            }
+            wl_keyboard::EV_LEAVE => {
+                self.stop_repeat();
+                // Lost keyboard focus: hide the caret, stop blinking, and let the
+                // loop go idle (no 500ms blink wake-ups while unfocused).
+                self.focused = false;
+                self.caret_visible = false;
+                self.caret_blink_at = None;
+                self.dirty = true;
+            }
             _ => {}
         }
         Ok(())
@@ -1039,22 +1113,33 @@ impl State {
                 self.goal_x = None;
                 self.text.redo()
             }
-            // The clipboard actions manage their own redraw and may do I/O. With an
-            // image selected, Copy puts the picture on the clipboard instead of text.
+            // The clipboard actions manage their own redraw and may do I/O over a
+            // pipe to another app. As with Save, an I/O failure (e.g. a peer that
+            // closes the pipe early, EPIPE) must not bring the editor down and lose
+            // the user's unsaved work, so it is reported and swallowed rather than
+            // propagated out of the loop. With an image selected, Copy puts the
+            // picture on the clipboard instead of text.
             KeyAction::Copy => {
-                if self.selected_image.is_some() {
-                    self.copy_selected_image()?;
+                let result = if self.selected_image.is_some() {
+                    self.copy_selected_image()
                 } else {
-                    self.copy_selection()?;
+                    self.copy_selection()
+                };
+                if let Err(e) = result {
+                    eprintln!("bnknotes: copy failed: {e}");
                 }
                 false
             }
             KeyAction::Cut => {
-                self.cut_selection()?;
+                if let Err(e) = self.cut_selection() {
+                    eprintln!("bnknotes: cut failed: {e}");
+                }
                 false
             }
             KeyAction::Paste => {
-                self.paste()?;
+                if let Err(e) = self.paste() {
+                    eprintln!("bnknotes: paste failed: {e}");
+                }
                 false
             }
             // Saving touches the disk but not the buffer; a failure must not
@@ -1112,6 +1197,13 @@ impl State {
     /// Send the toplevel title only if it changed, so the modified indicator and
     /// filename stay current without re-setting an identical string each frame.
     fn refresh_title(&mut self) {
+        // The title depends only on the modified flag and the (session-fixed)
+        // filename, so a cursor move that left the modified state untouched cannot
+        // change it: skip the format!+compare on that common path.
+        let modified = self.text.is_modified();
+        if self.title_modified == Some(modified) {
+            return;
+        }
         let desired = self.window_title();
         if desired != self.title {
             self.conn.request(
@@ -1121,28 +1213,37 @@ impl State {
             );
             self.title = desired;
         }
+        self.title_modified = Some(modified);
     }
 
     /// Move the cursor `dir` lines (-1 up, +1 down), keeping a sticky goal x.
     fn move_vertical(&mut self, dir: i32, extend: bool) -> bool {
-        let layout = self.layout();
+        self.ensure_layout();
         let cursor = self.text.cursor();
+        let before_sel = self.text.selection();
+        // Read the cached layout by reference; `goal_x`/`text` are disjoint fields,
+        // so they can be touched while the layout borrow is live.
+        let Some(layout) = self.layout_cache.as_ref() else {
+            return false;
+        };
         let (caret_x, _, _) = layout.caret(&self.fonts, self.text.rope(), cursor);
         let goal = self.goal_x.unwrap_or(caret_x as f32);
-        self.goal_x = Some(goal);
         let target = layout.offset_vertical(&self.fonts, self.text.rope(), cursor, dir, goal);
-        let before_sel = self.text.selection();
+        self.goal_x = Some(goal);
         self.text.set_cursor(target, extend);
         self.text.cursor() != cursor || self.text.selection() != before_sel
     }
 
     /// Move the cursor to the start (`to_end = false`) or end of its line.
     fn move_line_edge(&mut self, to_end: bool, extend: bool) -> bool {
-        let layout = self.layout();
+        self.ensure_layout();
         let cursor = self.text.cursor();
+        let before_sel = self.text.selection();
+        let Some(layout) = self.layout_cache.as_ref() else {
+            return false;
+        };
         let (start, end) = layout.line_bounds(cursor);
         let target = if to_end { end } else { start };
-        let before_sel = self.text.selection();
         self.text.set_cursor(target, extend);
         self.text.cursor() != cursor || self.text.selection() != before_sel
     }
@@ -1151,22 +1252,26 @@ impl State {
     /// keeping the sticky goal column, like a run of Up/Down. The view follows
     /// via the caret-reveal scroll in `after_edit`. Returns whether it moved.
     fn move_page(&mut self, dir: i32, extend: bool) -> bool {
-        let layout = self.layout();
+        self.ensure_layout();
         let cursor = self.text.cursor();
+        let before_sel = self.text.selection();
+        let page_lines = self.page_lines();
+        let Some(layout) = self.layout_cache.as_ref() else {
+            return false;
+        };
         let (caret_x, _, _) = layout.caret(&self.fonts, self.text.rope(), cursor);
         let goal = self.goal_x.unwrap_or(caret_x as f32);
-        self.goal_x = Some(goal);
         // Step a line at a time so each hop honors the goal column and the
         // varying per-line heights; stop early at the first or last line.
         let mut target = cursor;
-        for _ in 0..self.page_lines() {
+        for _ in 0..page_lines {
             let next = layout.offset_vertical(&self.fonts, self.text.rope(), target, dir, goal);
             if next == target {
                 break;
             }
             target = next;
         }
-        let before_sel = self.text.selection();
+        self.goal_x = Some(goal);
         self.text.set_cursor(target, extend);
         self.text.cursor() != cursor || self.text.selection() != before_sel
     }
@@ -1311,8 +1416,15 @@ impl State {
     /// auto-reveal.
     fn on_image_press(&mut self) -> bool {
         let (x, y) = (self.pointer_x, self.pointer_y + self.scroll_y as f32);
-        let layout = self.layout();
-        if let Some(ls) = layout.image_button_at(&self.fonts, x, y) {
+        self.ensure_layout();
+        // Query both hits up front (each a copyable `Option<usize>`) so the layout
+        // borrow ends before the mutations below, which touch other `State` fields.
+        let Some(layout) = self.layout_cache.as_ref() else {
+            return false;
+        };
+        let button = layout.image_button_at(&self.fonts, x, y);
+        let image = layout.image_at(&self.fonts, x, y);
+        if let Some(ls) = button {
             self.raw_image = if self.raw_image == Some(ls) {
                 None
             } else {
@@ -1321,7 +1433,7 @@ impl State {
             self.dirty = true;
             return true;
         }
-        if let Some(ls) = layout.image_at(&self.fonts, x, y) {
+        if let Some(ls) = image {
             self.selected_image = Some(ls);
             self.raw_image = None;
             // Collapse any text selection so a copy targets the image, and leave
@@ -1370,8 +1482,12 @@ impl State {
         // across one.
         if !self.xkb.shift_active() {
             let cy = self.pointer_y + self.scroll_y as f32;
-            let layout = self.layout();
-            if let Some((start, end)) = layout.rule_at(&self.fonts, cy) {
+            self.ensure_layout();
+            let rule = self
+                .layout_cache
+                .as_ref()
+                .and_then(|l| l.rule_at(&self.fonts, cy));
+            if let Some((start, end)) = rule {
                 self.text.select_range(start, end);
                 self.selecting = false;
                 self.dirty = true;
@@ -1464,6 +1580,11 @@ impl State {
     /// Toggle the caret if its blink interval has elapsed, requesting a redraw.
     /// The first call just arms the timer.
     fn fire_caret_blink(&mut self) {
+        // An unfocused window shows no caret and arms no blink timer, so it never
+        // wakes the loop just to toggle a caret nobody is looking at.
+        if !self.focused {
+            return;
+        }
         let now = Instant::now();
         match self.caret_blink_at {
             None => self.caret_blink_at = Some(now + CARET_BLINK),
@@ -1541,7 +1662,14 @@ impl State {
             .then_some(self.autoscroll_at)
             .flatten()
             .map(until);
-        let caret = self.caret_blink_at.map(until);
+        // Only wake for the caret while focused, matching `fire_caret_blink`: a
+        // stray `bump_caret` off a pointer event on an unfocused window must not
+        // leave a past deadline that spins the loop.
+        let caret = self
+            .focused
+            .then_some(self.caret_blink_at)
+            .flatten()
+            .map(until);
         [self.repeat_timeout(), autoscroll, caret]
             .into_iter()
             .flatten()
@@ -1586,7 +1714,13 @@ impl State {
                     .conn
                     .take_fd()
                     .ok_or_else(|| Error::msg("data_source.send arrived without its fd"))?;
-                ffi::write_all(fd.as_raw_fd(), &self.clipboard_data)?;
+                // A target that closes its read end early makes this write fail
+                // (EPIPE). Serving the clipboard must not bring the editor down, so
+                // report and swallow the I/O error rather than propagate it out of
+                // the event loop (the protocol-parse errors above stay fatal).
+                if let Err(e) = ffi::write_all(fd.as_raw_fd(), &self.clipboard_data) {
+                    eprintln!("bnknotes: clipboard serve failed: {e}");
+                }
             }
             wl_data_source::EV_CANCELLED => {
                 // Another selection replaced ours; tear the source down.
@@ -1746,9 +1880,15 @@ impl State {
 
     /// Scroll the minimum needed to keep the caret visible after a cursor move.
     fn scroll_caret_into_view(&mut self) {
-        let layout = self.layout();
-        let (_, caret_top, caret_h) =
-            layout.caret(&self.fonts, self.text.rope(), self.text.cursor());
+        self.ensure_layout();
+        let cursor = self.text.cursor();
+        let Some((_, caret_top, caret_h)) = self
+            .layout_cache
+            .as_ref()
+            .map(|l| l.caret(&self.fonts, self.text.rope(), cursor))
+        else {
+            return;
+        };
         let sy = scroll::reveal(
             self.scroll_y,
             caret_top,
@@ -1783,19 +1923,30 @@ impl State {
     /// [`Self::reveal_range`]) is the active range, so a heading the caret is
     /// editing keeps its `#` markers while the rest collapse them.
     ///
-    /// Memoized on `(version, width, active)`: the geometry depends on nothing
-    /// else, so a scroll or idle redraw is a no-op here and reuses the cache. Only
-    /// an edit, cursor move, or resize misses and rebuilds. Pinning the reveal
-    /// during a drag keeps this key constant, so a drag never re-lays out.
+    /// Memoized on `(version, width, font size, active line span, image UI)`: the
+    /// geometry depends on nothing else, so a scroll or idle redraw is a no-op here
+    /// and reuses the cache. The marker reveal depends only on *which logical
+    /// lines* the active range touches, so the key uses the range's line span, not
+    /// its raw byte offsets: a cursor move within one line then reuses the cache
+    /// instead of rebuilding. Only an edit, a move onto another line, or a resize
+    /// misses. Pinning the reveal during a drag keeps this key constant too.
     fn ensure_layout(&mut self) {
         let active = self.reveal_range();
-        // The layout depends on the image UI state too (selection draws a border,
-        // a pinned source stacks above the picture), so it is part of the cache key.
+        // Key on the active range's logical line span (equivalent to the
+        // build's per-line `on_line` reveal test) so within-line motion is a cache
+        // hit. The image UI state (a selection border, a pinned source stacked
+        // above the picture) and FONT_SIZE are part of the key too, so a future
+        // zoom or font change cannot serve stale geometry.
+        let active_lines = {
+            let rope = self.text.rope();
+            (rope.byte_to_line(active.0), rope.byte_to_line(active.1))
+        };
         let key = (
             self.text.version(),
             self.width,
-            active.0,
-            active.1,
+            FONT_SIZE,
+            active_lines.0,
+            active_lines.1,
             self.selected_image,
             self.raw_image,
         );
@@ -1849,30 +2000,6 @@ impl State {
                 self.images.ensure(&raw);
             }
         }
-    }
-
-    /// The memoized layout, cloned for callers that read its geometry while also
-    /// mutating other `State` fields. The scroll path avoids the clone via
-    /// [`Self::ensure_layout`] and the cached [`Self::content_height`].
-    fn layout(&mut self) -> Layout {
-        self.ensure_layout();
-        // `ensure_layout` populates the cache; the rebuild branch is an
-        // unreachable guard that keeps this allocation-free path panic-free.
-        let active = self.reveal_range();
-        let image_ui = self.image_ui();
-        self.layout_cache.clone().unwrap_or_else(|| {
-            Layout::build_with_images(
-                &self.fonts,
-                self.text.rope(),
-                MARGIN,
-                MARGIN,
-                self.width as i32 - 2 * MARGIN,
-                FONT_SIZE,
-                active,
-                &self.images,
-                image_ui,
-            )
-        })
     }
 
     fn bind(&mut self, name: u32, interface: &str, version: u32, id: u32) {

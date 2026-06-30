@@ -68,6 +68,9 @@ const CODE_COLOR: u32 = 0x00f3_8ba8;
 const CODE_BG: u32 = 0x0028_2c34;
 /// Corner radius of a fenced code block's panel: a very subtle rounding, no border.
 const CODE_RADIUS: i32 = 4;
+/// An inline link's text color (the accent blue, `hsl(215,75%,70%)`); the
+/// text is also underlined so a link reads as a link without its `[..](..)` markup.
+const LINK_COLOR: u32 = 0x005c_9cf6;
 /// A selected image's border (a bright accent so it reads as "selected") and its
 /// thickness; the corner button's panel and corner radius. The button glyph reuses
 /// [`FOREGROUND`].
@@ -1396,9 +1399,13 @@ impl State {
     /// every motion event. Uses the cached layout (no clone).
     fn update_cursor_shape(&mut self) {
         use wp_cursor_shape_device_v1::{SHAPE_DEFAULT, SHAPE_POINTER, SHAPE_TEXT};
+        // A rendered link reads as clickable: the hand pointer, the same affordance
+        // the image button uses. Checked first so it wins over the I-beam.
+        let over_link = self.link_under_pointer().is_some();
         self.ensure_layout();
         let (x, y) = (self.pointer_x, self.pointer_y + self.scroll_y as f32);
         let shape = match self.layout_cache.as_ref() {
+            _ if over_link => SHAPE_POINTER,
             Some(layout) if layout.image_button_at(&self.fonts, x, y).is_some() => SHAPE_POINTER,
             Some(layout) if layout.image_at(&self.fonts, x, y).is_some() => SHAPE_DEFAULT,
             _ => SHAPE_TEXT,
@@ -1496,6 +1503,22 @@ impl State {
             }
         }
 
+        // A plain click on a link while it is rendered (its `[..](..)` markup
+        // collapsed because the cursor is on another line) follows the link instead
+        // of dropping a caret; once the cursor is on the line the markup shows and
+        // clicks edit normally. Gated to an un-chained, unmodified press so a
+        // double-click cannot open it twice.
+        if !chained && !self.xkb.shift_active() {
+            if let Some(dest) = self.link_under_pointer() {
+                // If the browser genuinely cannot launch, fall through so the click
+                // still places a caret rather than doing nothing.
+                if crate::browser::open_url(&dest).is_ok() {
+                    self.selecting = false;
+                    return;
+                }
+            }
+        }
+
         match self.click_count {
             1 => {
                 let extend = self.xkb.shift_active();
@@ -1517,6 +1540,37 @@ impl State {
             }
         }
         self.bump_caret();
+    }
+
+    /// The destination of the openable link under the pointer, if any. A link
+    /// qualifies only when its line is *rendered* (the reveal range does not touch
+    /// it, so its `[..](..)` markup is collapsed), the pointer is over its text, and
+    /// the destination has a scheme the browser will open. On the active line
+    /// (markup shown for editing) this is `None`, so clicks there edit normally.
+    /// Drives both following a click and the clickable pointer shape on hover.
+    fn link_under_pointer(&mut self) -> Option<String> {
+        let off = self.pointer_offset();
+        let (a0, a1) = self.reveal_range();
+        let rope = self.text.rope();
+        let line = rope.byte_to_line(off);
+        let ls = rope.line_to_byte(line);
+        // The logical line spans `ls` up to (but not including) its trailing '\n'.
+        let le = if line + 1 < rope.len_lines() {
+            rope.line_to_byte(line + 1).saturating_sub(1)
+        } else {
+            rope.len()
+        };
+        // A revealed line shows its markup, so a click there should edit, not follow.
+        if a0 <= le && a1 >= ls {
+            return None;
+        }
+        let content = rope.byte_slice(ls..le);
+        let rel = off - ls;
+        let link = markdown::links(&content)
+            .into_iter()
+            .find(|l| l.text.0 <= rel && rel <= l.text.1)?;
+        let dest = content[link.dest.0..link.dest.1].to_string();
+        crate::browser::can_open(&dest).then_some(dest)
     }
 
     /// The byte offset under the pointer, mapping its window position into
@@ -2207,6 +2261,7 @@ pub(crate) fn paint_document(
             let color = match run.kind {
                 markdown::SpanKind::Marker => MARKER_COLOR,
                 markdown::SpanKind::Text(markdown::Emphasis::Code) => CODE_COLOR,
+                markdown::SpanKind::Text(markdown::Emphasis::Link) => LINK_COLOR,
                 // Heading prose takes the level's color (the marker and any inline
                 // code on the line keep their own); body prose is FG.
                 markdown::SpanKind::Text(_) => match line.heading {
@@ -2220,7 +2275,25 @@ pub(crate) fn paint_document(
             // Code backgrounds (inline panels and the full-width block panel) are
             // painted in the pre-pass above, beneath the selection; here we only
             // draw the glyphs over them.
+            let run_x = pen;
             pen = canvas.draw_text(face, pen, baseline, &slice, color);
+            // Inline decorations over the glyphs, each spanning the run's drawn
+            // width: a link is underlined and struck text gets a line through its
+            // middle, both in the run's own color. Thickness scales with the
+            // line's size so it stays proportionate on larger headings.
+            let deco = match run.kind {
+                markdown::SpanKind::Text(markdown::Emphasis::Link) => {
+                    Some(baseline + m.descent / 3)
+                }
+                markdown::SpanKind::Text(markdown::Emphasis::Strikethrough) => {
+                    Some(baseline - m.ascent / 3)
+                }
+                _ => None,
+            };
+            if let Some(y) = deco {
+                let thickness = (line.size as i32 / 14).max(1);
+                canvas.fill_rect(run_x, y, pen - run_x, thickness, color);
+            }
         }
     }
 

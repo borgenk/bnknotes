@@ -3,6 +3,7 @@
 //! find out how far we get owning the whole stack.
 
 mod app;
+mod browser;
 mod conn;
 mod error;
 mod ffi;

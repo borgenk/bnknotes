@@ -11,14 +11,14 @@
 //!   into, sharing all the cursor and selection math. A heading hides its marker
 //!   once the cursor leaves; a list or quote marker persists (see
 //!   [`block_marker_persists`]).
-//! - **Inline spans** ([`inline_spans`]): code spans and emphasis (`*`/`_`)
-//!   style interior runs of a line, with their delimiters hidden once the cursor
-//!   leaves the line.
+//! - **Inline spans** ([`inline_spans`]): code spans, inline links, emphasis
+//!   (`*`/`_`), and strikethrough (`~~`) style interior runs of a line, with their
+//!   delimiters hidden once the cursor leaves the line.
 //!
 //! Scope for now: ATX headings, bullet/ordered/quote lines (which may be indented
 //! for nesting, [`LIST_INDENT_SPACES`] per level), thematic breaks (horizontal
-//! rules), inline code, and bold/italic emphasis. Indented *headings* and quotes
-//! are still not recognized; only list items nest.
+//! rules), inline code, bold/italic emphasis, strikethrough, and inline links.
+//! Indented *headings* and quotes are still not recognized; only list items nest.
 
 /// The block style of one logical line. A closed set, extended as more markup
 /// lands.
@@ -279,22 +279,28 @@ pub fn all_sizes(base: u32) -> Vec<u32> {
 // hide the delimiters once the cursor leaves the line, the same live-preview
 // collapse headings already use.
 //
-// Two layers, in CommonMark's precedence order:
+// Three layers, in CommonMark's precedence order (links and code bind tighter
+// than emphasis):
 //
 //   1. Code spans (`` `code` ``): a run of N backticks opens a span the next run
 //      of exactly N backticks closes; an unclosed run is literal. Delimiters
 //      inside a code span (a `*`, say) are inert.
-//   2. Emphasis (`*`/`_`, `**`/`__`, `***`/`___`): `*`/`_` runs outside code are
-//      paired opener-to-closer with a stack (innermost first) to mark italic,
-//      bold, or both. Whether a run can open or close follows a simplified
-//      reading of CommonMark's flanking rules (including the `_` intraword
-//      restriction, so `snake_case` stays literal).
+//   2. Inline links (`[text](dest)`): the `[`, `]`, and `(dest)` are markers; the
+//      text styles as a link. The whole link is inert for emphasis, so a `*` or
+//      `_` inside the text or the URL stays literal.
+//   3. Emphasis and strikethrough (`*`/`_`, `**`/`__`, `***`/`___`, `~~`): runs
+//      outside code and links are paired opener-to-closer with a stack (innermost
+//      first) to mark italic, bold, both, or struck. Whether a run can open or
+//      close follows a simplified reading of CommonMark's flanking rules
+//      (including the `_` intraword restriction, so `snake_case` stays literal).
 //
-// Deliberate simplifications: only single/double/triple delimiter runs emphasize
-// (longer runs stay literal), an opener matches only a closer of the same length
-// (no partial-run consumption), emphasis is single-line, and backslash escapes
-// and the one-space stripping inside code spans are not handled. Notes rarely
-// need the omitted cases.
+// Deliberate simplifications: only single/double/triple `*`/`_` runs emphasize
+// and only a `~~` pair strikes (other lengths stay literal, so a lone `~` in
+// prose is safe), an opener matches only a closer of the same length (no
+// partial-run consumption), strikethrough does not compose with bold/italic,
+// links do not nest brackets and reference links (`[text][id]`) are unhandled,
+// everything is single-line, and backslash escapes and the one-space stripping
+// inside code spans are not handled. Notes rarely need the omitted cases.
 
 /// Inline emphasis of a text run, selecting the face and color it renders with.
 /// A closed set; [`crate::freetype::FontStyle`] maps it to an actual face.
@@ -310,6 +316,12 @@ pub enum Emphasis {
     Italic,
     /// `***both***`, drawn in the bold-italic face.
     BoldItalic,
+    /// The text of an inline link `[text](dest)`, drawn in the accent color and
+    /// underlined. The brackets and `(dest)` are [`SpanKind::Marker`]s, hidden
+    /// off the active line; only this run shows when the link is collapsed.
+    Link,
+    /// `~~struck~~`, drawn body weight with a line through its middle.
+    Strikethrough,
 }
 
 /// What one inline span is: text to render with an [`Emphasis`], or a delimiter
@@ -329,9 +341,9 @@ pub struct Span {
 }
 
 /// Split `content` into a contiguous list of inline spans covering `[0, len)`,
-/// recognizing code spans and `*`/`_` emphasis. Text between and around markup
-/// becomes `Text(..)` spans, so the result has no gaps. Empty input yields no
-/// spans.
+/// recognizing code spans, inline links, and `*`/`_`/`~~` emphasis. Text between
+/// and around markup becomes `Text(..)` spans, so the result has no gaps. Empty
+/// input yields no spans.
 pub fn inline_spans(content: &str) -> Vec<Span> {
     let bytes = content.as_bytes();
     let n = bytes.len();
@@ -339,66 +351,62 @@ pub fn inline_spans(content: &str) -> Vec<Span> {
         return Vec::new();
     }
 
-    // Code spans first, since they bind tighter than emphasis. Flag each fence and
-    // content byte; `in_code` marks every byte a `*`/`_` would be inert inside.
-    let mut is_code_marker = vec![false; n];
-    let mut is_code_content = vec![false; n];
-    let mut in_code = vec![false; n];
-    let mut i = 0;
-    while i < n {
-        if bytes[i] != b'`' {
-            i += 1;
-            continue;
-        }
-        let open = i;
-        let after_open = backtick_run_end(bytes, open);
-        let fence = after_open - open;
-        let Some((close, after_close)) = find_code_closer(bytes, after_open, fence) else {
-            // Unclosed: the backticks are literal text. Skip past them so a later
-            // run of the same length is not mistaken for this run's closer.
-            i = after_open;
-            continue;
-        };
-        for b in open..after_open {
-            is_code_marker[b] = true;
-            in_code[b] = true;
-        }
-        for b in after_open..close {
-            is_code_content[b] = true;
-            in_code[b] = true;
-        }
-        for b in close..after_close {
-            is_code_marker[b] = true;
-            in_code[b] = true;
-        }
-        i = after_close;
+    // Code spans first, since they bind tighter than emphasis. `in_code` marks every
+    // byte a `*`/`_` (or a link bracket) would be inert inside.
+    let (is_code_marker, is_code_content, in_code) = code_masks(content);
+
+    // Then inline links `[text](dest)`. The `[`, `]`, and `(dest)` are markers
+    // (hidden off the active line like any other markup); the text styles as a
+    // link. The whole link is inert for emphasis. An image `![..](..)` is left
+    // alone (its `!` guards it) and reference links `[text][id]` are not handled.
+    let mut is_link_marker = vec![false; n];
+    let mut is_link_text = vec![false; n];
+    let mut in_link = vec![false; n];
+    for l in link_spans(bytes, &in_code) {
+        is_link_marker[l.open] = true; // `[`
+        is_link_text[l.open + 1..l.rb].fill(true); // text
+        is_link_marker[l.rb..=l.rp].fill(true); // `]` .. `)`
+        in_link[l.open..=l.rp].fill(true);
     }
 
-    // Then emphasis. Pair `*`/`_` delimiter runs outside code, then flag the
-    // matched delimiters as markers and stamp bold/italic over the text between.
-    let delims = emphasis_delims(content, &in_code);
+    // Then emphasis and strikethrough. Pair `*`/`_`/`~~` delimiter runs that
+    // lie outside both code and links, then flag the matched delimiters as markers
+    // and stamp bold/italic/strike over the text between.
+    let inert: Vec<bool> = (0..n).map(|b| in_code[b] || in_link[b]).collect();
+    let delims = emphasis_delims(content, &inert);
     let mut is_em_marker = vec![false; n];
     let mut is_bold = vec![false; n];
     let mut is_italic = vec![false; n];
+    let mut is_strike = vec![false; n];
     for (open, close) in match_delims(&delims) {
         is_em_marker[delims[open].start..delims[open].end].fill(true);
         is_em_marker[delims[close].start..delims[close].end].fill(true);
-        // A run of 1 is italic, 2 is bold, 3 is both.
-        let bold = delims[open].len != 1;
-        let italic = delims[open].len != 2;
-        for b in delims[open].end..delims[close].start {
-            is_bold[b] |= bold;
-            is_italic[b] |= italic;
+        let (text_start, text_end) = (delims[open].end, delims[close].start);
+        if delims[open].ch == b'~' {
+            is_strike[text_start..text_end].fill(true);
+        } else {
+            // A run of 1 is italic, 2 is bold, 3 is both.
+            let bold = delims[open].len != 1;
+            let italic = delims[open].len != 2;
+            for b in text_start..text_end {
+                is_bold[b] |= bold;
+                is_italic[b] |= italic;
+            }
         }
     }
 
     // Resolve each byte to a single kind, then coalesce equal neighbors so the
-    // spans tile the content with no gaps and no redundant splits.
+    // spans tile the content with no gaps and no redundant splits. Markers win,
+    // then code, then a link's text, then strikethrough, then plain emphasis.
     let kind_at = |b: usize| -> SpanKind {
-        if is_code_marker[b] || is_em_marker[b] {
+        if is_code_marker[b] || is_em_marker[b] || is_link_marker[b] {
             SpanKind::Marker
         } else if is_code_content[b] {
             SpanKind::Text(Emphasis::Code)
+        } else if is_link_text[b] {
+            SpanKind::Text(Emphasis::Link)
+        } else if is_strike[b] {
+            SpanKind::Text(Emphasis::Strikethrough)
         } else {
             SpanKind::Text(match (is_bold[b], is_italic[b]) {
                 (true, true) => Emphasis::BoldItalic,
@@ -442,28 +450,35 @@ struct Delim {
     can_close: bool,
 }
 
-/// Collect the emphasis delimiter runs of `content`, skipping any byte flagged in
-/// `in_code`. Only single/double/triple runs are kept; longer runs stay literal.
-fn emphasis_delims(content: &str, in_code: &[bool]) -> Vec<Delim> {
+/// Collect the emphasis and strikethrough delimiter runs of `content`, skipping
+/// any byte flagged in `inert` (inside a code span or a link). An `*`/`_` run of
+/// one to three is kept; a `~` run is kept only when it is exactly `~~` (so a lone
+/// `~` in prose stays literal). Other lengths are dropped.
+fn emphasis_delims(content: &str, inert: &[bool]) -> Vec<Delim> {
     let bytes = content.as_bytes();
     let n = bytes.len();
     let mut delims = Vec::new();
     let mut i = 0;
     while i < n {
         let ch = bytes[i];
-        if in_code[i] || (ch != b'*' && ch != b'_') {
+        if inert[i] || !matches!(ch, b'*' | b'_' | b'~') {
             i += 1;
             continue;
         }
         let start = i;
         let mut end = i;
-        while end < n && bytes[end] == ch && !in_code[end] {
+        while end < n && bytes[end] == ch && !inert[end] {
             end += 1;
         }
         let len = end - start;
-        if (1..=3).contains(&len) {
+        let keep = if ch == b'~' {
+            len == 2
+        } else {
+            (1..=3).contains(&len)
+        };
+        if keep {
             // Flanking is decided by the raw neighboring characters; `start` and
-            // `end` sit on char boundaries (the run is ASCII `*`/`_`).
+            // `end` sit on char boundaries (the run is ASCII `*`/`_`/`~`).
             let before = content[..start].chars().next_back();
             let after = content[end..].chars().next();
             let (can_open, can_close) = flanking(ch, before, after);
@@ -510,7 +525,8 @@ fn match_delims(delims: &[Delim]) -> Vec<(usize, usize)> {
 /// characters immediately before and after it: a simplified reading of
 /// CommonMark's left/right-flanking rules. A missing neighbor (the line edge)
 /// counts as whitespace. The `_` form keeps the intraword restriction so an
-/// underscore inside a word neither opens nor closes.
+/// underscore inside a word neither opens nor closes; `*` and `~` (strikethrough)
+/// share the unrestricted form.
 fn flanking(ch: u8, before: Option<char>, after: Option<char>) -> (bool, bool) {
     let before_ws = before.is_none_or(|c| c.is_whitespace());
     let after_ws = after.is_none_or(|c| c.is_whitespace());
@@ -527,6 +543,13 @@ fn flanking(ch: u8, before: Option<char>, after: Option<char>) -> (bool, bool) {
     } else {
         (left_flanking, right_flanking)
     }
+}
+
+/// The index of the first `target` byte at or after `from` that is not inside a
+/// code span, or `None`. Used to find a link's `]` and `)` while skipping any that
+/// sit in inline code.
+fn find_byte(bytes: &[u8], from: usize, target: u8, in_code: &[bool]) -> Option<usize> {
+    (from..bytes.len()).find(|&i| bytes[i] == target && !in_code[i])
 }
 
 /// The byte index just past the run of backticks starting at `start` (which must
@@ -556,6 +579,125 @@ fn find_code_closer(bytes: &[u8], from: usize, fence: usize) -> Option<(usize, u
         }
     }
     None
+}
+
+/// Flag the code-span bytes of `content`: the fence backticks (`is_marker`), the
+/// span interior (`is_content`), and every byte inside a span (`in_code`, which
+/// keeps other markup inert). Returned as `(is_marker, is_content, in_code)`, all
+/// `content.len()` long. The single source so [`inline_spans`] and [`links`] agree
+/// on where code lies.
+fn code_masks(content: &str) -> (Vec<bool>, Vec<bool>, Vec<bool>) {
+    let bytes = content.as_bytes();
+    let n = bytes.len();
+    let mut is_marker = vec![false; n];
+    let mut is_content = vec![false; n];
+    let mut in_code = vec![false; n];
+    let mut i = 0;
+    while i < n {
+        if bytes[i] != b'`' {
+            i += 1;
+            continue;
+        }
+        let open = i;
+        let after_open = backtick_run_end(bytes, open);
+        let fence = after_open - open;
+        let Some((close, after_close)) = find_code_closer(bytes, after_open, fence) else {
+            // Unclosed: the backticks are literal text. Skip past them so a later
+            // run of the same length is not mistaken for this run's closer.
+            i = after_open;
+            continue;
+        };
+        for b in open..after_open {
+            is_marker[b] = true;
+            in_code[b] = true;
+        }
+        for b in after_open..close {
+            is_content[b] = true;
+            in_code[b] = true;
+        }
+        for b in close..after_close {
+            is_marker[b] = true;
+            in_code[b] = true;
+        }
+        i = after_close;
+    }
+    (is_marker, is_content, in_code)
+}
+
+/// The bracket indices of one inline link, into the scanned content.
+struct LinkSpan {
+    /// Index of the opening `[`. The text is `open + 1 .. rb`.
+    open: usize,
+    /// Index of the `]`; the `(` is always `rb + 1` and the dest is `rb + 2 .. rp`.
+    rb: usize,
+    /// Index of the closing `)`.
+    rp: usize,
+}
+
+/// Locate the inline links in `bytes`, skipping any markup inside a code span
+/// (flagged in `in_code`). A link is `[text](dest)` with non-empty text and
+/// destination; an image `![..](..)` is skipped (its `!` guards it) and reference
+/// links `[text][id]` are ignored (no `(` follows the `]`). The first `]`/`)`
+/// outside code close the text/dest, so nested brackets are not handled.
+fn link_spans(bytes: &[u8], in_code: &[bool]) -> Vec<LinkSpan> {
+    let n = bytes.len();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < n {
+        if bytes[i] != b'[' || in_code[i] || (i > 0 && bytes[i - 1] == b'!') {
+            i += 1;
+            continue;
+        }
+        let open = i;
+        let Some(rb) = find_byte(bytes, open + 1, b']', in_code) else {
+            i = open + 1;
+            continue;
+        };
+        // A `(` must immediately follow the `]`, and a `)` must close the dest.
+        if bytes.get(rb + 1) != Some(&b'(') {
+            i = rb + 1;
+            continue;
+        }
+        let Some(rp) = find_byte(bytes, rb + 2, b')', in_code) else {
+            i = rb + 2;
+            continue;
+        };
+        // Empty text or empty destination is not a link; leave the bytes literal.
+        if rb == open + 1 || rp == rb + 2 {
+            i = rp + 1;
+            continue;
+        }
+        out.push(LinkSpan { open, rb, rp });
+        i = rp + 1;
+    }
+    out
+}
+
+/// One inline link `[text](dest)` located in a line, as byte ranges into that
+/// line. See [`links`].
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Link {
+    /// Byte range of the link text, between `[` and `]`.
+    pub text: (usize, usize),
+    /// Byte range of the destination URL, with any `<...>` wrapper and `"title"`
+    /// suffix already removed, so it is ready to hand to a browser.
+    pub dest: (usize, usize),
+}
+
+/// The inline links in `content`, each with its text range and a cleaned
+/// destination, as byte ranges into `content`. The renderer reaches links through
+/// [`inline_spans`]; this is the structured view the editor uses to follow the link
+/// the pointer clicks. A `[x](y)` inside a code span is skipped, matching the
+/// renderer.
+pub fn links(content: &str) -> Vec<Link> {
+    let (.., in_code) = code_masks(content);
+    link_spans(content.as_bytes(), &in_code)
+        .into_iter()
+        .map(|l| Link {
+            text: (l.open + 1, l.rb),
+            dest: path_of_dest(content, l.rb + 2, l.rp),
+        })
+        .collect()
 }
 
 // --- Block images -----------------------------------------------------------
@@ -922,6 +1064,13 @@ mod tests {
             "*a `b` c*",
             "foo_bar",
             "*unclosed",
+            "[a](b)",
+            "see [x](y) end",
+            "[*a*](b_c)",
+            "~~x~~",
+            "~~a~~ b",
+            "~lone",
+            "[a](b) and ~~c~~",
         ] {
             let sp = inline_spans(input);
             assert_eq!(
@@ -1109,6 +1258,145 @@ mod tests {
                 (1, 6, SpanKind::Text(Emphasis::Code)),
                 (6, 7, SpanKind::Marker),
             ]
+        );
+    }
+
+    // --- Inline links -----------------------------------------------------
+
+    #[test]
+    fn a_link_splits_into_markers_and_link_text() {
+        // "[a](b)": '[' marker, "a" link text, "](b)" marker.
+        assert_eq!(
+            spans("[a](b)"),
+            vec![
+                (0, 1, SpanKind::Marker),
+                (1, 2, SpanKind::Text(Emphasis::Link)),
+                (2, 6, SpanKind::Marker),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_link_inside_prose_keeps_its_surroundings() {
+        assert_eq!(
+            spans("see [docs](u) now"),
+            vec![
+                (0, 4, SpanKind::Text(Emphasis::Regular)),
+                (4, 5, SpanKind::Marker),
+                (5, 9, SpanKind::Text(Emphasis::Link)),
+                (9, 13, SpanKind::Marker),
+                (13, 17, SpanKind::Text(Emphasis::Regular)),
+            ]
+        );
+    }
+
+    #[test]
+    fn link_text_and_url_are_inert_for_emphasis() {
+        // A `*` in the text or a `_` in the URL stays literal: the text is one
+        // Link run and the destination one marker run, with no emphasis splits.
+        assert_eq!(
+            spans("[*a*](b_c)"),
+            vec![
+                (0, 1, SpanKind::Marker),
+                (1, 4, SpanKind::Text(Emphasis::Link)),
+                (4, 10, SpanKind::Marker),
+            ]
+        );
+    }
+
+    #[test]
+    fn an_image_is_not_treated_as_a_link() {
+        // The `!` guards `![alt](url)`; inline images stay literal source.
+        assert_eq!(
+            spans("![a](b)"),
+            vec![(0, 7, SpanKind::Text(Emphasis::Regular))]
+        );
+    }
+
+    #[test]
+    fn malformed_links_stay_literal() {
+        // `[id]` with no destination (a bare bracket pair or a reference link).
+        assert_eq!(
+            spans("[id]"),
+            vec![(0, 4, SpanKind::Text(Emphasis::Regular))]
+        );
+        // A space between `]` and `(` breaks the link.
+        assert_eq!(
+            spans("[x] (y)"),
+            vec![(0, 7, SpanKind::Text(Emphasis::Regular))]
+        );
+        // Empty text or empty destination is not a link.
+        assert_eq!(
+            spans("[](y)"),
+            vec![(0, 5, SpanKind::Text(Emphasis::Regular))]
+        );
+        assert_eq!(
+            spans("[x]()"),
+            vec![(0, 5, SpanKind::Text(Emphasis::Regular))]
+        );
+    }
+
+    /// `(text, cleaned dest)` pairs for every link found, sliced back out of `s`.
+    fn link_list(s: &str) -> Vec<(&str, &str)> {
+        links(s)
+            .into_iter()
+            .map(|l| (&s[l.text.0..l.text.1], &s[l.dest.0..l.dest.1]))
+            .collect()
+    }
+
+    #[test]
+    fn links_returns_text_and_destination() {
+        assert_eq!(link_list("[a](b)"), vec![("a", "b")]);
+        assert_eq!(
+            link_list("see [docs](http://x) and [more](http://y) now"),
+            vec![("docs", "http://x"), ("more", "http://y")]
+        );
+    }
+
+    #[test]
+    fn links_clean_the_destination() {
+        // A title and an angle-bracket wrapper are stripped, matching images.
+        assert_eq!(
+            link_list(r#"[a](http://x "title")"#),
+            vec![("a", "http://x")]
+        );
+        assert_eq!(link_list("[a](<b c>)"), vec![("a", "b c")]);
+    }
+
+    #[test]
+    fn links_skip_images_code_and_malformed() {
+        assert!(link_list("![a](b)").is_empty(), "image, not a link");
+        assert!(link_list("`[a](b)`").is_empty(), "inside a code span");
+        assert!(link_list("[a]").is_empty(), "no destination");
+        assert!(link_list("[a] (b)").is_empty(), "gap before the dest");
+        assert!(link_list("[](b)").is_empty(), "empty text");
+    }
+
+    // --- Strikethrough ----------------------------------------------------
+
+    #[test]
+    fn a_double_tilde_pair_strikes_through() {
+        assert_eq!(
+            spans("~~x~~"),
+            vec![
+                (0, 2, SpanKind::Marker),
+                (2, 3, SpanKind::Text(Emphasis::Strikethrough)),
+                (3, 5, SpanKind::Marker),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_lone_or_unclosed_tilde_stays_literal() {
+        // A single `~` never strikes, so "~5 min" and a file path are safe.
+        assert_eq!(
+            spans("~5 min"),
+            vec![(0, 6, SpanKind::Text(Emphasis::Regular))]
+        );
+        // An unmatched `~~` is literal too.
+        assert_eq!(
+            spans("~~x"),
+            vec![(0, 3, SpanKind::Text(Emphasis::Regular))]
         );
     }
 

@@ -19,7 +19,8 @@ use std::hint::black_box;
 use std::path::Path;
 use std::time::Instant;
 
-use crate::app::{paint_document, PaintParams, FONT_SIZE, MARGIN};
+use crate::app::{build_display_list, paint_document, PaintParams, FONT_SIZE, MARGIN};
+use crate::display;
 use crate::error::{Error, Result};
 use crate::freetype::Fonts;
 use crate::image::{Image, ImageStore};
@@ -247,6 +248,29 @@ fn measure() -> Result<Vec<Sample>> {
                 sum += face.rasterize(c as char).coverage.len();
             }
             sum
+        }),
+    });
+
+    // The incremental damage path: an idle caret blink. Only the caret toggles
+    // between frames, so the diff against the on-screen frame yields a caret-sized
+    // region and the repaint touches a sliver of the buffer, not the whole surface.
+    // This is what the display list and damage tracking buy, so it should be a
+    // fraction of `paint_frame` above; a regression here means a blink frame stopped
+    // being incremental (e.g. the diff started reporting the whole surface, or the
+    // build itself got expensive).
+    let caret_on = build_display_list(&fonts, &layout, &rope, &params(0, None));
+    let mut caret_off = params(0, None);
+    caret_off.caret_visible = false;
+    out.push(Sample {
+        name: "damage_blink",
+        ns: bench(2000, || {
+            let frame = build_display_list(&fonts, &layout, &rope, &caret_off);
+            let dmg = display::damage(&caret_on, &frame, WIDTH as i32, HEIGHT as i32);
+            let mut canvas = Canvas::new(&mut buf, WIDTH, HEIGHT);
+            for clip in &dmg {
+                display::execute(&mut canvas, &fonts, &images, &frame, Some(*clip));
+            }
+            dmg.len()
         }),
     });
 

@@ -106,12 +106,32 @@ fn code_regular_path(prose: &FontFamily) -> Option<&'static str> {
 /// file. Kept distinct from [`crate::markdown::Emphasis`] so this font layer
 /// stays independent of the markdown vocabulary: an inline code span is its own
 /// emphasis but still renders in the regular monospace face.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum FontStyle {
     Regular,
     Bold,
     Italic,
     BoldItalic,
+}
+
+/// A self-contained description of which [`Face`] a run draws in, with no borrow
+/// of [`Fonts`]. The display list stores this (rather than a `&Face`) so a built
+/// frame outlives the borrow and can be diffed across frames; [`Fonts::face_for`]
+/// resolves it back to a face at paint time. The two arms mirror the two families
+/// [`Fonts`] holds: the prose family at a style, and the distinct code family.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum FaceKey {
+    Prose { size: u32, style: FontStyle },
+    Code { size: u32 },
+}
+
+impl FaceKey {
+    /// The pixel size this face is drawn at, carried by both arms.
+    pub fn size(self) -> u32 {
+        match self {
+            FaceKey::Prose { size, .. } | FaceKey::Code { size } => size,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -691,6 +711,16 @@ impl Fonts {
     pub fn code_face(&self, size: u32) -> &Face {
         let entry = self.entry(size);
         entry.code.as_ref().unwrap_or(&entry.regular)
+    }
+
+    /// Resolve a [`FaceKey`] to its face, the inverse of the key a run records.
+    /// Routes to [`Self::face`] or [`Self::code_face`], so it inherits their
+    /// fallbacks and never panics.
+    pub fn face_for(&self, key: FaceKey) -> &Face {
+        match key {
+            FaceKey::Prose { size, style } => self.face(size, style),
+            FaceKey::Code { size } => self.code_face(size),
+        }
     }
 
     /// The metrics for `size`, or the fallback's metrics if `size` was not opened.

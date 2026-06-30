@@ -55,7 +55,7 @@
 //! hides its `#`, so an unfocused block reads without visible fences; the panel
 //! still draws those rows, leaving blank top and bottom padding.
 
-use crate::freetype::{Face, FontStyle, Fonts};
+use crate::freetype::{Face, FaceKey, FontStyle, Fonts};
 use crate::grapheme;
 use crate::image::ImageStore;
 use crate::markdown;
@@ -225,10 +225,24 @@ fn font_style(kind: markdown::SpanKind) -> FontStyle {
 /// inline code keep their own face. The single source of truth so layout's
 /// measuring and the app's drawing pick the same face and never disagree on widths.
 pub(crate) fn run_face(fonts: &Fonts, size: u32, kind: markdown::SpanKind, heading: bool) -> &Face {
+    fonts.face_for(face_key(size, kind, heading))
+}
+
+/// The [`FaceKey`] a run of `kind` at `size` draws in, the borrow-free twin of
+/// [`run_face`]: the display list records this so a painted run can resolve its
+/// face later without holding a borrow of [`Fonts`]. Same decision as `run_face`,
+/// so the two never disagree on which face (hence which width) a run uses.
+pub(crate) fn face_key(size: u32, kind: markdown::SpanKind, heading: bool) -> FaceKey {
     match kind {
-        markdown::SpanKind::Text(markdown::Emphasis::Code) => fonts.code_face(size),
-        markdown::SpanKind::Text(_) if heading => fonts.face(size, embolden(font_style(kind))),
-        other => fonts.face(size, font_style(other)),
+        markdown::SpanKind::Text(markdown::Emphasis::Code) => FaceKey::Code { size },
+        markdown::SpanKind::Text(_) if heading => FaceKey::Prose {
+            size,
+            style: embolden(font_style(kind)),
+        },
+        other => FaceKey::Prose {
+            size,
+            style: font_style(other),
+        },
     }
 }
 
@@ -254,6 +268,7 @@ fn kind_at(spans: &[markdown::Span], off: usize) -> markdown::SpanKind {
 }
 
 /// An axis-aligned rectangle in window pixels.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct Rect {
     pub x: i32,
     pub y: i32,

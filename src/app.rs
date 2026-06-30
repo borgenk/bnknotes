@@ -23,12 +23,13 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use crate::conn::{Connection, Fill};
+use crate::display::{self, DisplayList, DrawCmd};
 use crate::error::{Error, Result};
 use crate::ffi;
 use crate::file::{self, FileFormat};
-use crate::freetype::Fonts;
+use crate::freetype::{FaceKey, Fonts, Metrics};
 use crate::image::ImageStore;
-use crate::layout::{image_button_rect, run_face, Gutter, ImageUi, Layout, Rect};
+use crate::layout::{face_key, image_button_rect, Gutter, ImageUi, Layout, Rect};
 use crate::markdown;
 use crate::protocol::{
     self, wl_buffer, wl_callback, wl_compositor, wl_data_device, wl_data_device_manager,
@@ -324,6 +325,16 @@ struct State {
     buffers: [u32; 2],
     busy: [bool; 2],
     frame_len: usize,
+    /// The display list each back buffer currently holds, so a repaint diffs the
+    /// new frame against what is already in *that* buffer and clears only the
+    /// changed regions. The two age independently (each is painted on alternate
+    /// frames), which is why damage is tracked per buffer. Reset to empty whenever
+    /// the buffers are recreated, forcing a full repaint of the fresh memory.
+    buffer_lists: [DisplayList; 2],
+    /// The display list last committed to the compositor, i.e. what is on screen.
+    /// The new frame is diffed against this to decide whether to present at all
+    /// and which regions to report as damaged.
+    present_list: DisplayList,
 
     // Id allocation: a bump counter plus a free list fed by `delete_id`.
     next_id: u32,
@@ -437,6 +448,8 @@ impl State {
             buffers: [0, 0],
             busy: [false, false],
             frame_len: 0,
+            buffer_lists: [Vec::new(), Vec::new()],
+            present_list: Vec::new(),
             next_id: 2, // 1 is wl_display
             free_ids: Vec::new(),
             pending_sync: None,
@@ -579,6 +592,11 @@ impl State {
         self.pool = Some(pool);
         self.pool_id = pool_id;
         self.busy = [false, false];
+        // The new buffers hold undefined memory and the surface size may have
+        // changed, so no stored frame describes them: clear the damage history to
+        // force the next frame to repaint each buffer (and the screen) in full.
+        self.buffer_lists = [Vec::new(), Vec::new()];
+        self.present_list = Vec::new();
         Ok(())
     }
 
@@ -652,26 +670,33 @@ impl State {
         }
     }
 
-    /// Paint the current text into a free buffer and present it. Returns false
-    /// if both buffers are still held by the compositor, leaving `dirty` set so
-    /// the next buffer release triggers another attempt.
+    /// Build the current frame, repaint only what changed in a free buffer, and
+    /// present it. Returns false if both buffers are still held by the compositor,
+    /// leaving `dirty` set so the next buffer release retries.
+    ///
+    /// Two diffs over the display list drive the damage tracking:
+    ///
+    /// - against `present_list` (what is on screen) to decide whether to present at
+    ///   all and which regions to report as damaged to the compositor;
+    /// - against this buffer's last frame to decide which regions to repaint into
+    ///   it, since the two back buffers age independently.
+    ///
+    /// An idle caret blink thus repaints a caret-sized region (often nothing, when
+    /// the chosen buffer already holds that state) instead of the whole surface.
     fn render_frame(&mut self) -> Result<bool> {
         let Some(idx) = (0..2).find(|&i| !self.busy[i]) else {
             return Ok(false);
         };
         // Time the whole frame (layout reuse/rebuild plus paint) when stats are on.
         let started = self.stats.then(Instant::now);
-        // Build (or reuse) the layout up front, then paint from the cache *by
-        // reference*: the painter borrows the cached layout alongside a mutable
-        // borrow of the disjoint `pool` field, so a presented frame never clones
-        // the whole document's visual lines.
+        // Build (or reuse) the layout up front, then build the frame *by reference*
+        // off the cached layout, so a frame never clones the document's visual lines.
         self.ensure_layout();
         // Keep the scroll offset valid for the current content and window size.
         self.scroll_y = scroll::clamp(self.scroll_y, self.content_height, self.height as i32);
-        let frame_len = self.frame_len;
-        let offset = idx * frame_len;
         let width = self.width as usize;
         let height = self.height as usize;
+        let (sw, sh) = (self.width as i32, self.height as i32);
         let params = PaintParams {
             width,
             height,
@@ -681,24 +706,45 @@ impl State {
             caret_visible: self.caret_visible,
         };
 
-        {
+        let new_list = {
             let Some(layout) = self.layout_cache.as_ref() else {
                 return Ok(false);
             };
+            build_display_list(&self.fonts, layout, self.text.rope(), &params)
+        };
+
+        // Nothing changed since the on-screen frame: it already shows this content,
+        // so there is nothing to present (the common idle case).
+        let screen_dmg = display::damage(&self.present_list, &new_list, sw, sh);
+        if screen_dmg.is_empty() {
+            return Ok(true);
+        }
+
+        // Repaint only the regions of this buffer that differ from what it already
+        // holds. The background fill at the head of the list clears each clip, then
+        // the rest of the list repaints it, so a clipped region matches a full
+        // repaint exactly.
+        let buf_dmg = display::damage(&self.buffer_lists[idx], &new_list, sw, sh);
+        if !buf_dmg.is_empty() {
+            let frame_len = self.frame_len;
+            let offset = idx * frame_len;
             let Some(pool) = self.pool.as_mut() else {
                 return Ok(false);
             };
             let frame = &mut pool.data_mut()[offset..offset + frame_len];
             let mut canvas = Canvas::new(frame, width, height);
-            paint_document(
-                &mut canvas,
-                &self.fonts,
-                layout,
-                self.text.rope(),
-                &self.images,
-                &params,
-            );
+            for clip in &buf_dmg {
+                display::execute(
+                    &mut canvas,
+                    &self.fonts,
+                    &self.images,
+                    &new_list,
+                    Some(*clip),
+                );
+            }
         }
+        self.buffer_lists[idx] = new_list.clone();
+        self.present_list = new_list;
 
         let buffer = self.buffers[idx];
         self.conn.request(
@@ -706,16 +752,15 @@ impl State {
             wl_surface::ATTACH,
             &[Arg::Object(buffer), Arg::Int(0), Arg::Int(0)],
         );
-        self.conn.request(
-            self.surface,
-            wl_surface::DAMAGE,
-            &[
-                Arg::Int(0),
-                Arg::Int(0),
-                Arg::Int(self.width as i32),
-                Arg::Int(self.height as i32),
-            ],
-        );
+        // Report just the regions that changed on screen, so the compositor
+        // recomposites only those rather than the whole surface.
+        for r in &screen_dmg {
+            self.conn.request(
+                self.surface,
+                wl_surface::DAMAGE,
+                &[Arg::Int(r.x), Arg::Int(r.y), Arg::Int(r.w), Arg::Int(r.h)],
+            );
+        }
         // Arm a frame callback before committing, so the compositor tells us when
         // the next frame is due. `run_until` won't draw again until its `done`
         // clears `frame_callback`, which is what paces redraws to the refresh.
@@ -2090,13 +2135,10 @@ pub(crate) struct PaintParams {
     pub caret_visible: bool,
 }
 
-/// Paint one frame of the document into `canvas`: background, code-block panels,
-/// inline-code panels, the selection highlight, the text (run by run, in each
-/// run's face and color, with markers collapsed or revealed as the layout
-/// decided), and the caret. Pure CPU work over the layout and rope, with no
-/// Wayland or `State` dependency, so [`State::render_frame`] and the perf harness
-/// share the exact same painter. Off-screen lines are skipped, so cost tracks the
-/// viewport, not the document.
+/// Paint one frame of the document into `canvas`, building the display list and
+/// executing it in full. The convenience used by tests and the perf harness; the
+/// live editor instead diffs the list against the buffer's last frame and repaints
+/// only the changed regions (see [`State::render_frame`]).
 pub(crate) fn paint_document(
     canvas: &mut Canvas,
     fonts: &Fonts,
@@ -2105,9 +2147,72 @@ pub(crate) fn paint_document(
     images: &ImageStore,
     p: &PaintParams,
 ) {
+    let list = build_display_list(fonts, layout, rope, p);
+    display::execute(canvas, fonts, images, &list, None);
+}
+
+/// A [`DrawCmd::Text`] for `text` from `x` along `baseline` in `face`/`color`,
+/// where `end` is the pen x after the run (its drawn width). The damage bounds are
+/// the run's box padded for glyph ink that overhangs the advance, so a diff or a
+/// clip never shears a glyph's edge.
+fn text_cmd(
+    face: FaceKey,
+    x: i32,
+    baseline: i32,
+    end: i32,
+    color: u32,
+    text: String,
+    m: Metrics,
+) -> DrawCmd {
+    let size = face.size();
+    let pad_x = (size as i32 / 2).max(2);
+    let pad_y = (size as i32 / 4).max(1);
+    let bounds = Rect {
+        x: x - pad_x,
+        y: baseline - m.ascent - pad_y,
+        w: (end - x).max(0) + 2 * pad_x,
+        h: m.ascent + m.descent + 2 * pad_y,
+    };
+    DrawCmd::Text {
+        bounds,
+        x,
+        baseline,
+        face,
+        color,
+        text,
+    }
+}
+
+/// Build the frame as a display list in screen (post-scroll) pixels: background,
+/// code-block panels, inline-code panels, the selection highlight, the text (run
+/// by run, in each run's face and color, with markers collapsed or revealed as
+/// the layout decided), and the caret, in that stacking order. Pure CPU work over
+/// the layout and rope, with no Wayland or `State` dependency. Off-screen lines
+/// and spans are skipped, so the list (and the cost) track the viewport, not the
+/// document.
+pub(crate) fn build_display_list(
+    fonts: &Fonts,
+    layout: &Layout,
+    rope: &crate::rope::Rope,
+    p: &PaintParams,
+) -> DisplayList {
     let (width, scroll_y) = (p.width, p.scroll_y);
     let view_h = p.height as i32;
-    canvas.fill(BACKGROUND);
+    // Roughly a few commands per visual line (panel, runs, decorations) plus the
+    // background and caret; one upfront allocation beats growing the list mid-build.
+    let mut list: DisplayList = Vec::with_capacity(layout.lines().len() * 3 + 8);
+
+    // The background, full surface, first so a clipped repaint clears its region
+    // before the rest of the list draws over it.
+    list.push(DrawCmd::Fill {
+        rect: Rect {
+            x: 0,
+            y: 0,
+            w: width as i32,
+            h: view_h,
+        },
+        color: BACKGROUND,
+    });
 
     // Block backgrounds paint first, beneath both the selection highlight and the
     // text: a fenced code block sits on a full-width tinted panel, one line box
@@ -2137,21 +2242,45 @@ pub(crate) fn paint_document(
             (false, true) => render::RoundedCorners::Bottom,
             (false, false) => render::RoundedCorners::None,
         };
-        canvas.fill_round_rect(MARGIN, top, panel_w, h, CODE_BG, CODE_RADIUS, corners);
+        list.push(DrawCmd::RoundRect {
+            rect: Rect {
+                x: MARGIN,
+                y: top,
+                w: panel_w,
+                h,
+            },
+            color: CODE_BG,
+            radius: CODE_RADIUS,
+            corners,
+        });
     }
 
     // Inline code spans get their own tinted panel, also beneath the selection so a
     // selection over inline code shows through (the glyphs still draw on top in the
     // text loop). Block code is excluded here; its full-width panel above covers it.
     for rect in layout.code_rects(fonts, rope) {
-        canvas.fill_rect(rect.x, rect.y - scroll_y, rect.w, rect.h, CODE_BG);
+        let y = rect.y - scroll_y;
+        if y + rect.h <= 0 || y >= view_h {
+            continue;
+        }
+        list.push(DrawCmd::Fill {
+            rect: Rect { y, ..rect },
+            color: CODE_BG,
+        });
     }
 
     // Everything is laid out in content space; the viewport scroll shifts it up by
-    // `scroll_y`. The canvas clips whatever falls off-screen.
+    // `scroll_y`. Off-screen rectangles are dropped from the list.
     if let Some((start, end)) = p.selection {
         for rect in layout.selection_rects(fonts, rope, start, end) {
-            canvas.fill_rect(rect.x, rect.y - scroll_y, rect.w, rect.h, SELECTION_COLOR);
+            let y = rect.y - scroll_y;
+            if y + rect.h <= 0 || y >= view_h {
+                continue;
+            }
+            list.push(DrawCmd::Fill {
+                rect: Rect { y, ..rect },
+                color: SELECTION_COLOR,
+            });
         }
     }
 
@@ -2160,7 +2289,7 @@ pub(crate) fn paint_document(
     // (drawn in the code face on a tinted panel), and the delimiter markers, which
     // are dimmed on the cursor's line and collapse to nothing (skipped) once it
     // leaves, the live-preview reveal that `layout` bakes into each run's `visible`.
-    for line in layout.lines() {
+    for line in lines {
         let m = fonts.metrics(line.size);
         let baseline = line.baseline - scroll_y;
         // An image line blits its decoded picture into its (taller-than-text) box,
@@ -2170,24 +2299,23 @@ pub(crate) fn paint_document(
         if let Some(img) = line.image {
             let box_top = baseline - m.ascent;
             if box_top < view_h && box_top + img.box_height() > 0 {
-                let x = MARGIN + line.indent;
-                let y = box_top + (img.box_height() - img.height) / 2;
-                let raw = rope.byte_slice(img.path_start..img.path_end);
+                let pic = Rect {
+                    x: MARGIN + line.indent,
+                    y: box_top + (img.box_height() - img.height) / 2,
+                    w: img.width,
+                    h: img.height,
+                };
                 // Blit the cached display-size bitmap (resampled once, not per
-                // frame). A no-op if the image is not decoded.
-                let _ = images.with_scaled(&raw, img.width as u32, img.height as u32, |bitmap| {
-                    canvas.blit_argb(x, y, img.width, img.height, bitmap);
+                // frame); a no-op at paint time if the image is not decoded.
+                list.push(DrawCmd::Image {
+                    rect: pic,
+                    path: rope.byte_slice(img.path_start..img.path_end),
                 });
-                // A selected image gets an accent border and a corner toggle button.
+                // A selected image gets an accent border (four thin edge fills) and
+                // a corner toggle button: a rounded panel with a centered `</>`
+                // "source" glyph, the affordance to reveal its markdown.
                 if img.selected {
-                    let rect = Rect {
-                        x,
-                        y,
-                        w: img.width,
-                        h: img.height,
-                    };
-                    draw_image_border(canvas, &rect);
-                    draw_image_button(canvas, fonts, &image_button_rect(&rect));
+                    push_image_chrome(&mut list, fonts, &pic);
                 }
             }
             continue;
@@ -2199,29 +2327,33 @@ pub(crate) fn paint_document(
         }
         // A blockquote draws a bar down its gutter, on every wrapped line.
         if matches!(line.gutter, Gutter::QuoteBar { .. }) {
-            canvas.fill_rect(
-                MARGIN,
-                baseline - m.ascent,
-                QUOTE_BAR_WIDTH,
-                m.line_height,
-                QUOTE_BAR_COLOR,
-            );
+            list.push(DrawCmd::Fill {
+                rect: Rect {
+                    x: MARGIN,
+                    y: baseline - m.ascent,
+                    w: QUOTE_BAR_WIDTH,
+                    h: m.line_height,
+                },
+                color: QUOTE_BAR_COLOR,
+            });
         }
         // A thematic break draws a horizontal line centered in its row; the raw `---`
         // is collapsed (its runs are hidden), so nothing else paints on the line.
         if line.rule {
             let mid = baseline - m.ascent + m.line_height / 2;
-            let rule_w = (width as i32 - 2 * MARGIN).max(0);
-            canvas.fill_rect(
-                MARGIN,
-                mid - RULE_THICKNESS / 2,
-                rule_w,
-                RULE_THICKNESS,
-                RULE_COLOR,
-            );
+            list.push(DrawCmd::Fill {
+                rect: Rect {
+                    x: MARGIN,
+                    y: mid - RULE_THICKNESS / 2,
+                    w: (width as i32 - 2 * MARGIN).max(0),
+                    h: RULE_THICKNESS,
+                },
+                color: RULE_COLOR,
+            });
         }
         // Content is inset by the line's hanging indent (0 unless this is a wrapped
         // list/quote continuation).
+        let heading = line.heading.is_some();
         let mut pen = MARGIN + line.indent;
         for (i, run) in line.runs.iter().enumerate() {
             if !run.visible {
@@ -2230,7 +2362,8 @@ pub(crate) fn paint_document(
             // Each run draws in its own face, so bold/italic emphasis is carried by
             // the glyphs, not color: only code and markers recolor, the rest
             // (regular and emphasized prose) is FG.
-            let face = run_face(fonts, line.size, run.kind, line.heading.is_some());
+            let fk = face_key(line.size, run.kind, heading);
+            let face = fonts.face_for(fk);
             let slice = rope.byte_slice(run.start..run.end);
             // The block marker (the first run on a list/quote line) gives way to its
             // gutter decoration: a bullet glyph for a list, nothing for a quote (the
@@ -2240,14 +2373,24 @@ pub(crate) fn paint_document(
                 let advance = render::text_advance(face, &slice).round() as i32;
                 match line.gutter {
                     Gutter::Bullet => {
-                        // Draw the marker's leading indentation first, so a nested
+                        // Place the marker's leading indentation first, so a nested
                         // item's dot sits at its depth, then the dot in place of the
                         // dash. The dot stands in for the `- ` marker, so it takes
                         // the muted marker color (MARKER_COLOR), not the body FG.
                         let indent = slice.len() - slice.trim_start().len();
                         let dot_x =
                             pen + render::text_advance(face, &slice[..indent]).round() as i32;
-                        canvas.draw_text(face, dot_x, baseline, BULLET, MARKER_COLOR);
+                        let end =
+                            (dot_x as f32 + render::text_advance(face, BULLET)).round() as i32;
+                        list.push(text_cmd(
+                            fk,
+                            dot_x,
+                            baseline,
+                            end,
+                            MARKER_COLOR,
+                            BULLET.to_string(),
+                            m,
+                        ));
                         pen += advance;
                         continue;
                     }
@@ -2273,10 +2416,12 @@ pub(crate) fn paint_document(
                 },
             };
             // Code backgrounds (inline panels and the full-width block panel) are
-            // painted in the pre-pass above, beneath the selection; here we only
+            // emitted in the pre-pass above, beneath the selection; here we only
             // draw the glyphs over them.
             let run_x = pen;
-            pen = canvas.draw_text(face, pen, baseline, &slice, color);
+            let end = (run_x as f32 + render::text_advance(face, &slice)).round() as i32;
+            list.push(text_cmd(fk, run_x, baseline, end, color, slice, m));
+            pen = end;
             // Inline decorations over the glyphs, each spanning the run's drawn
             // width: a link is underlined and struck text gets a line through its
             // middle, both in the run's own color. Thickness scales with the
@@ -2292,7 +2437,15 @@ pub(crate) fn paint_document(
             };
             if let Some(y) = deco {
                 let thickness = (line.size as i32 / 14).max(1);
-                canvas.fill_rect(run_x, y, pen - run_x, thickness, color);
+                list.push(DrawCmd::Fill {
+                    rect: Rect {
+                        x: run_x,
+                        y,
+                        w: end - run_x,
+                        h: thickness,
+                    },
+                    color,
+                });
             }
         }
     }
@@ -2300,41 +2453,81 @@ pub(crate) fn paint_document(
     // The caret, drawn only on the visible half of its blink cycle.
     if p.caret_visible {
         let (cx, cy, ch) = layout.caret(fonts, rope, p.cursor);
-        canvas.fill_rect(cx, cy - scroll_y, CARET_WIDTH, ch, CARET_COLOR);
+        list.push(DrawCmd::Fill {
+            rect: Rect {
+                x: cx,
+                y: cy - scroll_y,
+                w: CARET_WIDTH,
+                h: ch,
+            },
+            color: CARET_COLOR,
+        });
     }
+
+    list
 }
 
-/// Draw the accent border around a selected image's picture rect (`rect` already
-/// in screen space). Four thin fills, one per edge.
-fn draw_image_border(canvas: &mut Canvas, rect: &Rect) {
+/// Append the selection chrome for a selected image at picture rect `pic` (screen
+/// space): a four-edge accent border and the corner `</>` toggle button.
+fn push_image_chrome(list: &mut DisplayList, fonts: &Fonts, pic: &Rect) {
     let t = IMAGE_BORDER_THICKNESS;
-    canvas.fill_rect(rect.x, rect.y, rect.w, t, IMAGE_BORDER_COLOR);
-    canvas.fill_rect(rect.x, rect.y + rect.h - t, rect.w, t, IMAGE_BORDER_COLOR);
-    canvas.fill_rect(rect.x, rect.y, t, rect.h, IMAGE_BORDER_COLOR);
-    canvas.fill_rect(rect.x + rect.w - t, rect.y, t, rect.h, IMAGE_BORDER_COLOR);
-}
+    for rect in [
+        Rect {
+            x: pic.x,
+            y: pic.y,
+            w: pic.w,
+            h: t,
+        },
+        Rect {
+            x: pic.x,
+            y: pic.y + pic.h - t,
+            w: pic.w,
+            h: t,
+        },
+        Rect {
+            x: pic.x,
+            y: pic.y,
+            w: t,
+            h: pic.h,
+        },
+        Rect {
+            x: pic.x + pic.w - t,
+            y: pic.y,
+            w: t,
+            h: pic.h,
+        },
+    ] {
+        list.push(DrawCmd::Fill {
+            rect,
+            color: IMAGE_BORDER_COLOR,
+        });
+    }
 
-/// Draw the corner toggle button into `btn` (screen space): a rounded panel with a
-/// centered `</>` "source" glyph, so a selected image offers an obvious way to
-/// reveal its markdown.
-fn draw_image_button(canvas: &mut Canvas, fonts: &Fonts, btn: &Rect) {
-    canvas.fill_round_rect(
-        btn.x,
-        btn.y,
-        btn.w,
-        btn.h,
-        IMAGE_BUTTON_BG,
-        IMAGE_BUTTON_RADIUS,
-        render::RoundedCorners::Both,
-    );
+    let btn = image_button_rect(pic);
+    list.push(DrawCmd::RoundRect {
+        rect: btn,
+        color: IMAGE_BUTTON_BG,
+        radius: IMAGE_BUTTON_RADIUS,
+        corners: render::RoundedCorners::Both,
+    });
     // Center the glyph in both axes from the code-face metrics.
-    let face = fonts.code_face(FONT_SIZE);
+    let fk = FaceKey::Code { size: FONT_SIZE };
+    let face = fonts.face_for(fk);
     let glyph = "</>";
     let advance = render::text_advance(face, glyph).round() as i32;
     let m = fonts.metrics(FONT_SIZE);
-    let x = btn.x + (btn.w - advance) / 2;
-    let baseline = btn.y + (btn.h - (m.ascent + m.descent)) / 2 + m.ascent;
-    canvas.draw_text(face, x, baseline, glyph, FOREGROUND);
+    let gx = btn.x + (btn.w - advance) / 2;
+    let gbaseline = btn.y + (btn.h - (m.ascent + m.descent)) / 2 + m.ascent;
+    let gend = (gx as f32 + render::text_advance(face, glyph)).round() as i32;
+    list.push(text_cmd(
+        fk,
+        gx,
+        gbaseline,
+        gend,
+        FOREGROUND,
+        glyph.to_string(),
+        m,
+    ));
 }
 
 #[cfg(test)]
@@ -2444,5 +2637,112 @@ mod tests {
             .chunks_exact(4)
             .any(|p| u32::from_ne_bytes(p.try_into().unwrap()) & 0x00ff_ffff == IMAGE_BORDER_COLOR);
         assert!(!border, "no border without selection");
+    }
+
+    /// Repainting only the damaged regions when going from frame `a` to frame `b`
+    /// must land on exactly the pixels a full repaint of `b` would: the invariant
+    /// the whole damage path rests on, and the one an under-reporting diff breaks.
+    fn assert_incremental_matches_full(
+        fonts: &Fonts,
+        images: &ImageStore,
+        a: &DisplayList,
+        b: &DisplayList,
+        w: usize,
+        h: usize,
+        label: &str,
+    ) {
+        // Reference: b painted from scratch.
+        let mut full = vec![0u8; w * h * 4];
+        {
+            let mut c = Canvas::new(&mut full, w, h);
+            display::execute(&mut c, fonts, images, b, None);
+        }
+        // Incremental: a painted in full, then only damage(a, b) repainted with b.
+        let mut inc = vec![0u8; w * h * 4];
+        {
+            let mut c = Canvas::new(&mut inc, w, h);
+            display::execute(&mut c, fonts, images, a, None);
+        }
+        let dmg = display::damage(a, b, w as i32, h as i32);
+        {
+            let mut c = Canvas::new(&mut inc, w, h);
+            for clip in &dmg {
+                display::execute(&mut c, fonts, images, b, Some(*clip));
+            }
+        }
+        assert!(
+            inc == full,
+            "incremental repaint must match a full repaint: {label}"
+        );
+    }
+
+    #[test]
+    fn incremental_repaint_matches_a_full_repaint() {
+        let fonts = Fonts::new(&markdown::all_sizes(FONT_SIZE)).expect("a default font");
+        let images = ImageStore::new(None);
+        let rope =
+            Rope::from_str("# Title\n\nSome *body* text with `code`.\n\nsecond paragraph here\n");
+        let (w, h) = (400usize, 300usize);
+        let wrap = w as i32 - 2 * MARGIN;
+        let far = rope.len().saturating_sub(2); // inside the last paragraph
+
+        // The cursor on the heading reveals its `#` (and pushes the title right);
+        // far away the marker collapses and the title shifts left.
+        let lay_top = Layout::build(&fonts, &rope, MARGIN, MARGIN, wrap, FONT_SIZE, (0, 0));
+        let lay_far = Layout::build(&fonts, &rope, MARGIN, MARGIN, wrap, FONT_SIZE, (far, far));
+
+        let frame =
+            |layout: &Layout, cursor: usize, caret: bool, selection: Option<(usize, usize)>| {
+                build_display_list(
+                    &fonts,
+                    layout,
+                    &rope,
+                    &PaintParams {
+                        width: w,
+                        height: h,
+                        scroll_y: 0,
+                        selection,
+                        cursor,
+                        caret_visible: caret,
+                    },
+                )
+            };
+
+        let on_top = frame(&lay_top, 0, true, None);
+        let off_top = frame(&lay_top, 0, false, None);
+        let sel_top = frame(&lay_top, 0, true, Some((0, 5)));
+        let far_frame = frame(&lay_far, far, true, None);
+
+        // Caret blink, a selection appearing, and a cursor move that collapses the
+        // heading marker and shifts its text (both directions): each incremental
+        // repaint must be pixel-identical to painting the target frame from scratch.
+        assert_incremental_matches_full(&fonts, &images, &on_top, &off_top, w, h, "caret blink");
+        assert_incremental_matches_full(
+            &fonts,
+            &images,
+            &on_top,
+            &sel_top,
+            w,
+            h,
+            "selection appears",
+        );
+        assert_incremental_matches_full(
+            &fonts,
+            &images,
+            &on_top,
+            &far_frame,
+            w,
+            h,
+            "cursor leaves heading",
+        );
+        assert_incremental_matches_full(
+            &fonts,
+            &images,
+            &far_frame,
+            &on_top,
+            w,
+            h,
+            "cursor enters heading",
+        );
     }
 }

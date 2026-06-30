@@ -7,7 +7,7 @@ use crate::freetype::Face;
 /// Which corners [`Canvas::fill_round_rect`] rounds. A fenced code block's panel
 /// is drawn row by row: its first row rounds the top, its last row the bottom, a
 /// single-row block both, and the rows between none.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum RoundedCorners {
     None,
     Top,
@@ -28,25 +28,85 @@ pub struct Canvas<'a> {
     buf: &'a mut [u8],
     width: usize,
     height: usize,
+    /// An optional clip rectangle `(x, y, w, h)` in pixels. When set, every
+    /// primitive is confined to it (intersected with the surface): the damage path
+    /// paints one changed region at a time without disturbing the rest of the
+    /// buffer. `None` means clip only to the surface. Set via [`Self::set_clip`].
+    clip: Option<(i32, i32, i32, i32)>,
 }
 
 impl<'a> Canvas<'a> {
     pub fn new(buf: &'a mut [u8], width: usize, height: usize) -> Self {
-        Self { buf, width, height }
-    }
-
-    /// Paint every pixel with `color` (0x00RRGGBB).
-    pub fn fill(&mut self, color: u32) {
-        let bytes = color.to_ne_bytes();
-        for pixel in self.buf.chunks_exact_mut(4) {
-            pixel.copy_from_slice(&bytes);
+        Self {
+            buf,
+            width,
+            height,
+            clip: None,
         }
     }
 
+    /// Confine subsequent drawing to `clip` (`(x, y, w, h)` in pixels), or clear
+    /// the restriction with `None`. The clip is always intersected with the
+    /// surface, so an oversized or negative rectangle can never write out of
+    /// bounds. The damage executor sets this per changed region.
+    pub fn set_clip(&mut self, clip: Option<(i32, i32, i32, i32)>) {
+        self.clip = clip;
+    }
+
+    /// Whether pixel `(x, y)` is inside the active clip (always true when no clip
+    /// is set). Surface bounds are checked separately by the caller.
+    fn in_clip(&self, x: i32, y: i32) -> bool {
+        match self.clip {
+            None => true,
+            Some((cx, cy, cw, ch)) => x >= cx && y >= cy && x < cx + cw && y < cy + ch,
+        }
+    }
+
+    /// Fill an opaque rectangle by writing pixels directly (no per-pixel blend),
+    /// clipped to the surface and the active clip. This is the fast path for the
+    /// editor's solid fills (background, selection, caret, panels), and it is how
+    /// a damage region is cleared before the frame is repainted over it: row runs
+    /// are written with one `copy` each rather than a blend per pixel.
+    pub fn fill_solid(&mut self, x: i32, y: i32, w: i32, h: i32, color: u32) {
+        let (x0, y0, x1, y1) = self.clamp_rect(x, y, w, h);
+        if x0 >= x1 || y0 >= y1 {
+            return;
+        }
+        let bytes = color.to_ne_bytes();
+        let row_run = (x1 - x0) as usize * 4;
+        for row in y0..y1 {
+            let start = (row as usize * self.width + x0 as usize) * 4;
+            let dst = &mut self.buf[start..start + row_run];
+            for pixel in dst.chunks_exact_mut(4) {
+                pixel.copy_from_slice(&bytes);
+            }
+        }
+    }
+
+    /// The half-open pixel rectangle `[x0, x1) x [y0, y1)` of `(x, y, w, h)` after
+    /// clamping to the surface and (if any) the clip. An empty result has
+    /// `x0 >= x1` or `y0 >= y1`.
+    fn clamp_rect(&self, x: i32, y: i32, w: i32, h: i32) -> (i32, i32, i32, i32) {
+        let (mut x0, mut y0) = (x, y);
+        let (mut x1, mut y1) = (x + w.max(0), y + h.max(0));
+        if let Some((cx, cy, cw, ch)) = self.clip {
+            x0 = x0.max(cx);
+            y0 = y0.max(cy);
+            x1 = x1.min(cx + cw);
+            y1 = y1.min(cy + ch);
+        }
+        x0 = x0.clamp(0, self.width as i32);
+        y0 = y0.clamp(0, self.height as i32);
+        x1 = x1.clamp(0, self.width as i32);
+        y1 = y1.clamp(0, self.height as i32);
+        (x0, y0, x1, y1)
+    }
+
     /// Blend `color` over the pixel at (x, y) with `coverage` as the alpha
-    /// (0 = transparent, 255 = opaque). Out-of-bounds pixels are skipped.
+    /// (0 = transparent, 255 = opaque). Pixels outside the surface or the active
+    /// clip are skipped.
     pub fn blend(&mut self, x: i32, y: i32, color: u32, coverage: u8) {
-        if x < 0 || y < 0 {
+        if x < 0 || y < 0 || !self.in_clip(x, y) {
             return;
         }
         let (x, y) = (x as usize, y as usize);
@@ -302,13 +362,31 @@ mod tests {
     }
 
     #[test]
-    fn fill_writes_every_pixel() {
+    fn fill_solid_writes_every_pixel() {
         let mut buf = vec![0u8; 4 * 4]; // 2x2
         let mut canvas = Canvas::new(&mut buf, 2, 2);
-        canvas.fill(0x00_10_20_30);
+        canvas.fill_solid(0, 0, 2, 2, 0x00_10_20_30);
         for px in buf.chunks_exact(4) {
             assert_eq!(u32::from_ne_bytes(px.try_into().unwrap()), 0x00_10_20_30);
         }
+    }
+
+    #[test]
+    fn fill_solid_clips_to_surface_and_clip_rect() {
+        let mut buf = vec![0u8; 4 * 9]; // 3x3
+        let mut canvas = Canvas::new(&mut buf, 3, 3);
+        // A clip of the center column lets only that column through, even though the
+        // fill asks for the whole surface.
+        canvas.set_clip(Some((1, 0, 1, 3)));
+        canvas.fill_solid(0, 0, 3, 3, 0x00_ff_ff_ff);
+        canvas.set_clip(None);
+        let at = |x: usize, y: usize| {
+            let i = (y * 3 + x) * 4;
+            u32::from_ne_bytes(buf[i..i + 4].try_into().unwrap()) & 0x00ff_ffff
+        };
+        assert_eq!(at(0, 1), 0, "outside the clip column");
+        assert_eq!(at(1, 1), 0x00ff_ffff, "inside the clip column");
+        assert_eq!(at(2, 1), 0, "outside the clip column");
     }
 
     #[test]
@@ -428,7 +506,7 @@ mod tests {
     fn blit_argb_ignores_a_short_buffer() {
         let mut buf = vec![0u8; 4];
         let mut canvas = Canvas::new(&mut buf, 1, 1);
-        canvas.fill(0x00_aa_bb_cc);
+        canvas.fill_solid(0, 0, 1, 1, 0x00_aa_bb_cc);
         // Claims 2x2 but carries one pixel: refused rather than reading OOB.
         canvas.blit_argb(0, 0, 2, 2, &[0xff_ff_00_00]);
         assert_eq!(px(&buf, 1, 0, 0), 0x00_aa_bb_cc, "left untouched");

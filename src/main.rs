@@ -5,6 +5,7 @@
 mod app;
 mod browser;
 mod conn;
+mod display;
 mod error;
 mod ffi;
 mod file;

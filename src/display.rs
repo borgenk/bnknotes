@@ -1,0 +1,349 @@
+//! The frame as data: a flat list of drawing primitives the painter emits and a
+//! consumer executes. This is the display list, and two things hang off it:
+//!
+//! - **Damage tracking**: because a frame is now a value, two frames can be
+//!   compared. [`damage`] diffs the previous frame against the new one and
+//!   returns just the screen rectangles that changed, so an idle caret blink
+//!   repaints a caret-sized region instead of the whole surface, and a keystroke
+//!   repaints the edited line rather than the screen.
+//! - **A second backend later**: [`execute`] is the only code that
+//!   turns commands into pixels (here, the software [`Canvas`]). A GPU consumer
+//!   would execute the same list unchanged.
+//!
+//! Commands are in *screen* space (already shifted by the scroll), so scrolling,
+//! which moves every command, naturally diffs as "everything changed" and falls
+//! back to a full repaint.
+//!
+//! ```text
+//!   layout + params ──build_display_list──▶ DisplayList ──┬─ execute ─▶ pixels
+//!                                                         └─ damage(old,new) ─▶ [Rect]
+//! ```
+
+use std::collections::HashMap;
+
+use crate::freetype::{FaceKey, Fonts};
+use crate::image::ImageStore;
+use crate::layout::Rect;
+use crate::render::{Canvas, RoundedCorners};
+
+/// A frame, as the ordered primitives that draw it. Stacking is the list order:
+/// background first, then panels, selection, glyphs, and the caret last.
+pub type DisplayList = Vec<DrawCmd>;
+
+/// Beyond this many distinct changed regions, repainting the whole surface is
+/// cheaper than tracking and clipping each one.
+const MAX_DAMAGE_RECTS: usize = 16;
+
+/// One drawing primitive in screen (post-scroll) pixels. The set is deliberately
+/// small and low level so a future GPU backend can execute the same list; the
+/// painter decomposes higher-level chrome (an image's selection border, a button)
+/// into these. Every variant is `Eq + Hash` so [`damage`] can diff two frames by
+/// value, which is why text runs carry an owned [`String`] and a borrow-free
+/// [`FaceKey`] rather than a `&str`/`&Face` tied to the rope and fonts.
+#[derive(Clone, PartialEq, Eq, Hash, Debug)]
+pub enum DrawCmd {
+    /// A solid, opaque rectangle (background, selection, caret, quote bar, rule).
+    Fill { rect: Rect, color: u32 },
+    /// A solid rectangle with anti-aliased rounded corners (a code panel).
+    RoundRect {
+        rect: Rect,
+        color: u32,
+        radius: i32,
+        corners: RoundedCorners,
+    },
+    /// A run of text drawn from `x` along `baseline`. `bounds` is the run's screen
+    /// rectangle padded for glyph ink that overhangs the advance box, so the
+    /// damage diff and the clip test never clip a glyph's edge.
+    Text {
+        bounds: Rect,
+        x: i32,
+        baseline: i32,
+        face: FaceKey,
+        color: u32,
+        text: String,
+    },
+    /// A cached, display-size image bitmap blitted into `rect`. `path` is the
+    /// store key (the raw markdown destination); a not-yet-decoded image draws
+    /// nothing.
+    Image { rect: Rect, path: String },
+}
+
+impl DrawCmd {
+    /// The screen rectangle this command can touch: a region intersecting it must
+    /// be repainted, and the command itself is skipped when it misses the clip.
+    fn bounds(&self) -> Rect {
+        match self {
+            DrawCmd::Fill { rect, .. }
+            | DrawCmd::RoundRect { rect, .. }
+            | DrawCmd::Image { rect, .. } => *rect,
+            DrawCmd::Text { bounds, .. } => *bounds,
+        }
+    }
+}
+
+/// Draw `list` into `canvas`, optionally confined to `clip` (a single changed
+/// region). With a clip, the background fill at the head of the list clears the
+/// region and the following commands repaint it, so a clipped run reproduces
+/// exactly the pixels a full repaint would, just within the rectangle. Commands
+/// whose bounds miss the clip are skipped cheaply; the rest are clipped per pixel
+/// by the canvas.
+pub fn execute(
+    canvas: &mut Canvas,
+    fonts: &Fonts,
+    images: &ImageStore,
+    list: &[DrawCmd],
+    clip: Option<Rect>,
+) {
+    canvas.set_clip(clip.map(|r| (r.x, r.y, r.w, r.h)));
+    for cmd in list {
+        if let Some(c) = clip {
+            if !intersects(cmd.bounds(), c) {
+                continue;
+            }
+        }
+        match cmd {
+            DrawCmd::Fill { rect, color } => {
+                canvas.fill_solid(rect.x, rect.y, rect.w, rect.h, *color);
+            }
+            DrawCmd::RoundRect {
+                rect,
+                color,
+                radius,
+                corners,
+            } => {
+                canvas.fill_round_rect(rect.x, rect.y, rect.w, rect.h, *color, *radius, *corners);
+            }
+            DrawCmd::Text {
+                x,
+                baseline,
+                face,
+                color,
+                text,
+                ..
+            } => {
+                canvas.draw_text(fonts.face_for(*face), *x, *baseline, text, *color);
+            }
+            DrawCmd::Image { rect, path } => {
+                let _ = images.with_scaled(path, rect.w as u32, rect.h as u32, |bitmap| {
+                    canvas.blit_argb(rect.x, rect.y, rect.w, rect.h, bitmap);
+                });
+            }
+        }
+    }
+    canvas.set_clip(None);
+}
+
+/// The screen regions that differ between the previous frame `old` and the new
+/// frame `new`, clamped to the `width` x `height` surface and free of overlaps.
+///
+/// A multiset difference does the work: a command appearing an unequal number of
+/// times in the two frames contributes its bounds, so an identical command (same
+/// geometry, face, color, text) cancels and costs nothing, while a moved or
+/// restyled run shows up as a removal plus an addition and damages both spots.
+/// A frame that changed most of the surface (a scroll, a resize, a large edit)
+/// returns a single full-surface rectangle, since repainting whole then beats
+/// clipping many regions. An empty result means the two frames are identical.
+pub fn damage(old: &[DrawCmd], new: &[DrawCmd], width: i32, height: i32) -> Vec<Rect> {
+    let mut counts: HashMap<&DrawCmd, i32> = HashMap::new();
+    for c in old {
+        *counts.entry(c).or_insert(0) += 1;
+    }
+    for c in new {
+        *counts.entry(c).or_insert(0) -= 1;
+    }
+    let surface = Rect {
+        x: 0,
+        y: 0,
+        w: width.max(0),
+        h: height.max(0),
+    };
+    let mut rects: Vec<Rect> = counts
+        .into_iter()
+        .filter(|&(_, n)| n != 0)
+        .filter_map(|(c, _)| intersection(c.bounds(), surface))
+        .collect();
+    coalesce(&mut rects);
+    let area: i64 = rects.iter().map(|r| r.w as i64 * r.h as i64).sum();
+    let surface_area = surface.w as i64 * surface.h as i64;
+    if rects.len() > MAX_DAMAGE_RECTS || area * 2 > surface_area {
+        return if surface_area > 0 {
+            vec![surface]
+        } else {
+            Vec::new()
+        };
+    }
+    rects
+}
+
+/// Merge any two overlapping rectangles into their bounding box, repeated until
+/// none overlap, so a region is never cleared and repainted twice. The damage set
+/// is tiny in practice, so the quadratic scan never matters.
+fn coalesce(rects: &mut Vec<Rect>) {
+    let mut merged = true;
+    while merged {
+        merged = false;
+        'scan: for i in 0..rects.len() {
+            for j in (i + 1)..rects.len() {
+                if intersects(rects[i], rects[j]) {
+                    rects[i] = union(rects[i], rects[j]);
+                    rects.remove(j);
+                    merged = true;
+                    break 'scan;
+                }
+            }
+        }
+    }
+}
+
+/// Whether two rectangles share any interior pixel (touching edges do not count).
+fn intersects(a: Rect, b: Rect) -> bool {
+    a.x < b.x + b.w && b.x < a.x + a.w && a.y < b.y + b.h && b.y < a.y + a.h
+}
+
+/// The smallest rectangle covering both `a` and `b`.
+fn union(a: Rect, b: Rect) -> Rect {
+    let x0 = a.x.min(b.x);
+    let y0 = a.y.min(b.y);
+    let x1 = (a.x + a.w).max(b.x + b.w);
+    let y1 = (a.y + a.h).max(b.y + b.h);
+    Rect {
+        x: x0,
+        y: y0,
+        w: x1 - x0,
+        h: y1 - y0,
+    }
+}
+
+/// The overlap of `a` and `b`, or `None` when they are disjoint.
+fn intersection(a: Rect, b: Rect) -> Option<Rect> {
+    let x0 = a.x.max(b.x);
+    let y0 = a.y.max(b.y);
+    let x1 = (a.x + a.w).min(b.x + b.w);
+    let y1 = (a.y + a.h).min(b.y + b.h);
+    (x0 < x1 && y0 < y1).then_some(Rect {
+        x: x0,
+        y: y0,
+        w: x1 - x0,
+        h: y1 - y0,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn fill(x: i32, y: i32, w: i32, h: i32, color: u32) -> DrawCmd {
+        DrawCmd::Fill {
+            rect: Rect { x, y, w, h },
+            color,
+        }
+    }
+
+    const W: i32 = 800;
+    const H: i32 = 600;
+
+    #[test]
+    fn identical_frames_have_no_damage() {
+        let frame = vec![fill(0, 0, W, H, 0x010101), fill(10, 10, 5, 5, 0xffffff)];
+        assert!(damage(&frame, &frame, W, H).is_empty());
+    }
+
+    #[test]
+    fn a_caret_toggle_damages_only_the_caret() {
+        // The blink case: the frames differ by one small Fill (the caret).
+        let bg = fill(0, 0, W, H, 0x010101);
+        let caret = fill(100, 50, 2, 18, 0xffffff);
+        let off = vec![bg.clone()];
+        let on = vec![bg, caret];
+        assert_eq!(
+            damage(&off, &on, W, H),
+            vec![Rect {
+                x: 100,
+                y: 50,
+                w: 2,
+                h: 18
+            }],
+            "only the caret rectangle is damaged"
+        );
+    }
+
+    #[test]
+    fn a_moved_command_damages_both_positions() {
+        // A run that shifts (an edit before it) appears as a remove plus an add;
+        // the two non-overlapping spots both need repainting.
+        let bg = fill(0, 0, W, H, 0x010101);
+        let before = vec![bg.clone(), fill(10, 10, 4, 4, 0xaa)];
+        let after = vec![bg, fill(500, 400, 4, 4, 0xaa)];
+        let mut d = damage(&before, &after, W, H);
+        d.sort_by_key(|r| r.x);
+        assert_eq!(
+            d,
+            vec![
+                Rect {
+                    x: 10,
+                    y: 10,
+                    w: 4,
+                    h: 4
+                },
+                Rect {
+                    x: 500,
+                    y: 400,
+                    w: 4,
+                    h: 4
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn overlapping_changes_coalesce_into_one_region() {
+        let bg = fill(0, 0, W, H, 0x010101);
+        let old = vec![bg.clone()];
+        let new = vec![bg, fill(10, 10, 20, 20, 0x01), fill(20, 20, 20, 20, 0x02)];
+        // The two added fills overlap, so the damage is their bounding box.
+        assert_eq!(
+            damage(&old, &new, W, H),
+            vec![Rect {
+                x: 10,
+                y: 10,
+                w: 30,
+                h: 30
+            }]
+        );
+    }
+
+    #[test]
+    fn a_large_change_falls_back_to_a_full_repaint() {
+        // Two big disjoint fills cover more than half the surface, so the diff
+        // collapses to one whole-surface rectangle rather than tracking regions.
+        let old: Vec<DrawCmd> = Vec::new();
+        let new = vec![fill(0, 0, W, H / 2 + 10, 0x01), fill(0, H / 2, W, H, 0x02)];
+        assert_eq!(
+            damage(&old, &new, W, H),
+            vec![Rect {
+                x: 0,
+                y: 0,
+                w: W,
+                h: H
+            }]
+        );
+    }
+
+    #[test]
+    fn damage_is_clamped_to_the_surface() {
+        // A command partly off-screen damages only its on-surface part; one fully
+        // off-screen contributes nothing.
+        let on = fill(-5, -5, 20, 20, 0x01);
+        let off = fill(W + 100, 0, 10, 10, 0x02);
+        let new = vec![on, off];
+        assert_eq!(
+            damage(&[], &new, W, H),
+            vec![Rect {
+                x: 0,
+                y: 0,
+                w: 15,
+                h: 15
+            }]
+        );
+    }
+}

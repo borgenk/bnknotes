@@ -2487,4 +2487,27 @@ mod tests {
             "the source text itself is still highlighted"
         );
     }
+
+    #[test]
+    fn hit_testing_an_emoji_line_snaps_to_cluster_boundaries() {
+        let f = fonts();
+        let r = rope("a😀b");
+        let l = layout(&f, &r);
+        let face = f.face(BODY, FontStyle::Regular);
+        let m = f.metrics(BODY);
+        let y = TOP as f32 + m.ascent as f32 / 2.0;
+        // Sweep x across the whole line: every hit must land on a cluster
+        // boundary (the emoji is bytes 1..5), never inside the cluster, whether
+        // the emoji renders in color or as tofu.
+        let end = LEFT as f32 + render::text_advance(face, "a😀b") + 20.0;
+        let mut x = 0.0f32;
+        while x < end {
+            let off = l.offset_at(&f, &r, x, y);
+            assert!(
+                [0usize, 1, 5, 6].contains(&off),
+                "hit at x={x} returned mid-cluster offset {off}"
+            );
+            x += 3.0;
+        }
+    }
 }

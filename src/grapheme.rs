@@ -248,7 +248,10 @@ fn incb(c: char) -> Option<Incb> {
     search(INCB_RANGES, c as u32)
 }
 
-fn is_extended_pictographic(c: char) -> bool {
+/// Whether `c` has the Unicode `Extended_Pictographic` property, i.e. is (or
+/// can start) an emoji-form cluster. Public for the font layer, which uses it
+/// to route emoji clusters to the color emoji face.
+pub fn is_extended_pictographic(c: char) -> bool {
     let u = c as u32;
     EXTENDED_PICTOGRAPHIC
         .binary_search_by(|&(lo, hi)| {

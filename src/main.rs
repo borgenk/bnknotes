@@ -19,6 +19,7 @@ mod protocol;
 mod render;
 mod rope;
 mod scroll;
+mod shape;
 mod shm;
 mod text;
 mod wire;

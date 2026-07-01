@@ -3,6 +3,7 @@
 //! per-pixel coverage blending for anti-aliased glyphs.
 
 use crate::freetype::Face;
+use crate::grapheme;
 
 /// Which corners [`Canvas::fill_round_rect`] rounds. A fenced code block's panel
 /// is drawn row by row: its first row rounds the top, its last row the bottom, a
@@ -191,10 +192,11 @@ impl<'a> Canvas<'a> {
     /// Glyphs are rasterized on demand; the pen advances by each glyph's
     /// advance. Returns the pen x after the last glyph.
     ///
-    /// Each glyph's bitmap is clipped once to the visible region (surface
-    /// intersected with any active clip) and the in-range pixels are blended with
-    /// no per-pixel bounds check, so a screenful of glyphs costs millions fewer
-    /// branches than guarding every pixel.
+    /// ASCII text (the overwhelming case) draws one glyph per byte with no
+    /// segmentation. Everything else walks grapheme clusters: an emoji cluster
+    /// blits its color glyph, any other cluster draws its characters one by
+    /// one, exactly like the fast path. The routing mirrors [`text_advance`],
+    /// so pixels land where layout measured.
     pub fn draw_text(
         &mut self,
         face: &Face,
@@ -203,32 +205,75 @@ impl<'a> Canvas<'a> {
         text: &str,
         color: u32,
     ) -> i32 {
-        let (cx0, cy0, cx1, cy1) = self.clamp_rect(0, 0, self.width as i32, self.height as i32);
-        let width = self.width;
+        let clip = self.clamp_rect(0, 0, self.width as i32, self.height as i32);
         let mut pen = pen_x as f32;
-        for ch in text.chars() {
-            face.with_glyph(ch, |glyph| {
-                let origin_x = pen.round() as i32 + glyph.left;
-                let origin_y = baseline - glyph.top;
-                // The glyph's bitmap rectangle, clipped to the visible region.
-                let gx0 = origin_x.max(cx0);
-                let gy0 = origin_y.max(cy0);
-                let gx1 = (origin_x + glyph.width as i32).min(cx1);
-                let gy1 = (origin_y + glyph.rows as i32).min(cy1);
-                for y in gy0..gy1 {
-                    let cov_row = (y - origin_y) as usize * glyph.width;
-                    let px_row = y as usize * width;
-                    for x in gx0..gx1 {
-                        let coverage = glyph.coverage[cov_row + (x - origin_x) as usize];
-                        if coverage > 0 {
-                            self.blend_at((px_row + x as usize) * 4, color, coverage);
-                        }
+        if text.is_ascii() {
+            for ch in text.chars() {
+                pen = self.draw_scalar(face, ch, pen, baseline, color, clip);
+            }
+            return pen.round() as i32;
+        }
+        for (_, cluster) in grapheme::graphemes(text) {
+            let emoji = face.with_cluster_glyph(cluster, |glyph| {
+                self.blit_argb(
+                    pen.round() as i32 + glyph.left,
+                    baseline - glyph.top,
+                    glyph.width as i32,
+                    glyph.rows as i32,
+                    &glyph.argb,
+                );
+                glyph.advance
+            });
+            match emoji {
+                Some(advance) => pen += advance,
+                None => {
+                    for ch in cluster.chars() {
+                        pen = self.draw_scalar(face, ch, pen, baseline, color, clip);
                     }
                 }
-                pen += glyph.advance;
-            });
+            }
         }
         pen.round() as i32
+    }
+
+    /// Draw one character's glyph at `pen`, returning the advanced pen. The
+    /// inner loop of [`Self::draw_text`]: the glyph's bitmap is clipped once
+    /// against `clip` (the surface intersected with any active clip) and the
+    /// in-range pixels are blended with no per-pixel bounds check, so a
+    /// screenful of glyphs costs millions fewer branches than guarding every
+    /// pixel.
+    #[inline]
+    fn draw_scalar(
+        &mut self,
+        face: &Face,
+        ch: char,
+        pen: f32,
+        baseline: i32,
+        color: u32,
+        clip: (i32, i32, i32, i32),
+    ) -> f32 {
+        let (cx0, cy0, cx1, cy1) = clip;
+        let width = self.width;
+        face.with_glyph(ch, |glyph| {
+            let origin_x = pen.round() as i32 + glyph.left;
+            let origin_y = baseline - glyph.top;
+            // The glyph's bitmap rectangle, clipped to the visible region.
+            let gx0 = origin_x.max(cx0);
+            let gy0 = origin_y.max(cy0);
+            let gx1 = (origin_x + glyph.width as i32).min(cx1);
+            let gy1 = (origin_y + glyph.rows as i32).min(cy1);
+            for y in gy0..gy1 {
+                let cov_row = (y - origin_y) as usize * glyph.width;
+                let px_row = y as usize * width;
+                for x in gx0..gx1 {
+                    let coverage = glyph.coverage[cov_row + (x - origin_x) as usize];
+                    if coverage > 0 {
+                        self.blend_at((px_row + x as usize) * 4, color, coverage);
+                    }
+                }
+            }
+            pen + glyph.advance
+        })
     }
 
     /// Blit `src` (ARGB8888 `0xAARRGGBB`, exactly `w` x `h`, row-major) into the
@@ -264,9 +309,13 @@ impl<'a> Canvas<'a> {
     }
 }
 
-/// Bilinearly resample ARGB `src` (`src_w` x `src_h`) into a fresh `dst_w` x
-/// `dst_h` buffer. The image store caches the result per (image, display size), so
-/// this runs once when an image first appears (or is resized) rather than on every
+/// Resample ARGB `src` (`src_w` x `src_h`) into a fresh `dst_w` x `dst_h`
+/// buffer. A downscale uses an area (box) filter, so every source pixel
+/// contributes its coverage-weighted share — a bilinear tap would read only the
+/// four nearest texels and alias badly past a ~2x reduction (misshapen emoji
+/// eyes, stair-stepped edges). Upscales and 1:1 use bilinear, which is exact at
+/// 1:1 and smooth going up. The image store and the emoji font cache the result
+/// per display size, so this runs once per (source, size) rather than on every
 /// frame; [`Canvas::blit_argb`] then draws the cached bitmap cheaply. Returns an
 /// empty buffer for degenerate or malformed input.
 pub(crate) fn resample_argb(
@@ -281,6 +330,18 @@ pub(crate) fn resample_argb(
         return Vec::new();
     }
     let mut out = Vec::with_capacity((dst_w * dst_h) as usize);
+    if dst_w < sw || dst_h < sh {
+        // Downscale: average each destination pixel's source footprint.
+        let (fx, fy) = (sw as f32 / dst_w as f32, sh as f32 / dst_h as f32);
+        for dy in 0..dst_h {
+            let (y0, y1) = (dy as f32 * fy, (dy + 1) as f32 * fy);
+            for dx in 0..dst_w {
+                let (x0, x1) = (dx as f32 * fx, (dx + 1) as f32 * fx);
+                out.push(sample_area(src, sw, sh, x0, x1, y0, y1));
+            }
+        }
+        return out;
+    }
     for dy in 0..dst_h {
         // Map each destination pixel center back into source space; the -0.5
         // offsets sample at source pixel centers, so a 1:1 copy is exact.
@@ -293,11 +354,47 @@ pub(crate) fn resample_argb(
     out
 }
 
+/// Average the ARGB pixels of `src` (`w` x `h`, row-major) over the fractional
+/// box `[x0, x1) x [y0, y1)`, weighting edge rows and columns by how much of
+/// them the box covers. Indices are clamped into the surface, so a box edge
+/// that lands a rounding error past the last row or column stays in bounds.
+/// Each channel, alpha included, is averaged independently; the caller keeps
+/// color meaningful under a varying alpha by passing premultiplied pixels
+/// where that matters (the emoji path does).
+fn sample_area(src: &[u32], w: i32, h: i32, x0: f32, x1: f32, y0: f32, y1: f32) -> u32 {
+    let mut acc = [0.0f32; 4];
+    let mut total = 0.0f32;
+    let mut y = y0.floor();
+    while y < y1 {
+        let weight_y = (y + 1.0).min(y1) - y.max(y0);
+        let row = (y as i32).clamp(0, h - 1) * w;
+        let mut x = x0.floor();
+        while x < x1 {
+            let weight = weight_y * ((x + 1.0).min(x1) - x.max(x0));
+            let px = src[(row + (x as i32).clamp(0, w - 1)) as usize];
+            for (i, a) in acc.iter_mut().enumerate() {
+                *a += ((px >> (i * 8)) & 0xff) as f32 * weight;
+            }
+            total += weight;
+            x += 1.0;
+        }
+        y += 1.0;
+    }
+    if total <= 0.0 {
+        return 0;
+    }
+    let mut out = 0u32;
+    for (i, a) in acc.iter().enumerate() {
+        out |= ((a / total).round().clamp(0.0, 255.0) as u32) << (i * 8);
+    }
+    out
+}
+
 /// Bilinearly sample the ARGB pixels `src` (`w` x `h`, row-major) at fractional
 /// `(fx, fy)`, clamping to the edges. Each channel, alpha included, is
-/// interpolated independently across the four nearest texels. Heavy downscaling
-/// aliases (this skips source pixels rather than averaging them); an area filter
-/// would be the polish if that ever shows.
+/// interpolated independently across the four nearest texels. Used for upscales
+/// and 1:1 only; downscales go through [`sample_area`], which averages instead
+/// of skipping source pixels.
 fn sample_bilinear(src: &[u32], w: i32, h: i32, fx: f32, fy: f32) -> u32 {
     let (x0f, y0f) = (fx.floor(), fy.floor());
     let (tx, ty) = (fx - x0f, fy - y0f);
@@ -325,8 +422,18 @@ fn sample_bilinear(src: &[u32], w: i32, h: i32, fx: f32, fy: f32) -> u32 {
 /// Measures with metrics only (no rasterization), matching how `draw_text`
 /// advances the pen, so the caret lands where the next glyph would be drawn.
 /// [`crate::layout`] uses this to place the caret and hit-test clicks.
+///
+/// ASCII, the overwhelming case, skips cluster segmentation entirely; other
+/// text measures per grapheme cluster so an emoji cluster gets its color
+/// glyph's advance, routed identically to [`Canvas::draw_text`].
 pub fn text_advance(face: &Face, text: &str) -> f32 {
-    text.chars().map(|c| face.advance(c)).sum()
+    if text.is_ascii() {
+        return text.chars().map(|c| face.advance(c)).sum();
+    }
+    grapheme::graphemes(text)
+        .into_iter()
+        .map(|(_, cluster)| face.cluster_advance(cluster))
+        .sum()
 }
 
 /// Coverage (0..=255) of pixel `(dx, dy)` within a `w`x`h` rounded rectangle
@@ -521,6 +628,36 @@ mod tests {
     }
 
     #[test]
+    fn resample_downscale_averages_rather_than_skips() {
+        // 4x1 [white, black, black, black] to 1x1: the area filter yields the
+        // 25% average; a bilinear tap between the middle pixels would give
+        // plain black, silently dropping the white pixel.
+        let src = [0xff_ff_ff_ff, 0xff_00_00_00, 0xff_00_00_00, 0xff_00_00_00];
+        let out = resample_argb(&src, 4, 1, 1, 1);
+        let gray = out[0] & 0xff;
+        assert!(
+            (60..=68).contains(&gray),
+            "expected the 25% average, got {:08x}",
+            out[0]
+        );
+    }
+
+    #[test]
+    fn resample_downscale_keeps_every_source_pixel_contributing() {
+        // A lone red corner pixel in an otherwise black 3x3 must tint the 1x1
+        // result; a center-only sample would drop it entirely.
+        let mut src = [0xff_00_00_00; 9];
+        src[0] = 0xff_ff_00_00;
+        let out = resample_argb(&src, 3, 3, 1, 1);
+        let red = (out[0] >> 16) & 0xff;
+        assert!(
+            red > 0,
+            "the corner pixel must contribute, got {:08x}",
+            out[0]
+        );
+    }
+
+    #[test]
     fn resample_is_exact_at_one_to_one() {
         let src = [0xff_11_22_33, 0xff_44_55_66, 0xff_77_88_99, 0xff_aa_bb_cc];
         let out = resample_argb(&src, 2, 2, 2, 2);
@@ -581,5 +718,40 @@ mod tests {
         let two = text_advance(&face, "mm");
         assert!(one > 0.0);
         assert!(two > one, "two glyphs advance further than one");
+    }
+
+    #[test]
+    fn text_advance_ascii_fast_path_matches_the_cluster_path() {
+        let face = Face::open_default(32).expect("a default font");
+        let text = "Hello, world 123 <> []";
+        let fast = text_advance(&face, text);
+        let clustered: f32 = grapheme::graphemes(text)
+            .into_iter()
+            .map(|(_, cluster)| face.cluster_advance(cluster))
+            .sum();
+        assert_eq!(
+            fast, clustered,
+            "the ASCII shortcut must not change measurement"
+        );
+    }
+
+    #[test]
+    fn draw_text_renders_an_emoji_cluster_in_color() {
+        let fonts = crate::freetype::Fonts::new(&[32]).expect("a default font");
+        let face = fonts.face(32, crate::freetype::FontStyle::Regular);
+        let (w, h) = (64usize, 48usize);
+        let mut buf = vec![0u8; w * h * 4];
+        let mut canvas = Canvas::new(&mut buf, w, h);
+        let pen_end = canvas.draw_text(face, 2, 40, "😀", 0x00ff_ffff);
+        assert!(pen_end > 2, "the pen advanced past the emoji");
+        assert_eq!(
+            pen_end - 2,
+            text_advance(face, "😀").round() as i32,
+            "draw and measure agree on the advance"
+        );
+        // A color emoji writes chromatic pixels; a gray tofu box (or the white
+        // draw color) never has channels that differ.
+        let chromatic = buf.chunks_exact(4).any(|p| p[0] != p[1] || p[1] != p[2]);
+        assert!(chromatic, "expected colored emoji pixels on the canvas");
     }
 }

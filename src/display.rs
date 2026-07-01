@@ -144,6 +144,21 @@ pub fn execute(
 /// returns a single full-surface rectangle, since repainting whole then beats
 /// clipping many regions. An empty result means the two frames are identical.
 pub fn damage(old: &[DrawCmd], new: &[DrawCmd], width: i32, height: i32) -> Vec<Rect> {
+    // Dropping an equal pair (one command from each frame) never changes the
+    // multiset difference, so strip the common prefix and suffix first. Lists are
+    // built in document order, so a blink or a small edit differs only in a
+    // handful of commands and the hash work below shrinks to just those;
+    // equality bails on the first differing field, cheaper than hashing.
+    let prefix = old.iter().zip(new).take_while(|(a, b)| a == b).count();
+    let (old, new) = (&old[prefix..], &new[prefix..]);
+    let suffix = old
+        .iter()
+        .rev()
+        .zip(new.iter().rev())
+        .take_while(|(a, b)| a == b)
+        .count();
+    let (old, new) = (&old[..old.len() - suffix], &new[..new.len() - suffix]);
+
     let mut counts: HashMap<&DrawCmd, i32> = HashMap::new();
     for c in old {
         *counts.entry(c).or_insert(0) += 1;

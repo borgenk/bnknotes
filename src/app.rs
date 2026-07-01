@@ -20,6 +20,7 @@
 
 use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use crate::conn::{Connection, Fill};
@@ -330,11 +331,13 @@ struct State {
     /// changed regions. The two age independently (each is painted on alternate
     /// frames), which is why damage is tracked per buffer. Reset to empty whenever
     /// the buffers are recreated, forcing a full repaint of the fresh memory.
-    buffer_lists: [DisplayList; 2],
+    /// `Rc`: after a paint, the freshly built list is also `present_list`, so
+    /// storing it twice is a refcount bump, not a deep clone of every text run.
+    buffer_lists: [Rc<DisplayList>; 2],
     /// The display list last committed to the compositor, i.e. what is on screen.
     /// The new frame is diffed against this to decide whether to present at all
     /// and which regions to report as damaged.
-    present_list: DisplayList,
+    present_list: Rc<DisplayList>,
 
     // Id allocation: a bump counter plus a free list fed by `delete_id`.
     next_id: u32,
@@ -448,8 +451,8 @@ impl State {
             buffers: [0, 0],
             busy: [false, false],
             frame_len: 0,
-            buffer_lists: [Vec::new(), Vec::new()],
-            present_list: Vec::new(),
+            buffer_lists: [Rc::default(), Rc::default()],
+            present_list: Rc::default(),
             next_id: 2, // 1 is wl_display
             free_ids: Vec::new(),
             pending_sync: None,
@@ -595,8 +598,8 @@ impl State {
         // The new buffers hold undefined memory and the surface size may have
         // changed, so no stored frame describes them: clear the damage history to
         // force the next frame to repaint each buffer (and the screen) in full.
-        self.buffer_lists = [Vec::new(), Vec::new()];
-        self.present_list = Vec::new();
+        self.buffer_lists = [Rc::default(), Rc::default()];
+        self.present_list = Rc::default();
         Ok(())
     }
 
@@ -710,7 +713,12 @@ impl State {
             let Some(layout) = self.layout_cache.as_ref() else {
                 return Ok(false);
             };
-            build_display_list(&self.fonts, layout, self.text.rope(), &params)
+            Rc::new(build_display_list(
+                &self.fonts,
+                layout,
+                self.text.rope(),
+                &params,
+            ))
         };
 
         // Nothing changed since the on-screen frame: it already shows this content,
@@ -743,7 +751,7 @@ impl State {
                 );
             }
         }
-        self.buffer_lists[idx] = new_list.clone();
+        self.buffer_lists[idx] = Rc::clone(&new_list);
         self.present_list = new_list;
 
         let buffer = self.buffers[idx];
@@ -2673,6 +2681,33 @@ mod tests {
         assert!(
             inc == full,
             "incremental repaint must match a full repaint: {label}"
+        );
+    }
+
+    #[test]
+    fn executing_a_frame_records_glyph_cache_activity() {
+        // Guards the BNKNOTES_STATS path end to end: drawing real text through the
+        // display list registers glyph-cache lookups on the same Fonts the frame
+        // loop rolls its stats up from, so a non-empty document never reports a
+        // silent zero. A cold first paint is all misses.
+        let fonts = Fonts::new(&markdown::all_sizes(FONT_SIZE)).expect("a default font");
+        let images = ImageStore::new(None);
+        let rope = Rope::from_str("hello world");
+        let (w, h) = (200usize, 80usize);
+        let wrap = w as i32 - 2 * MARGIN;
+        let layout = Layout::build(&fonts, &rope, MARGIN, MARGIN, wrap, FONT_SIZE, (0, 0));
+        let list = build_display_list(&fonts, &layout, &rope, &paint_params(w, h));
+        let mut buf = vec![0u8; w * h * 4];
+        {
+            let mut canvas = Canvas::new(&mut buf, w, h);
+            display::execute(&mut canvas, &fonts, &images, &list, None);
+        }
+        let stats = fonts.cache_stats();
+        assert!(
+            stats.lookups() > 0,
+            "drawing text must record glyph-cache lookups, got hits={} misses={}",
+            stats.hits,
+            stats.misses
         );
     }
 

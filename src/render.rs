@@ -126,18 +126,17 @@ impl<'a> Canvas<'a> {
     #[inline]
     fn blend_at(&mut self, idx: usize, color: u32, coverage: u8) {
         let dst = &mut self.buf[idx..idx + 4];
+        // Full coverage replaces the pixel outright (`blend_over` at 255 is exact),
+        // skipping the read-modify-write. Glyph interiors and opaque image pixels
+        // dominate real blits, so this is the common case, not the corner case.
+        // The mask keeps the written bytes identical to `blend_over`'s, which
+        // clears the unused x byte whatever the caller passed.
+        if coverage == 255 {
+            dst.copy_from_slice(&(color & 0x00ff_ffff).to_ne_bytes());
+            return;
+        }
         let bg = u32::from_ne_bytes([dst[0], dst[1], dst[2], dst[3]]);
         dst.copy_from_slice(&blend_over(bg, color, coverage).to_ne_bytes());
-    }
-
-    /// Fill an axis-aligned rectangle with an opaque `color`. Used for the
-    /// caret. Pixels outside the canvas are clipped by `blend`.
-    pub fn fill_rect(&mut self, x: i32, y: i32, w: i32, h: i32, color: u32) {
-        for dy in 0..h {
-            for dx in 0..w {
-                self.blend(x + dx, y + dy, color, 255);
-            }
-        }
     }
 
     /// Fill a rectangle whose top and/or bottom corners are rounded with `radius`,
@@ -145,8 +144,11 @@ impl<'a> Canvas<'a> {
     /// block's first row rounds its top corners and its last row its bottom ones,
     /// and a multi-row block reads as one rounded panel. Pixels outside a rounded
     /// corner are left untouched, so the background shows through the curve. With
-    /// no rounded corner (or zero radius) this is a plain [`Self::fill_rect`].
-    // Positional geometry args, like `fill_rect`; a struct would not read clearer.
+    /// no rounded corner (or zero radius) this is a plain [`Self::fill_solid`].
+    ///
+    /// Only the `radius`-sized corner cells blend per pixel; everything else is
+    /// solid row runs, so a panel costs about the same as a plain fill.
+    // Positional geometry args, like `fill_solid`; a struct would not read clearer.
     #[allow(clippy::too_many_arguments)]
     pub fn fill_round_rect(
         &mut self,
@@ -164,11 +166,19 @@ impl<'a> Canvas<'a> {
         let r = radius.clamp(0, (w / 2).min(h / 2).max(0));
         let (round_top, round_bottom) = (corners.top(), corners.bottom());
         if r == 0 || (!round_top && !round_bottom) {
-            self.fill_rect(x, y, w, h, color);
+            self.fill_solid(x, y, w, h, color);
             return;
         }
-        for dy in 0..h {
-            for dx in 0..w {
+        // The rows clear of both corner bands are one solid block.
+        let top_band = if round_top { r } else { 0 };
+        let bottom_band = if round_bottom { r } else { 0 };
+        self.fill_solid(x, y + top_band, w, h - top_band - bottom_band, color);
+        // Within a corner band, only the two r-wide corner cells need per-pixel
+        // coverage; the span between them is a solid run. `r <= w/2` and
+        // `r <= h/2` keep the cells and bands from overlapping.
+        for dy in (0..top_band).chain(h - bottom_band..h) {
+            self.fill_solid(x + r, y + dy, w - 2 * r, 1, color);
+            for dx in (0..r).chain(w - r..w) {
                 let coverage = corner_coverage(dx, dy, w, h, r, round_top, round_bottom);
                 if coverage > 0 {
                     self.blend(x + dx, y + dy, color, coverage);
@@ -428,19 +438,41 @@ mod tests {
     }
 
     #[test]
-    fn fill_rect_paints_only_its_region_and_clips() {
-        let mut buf = vec![0u8; 4 * 9]; // 3x3
-        let mut canvas = Canvas::new(&mut buf, 3, 3);
-        // A 2x2 rect at (1,1) reaches one pixel past the edge and must clip.
-        canvas.fill_rect(1, 1, 2, 2, 0x00_ff_ff_ff);
-        let px = |x: usize, y: usize| {
-            let i = (y * 3 + x) * 4;
-            u32::from_ne_bytes(buf[i..i + 4].try_into().unwrap())
-        };
-        assert_eq!(px(0, 0), 0, "outside the rect");
-        assert_eq!(px(1, 1), 0x00_ff_ff_ff, "inside");
-        assert_eq!(px(2, 2), 0x00_ff_ff_ff, "inside, at the corner");
-        assert_eq!(px(0, 1), 0, "left of the rect");
+    fn round_rect_matches_a_per_pixel_coverage_reference() {
+        // The row-run fast path must write exactly what blending `corner_coverage`
+        // over every pixel would, for every corner combination and thin shapes.
+        let color = 0x00_ab_cd_ef;
+        for corners in [
+            RoundedCorners::None,
+            RoundedCorners::Top,
+            RoundedCorners::Bottom,
+            RoundedCorners::Both,
+        ] {
+            for (w, h, r) in [(12, 9, 3), (8, 8, 4), (10, 2, 3), (2, 10, 5)] {
+                let mut fast = vec![0u8; (w * h) as usize * 4];
+                Canvas::new(&mut fast, w as usize, h as usize)
+                    .fill_round_rect(0, 0, w, h, color, r, corners);
+                let mut reference = vec![0u8; (w * h) as usize * 4];
+                let mut canvas = Canvas::new(&mut reference, w as usize, h as usize);
+                let rr = r.clamp(0, (w / 2).min(h / 2).max(0));
+                for dy in 0..h {
+                    for dx in 0..w {
+                        let cov = if rr == 0 || corners == RoundedCorners::None {
+                            255
+                        } else {
+                            corner_coverage(dx, dy, w, h, rr, corners.top(), corners.bottom())
+                        };
+                        if cov > 0 {
+                            canvas.blend(dx, dy, color, cov);
+                        }
+                    }
+                }
+                assert_eq!(
+                    fast, reference,
+                    "row-run path diverges for {corners:?} at {w}x{h} r{r}"
+                );
+            }
+        }
     }
 
     #[test]

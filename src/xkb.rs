@@ -25,6 +25,7 @@ use crate::error::{Error, Result};
 const EVDEV_OFFSET: u32 = 8;
 
 mod keycode {
+    pub const ESC: u32 = 1;
     pub const BACKSPACE: u32 = 14;
     pub const TAB: u32 = 15;
     pub const ENTER: u32 = 28;
@@ -46,6 +47,9 @@ const XKB_STATE_MODS_EFFECTIVE: u32 = 1 << 0;
 /// libxkbcommon's canonical names for the Shift and Control modifiers.
 const XKB_MOD_NAME_SHIFT: &[u8] = b"Shift\0";
 const XKB_MOD_NAME_CTRL: &[u8] = b"Control\0";
+/// The plain Alt key. AltGr is a different modifier (Level3), so this stays
+/// false while typing AltGr characters.
+const XKB_MOD_NAME_ALT: &[u8] = b"Mod1\0";
 
 /// Compose-sequence status after feeding a keysym. The fourth state, "nothing"
 /// (`0`, the keysym is part of no sequence), is the catch-all in the match below.
@@ -131,6 +135,12 @@ pub enum KeyAction {
     Undo,
     Redo,
     Save,
+    /// Open (or, while open, close) the find bar (Ctrl+F).
+    Find,
+    /// Open the find bar with its replace row (Ctrl+H).
+    Replace,
+    /// Leave a transient mode such as the find bar (Escape).
+    Escape,
     None,
 }
 
@@ -244,6 +254,11 @@ impl Xkb {
         self.mod_active(XKB_MOD_NAME_CTRL)
     }
 
+    /// Whether (plain) Alt is currently active; the find bar's mode toggles.
+    pub fn alt_active(&self) -> bool {
+        self.mod_active(XKB_MOD_NAME_ALT)
+    }
+
     fn mod_active(&self, name: &[u8]) -> bool {
         let Some(state) = self.state else {
             return false;
@@ -291,6 +306,7 @@ impl Xkb {
                     KeyAction::Delete
                 };
             }
+            keycode::ESC => return KeyAction::Escape,
             keycode::ENTER | keycode::KP_ENTER => return KeyAction::Enter,
             // Ctrl+Tab falls through to the (empty) Ctrl handler so it does not
             // insert; plain Tab inserts indentation.
@@ -429,6 +445,8 @@ impl Xkb {
         match sym {
             0x61 => KeyAction::SelectAll, // a
             0x63 => KeyAction::Copy,      // c
+            0x66 => KeyAction::Find,      // f
+            0x68 => KeyAction::Replace,   // h
             0x73 => KeyAction::Save,      // s
             0x78 => KeyAction::Cut,       // x
             0x76 => KeyAction::Paste,     // v

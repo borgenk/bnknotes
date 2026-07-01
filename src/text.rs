@@ -181,6 +181,33 @@ impl TextBuffer {
         self.touch();
     }
 
+    /// Replace every `[start, end)` range in `ranges` (ascending, disjoint,
+    /// in-bounds — the find machinery's match list) with `with`, as a single
+    /// undo step. The cursor lands at the end of the last replacement.
+    /// Returns whether anything changed.
+    pub fn replace_ranges(&mut self, ranges: &[(usize, usize)], with: &str) -> bool {
+        if ranges.is_empty() {
+            return false;
+        }
+        self.checkpoint(Coalesce::None);
+        // Edit back to front so earlier ranges stay valid while later ones are
+        // spliced; each replacement before the last shifts the last one's
+        // position by the length difference.
+        for &(start, end) in ranges.iter().rev() {
+            self.text.remove(start..end);
+            self.text.insert(start, with);
+        }
+        let last_start = ranges[ranges.len() - 1].0;
+        let shift: isize = ranges[..ranges.len() - 1]
+            .iter()
+            .map(|&(s, e)| with.len() as isize - (e - s) as isize)
+            .sum();
+        self.cursor = (last_start as isize + shift).max(0) as usize + with.len();
+        self.anchor = None;
+        self.touch();
+        true
+    }
+
     /// Handle the Enter key, continuing a list or quote where one is in play.
     /// On a bullet, ordered, or quote line a non-empty item starts a new one
     /// with the same (or next) marker, splitting the line at the cursor; an
@@ -1533,5 +1560,34 @@ mod tests {
         b.select_range(2, 2);
         assert_eq!(b.selection(), None);
         assert_eq!(b.cursor(), 2);
+    }
+
+    #[test]
+    fn replace_ranges_is_one_undo_step() {
+        let mut b = TextBuffer::from_text("aa bb aa bb aa".to_string());
+        assert!(b.replace_ranges(&[(0, 2), (6, 8), (12, 14)], "XYZ"));
+        assert_eq!(b.text(), "XYZ bb XYZ bb XYZ");
+        assert_eq!(b.cursor(), 17, "cursor at the end of the last replacement");
+        assert!(b.undo());
+        assert_eq!(b.text(), "aa bb aa bb aa", "all three undone at once");
+    }
+
+    #[test]
+    fn replace_ranges_handles_varying_lengths() {
+        // Regex matches vary in length; the cursor must land after the last
+        // replacement even when earlier splices shift it.
+        let mut b = TextBuffer::from_text("a11 b2 c333".to_string());
+        assert!(b.replace_ranges(&[(1, 3), (5, 6), (8, 11)], "N"));
+        assert_eq!(b.text(), "aN bN cN");
+        assert_eq!(b.cursor(), 8);
+        assert!(!b.replace_ranges(&[], "x"), "no ranges, no change");
+    }
+
+    #[test]
+    fn replace_ranges_with_empty_replacement_deletes() {
+        let mut b = TextBuffer::from_text("xay".to_string());
+        assert!(b.replace_ranges(&[(1, 2)], ""));
+        assert_eq!(b.text(), "xy");
+        assert_eq!(b.cursor(), 1);
     }
 }

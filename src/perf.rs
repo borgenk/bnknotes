@@ -278,7 +278,7 @@ fn measure() -> Result<Vec<Sample>> {
 }
 
 /// Paint parameters for a frame at `scroll_y` with an optional `selection`.
-fn params(scroll_y: i32, selection: Option<(usize, usize)>) -> PaintParams {
+fn params(scroll_y: i32, selection: Option<(usize, usize)>) -> PaintParams<'static> {
     PaintParams {
         width: WIDTH,
         height: HEIGHT,
@@ -286,6 +286,7 @@ fn params(scroll_y: i32, selection: Option<(usize, usize)>) -> PaintParams {
         selection,
         cursor: 0,
         caret_visible: true,
+        find: None,
     }
 }
 

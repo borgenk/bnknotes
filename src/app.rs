@@ -28,7 +28,9 @@ use crate::display::{self, DisplayList, DrawCmd};
 use crate::error::{Error, Result};
 use crate::ffi;
 use crate::file::{self, FileFormat};
-use crate::freetype::{FaceKey, Fonts, Metrics};
+use crate::find::{self, FindState};
+use crate::freetype::{FaceKey, FontStyle, Fonts, Metrics};
+use crate::grapheme;
 use crate::image::ImageStore;
 use crate::layout::{face_key, image_button_rect, Gutter, ImageUi, Layout, Rect};
 use crate::markdown;
@@ -61,6 +63,19 @@ const FOREGROUND: u32 = 0x00da_dada;
 /// opaque, so this is the accent at a set opacity, high enough to stay legible
 /// over the darker code panel.
 const SELECTION_COLOR: u32 = 0x0041_5776;
+/// Fill behind find matches other than the current one; the current match is
+/// the live selection, so a muted gold keeps the two apart at a glance.
+const FIND_MATCH_COLOR: u32 = 0x005e_5128;
+/// The find bar's floating panel.
+const FIND_BG: u32 = 0x0031_3244;
+/// An invalid regex query and its counter, drawn in the alert color.
+const FIND_ERROR_COLOR: u32 = 0x00f3_8ba8;
+/// The right-edge match ticks (brighter than the in-text match fill, since a
+/// tick is a few pixels).
+const FIND_TICK_COLOR: u32 = 0x00a8_9040;
+/// Geometry of one right-edge match tick.
+const TICK_WIDTH: i32 = 4;
+const TICK_HEIGHT: i32 = 3;
 /// Dimmed color for markdown syntax markers (a heading's `#`s, a code span's
 /// backticks), so they read as syntax rather than content.
 const MARKER_COLOR: u32 = 0x005d_6c7e;
@@ -274,6 +289,9 @@ struct State {
     autoscroll_at: Option<Instant>,
     /// Sticky x for vertical motion, so repeated Up/Down keep a column.
     goal_x: Option<f32>,
+    /// The find bar (Ctrl+F). While open the keyboard drives its query and the
+    /// current match is mirrored into the buffer selection.
+    find: FindState,
     /// How far the viewport is scrolled down the document, in pixels.
     scroll_y: i32,
     /// Caret blink: whether the caret is currently shown, and when it next
@@ -427,6 +445,7 @@ impl State {
             autoscroll: 0,
             autoscroll_at: None,
             goal_x: None,
+            find: FindState::new(),
             scroll_y: 0,
             caret_visible: true,
             caret_blink_at: None,
@@ -700,6 +719,21 @@ impl State {
         let width = self.width as usize;
         let height = self.height as usize;
         let (sw, sh) = (self.width as i32, self.height as i32);
+        let find = if self.find.is_open() {
+            Some(FindPaint {
+                query: self.find.query(),
+                replace: self.find.show_replace().then(|| self.find.replacement()),
+                focus_replace: self.find.focus() == find::Field::Replace,
+                selected: self.find.selected(),
+                word: self.find.word(),
+                regex: self.find.regex(),
+                error: self.find.error(),
+                matches: self.find.matches(),
+                current: self.find.current(),
+            })
+        } else {
+            None
+        };
         let params = PaintParams {
             width,
             height,
@@ -707,6 +741,7 @@ impl State {
             selection: self.text.selection(),
             cursor: self.text.cursor(),
             caret_visible: self.caret_visible,
+            find,
         };
 
         let new_list = {
@@ -1080,6 +1115,24 @@ impl State {
             self.dirty = true;
         }
         let extend = self.xkb.shift_active();
+        // With the find bar open the keyboard drives the query, not the buffer,
+        // so a stray shortcut cannot edit the document mid-search (replacements
+        // go through the bar's own Enter handling).
+        if self.find.is_open() {
+            self.handle_find_key(action);
+            return Ok(());
+        }
+        if matches!(action, KeyAction::Find | KeyAction::Replace) {
+            let text = self.text.text();
+            let cursor = self.text.cursor();
+            let target = if action == KeyAction::Find {
+                self.find.open_at(cursor, &text)
+            } else {
+                self.find.open_replace_at(cursor, &text)
+            };
+            self.land_on_match(target);
+            return Ok(());
+        }
         let changed = match action {
             KeyAction::Char(c) => {
                 let mut encoded = [0u8; 4];
@@ -1207,12 +1260,136 @@ impl State {
                 }
                 false
             }
+            // Handled before this match: Find/Replace open the bar, and all
+            // three are consumed by the bar while it is open. With no bar
+            // there is nothing for Escape to leave.
+            KeyAction::Find | KeyAction::Replace | KeyAction::Escape => false,
             KeyAction::None => false,
         };
         if changed {
             self.after_edit();
         }
         Ok(())
+    }
+
+    /// One key while the find bar is open: characters and Backspace edit the
+    /// query, Enter steps to the next match (Shift+Enter to the previous), and
+    /// Escape or Ctrl+F closes the bar, keeping the current match selected.
+    /// Anything else is ignored. Whenever the state machine yields a match, it
+    /// becomes the buffer selection and is scrolled into view.
+    /// One key while the find bar is open. Characters and Backspace edit the
+    /// focused field (Alt+W / Alt+R toggle whole-word and regex instead), Tab
+    /// moves between the query and replace fields, Ctrl+V pastes into the
+    /// focused field, and Enter navigates or replaces: next match from the
+    /// query field (Shift+Enter previous), replace-current-and-advance from
+    /// the replace field, replace-all with Ctrl. Escape or Ctrl+F closes the
+    /// bar, keeping the current match selected. Anything else is ignored.
+    fn handle_find_key(&mut self, action: KeyAction) {
+        let shift = self.xkb.shift_active();
+        let ctrl = self.xkb.ctrl_active();
+        let alt = self.xkb.alt_active();
+        let target = match action {
+            KeyAction::Char(c) if alt => {
+                let text = self.text.text();
+                match c.to_ascii_lowercase() {
+                    'w' => self.find.toggle_word(&text),
+                    'r' => self.find.toggle_regex(&text),
+                    _ => return,
+                }
+            }
+            KeyAction::Char(c) => {
+                let text = self.text.text();
+                self.find.push(c, &text)
+            }
+            KeyAction::Backspace => {
+                let text = self.text.text();
+                self.find.pop(&text)
+            }
+            KeyAction::Tab => {
+                self.find.toggle_focus();
+                None
+            }
+            KeyAction::SelectAll => {
+                self.find.select_all();
+                None
+            }
+            KeyAction::Paste => match self.clipboard_text() {
+                Ok(Some(pasted)) => {
+                    let text = self.text.text();
+                    self.find.push_str(&pasted, &text)
+                }
+                Ok(None) => None,
+                Err(e) => {
+                    eprintln!("bnknotes: paste failed: {e}");
+                    None
+                }
+            },
+            KeyAction::Enter if ctrl => {
+                self.replace_all_matches();
+                return;
+            }
+            KeyAction::Enter if shift => self.find.prev(),
+            KeyAction::Enter
+                if self.find.show_replace() && self.find.focus() == find::Field::Replace =>
+            {
+                self.replace_current_match();
+                return;
+            }
+            KeyAction::Enter => self.find.next(),
+            KeyAction::Replace => {
+                let text = self.text.text();
+                let cursor = self.text.cursor();
+                self.find.open_replace_at(cursor, &text)
+            }
+            KeyAction::Escape | KeyAction::Find => {
+                self.find.close();
+                self.dirty = true;
+                return;
+            }
+            _ => return,
+        };
+        self.land_on_match(target);
+    }
+
+    /// Select `target` (a match's byte range) and bring it on screen; with no
+    /// target, just repaint so the bar reflects its state.
+    fn land_on_match(&mut self, target: Option<(usize, usize)>) {
+        if let Some((start, end)) = target {
+            self.text.select_range(start, end);
+            self.bump_caret();
+            self.scroll_caret_into_view();
+        }
+        self.dirty = true;
+    }
+
+    /// Replace the current match with the bar's replacement and advance to the
+    /// next match, rescanning from just past the inserted text so a
+    /// replacement containing the query is not immediately re-matched.
+    fn replace_current_match(&mut self) {
+        let Some((start, end)) = self.find.current_match() else {
+            self.dirty = true;
+            return;
+        };
+        let with = self.find.replacement().to_string();
+        self.text.select_range(start, end);
+        self.text.insert_str(&with);
+        self.after_edit();
+        let text = self.text.text();
+        let target = self.find.refresh(&text, start + with.len());
+        self.land_on_match(target);
+    }
+
+    /// Replace every match with the bar's replacement in one undo step.
+    fn replace_all_matches(&mut self) {
+        let ranges = self.find.matches().to_vec();
+        let with = self.find.replacement().to_string();
+        if !self.text.replace_ranges(&ranges, &with) {
+            return;
+        }
+        self.after_edit();
+        let text = self.text.text();
+        let target = self.find.refresh(&text, self.text.cursor());
+        self.land_on_match(target);
     }
 
     /// Common bookkeeping after a buffer edit: request a redraw, keep the caret
@@ -1513,6 +1690,12 @@ impl State {
     /// held) and starts a drag; a double-click selects the word under the
     /// pointer; a triple (or more) selects the whole logical line.
     fn on_left_press(&mut self) {
+        // A click in the document takes the focus back from the find bar; the
+        // click itself then places the cursor (or selects) as usual.
+        if self.find.is_open() {
+            self.find.close();
+            self.dirty = true;
+        }
         // Image interactions take precedence over text: a click on a selected
         // image's button toggles its raw source, a click on a picture selects it.
         if self.on_image_press() {
@@ -1928,23 +2111,31 @@ impl State {
 
     /// Insert the clipboard's text at the cursor.
     fn paste(&mut self) -> Result<()> {
-        // If we own the clipboard, insert our own data directly. Going through the
-        // compositor would deadlock: we'd block reading the pipe while also needing
-        // to service our own source's send event. Only text pastes into the buffer;
-        // a copied image has no text representation, so pasting it here is a no-op.
+        if let Some(text) = self.clipboard_text()? {
+            self.insert_clipboard(&text);
+        }
+        Ok(())
+    }
+
+    /// The clipboard's text, if it holds any. If we own the clipboard, our own
+    /// data is returned directly: going through the compositor would deadlock,
+    /// blocking on the pipe while also needing to service our own source's
+    /// send event. Otherwise the data is received through a pipe (hand the
+    /// write end to the compositor, close our copy, read the read end to EOF).
+    /// A copied image has no text representation and yields `None`.
+    fn clipboard_text(&mut self) -> Result<Option<String>> {
         if self.clipboard_source != 0 {
             if self.clipboard_mimes.iter().any(|m| is_text_mime(m)) {
-                let text = String::from_utf8_lossy(&self.clipboard_data).into_owned();
-                self.insert_clipboard(&text);
+                return Ok(Some(
+                    String::from_utf8_lossy(&self.clipboard_data).into_owned(),
+                ));
             }
-            return Ok(());
+            return Ok(None);
         }
         let (Some(mime), true) = (self.selection_text_mime.clone(), self.selection_offer != 0)
         else {
-            return Ok(());
+            return Ok(None);
         };
-        // Receive the data through a pipe: hand the write end to the compositor,
-        // close our copy, and read the read end to EOF.
         let (read_end, write_end) = ffi::pipe()?;
         self.conn.request_with_fd(
             self.selection_offer,
@@ -1954,10 +2145,7 @@ impl State {
         )?;
         drop(write_end);
         let bytes = ffi::read_to_end(read_end.as_raw_fd())?;
-        if let Ok(text) = String::from_utf8(bytes) {
-            self.insert_clipboard(&text);
-        }
-        Ok(())
+        Ok(String::from_utf8(bytes).ok())
     }
 
     fn insert_clipboard(&mut self, text: &str) {
@@ -2134,13 +2322,40 @@ fn is_text_mime(mime: &str) -> bool {
 /// surface size, the scroll offset, the live selection and cursor, and whether
 /// the caret is on this blink. Bundled so the paint signature stays readable and
 /// so the perf harness can drive a paint without a live surface.
-pub(crate) struct PaintParams {
+pub(crate) struct PaintParams<'a> {
     pub width: usize,
     pub height: usize,
     pub scroll_y: i32,
     pub selection: Option<(usize, usize)>,
     pub cursor: usize,
     pub caret_visible: bool,
+    /// The find bar's paint state while it is open; `None` draws no bar and no
+    /// match highlights.
+    pub find: Option<FindPaint<'a>>,
+}
+
+/// What the painter needs from an open find bar, borrowed from the app's
+/// [`FindState`] for the frame being built.
+pub(crate) struct FindPaint<'a> {
+    /// The query as typed; the bar shows the tail that fits.
+    pub query: &'a str,
+    /// The replacement text when the replace row is shown.
+    pub replace: Option<&'a str>,
+    /// Whether the replace field (rather than the query) has the keyboard.
+    pub focus_replace: bool,
+    /// The focused field's whole content is selected (Ctrl+A or a reopened
+    /// query); drawn on a selection fill since the next edit replaces it.
+    pub selected: bool,
+    /// Mode flags, drawn bright when on.
+    pub word: bool,
+    pub regex: bool,
+    /// The query is an invalid regular expression.
+    pub error: bool,
+    /// Byte ranges of every match, in document order.
+    pub matches: &'a [(usize, usize)],
+    /// Index into `matches` of the current match. It is not highlighted here
+    /// because the app mirrors it into the buffer selection.
+    pub current: usize,
 }
 
 /// Paint one frame of the document into `canvas`, building the display list and
@@ -2289,6 +2504,33 @@ pub(crate) fn build_display_list(
                 rect: Rect { y, ..rect },
                 color: SELECTION_COLOR,
             });
+        }
+    }
+
+    // Find matches, filled like a dimmer selection beneath the text. The current
+    // match is skipped: the app mirrors it into the buffer selection, which was
+    // just painted. Only matches inside the visible byte range are measured, so a
+    // short query with thousands of hits does not price every frame by them.
+    if let Some(find) = &p.find {
+        let visible = visible_byte_range(fonts, layout, scroll_y, view_h);
+        let lo = find.matches.partition_point(|&(_, end)| end <= visible.0);
+        let hi = find
+            .matches
+            .partition_point(|&(start, _)| start < visible.1);
+        for (i, &(start, end)) in find.matches.iter().enumerate().take(hi).skip(lo) {
+            if i == find.current {
+                continue;
+            }
+            for rect in layout.selection_rects(fonts, rope, start, end) {
+                let y = rect.y - scroll_y;
+                if y + rect.h <= 0 || y >= view_h {
+                    continue;
+                }
+                list.push(DrawCmd::Fill {
+                    rect: Rect { y, ..rect },
+                    color: FIND_MATCH_COLOR,
+                });
+            }
         }
     }
 
@@ -2472,7 +2714,292 @@ pub(crate) fn build_display_list(
         });
     }
 
+    // The find bar and its match ticks float over everything else, so they go
+    // last.
+    if let Some(find) = &p.find {
+        push_find_ticks(&mut list, layout, find, width as i32, view_h);
+        push_find_bar(&mut list, fonts, find, width as i32);
+    }
+
     list
+}
+
+/// Append the right-edge tick strip while find is open: one mark per match at
+/// its document-proportional height, so the distribution of hits is visible at
+/// a glance and survives scrolling. Ticks are deduplicated per two-pixel row,
+/// which bounds the strip to O(viewport) commands however many matches exist;
+/// the current match's tick is wider and bright.
+fn push_find_ticks(
+    list: &mut DisplayList,
+    layout: &Layout,
+    find: &FindPaint,
+    width: i32,
+    view_h: i32,
+) {
+    if find.matches.is_empty() || view_h <= 0 {
+        return;
+    }
+    let lines = layout.lines();
+    let content_h = (layout.text_height() + 2 * MARGIN).max(view_h) as i64;
+    let mut occupied = vec![false; (view_h / 2 + 1) as usize];
+    for (i, &(start, _)) in find.matches.iter().enumerate() {
+        // The line containing the match's start; matches always sit inside
+        // some line, but fall back to the top defensively.
+        let idx = lines
+            .partition_point(|l| l.start <= start)
+            .saturating_sub(1);
+        let Some(line) = lines.get(idx) else {
+            continue;
+        };
+        let y = (line.baseline as i64 * (view_h - TICK_HEIGHT) as i64 / content_h) as i32;
+        let bucket = (y / 2).clamp(0, view_h / 2) as usize;
+        let current = i == find.current;
+        if occupied[bucket] && !current {
+            continue;
+        }
+        occupied[bucket] = true;
+        let (w, color) = if current {
+            (TICK_WIDTH + 3, CARET_COLOR)
+        } else {
+            (TICK_WIDTH, FIND_TICK_COLOR)
+        };
+        list.push(DrawCmd::Fill {
+            rect: Rect {
+                x: width - w - 1,
+                y,
+                w,
+                h: TICK_HEIGHT,
+            },
+            color,
+        });
+    }
+}
+
+/// The byte range spanned by the visual lines that touch the viewport, for
+/// culling by byte offset before any geometry is measured. Conservative: a
+/// line's visibility is judged by its text box, and the empty viewport yields
+/// an empty range.
+fn visible_byte_range(
+    fonts: &Fonts,
+    layout: &Layout,
+    scroll_y: i32,
+    view_h: i32,
+) -> (usize, usize) {
+    let mut range = (usize::MAX, 0);
+    for line in layout.lines() {
+        let m = fonts.metrics(line.size);
+        let baseline = line.baseline - scroll_y;
+        if baseline - m.ascent >= view_h || baseline + m.descent <= 0 {
+            continue;
+        }
+        range.0 = range.0.min(line.start);
+        range.1 = range.1.max(line.end);
+    }
+    if range.0 > range.1 {
+        (0, 0)
+    } else {
+        range
+    }
+}
+
+/// Append the find bar: a rounded panel floating at the top-right with the
+/// query (its tail, when it overflows — the end is where editing happens), a
+/// steady caret after it, and a match counter. Drawn from plain display-list
+/// commands, so damage tracking and clipped repaints treat it like any other
+/// content.
+fn push_find_bar(list: &mut DisplayList, fonts: &Fonts, find: &FindPaint, width: i32) {
+    let size = FONT_SIZE;
+    let key = FaceKey::Prose {
+        size,
+        style: FontStyle::Regular,
+    };
+    let face = fonts.face(size, FontStyle::Regular);
+    let m = fonts.metrics(size);
+    let pad = size as i32 / 2;
+    let row_h = m.ascent + m.descent;
+
+    // The right-hand cluster on the query row: the mode flags (bright when
+    // on) and the match counter (the alert color for a broken regex).
+    let counter = if find.query.is_empty() {
+        String::new()
+    } else if find.error {
+        "!".to_string()
+    } else if find.matches.is_empty() {
+        "0/0".to_string()
+    } else {
+        format!("{}/{}", find.current + 1, find.matches.len())
+    };
+    let counter_w = render::text_advance(face, &counter).ceil() as i32;
+    let flag_word_w = render::text_advance(face, "W").ceil() as i32;
+    let flag_regex_w = render::text_advance(face, ".*").ceil() as i32;
+    let gap = pad / 2;
+    let tail_w = flag_word_w + gap + flag_regex_w + gap + counter_w;
+
+    // Keep a field's display within a third of the window by dropping leading
+    // clusters: the end is where editing happens. Queries are short, so the
+    // remeasure loop is cheap.
+    fn tail_that_fits<'t>(face: &crate::freetype::Face, text: &'t str, max: f32) -> &'t str {
+        let mut shown = text;
+        while render::text_advance(face, shown) > max && !shown.is_empty() {
+            shown = &shown[grapheme::next_boundary(shown, 0)..];
+        }
+        shown
+    }
+    let field_max = (width / 3).max(3 * size as i32) as f32;
+    let query = tail_that_fits(face, find.query, field_max);
+    let query_w = render::text_advance(face, query).ceil() as i32;
+    let replace = find.replace.map(|r| tail_that_fits(face, r, field_max));
+    let replace_w = replace
+        .map(|r| render::text_advance(face, r).ceil() as i32)
+        .unwrap_or(0);
+    let arrow = "→ ";
+    let arrow_w = render::text_advance(face, arrow).ceil() as i32;
+
+    let rows = 1 + replace.is_some() as i32;
+    let replace_row_w = if replace.is_some() {
+        arrow_w + replace_w
+    } else {
+        0
+    };
+    let field_w = query_w.max(replace_row_w) + CARET_WIDTH + 2;
+    let w = (field_w + pad + tail_w + 2 * pad).max(6 * size as i32);
+    let h = rows * row_h + (rows + 1) * (pad / 2);
+    let x = width - w - MARGIN;
+    let y = MARGIN / 2;
+    list.push(DrawCmd::RoundRect {
+        rect: Rect { x, y, w, h },
+        color: FIND_BG,
+        radius: (pad / 2).max(2),
+        corners: render::RoundedCorners::Both,
+    });
+
+    // A steady caret (no blink) after the focused field's text: it marks where
+    // typing goes while the bar holds the keyboard.
+    let caret_after = |list: &mut DisplayList, pen: i32, baseline: i32| {
+        list.push(DrawCmd::Fill {
+            rect: Rect {
+                x: pen + 1,
+                y: baseline - m.ascent,
+                w: CARET_WIDTH,
+                h: row_h,
+            },
+            color: CARET_COLOR,
+        });
+    };
+
+    // Row one: the query, a selected query on a selection-colored fill,
+    // invalid regexes in the alert color.
+    let baseline = y + pad / 2 + m.ascent;
+    let pen = x + pad;
+    if !query.is_empty() {
+        if find.selected && !find.focus_replace {
+            list.push(DrawCmd::Fill {
+                rect: Rect {
+                    x: pen,
+                    y: baseline - m.ascent,
+                    w: query_w,
+                    h: row_h,
+                },
+                color: SELECTION_COLOR,
+            });
+        }
+        let color = if find.error {
+            FIND_ERROR_COLOR
+        } else {
+            FOREGROUND
+        };
+        list.push(text_cmd(
+            key,
+            pen,
+            baseline,
+            pen + query_w,
+            color,
+            query.to_string(),
+            m,
+        ));
+    }
+    if !find.focus_replace {
+        caret_after(list, pen + query_w, baseline);
+    }
+
+    // The flags and counter, right-aligned on the query row.
+    let mut tx = x + w - pad - tail_w;
+    list.push(text_cmd(
+        key,
+        tx,
+        baseline,
+        tx + flag_word_w,
+        if find.word { FOREGROUND } else { MARKER_COLOR },
+        "W".to_string(),
+        m,
+    ));
+    tx += flag_word_w + gap;
+    list.push(text_cmd(
+        key,
+        tx,
+        baseline,
+        tx + flag_regex_w,
+        if find.regex { FOREGROUND } else { MARKER_COLOR },
+        ".*".to_string(),
+        m,
+    ));
+    tx += flag_regex_w + gap;
+    if !counter.is_empty() {
+        let color = if find.error {
+            FIND_ERROR_COLOR
+        } else {
+            MARKER_COLOR
+        };
+        list.push(text_cmd(
+            key,
+            tx,
+            baseline,
+            tx + counter_w,
+            color,
+            counter,
+            m,
+        ));
+    }
+
+    // Row two: the replacement, prefixed with a dim arrow; selected content
+    // sits on the same selection fill as a selected query.
+    if let Some(replacement) = replace {
+        let baseline = baseline + row_h + pad / 2;
+        list.push(text_cmd(
+            key,
+            pen,
+            baseline,
+            pen + arrow_w,
+            MARKER_COLOR,
+            arrow.to_string(),
+            m,
+        ));
+        if !replacement.is_empty() {
+            if find.selected && find.focus_replace {
+                list.push(DrawCmd::Fill {
+                    rect: Rect {
+                        x: pen + arrow_w,
+                        y: baseline - m.ascent,
+                        w: replace_w,
+                        h: row_h,
+                    },
+                    color: SELECTION_COLOR,
+                });
+            }
+            list.push(text_cmd(
+                key,
+                pen + arrow_w,
+                baseline,
+                pen + arrow_w + replace_w,
+                FOREGROUND,
+                replacement.to_string(),
+                m,
+            ));
+        }
+        if find.focus_replace {
+            caret_after(list, pen + arrow_w + replace_w, baseline);
+        }
+    }
 }
 
 /// Append the selection chrome for a selected image at picture rect `pic` (screen
@@ -2544,7 +3071,7 @@ mod tests {
     use crate::image::{Image, ImageStore};
     use crate::rope::Rope;
 
-    fn paint_params(width: usize, height: usize) -> PaintParams {
+    fn paint_params(width: usize, height: usize) -> PaintParams<'static> {
         PaintParams {
             width,
             height,
@@ -2552,6 +3079,7 @@ mod tests {
             selection: None,
             cursor: 0,
             caret_visible: false,
+            find: None,
         }
     }
 
@@ -2739,6 +3267,7 @@ mod tests {
                         selection,
                         cursor,
                         caret_visible: caret,
+                        find: None,
                     },
                 )
             };
@@ -2778,6 +3307,152 @@ mod tests {
             w,
             h,
             "cursor enters heading",
+        );
+
+        // The find bar appearing (panel, query, counter, match highlights, and
+        // the current match as selection) must also diff cleanly, both ways.
+        let mut fs = FindState::new();
+        let text = rope.to_string();
+        fs.open_at(0, &text);
+        let landed = fs.push('e', &text);
+        assert!(landed.is_some(), "the fixture contains an e");
+        let find_frame = build_display_list(
+            &fonts,
+            &lay_top,
+            &rope,
+            &PaintParams {
+                width: w,
+                height: h,
+                scroll_y: 0,
+                selection: landed,
+                cursor: landed.map_or(0, |(_, end)| end),
+                caret_visible: true,
+                find: Some(FindPaint {
+                    query: fs.query(),
+                    replace: None,
+                    focus_replace: false,
+                    selected: false,
+                    word: false,
+                    regex: false,
+                    error: false,
+                    matches: fs.matches(),
+                    current: fs.current(),
+                }),
+            },
+        );
+        assert_incremental_matches_full(&fonts, &images, &on_top, &find_frame, w, h, "find opens");
+        assert_incremental_matches_full(&fonts, &images, &find_frame, &on_top, w, h, "find closes");
+    }
+
+    #[test]
+    fn find_bar_and_match_highlights_reach_the_display_list() {
+        let fonts = Fonts::new(&markdown::all_sizes(FONT_SIZE)).expect("a default font");
+        let rope = Rope::from_str("one two one two one\n");
+        let (w, h) = (600usize, 200usize);
+        let wrap = w as i32 - 2 * MARGIN;
+        let layout = Layout::build(&fonts, &rope, MARGIN, MARGIN, wrap, FONT_SIZE, (0, 0));
+        let matches = [(0usize, 3usize), (8, 11), (16, 19)];
+        let params = PaintParams {
+            width: w,
+            height: h,
+            scroll_y: 0,
+            // The app mirrors the current match into the selection.
+            selection: Some((8, 11)),
+            cursor: 11,
+            caret_visible: false,
+            find: Some(FindPaint {
+                query: "one",
+                replace: None,
+                focus_replace: false,
+                selected: false,
+                word: false,
+                regex: false,
+                error: false,
+                matches: &matches,
+                current: 1,
+            }),
+        };
+        let list = build_display_list(&fonts, &layout, &rope, &params);
+        let match_fills = list
+            .iter()
+            .filter(|c| matches!(c, DrawCmd::Fill { color, .. } if *color == FIND_MATCH_COLOR))
+            .count();
+        assert_eq!(match_fills, 2, "the two non-current matches highlight");
+        assert!(
+            list.iter()
+                .any(|c| matches!(c, DrawCmd::Fill { color, .. } if *color == SELECTION_COLOR)),
+            "the current match is painted as the selection"
+        );
+        assert!(
+            list.iter()
+                .any(|c| matches!(c, DrawCmd::RoundRect { color, .. } if *color == FIND_BG)),
+            "the bar panel is drawn"
+        );
+        let texts: Vec<&str> = list
+            .iter()
+            .filter_map(|c| match c {
+                DrawCmd::Text { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(texts.contains(&"one"), "the query is drawn in the bar");
+        assert!(texts.contains(&"2/3"), "the counter shows current/total");
+    }
+
+    #[test]
+    fn the_replace_row_flags_and_ticks_reach_the_display_list() {
+        let fonts = Fonts::new(&markdown::all_sizes(FONT_SIZE)).expect("a default font");
+        let rope = Rope::from_str("one two one\nfiller\none more\n");
+        let (w, h) = (600usize, 200usize);
+        let wrap = w as i32 - 2 * MARGIN;
+        let layout = Layout::build(&fonts, &rope, MARGIN, MARGIN, wrap, FONT_SIZE, (0, 0));
+        let matches = [(0usize, 3usize), (8, 11), (19, 22)];
+        let params = PaintParams {
+            width: w,
+            height: h,
+            scroll_y: 0,
+            selection: Some((0, 3)),
+            cursor: 3,
+            caret_visible: false,
+            find: Some(FindPaint {
+                query: "one",
+                replace: Some("two"),
+                focus_replace: true,
+                selected: false,
+                word: true,
+                regex: false,
+                error: false,
+                matches: &matches,
+                current: 0,
+            }),
+        };
+        let list = build_display_list(&fonts, &layout, &rope, &params);
+        let texts: Vec<&str> = list
+            .iter()
+            .filter_map(|c| match c {
+                DrawCmd::Text { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(texts.contains(&"→ "), "the replace row is prefixed");
+        assert!(texts.contains(&"two"), "the replacement text is drawn");
+        assert!(
+            texts.contains(&"W") && texts.contains(&".*"),
+            "both mode flags are drawn"
+        );
+        // The right-edge tick strip: one accent tick for the current match and
+        // gold ticks for the rest (the bar caret sits well left of the edge).
+        let edge = w as i32 - 10;
+        let ticks = list
+            .iter()
+            .filter(|c| {
+                matches!(c, DrawCmd::Fill { color, rect }
+                    if (*color == FIND_TICK_COLOR || *color == CARET_COLOR) && rect.x >= edge)
+            })
+            .count();
+        assert!(
+            ticks >= 2,
+            "expected match ticks at the right edge, got {ticks}"
         );
     }
 }

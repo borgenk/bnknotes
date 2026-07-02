@@ -128,6 +128,7 @@ pub mod xdg_surface {
 
 pub mod xdg_toplevel {
     pub const SET_TITLE: u16 = 2;
+    pub const SET_APP_ID: u16 = 3;
     /// The compositor's chosen size and window states: `width`, `height`
     /// (ints), then a `states` array. A zero dimension means "you decide".
     pub const EV_CONFIGURE: u16 = 0;

@@ -1,6 +1,5 @@
-//! bnknotes: a minimal, software-rendered text edit field built on a native
-//! Wayland client (no winit, no smithay, no crates at all). The point is to
-//! find out how far we get owning the whole stack.
+//! bnknotes: a minimal, software-rendered markdown notes editor and a native
+//! Wayland client (no winit, no smithay, almost no crates).
 
 mod app;
 mod browser;

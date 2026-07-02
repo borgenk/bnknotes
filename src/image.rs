@@ -4,11 +4,11 @@
 //! backend can be swapped by rewriting this one file.
 //!
 //! Image decoders parse hostile, attacker-controlled bytes, so this is the one
-//! place the editor leans on memory-safe third-party code. [`Limits`] guards
-//! against decompression bombs: an image's declared dimensions are read from its
-//! header and checked before any pixel buffer is allocated. The decoders' own
-//! built-in dimension cap (16384 square) sits above that as a hard backstop, so
-//! an absurd size is refused even sooner.
+//! place the editor leans on memory-safe third-party code rather than an
+//! in-tree decoder. [`Limits`] guards against decompression bombs: an image's declared
+//! dimensions are read from its header and checked before any pixel buffer is
+//! allocated. The decoders' own built-in dimension cap (16384 square) sits above
+//! that as a hard backstop, so an absurd size is refused even sooner.
 
 use std::cell::RefCell;
 use std::collections::HashMap;

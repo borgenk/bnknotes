@@ -29,8 +29,8 @@ use crate::shape::Shaper;
 /// The first family whose `regular` file exists wins; a missing bold, italic, or
 /// bold-italic variant falls back to the regular face at render time, so a family
 /// that ships only some weights still renders (just without the slant or weight).
-/// A short list of hardcoded paths keeps the editor runnable across machines
-/// without crates.
+/// Paths are hardcoded by design; a short list keeps the editor runnable
+/// across machines without a font-discovery crate.
 struct FontFamily {
     regular: &'static str,
     bold: &'static str,

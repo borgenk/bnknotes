@@ -1,4 +1,4 @@
-//! A small regular-expression engine for find-in-document.
+//! A small, dependency-free regular-expression engine for find-in-document.
 //!
 //! Supported syntax: literal characters, `.` (any character but a newline),
 //! escapes (`\d \D \w \W \s \S`, `\n \t \r`, and `\x` for any punctuation `x`),

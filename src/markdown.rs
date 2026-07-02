@@ -16,9 +16,10 @@
 //!   delimiters hidden once the cursor leaves the line.
 //!
 //! Scope for now: ATX headings, bullet/ordered/quote lines (which may be indented
-//! for nesting, [`LIST_INDENT_SPACES`] per level), thematic breaks (horizontal
-//! rules), inline code, bold/italic emphasis, strikethrough, and inline links.
-//! Indented *headings* and quotes are still not recognized; only list items nest.
+//! for nesting, [`LIST_INDENT_SPACES`] per level), task-list items (`- [ ]` /
+//! `- [x]`), thematic breaks (horizontal rules), inline code, bold/italic
+//! emphasis, strikethrough, and inline links. Indented *headings* and quotes are
+//! still not recognized; only list items nest.
 
 /// The block style of one logical line. A closed set, extended as more markup
 /// lands.
@@ -32,6 +33,10 @@ pub enum LineStyle {
     Bullet,
     /// An ordered list item (`1.` or `1)` then a space).
     Ordered,
+    /// A task-list item: a bullet whose content opens with a checkbox, `[ ]`
+    /// (unchecked) or `[x]`/`[X]` (checked), then a space. The whole
+    /// `- [ ] ` prefix is its block marker.
+    Task { checked: bool },
     /// A blockquote (`>` then an optional space).
     Quote,
     /// A thematic break (horizontal rule): a line of `---`, `***`, `___`, or a
@@ -73,7 +78,12 @@ pub fn classify(line: &str) -> (LineStyle, usize) {
     } else if let Some(len) = quote_marker(line) {
         (LineStyle::Quote, len)
     } else if let Some(len) = bullet_marker(line) {
-        (LineStyle::Bullet, len)
+        // A bullet whose content opens with a checkbox is a task item, and the
+        // checkbox belongs to the marker.
+        match task_box(line, len) {
+            Some(checked) => (LineStyle::Task { checked }, len + 4),
+            None => (LineStyle::Bullet, len),
+        }
     } else if let Some(len) = ordered_marker(line) {
         (LineStyle::Ordered, len)
     } else {
@@ -108,13 +118,6 @@ pub fn is_thematic_break(line: &str) -> bool {
     count >= 3
 }
 
-/// Byte length of `line`'s block marker prefix (the syntax drawn in a distinct
-/// color so it reads as markup): a heading's `#`s plus a space, a list bullet or
-/// number plus a space, or a quote `>` plus an optional space. `0` for body text.
-pub fn marker_len(line: &str) -> usize {
-    classify(line).1
-}
-
 /// Whether `style`'s block marker stays visible once the cursor leaves the line.
 /// A heading hides its `#`s (the large text reads cleaner bare), but a list
 /// bullet or quote `>` is the only thing marking the line as a list or quote, so
@@ -122,21 +125,28 @@ pub fn marker_len(line: &str) -> usize {
 pub fn block_marker_persists(style: LineStyle) -> bool {
     matches!(
         style,
-        LineStyle::Bullet | LineStyle::Ordered | LineStyle::Quote
+        LineStyle::Bullet | LineStyle::Ordered | LineStyle::Quote | LineStyle::Task { .. }
     )
 }
 
 /// The marker that should open the next item when Enter is pressed on `line`,
 /// or `None` if `line` is not a continuable block (body, heading). A bullet or
-/// quote repeats its own marker verbatim; an ordered item advances the number,
-/// keeping its `.`/`)` delimiter and trailing space (`1. ` -> `2. `, `3) ` ->
-/// `4) `). The caller decides emptiness; this only builds the marker.
+/// quote repeats its own marker verbatim; a task item continues unchecked
+/// (`- [x] ` -> `- [ ] `); an ordered item advances the number, keeping its
+/// `.`/`)` delimiter and trailing space (`1. ` -> `2. `, `3) ` -> `4) `). The
+/// caller decides emptiness; this only builds the marker.
 pub fn next_item_marker(line: &str) -> Option<String> {
     let (style, marker_len) = classify(line);
     let marker = &line[..marker_len];
     match style {
         // A bullet or quote repeats its marker verbatim, keeping any indentation.
         LineStyle::Bullet | LineStyle::Quote => Some(marker.to_string()),
+        // A task item continues with a fresh unchecked box, keeping its
+        // indentation and bullet character; done-ness is not inherited.
+        LineStyle::Task { .. } => {
+            let indent = leading_indent(marker);
+            Some(format!("{}[ ] ", &marker[..indent + 2]))
+        }
         LineStyle::Ordered => {
             // The marker is <indent><digits><'.'|')'><space>; bump the number,
             // keep the indentation and delimiter so a nested item stays nested.
@@ -204,6 +214,24 @@ fn bullet_marker(line: &str) -> Option<usize> {
     }
 }
 
+/// The checked state of the `[ ]`, `[x]`, or `[X]` checkbox opening a bullet
+/// item's content at byte `after` (just past the bullet's marker), making the
+/// bullet a task item, or `None` when there is no such checkbox. The box needs
+/// a following space, so `- [ ]x` and a plain `- [y] z` stay ordinary bullets.
+/// The checkbox is 4 bytes, which the task item's marker length adds on top of
+/// the bullet's.
+fn task_box(line: &str, after: usize) -> Option<bool> {
+    let rest = &line.as_bytes()[after..];
+    if rest.first() != Some(&b'[') || rest.get(2) != Some(&b']') || rest.get(3) != Some(&b' ') {
+        return None;
+    }
+    match rest.get(1)? {
+        b' ' => Some(false),
+        b'x' | b'X' => Some(true),
+        _ => None,
+    }
+}
+
 /// Marker length if `line` is an ordered item: optional leading indentation, one
 /// to nine digits, then `.` or `)`, then a required space (so `1.foo` and a bare
 /// `1.` stay body text). The length spans the indentation and the marker.
@@ -218,6 +246,21 @@ fn ordered_marker(line: &str) -> Option<usize> {
         Some(b'.' | b')') if bytes.get(digits + 1) == Some(&b' ') => Some(indent + digits + 2),
         _ => None,
     }
+}
+
+/// The number of an ordered item together with the byte range of its digits
+/// (which sit just past any indentation), or `None` when `line` is not an
+/// ordered item: `"  12. x"` yields `(12, (2, 4))`. Drives the renumbering of
+/// the items that follow when Enter inserts a new numbered item.
+pub fn ordered_number(line: &str) -> Option<(u64, (usize, usize))> {
+    ordered_marker(line)?;
+    let indent = leading_indent(line);
+    let digits = line[indent..]
+        .bytes()
+        .take_while(u8::is_ascii_digit)
+        .count();
+    let value = line[indent..indent + digits].parse().ok()?;
+    Some((value, (indent, indent + digits)))
 }
 
 /// Marker length if `line` is a blockquote: a leading `>`, plus a single space if
@@ -241,6 +284,7 @@ pub fn font_size(style: LineStyle, base: u32) -> u32 {
         LineStyle::Body
         | LineStyle::Bullet
         | LineStyle::Ordered
+        | LineStyle::Task { .. }
         | LineStyle::Quote
         | LineStyle::Rule => {
             return base;
@@ -781,6 +825,11 @@ fn path_of_dest(line: &str, start: usize, end: usize) -> (usize, usize) {
 mod tests {
     use super::*;
 
+    /// The marker-length half of [`classify`], kept terse for the assertions.
+    fn marker_len(line: &str) -> usize {
+        classify(line).1
+    }
+
     #[test]
     fn recognizes_each_heading_level() {
         for level in 1..=6u8 {
@@ -938,6 +987,97 @@ mod tests {
         assert_eq!(marker_len("- x"), 2);
         assert_eq!(leading_indent("- x"), 0);
         assert_eq!(style_of("    plain"), LineStyle::Body);
+    }
+
+    // --- Task lists ---------------------------------------------------------
+
+    #[test]
+    fn recognizes_task_items_with_each_bullet_and_case() {
+        for marker in ["- ", "+ ", "* "] {
+            let unchecked = format!("{marker}[ ] todo");
+            assert_eq!(
+                style_of(&unchecked),
+                LineStyle::Task { checked: false },
+                "{unchecked:?}"
+            );
+            assert_eq!(marker_len(&unchecked), 6, "{unchecked:?}");
+        }
+        for check in ["x", "X"] {
+            let done = format!("- [{check}] done");
+            assert_eq!(
+                style_of(&done),
+                LineStyle::Task { checked: true },
+                "{done:?}"
+            );
+            assert_eq!(marker_len(&done), 6, "{done:?}");
+        }
+    }
+
+    #[test]
+    fn recognizes_indented_task_items() {
+        assert_eq!(
+            style_of("  - [ ] sub"),
+            LineStyle::Task { checked: false },
+            "indentation nests a task like any list item"
+        );
+        assert_eq!(marker_len("  - [x] sub"), 8);
+        assert_eq!(leading_indent("  - [x] sub"), 2);
+    }
+
+    #[test]
+    fn near_miss_checkboxes_stay_bullets_or_body() {
+        // No space after the box, an empty box pair, an unknown check char, or a
+        // box past other content: a plain bullet whose text happens to hold
+        // brackets. No bullet at all stays body.
+        for line in ["- [ ]x", "- []", "- [y] z", "- a [ ] b", "- [x]"] {
+            assert_eq!(style_of(line), LineStyle::Bullet, "{line:?}");
+            assert_eq!(marker_len(line), 2, "{line:?}");
+        }
+        assert_eq!(style_of("[ ] x"), LineStyle::Body);
+        assert_eq!(style_of("-[ ] x"), LineStyle::Body);
+    }
+
+    #[test]
+    fn an_empty_task_item_is_still_a_task() {
+        // The Enter continuation leaves `- [ ] ` (trailing space, no content);
+        // it must classify as a task so a second Enter clears the marker.
+        assert_eq!(style_of("- [ ] "), LineStyle::Task { checked: false });
+        assert_eq!(marker_len("- [ ] "), 6);
+    }
+
+    #[test]
+    fn a_task_is_body_sized_and_its_marker_persists() {
+        for style in [
+            LineStyle::Task { checked: false },
+            LineStyle::Task { checked: true },
+        ] {
+            assert!(block_marker_persists(style), "{style:?} persists");
+            assert_eq!(font_size(style, 32), 32, "{style:?} is body size");
+        }
+    }
+
+    #[test]
+    fn next_item_marker_continues_a_task_unchecked() {
+        assert_eq!(next_item_marker("- [ ] a").as_deref(), Some("- [ ] "));
+        assert_eq!(
+            next_item_marker("- [x] done").as_deref(),
+            Some("- [ ] "),
+            "a finished item's successor starts fresh"
+        );
+        assert_eq!(
+            next_item_marker("  + [X] b").as_deref(),
+            Some("  + [ ] "),
+            "indentation and the bullet character carry over"
+        );
+    }
+
+    #[test]
+    fn ordered_number_reports_the_value_and_digit_range() {
+        assert_eq!(ordered_number("1. a"), Some((1, (0, 1))));
+        assert_eq!(ordered_number("  12) b"), Some((12, (2, 4))));
+        for line in ["- a", "- [ ] a", "plain", "1.a", "1."] {
+            assert_eq!(ordered_number(line), None, "{line:?}");
+        }
     }
 
     #[test]

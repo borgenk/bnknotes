@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Bnknotes
+Comment=Markdown notes editor
+Exec=bnknotes %f
+Icon=bnknotes
+Terminal=false
+StartupNotify=false
+Categories=Utility;TextEditor;
+MimeType=text/markdown;

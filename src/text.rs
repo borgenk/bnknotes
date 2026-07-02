@@ -209,12 +209,13 @@ impl TextBuffer {
     }
 
     /// Handle the Enter key, continuing a list or quote where one is in play.
-    /// On a bullet, ordered, or quote line a non-empty item starts a new one
-    /// with the same (or next) marker, splitting the line at the cursor; an
+    /// On a bullet, ordered, task, or quote line a non-empty item starts a new
+    /// one with the same (or next) marker, splitting the line at the cursor; an
     /// empty item instead has its marker removed, leaving a blank line, so a
-    /// second Enter ends the list. Anywhere else, with a selection, or with the
-    /// cursor before the marker, it inserts a plain newline. Always changes the
-    /// buffer, so it returns `true`.
+    /// second Enter ends the list. Inserting a numbered item also renumbers the
+    /// same-level items after it, in the same undo step. Anywhere else, with a
+    /// selection, or with the cursor before the marker, it inserts a plain
+    /// newline. Always changes the buffer, so it returns `true`.
     pub fn enter(&mut self) -> bool {
         if self.selection().is_some() {
             self.insert_str("\n");
@@ -222,7 +223,7 @@ impl TextBuffer {
         }
         let (ls, le) = self.line_content_bounds(self.cursor);
         let line = self.text.byte_slice(ls..le);
-        let marker_len = markdown::marker_len(&line);
+        let (style, marker_len) = markdown::classify(&line);
         // Continue the list only while editing the item's content; with the
         // cursor before or within the marker a plain newline is what is meant.
         if marker_len == 0 || self.cursor < ls + marker_len {
@@ -233,6 +234,12 @@ impl TextBuffer {
             Some(_) if line[marker_len..].trim().is_empty() => self.delete_range(ls, le),
             Some(marker) => {
                 self.insert_str(&format!("\n{marker}"));
+                // The new number bumps every same-level item after it; the
+                // renumbering edits directly (no fresh checkpoint), so it
+                // shares the insertion's undo step.
+                if matches!(style, markdown::LineStyle::Ordered) {
+                    self.renumber_following_items();
+                }
                 true
             }
             None => {
@@ -240,6 +247,87 @@ impl TextBuffer {
                 true
             }
         }
+    }
+
+    /// Renumber the ordered items that follow the cursor's line at its list
+    /// level, so they continue its number in sequence. Runs after Enter inserts
+    /// the next numbered item; edits the rope directly with no checkpoint, so
+    /// the renumbering and the insertion undo as one step. Blank lines are
+    /// skipped (a loose list is still one list) and deeper-indented items are
+    /// left alone (a child list numbers itself); the first shallower or
+    /// differently-marked line ends the list, matching how the layout resolves
+    /// list nesting. All the edits land after the cursor's line, so the cursor
+    /// never moves.
+    fn renumber_following_items(&mut self) {
+        let (ls, le) = self.line_content_bounds(self.cursor);
+        let line = self.text.byte_slice(ls..le);
+        let Some((mut number, _)) = markdown::ordered_number(&line) else {
+            return;
+        };
+        let indent = markdown::leading_indent(&line);
+        // Collect the digit-range edits first: renumbering can change byte
+        // lengths ("9" -> "10"), so they apply back to front afterwards.
+        let mut edits: Vec<(usize, usize, u64)> = Vec::new();
+        let n = self.text.len_lines();
+        for i in self.text.byte_to_line(self.cursor) + 1..n {
+            let ls = self.text.line_to_byte(i);
+            let le = if i + 1 < n {
+                self.text.line_to_byte(i + 1) - 1
+            } else {
+                self.text.line_to_byte(i + 1)
+            };
+            let line = self.text.byte_slice(ls..le);
+            if line.trim().is_empty() {
+                continue;
+            }
+            let li = markdown::leading_indent(&line);
+            if is_list(&line) && li > indent {
+                continue; // a nested child; its numbering is its own
+            }
+            // A shallower line, a non-list line, or a same-level bullet/task
+            // (a different list marker) all end this ordered run.
+            let Some((value, (ds, de))) = markdown::ordered_number(&line) else {
+                break;
+            };
+            if li < indent {
+                break;
+            }
+            number += 1;
+            if value != number {
+                edits.push((ls + ds, ls + de, number));
+            }
+        }
+        if edits.is_empty() {
+            return;
+        }
+        for &(start, end, num) in edits.iter().rev() {
+            self.text.remove(start..end);
+            self.text.insert(start, &num.to_string());
+        }
+        // A fresh version: the insertion's stamp covered the pre-renumber text,
+        // and distinct contents must never share a version.
+        self.touch();
+    }
+
+    /// Toggle the checkbox of the task item on the line containing `offset`
+    /// (`[ ]` <-> `[x]`), as one undo step. The swap is a single byte, and the
+    /// cursor and selection stay untouched, so toggling never moves the caret
+    /// or reveals the line. Returns whether the buffer changed (`false` off a
+    /// task line).
+    pub fn toggle_task(&mut self, offset: usize) -> bool {
+        let (ls, le) = self.line_content_bounds(offset.min(self.text.len()));
+        let line = self.text.byte_slice(ls..le);
+        let (style, marker_len) = markdown::classify(&line);
+        let markdown::LineStyle::Task { checked } = style else {
+            return false;
+        };
+        // The check character sits inside the marker's trailing `[c] `.
+        let at = ls + marker_len - 3;
+        self.checkpoint(Coalesce::None);
+        self.text.remove(at..at + 1);
+        self.text.insert(at, if checked { " " } else { "x" });
+        self.touch();
+        true
     }
 
     /// The content byte range `[ls, le)` of the logical line containing `byte`,
@@ -711,12 +799,14 @@ impl TextBuffer {
     }
 }
 
-/// Whether `line` is a list item (bullet or ordered, perhaps indented), the
-/// lines Tab nests and `enter` continues.
+/// Whether `line` is a list item (bullet, ordered, or task, perhaps indented),
+/// the lines Tab nests and `enter` continues.
 fn is_list(line: &str) -> bool {
     matches!(
         markdown::style_of(line),
-        markdown::LineStyle::Bullet | markdown::LineStyle::Ordered
+        markdown::LineStyle::Bullet
+            | markdown::LineStyle::Ordered
+            | markdown::LineStyle::Task { .. }
     )
 }
 
@@ -1055,6 +1145,181 @@ mod tests {
         assert_eq!(b.text(), "- foo\n- ");
         assert!(b.undo());
         assert_eq!(b.text(), "- foo", "one undo reverts the whole continuation");
+    }
+
+    #[test]
+    fn enter_continues_a_task_with_a_fresh_unchecked_box() {
+        let mut b = TextBuffer::new();
+        b.insert_str("- [ ] foo");
+        assert!(b.enter());
+        assert_eq!(b.text(), "- [ ] foo\n- [ ] ");
+        assert_eq!(b.cursor(), 16);
+        // A finished item's successor still starts unchecked.
+        let mut b = TextBuffer::new();
+        b.insert_str("- [x] done");
+        b.enter();
+        assert_eq!(b.text(), "- [x] done\n- [ ] ");
+    }
+
+    #[test]
+    fn enter_on_an_empty_task_removes_the_marker() {
+        let mut b = TextBuffer::new();
+        b.insert_str("- [ ] ");
+        assert!(b.enter());
+        assert_eq!(b.text(), "", "an empty task clears its marker");
+        assert_eq!(b.cursor(), 0);
+    }
+
+    #[test]
+    fn tab_nests_a_task_item() {
+        let mut b = TextBuffer::new();
+        b.insert_str("- [ ] a\n- [x] b");
+        assert!(b.cursor_on_list_item(), "a task line is a list item");
+        assert!(b.nest_list_item(false));
+        assert_eq!(b.text(), "- [ ] a\n  - [x] b");
+    }
+
+    // --- Task toggling ------------------------------------------------------
+
+    #[test]
+    fn toggle_task_flips_the_box_both_ways_without_moving_the_cursor() {
+        let mut b = TextBuffer::from_text("- [ ] a\nplain".to_string());
+        b.set_cursor(13, false); // cursor far away, on "plain"
+        assert!(b.toggle_task(0));
+        assert_eq!(b.text(), "- [x] a\nplain");
+        assert_eq!(b.cursor(), 13, "the caret never moves");
+        assert!(b.toggle_task(0));
+        assert_eq!(b.text(), "- [ ] a\nplain");
+        // An uppercase X unchecks to a space too.
+        let mut b = TextBuffer::from_text("- [X] a".to_string());
+        assert!(b.toggle_task(0));
+        assert_eq!(b.text(), "- [ ] a");
+    }
+
+    #[test]
+    fn toggle_task_works_anywhere_on_the_line_and_on_nested_items() {
+        let mut b = TextBuffer::from_text("- a\n  - [ ] sub".to_string());
+        // Any offset within the task's logical line finds its box.
+        assert!(b.toggle_task(10));
+        assert_eq!(b.text(), "- a\n  - [x] sub");
+    }
+
+    #[test]
+    fn toggle_task_is_one_undo_step_and_ignores_non_tasks() {
+        let mut b = TextBuffer::from_text("- [ ] a".to_string());
+        assert!(b.toggle_task(0));
+        assert!(b.undo());
+        assert_eq!(b.text(), "- [ ] a", "one undo reverts the toggle");
+        for text in ["plain", "- bullet", "1. ordered", "# h"] {
+            let mut b = TextBuffer::from_text(text.to_string());
+            assert!(!b.toggle_task(0), "{text:?} has no box to toggle");
+            assert_eq!(b.text(), text);
+        }
+    }
+
+    #[test]
+    fn toggle_task_keeps_a_selection_intact() {
+        let mut b = TextBuffer::from_text("- [ ] a\nplain".to_string());
+        b.set_cursor(8, false);
+        b.set_cursor(13, true); // select "plain"
+        assert!(b.toggle_task(0));
+        assert_eq!(b.selection(), Some((8, 13)), "the selection survives");
+    }
+
+    // --- Ordered renumbering on Enter ---------------------------------------
+
+    #[test]
+    fn enter_renumbers_the_following_items() {
+        let mut b = TextBuffer::from_text("1. a\n2. b\n3. c".to_string());
+        b.set_cursor(4, false); // end of "1. a"
+        b.enter();
+        assert_eq!(b.text(), "1. a\n2. \n3. b\n4. c");
+        assert_eq!(b.cursor(), 8, "cursor after the new item's marker");
+    }
+
+    #[test]
+    fn enter_renumbering_is_one_undo_step() {
+        let mut b = TextBuffer::from_text("1. a\n2. b".to_string());
+        b.set_cursor(4, false);
+        b.enter();
+        assert_eq!(b.text(), "1. a\n2. \n3. b");
+        assert!(b.undo());
+        assert_eq!(
+            b.text(),
+            "1. a\n2. b",
+            "insertion and renumbering revert together"
+        );
+        assert!(b.redo());
+        assert_eq!(b.text(), "1. a\n2. \n3. b", "and redo replays both");
+    }
+
+    #[test]
+    fn splitting_an_item_renumbers_the_rest() {
+        let mut b = TextBuffer::from_text("1. ax\n2. b".to_string());
+        b.set_cursor(4, false); // between "a" and "x"
+        b.enter();
+        assert_eq!(b.text(), "1. a\n2. x\n3. b");
+    }
+
+    #[test]
+    fn renumbering_skips_children_and_blank_lines_and_carries_digits() {
+        // A deeper child list keeps its own numbers; a blank line does not end
+        // the list; "9" carries into "10".
+        let mut b = TextBuffer::from_text("1. a\n  1. child\n\n9. b".to_string());
+        b.set_cursor(4, false); // end of "1. a"
+        b.enter();
+        assert_eq!(b.text(), "1. a\n2. \n  1. child\n\n3. b");
+        let mut b = TextBuffer::from_text("9. a\n10. b".to_string());
+        b.set_cursor(4, false);
+        b.enter();
+        assert_eq!(b.text(), "9. a\n10. \n11. b");
+    }
+
+    #[test]
+    fn renumbering_stops_at_the_end_of_the_list() {
+        // A same-level bullet, a shallower item, or plain text all end the run.
+        let mut b = TextBuffer::from_text("1. a\n- x\n2. keep".to_string());
+        b.set_cursor(4, false);
+        b.enter();
+        assert_eq!(b.text(), "1. a\n2. \n- x\n2. keep");
+        let mut b = TextBuffer::from_text("1. a\nplain\n2. keep".to_string());
+        b.set_cursor(4, false);
+        b.enter();
+        assert_eq!(b.text(), "1. a\n2. \nplain\n2. keep");
+    }
+
+    #[test]
+    fn renumbering_keeps_each_items_own_delimiter() {
+        let mut b = TextBuffer::from_text("1) a\n2) b".to_string());
+        b.set_cursor(4, false);
+        b.enter();
+        assert_eq!(b.text(), "1) a\n2) \n3) b", "the paren style carries");
+    }
+
+    #[test]
+    fn renumbering_leaves_already_correct_numbers_alone() {
+        // Nothing follows, or the following numbers already fit: no extra edits
+        // (observable as: undo still reverts cleanly to the input).
+        let mut b = TextBuffer::from_text("1. a".to_string());
+        b.set_cursor(4, false);
+        b.enter();
+        assert_eq!(b.text(), "1. a\n2. ");
+        let mut b = TextBuffer::from_text("1. a\n3. b".to_string());
+        b.set_cursor(4, false);
+        b.enter();
+        assert_eq!(b.text(), "1. a\n2. \n3. b", "a lucky gap needs no edit");
+    }
+
+    #[test]
+    fn nested_ordered_items_renumber_within_their_level() {
+        let mut b = TextBuffer::from_text("1. a\n  1. x\n  2. y\n2. b".to_string());
+        b.set_cursor(11, false); // end of "  1. x"
+        b.enter();
+        assert_eq!(
+            b.text(),
+            "1. a\n  1. x\n  2. \n  3. y\n2. b",
+            "the child level renumbers; the parent level is untouched"
+        );
     }
 
     #[test]

@@ -534,6 +534,13 @@ impl State {
             xdg_surface::GET_TOPLEVEL,
             &[Arg::NewId(self.toplevel)],
         );
+        // The app_id ties the window to bnknotes.desktop, so the compositor can
+        // show the right icon and group windows in the taskbar.
+        self.conn.request(
+            self.toplevel,
+            xdg_toplevel::SET_APP_ID,
+            &[Arg::Str("bnknotes")],
+        );
         self.refresh_title();
 
         // The data device drives the clipboard; skip it if the compositor has no
@@ -1629,13 +1636,15 @@ impl State {
     /// every motion event. Uses the cached layout (no clone).
     fn update_cursor_shape(&mut self) {
         use wp_cursor_shape_device_v1::{SHAPE_DEFAULT, SHAPE_POINTER, SHAPE_TEXT};
-        // A rendered link reads as clickable: the hand pointer, the same affordance
-        // the image button uses. Checked first so it wins over the I-beam.
+        // A rendered link or task checkbox reads as clickable: the hand pointer,
+        // the same affordance the image button uses. Checked first so they win
+        // over the I-beam.
         let over_link = self.link_under_pointer().is_some();
+        let over_checkbox = self.checkbox_under_pointer().is_some();
         self.ensure_layout();
         let (x, y) = (self.pointer_x, self.pointer_y + self.scroll_y as f32);
         let shape = match self.layout_cache.as_ref() {
-            _ if over_link => SHAPE_POINTER,
+            _ if over_link || over_checkbox => SHAPE_POINTER,
             Some(layout) if layout.image_button_at(&self.fonts, x, y).is_some() => SHAPE_POINTER,
             Some(layout) if layout.image_at(&self.fonts, x, y).is_some() => SHAPE_DEFAULT,
             _ => SHAPE_TEXT,
@@ -1706,6 +1715,19 @@ impl State {
         // that source shown, otherwise it hides (matching "click away to dismiss").
         self.selected_image = None;
         self.raw_image = None;
+
+        // A plain click on a rendered task checkbox toggles it in place, one
+        // undo step, without moving the caret (the line is not revealed, so
+        // there is no raw marker under the pointer to edit). Shift-click falls
+        // through so it can still extend a selection across a task line.
+        if !self.xkb.shift_active() {
+            if let Some(ls) = self.checkbox_under_pointer() {
+                if self.text.toggle_task(ls) {
+                    self.dirty = true;
+                }
+                return;
+            }
+        }
 
         let now = Instant::now();
         let (lx, ly) = self.last_click_pos;
@@ -1807,6 +1829,19 @@ impl State {
             .find(|l| l.text.0 <= rel && rel <= l.text.1)?;
         let dest = content[link.dest.0..link.dest.1].to_string();
         crate::browser::can_open(&dest).then_some(dest)
+    }
+
+    /// The logical-line start of the rendered task checkbox under the pointer,
+    /// if any. Like [`Self::link_under_pointer`], only a line whose checkbox is
+    /// drawn qualifies (the cursor's own line shows its raw `- [ ]`, where
+    /// clicks edit); the layout's gutter already encodes that, so the hit-test
+    /// is the whole check. Drives the click toggle and the pointer shape.
+    fn checkbox_under_pointer(&mut self) -> Option<usize> {
+        self.ensure_layout();
+        let (x, y) = (self.pointer_x, self.pointer_y + self.scroll_y as f32);
+        self.layout_cache
+            .as_ref()?
+            .checkbox_at(&self.fonts, self.text.rope(), x, y)
     }
 
     /// The byte offset under the pointer, mapping its window position into
@@ -2604,6 +2639,9 @@ pub(crate) fn build_display_list(
         // Content is inset by the line's hanging indent (0 unless this is a wrapped
         // list/quote continuation).
         let heading = line.heading.is_some();
+        // A completed task's text reads dim and struck through, over the whole
+        // item (wrapped continuations included), so done items scan as done.
+        let done = line.task == Some(true);
         let mut pen = MARGIN + line.indent;
         for (i, run) in line.runs.iter().enumerate() {
             if !run.visible {
@@ -2644,6 +2682,22 @@ pub(crate) fn build_display_list(
                         pen += advance;
                         continue;
                     }
+                    // A task item's raw `- [ ]` gives way to a checkbox drawn
+                    // with fills (the prose face carries no ☐/☑ glyphs), placed
+                    // by the same geometry clicks hit-test against. The pen
+                    // still advances by the full marker, so the text never
+                    // shifts between the box and the revealed source.
+                    Gutter::Checkbox { checked } => {
+                        if let Some(rect) = layout.checkbox_rect(fonts, rope, line) {
+                            let rect = Rect {
+                                y: rect.y - scroll_y,
+                                ..rect
+                            };
+                            push_checkbox(&mut list, rect, checked);
+                        }
+                        pen += advance;
+                        continue;
+                    }
                     Gutter::QuoteBar { marker: true } => {
                         pen += advance;
                         continue;
@@ -2653,6 +2707,9 @@ pub(crate) fn build_display_list(
             }
             let color = match run.kind {
                 markdown::SpanKind::Marker => MARKER_COLOR,
+                // Every text run of a done task dims to the marker color, so
+                // the whole item (its code and links included) reads muted.
+                markdown::SpanKind::Text(_) if done => MARKER_COLOR,
                 markdown::SpanKind::Text(markdown::Emphasis::Code) => CODE_COLOR,
                 markdown::SpanKind::Text(markdown::Emphasis::Link) => LINK_COLOR,
                 // Heading prose takes the level's color (the marker and any inline
@@ -2675,8 +2732,10 @@ pub(crate) fn build_display_list(
             // Inline decorations over the glyphs, each spanning the run's drawn
             // width: a link is underlined and struck text gets a line through its
             // middle, both in the run's own color. Thickness scales with the
-            // line's size so it stays proportionate on larger headings.
+            // line's size so it stays proportionate on larger headings. A done
+            // task strikes through all of its text instead.
             let deco = match run.kind {
+                markdown::SpanKind::Text(_) if done => Some(baseline - m.ascent / 3),
                 markdown::SpanKind::Text(markdown::Emphasis::Link) => {
                     Some(baseline + m.descent / 3)
                 }
@@ -2999,6 +3058,66 @@ fn push_find_bar(list: &mut DisplayList, fonts: &Fonts, find: &FindPaint, width:
         if find.focus_replace {
             caret_after(list, pen + arrow_w + replace_w, baseline);
         }
+    }
+}
+
+/// Append a task item's checkbox at `rect` (screen space, from
+/// [`Layout::checkbox_rect`]): unchecked is an outlined rounded square (an
+/// inset background fill hollows the border), checked fills with the accent
+/// and carries a check mark. Built entirely from fills, since the prose face
+/// has no checkbox glyphs to lean on.
+fn push_checkbox(list: &mut DisplayList, rect: Rect, checked: bool) {
+    let radius = (rect.w / 4).max(2);
+    list.push(DrawCmd::RoundRect {
+        rect,
+        color: if checked { LINK_COLOR } else { MARKER_COLOR },
+        radius,
+        corners: render::RoundedCorners::Both,
+    });
+    if checked {
+        push_check_mark(list, rect);
+    } else {
+        let t = (rect.w / 8).max(1);
+        list.push(DrawCmd::RoundRect {
+            rect: Rect {
+                x: rect.x + t,
+                y: rect.y + t,
+                w: rect.w - 2 * t,
+                h: rect.h - 2 * t,
+            },
+            color: BACKGROUND,
+            radius: (radius - t).max(1),
+            corners: render::RoundedCorners::Both,
+        });
+    }
+}
+
+/// Append a check mark inside the checked box `b`: a small tick built from
+/// overlapping square fills stepping along its two arms (a short down-stroke
+/// meeting a longer up-stroke), in the background color over the accent fill.
+fn push_check_mark(list: &mut DisplayList, b: Rect) {
+    let u = (b.w / 6).max(1);
+    // The arms meet low and left of center, like a hand-drawn tick.
+    let (mx, my) = (b.x + b.w * 2 / 5, b.y + b.h * 13 / 20);
+    // Steps up-left (the short arm), the meeting point, then up-right (the
+    // long arm); cells one pixel larger than the step so the diagonal connects.
+    let cells = [
+        (mx - u, my - u),
+        (mx, my),
+        (mx + u, my - u),
+        (mx + 2 * u, my - 2 * u),
+        (mx + 3 * u, my - 3 * u),
+    ];
+    for (x, y) in cells {
+        list.push(DrawCmd::Fill {
+            rect: Rect {
+                x,
+                y,
+                w: u + 1,
+                h: u + 1,
+            },
+            color: BACKGROUND,
+        });
     }
 }
 
@@ -3342,6 +3461,110 @@ mod tests {
         );
         assert_incremental_matches_full(&fonts, &images, &on_top, &find_frame, w, h, "find opens");
         assert_incremental_matches_full(&fonts, &images, &find_frame, &on_top, w, h, "find closes");
+    }
+
+    #[test]
+    fn task_checkboxes_and_done_styling_reach_the_display_list() {
+        let fonts = Fonts::new(&markdown::all_sizes(FONT_SIZE)).expect("a default font");
+        let src = "- [ ] open\n- [x] done\nx";
+        let rope = Rope::from_str(src);
+        let (w, h) = (600usize, 200usize);
+        let wrap = w as i32 - 2 * MARGIN;
+        // Cursor on the trailing "x": both task lines render their boxes.
+        let off = src.len() - 1;
+        let layout = Layout::build(&fonts, &rope, MARGIN, MARGIN, wrap, FONT_SIZE, (off, off));
+        let list = build_display_list(&fonts, &layout, &rope, &paint_params(w, h));
+
+        // One outlined box (marker-color shell hollowed by a background inset)
+        // and one accent-filled box.
+        let round = |color: u32| {
+            list.iter()
+                .filter(|c| matches!(c, DrawCmd::RoundRect { color: c2, .. } if *c2 == color))
+                .count()
+        };
+        assert_eq!(round(MARKER_COLOR), 1, "the unchecked shell");
+        assert_eq!(round(BACKGROUND), 1, "its hollowing inset");
+        assert_eq!(round(LINK_COLOR), 1, "the checked fill");
+        // The check mark: small background-color cells inside the accent box.
+        let accent = list.iter().find_map(|c| match c {
+            DrawCmd::RoundRect { rect, color, .. } if *color == LINK_COLOR => Some(*rect),
+            _ => None,
+        });
+        let accent = accent.expect("the checked box");
+        let cells = list
+            .iter()
+            .filter(|c| {
+                matches!(c, DrawCmd::Fill { rect, color }
+                    if *color == BACKGROUND
+                        && rect.x >= accent.x
+                        && rect.x + rect.w <= accent.x + accent.w
+                        && rect.y >= accent.y
+                        && rect.y + rect.h <= accent.y + accent.h)
+            })
+            .count();
+        assert!(cells >= 5, "a stair of check cells, got {cells}");
+        // The raw markers are substituted, not drawn: no bracket glyphs.
+        let texts: Vec<&str> = list
+            .iter()
+            .filter_map(|c| match c {
+                DrawCmd::Text { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            !texts.iter().any(|t| t.contains('[')),
+            "no raw checkbox glyphs on rendered lines: {texts:?}"
+        );
+        // The done item's text dims to the marker color and gains a strike
+        // fill spanning its drawn width; the open item's text stays foreground.
+        let text_color = |needle: &str| {
+            list.iter().find_map(|c| match c {
+                DrawCmd::Text { text, color, .. } if text == needle => Some(*color),
+                _ => None,
+            })
+        };
+        assert_eq!(text_color("open"), Some(FOREGROUND));
+        assert_eq!(text_color("done"), Some(MARKER_COLOR), "done text is dim");
+        let done_run = list
+            .iter()
+            .find_map(|c| match c {
+                DrawCmd::Text {
+                    text, x, baseline, ..
+                } if text == "done" => Some((*x, *baseline)),
+                _ => None,
+            })
+            .expect("the done run");
+        let m = fonts.metrics(FONT_SIZE);
+        assert!(
+            list.iter().any(|c| {
+                matches!(c, DrawCmd::Fill { rect, color }
+                    if *color == MARKER_COLOR
+                        && rect.x == done_run.0
+                        && rect.y > done_run.1 - m.ascent
+                        && rect.y < done_run.1)
+            }),
+            "the done text is struck through"
+        );
+    }
+
+    #[test]
+    fn a_checkbox_toggle_repaints_incrementally_to_the_same_pixels() {
+        // Toggling `[ ]` -> `[x]` swaps the box fill and adds the check cells
+        // and strike; the damage diff must repaint exactly to a full repaint.
+        let fonts = Fonts::new(&markdown::all_sizes(FONT_SIZE)).expect("a default font");
+        let images = ImageStore::new(None);
+        let (w, h) = (400usize, 200usize);
+        let wrap = w as i32 - 2 * MARGIN;
+        let frame = |src: &str| {
+            let rope = Rope::from_str(src);
+            let off = src.len() - 1;
+            let layout = Layout::build(&fonts, &rope, MARGIN, MARGIN, wrap, FONT_SIZE, (off, off));
+            build_display_list(&fonts, &layout, &rope, &paint_params(w, h))
+        };
+        let open = frame("- [ ] task text\nx");
+        let done = frame("- [x] task text\nx");
+        assert_incremental_matches_full(&fonts, &images, &open, &done, w, h, "check a task");
+        assert_incremental_matches_full(&fonts, &images, &done, &open, w, h, "uncheck a task");
     }
 
     #[test]

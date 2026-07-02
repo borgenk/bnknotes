@@ -1,0 +1,16 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
+  <!-- App tile -->
+  <rect width="64" height="64" rx="14" fill="#1e2732"/>
+  <!-- Markdown heading hash -->
+  <g fill="none" stroke="#7cc4ff" stroke-width="5" stroke-linecap="round">
+    <path d="M26 13 L22 33"/>
+    <path d="M41 13 L37 33"/>
+    <path d="M17 19 h29"/>
+    <path d="M15 27 h29"/>
+  </g>
+  <!-- Body text lines -->
+  <g fill="none" stroke="#8fa1b3" stroke-width="4" stroke-linecap="round">
+    <path d="M16 44 h32"/>
+    <path d="M16 52 h21"/>
+  </g>
+</svg>

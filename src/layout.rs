@@ -42,9 +42,10 @@
 //! A list or quote item also hangs its wrapped continuations under the text: each
 //! visual line past the first is inset by the marker's width (`VisualLine::indent`)
 //! so the column aligns. Once the cursor leaves the line the raw marker gives way
-//! to a [`Gutter`] decoration, a bullet point `•` for a list or a bar for a quote,
-//! always the same width as the source marker so the text never shifts; on the
-//! cursor's own line the raw, editable marker shows instead.
+//! to a [`Gutter`] decoration, a bullet point `•` for a list, a drawn checkbox
+//! for a task item, or a bar for a quote, always the same width as the source
+//! marker so the text never shifts; on the cursor's own line the raw, editable
+//! marker shows instead.
 //!
 //! Fenced code blocks are the one construct whose classification crosses line
 //! boundaries: a ``` line opens a block and a later ``` closes it, and every line
@@ -80,6 +81,10 @@ const LIST_INDENT: i32 = 14;
 /// Vertical breathing room above and below a rendered block image, so it does not
 /// butt against the lines around it. Part of the image line's box height.
 const IMAGE_PAD_Y: i32 = 8;
+
+/// Extra pixels around a drawn task checkbox that still count as clicking it,
+/// so the small square is comfortable to hit.
+const CHECKBOX_HIT_PAD: i32 = 3;
 
 /// The selected-image toggle button: a rounded panel this wide and tall (wide
 /// enough for the `</>` glyph), inset this far from the picture's top-right corner.
@@ -124,6 +129,12 @@ pub struct VisualLine {
     /// app colors heading text by level, and the pixel `size` already carries the
     /// heading's scale.
     pub heading: Option<u8>,
+    /// `Some(checked)` when this line belongs to a task-list item, on every
+    /// visual line the item wraps into. A checked item's text renders dim and
+    /// struck through; the checkbox itself is the first line's
+    /// [`Gutter::Checkbox`]. `None` off task items (and on an over-nested one,
+    /// which renders as plain body text).
+    pub task: Option<bool>,
     /// True to draw a horizontal rule for this line: a thematic break (`---`)
     /// whose cursor has left, so its raw markers are collapsed. While the cursor is
     /// on the line this is false and the editable `---` shows instead.
@@ -188,6 +199,11 @@ pub enum Gutter {
     None,
     /// Paint a bullet point `•` in place of a `-`/`+`/`*` marker's glyph.
     Bullet,
+    /// Draw a checkbox (built from fills, no glyph dependency) in place of a
+    /// task item's `- [ ]`/`- [x]` marker, once the cursor leaves the line; on
+    /// the cursor's own line the raw marker shows for editing instead. The box
+    /// geometry is [`Layout::checkbox_rect`], shared with click hit-testing.
+    Checkbox { checked: bool },
     /// Draw a blockquote bar down the gutter. `marker` is true on the first line,
     /// where the bar stands in for the `>` marker (whose glyphs are not drawn),
     /// and false on wrapped continuations, which have no marker run of their own.
@@ -413,6 +429,7 @@ impl Layout {
                                 gutter: Gutter::None,
                                 code_block: false,
                                 heading: None,
+                                task: None,
                                 rule: false,
                                 image: Some(image),
                             });
@@ -485,6 +502,12 @@ impl Layout {
                 markdown::LineStyle::Heading(level) => Some(level),
                 _ => None,
             };
+            // Stamped on every segment of a task item, so a checked item's text
+            // dims and strikes through wrapped continuations too.
+            let task = match style {
+                markdown::LineStyle::Task { checked } => Some(checked),
+                _ => None,
+            };
             // A thematic break draws as a horizontal rule once the cursor leaves
             // it; on the line itself the raw `---` shows (and `revealed` is true),
             // matching how a heading reveals its `#`.
@@ -504,7 +527,9 @@ impl Layout {
             // panel; a list item shifts right by a small indent (one side only).
             let is_list = matches!(
                 style,
-                markdown::LineStyle::Bullet | markdown::LineStyle::Ordered
+                markdown::LineStyle::Bullet
+                    | markdown::LineStyle::Ordered
+                    | markdown::LineStyle::Task { .. }
             );
             let (seg_pad, wrap_reduce) = if code_block {
                 (CODE_PAD_X, 2 * CODE_PAD_X)
@@ -544,6 +569,12 @@ impl Layout {
                 // `> ` for editing, drawing the bar only once the cursor leaves.
                 let gutter = match style {
                     markdown::LineStyle::Bullet if k == 0 => Gutter::Bullet,
+                    // A task item draws its checkbox only once the cursor leaves
+                    // (like a quote's bar): on the line itself the raw `- [ ]` is
+                    // the editable source, and a click there edits, not toggles.
+                    markdown::LineStyle::Task { checked } if k == 0 && !revealed => {
+                        Gutter::Checkbox { checked }
+                    }
                     markdown::LineStyle::Quote if !revealed => Gutter::QuoteBar { marker: k == 0 },
                     _ => Gutter::None,
                 };
@@ -568,6 +599,7 @@ impl Layout {
                     gutter,
                     code_block,
                     heading,
+                    task,
                     rule,
                     image: None,
                 });
@@ -589,6 +621,7 @@ impl Layout {
                     gutter: Gutter::None,
                     code_block: false,
                     heading: None,
+                    task: None,
                     rule: false,
                     image: Some(image),
                 });
@@ -647,6 +680,62 @@ impl Layout {
     pub fn rule_at(&self, fonts: &Fonts, y: f32) -> Option<(usize, usize)> {
         let line = self.line_for_y(fonts, y);
         line.rule.then_some((line.start, line.end))
+    }
+
+    /// The drawn checkbox's rectangle in content space for a task line whose
+    /// gutter is [`Gutter::Checkbox`]: a square centered over the marker's
+    /// `[ ]`/`[x]` brackets (so toggling the reveal barely shifts it), sized to
+    /// the line's metrics and never wider than the marker it replaces (the
+    /// width-matched substitution the no-reflow invariant needs). The painter
+    /// draws the box here and [`Self::checkbox_at`] hit-tests clicks against it,
+    /// so the two always agree. `None` for any other line, including a revealed
+    /// task line, which shows its raw editable marker instead.
+    pub(crate) fn checkbox_rect(
+        &self,
+        fonts: &Fonts,
+        rope: &Rope,
+        line: &VisualLine,
+    ) -> Option<Rect> {
+        if !matches!(line.gutter, Gutter::Checkbox { .. }) {
+            return None;
+        }
+        // The block marker is the line's first run: `<indent>- [c] `. A wrap so
+        // narrow it splits the marker mid-way (degenerate) just draws no box.
+        let run = line.runs.first()?;
+        let marker = rope.byte_slice(run.start..run.end);
+        let indent = markdown::leading_indent(&marker);
+        let brackets = marker.get(indent + 2..indent + 5)?;
+        let face = fonts.face(line.size, FontStyle::Regular);
+        let pre = render::text_advance(face, marker.get(..indent + 2)?);
+        let brackets_w = render::text_advance(face, brackets);
+        let m = fonts.metrics(line.size);
+        let side = (m.ascent * 4 / 5).max(8);
+        let x = self.left + line.indent + (pre + (brackets_w - side as f32) / 2.0).round() as i32;
+        // Centered on the middle of the ascent band, where the glyphs' bulk sits.
+        let y = line.baseline - (m.ascent + side) / 2;
+        Some(Rect {
+            x,
+            y,
+            w: side,
+            h: side,
+        })
+    }
+
+    /// The logical-line start of the task item whose drawn checkbox contains
+    /// content-space `(x, y)`, or `None`. Only a non-revealed task line draws a
+    /// checkbox (the cursor's own line shows its raw marker, where clicks
+    /// edit), so a hit here always means "toggle", never "place the caret".
+    /// The target is padded a little past the drawn box for clickability.
+    pub fn checkbox_at(&self, fonts: &Fonts, rope: &Rope, x: f32, y: f32) -> Option<usize> {
+        let line = self.line_for_y(fonts, y);
+        let rect = self.checkbox_rect(fonts, rope, line)?;
+        let target = Rect {
+            x: rect.x - CHECKBOX_HIT_PAD,
+            y: rect.y - CHECKBOX_HIT_PAD,
+            w: rect.w + 2 * CHECKBOX_HIT_PAD,
+            h: rect.h + 2 * CHECKBOX_HIT_PAD,
+        };
+        rect_contains(&target, x, y).then_some(line.start)
     }
 
     /// The picture's rectangle in content space for an image `line` (the painter
@@ -929,13 +1018,6 @@ impl Layout {
     }
 }
 
-/// Resolve a line's block style against the running list nesting `list_depth`
-/// (the depth of the most recent valid list item, or `None` outside a list),
-/// returning the effective style and its block-marker length. A list item nests
-/// by leading indentation ([`markdown::LIST_INDENT_SPACES`] per level); it only
-/// renders as a list item when its parent, one level shallower, is present above
-/// it, otherwise it falls back to plain body text (marker length `0`). Blank
-/// lines leave the nesting untouched; any other non-list line ends it.
 /// Display size for an image of intrinsic size `iw` x `ih` shown in a `column`
 /// of pixels: the intrinsic size when it already fits, otherwise scaled down to
 /// the column width with its aspect ratio preserved. Never upscaled (a small
@@ -972,15 +1054,24 @@ fn rect_contains(rect: &Rect, x: f32, y: f32) -> bool {
         && y < (rect.y + rect.h) as f32
 }
 
+/// Resolve a line's block style against the running list nesting `list_depth`
+/// (the depth of the most recent valid list item, or `None` outside a list),
+/// returning the effective style and its block-marker length. A list item nests
+/// by leading indentation ([`markdown::LIST_INDENT_SPACES`] per level); it only
+/// renders as a list item when its parent, one level shallower, is present above
+/// it, otherwise it falls back to plain body text (marker length `0`). Blank
+/// lines leave the nesting untouched; any other non-list line ends it.
 fn resolve_list(line: &str, list_depth: &mut Option<usize>) -> (markdown::LineStyle, usize) {
-    let style = markdown::style_of(line);
+    let (style, marker) = markdown::classify(line);
     match style {
-        markdown::LineStyle::Bullet | markdown::LineStyle::Ordered => {
+        markdown::LineStyle::Bullet
+        | markdown::LineStyle::Ordered
+        | markdown::LineStyle::Task { .. } => {
             let depth = markdown::leading_indent(line) / markdown::LIST_INDENT_SPACES;
             let allowed = list_depth.map_or(0, |d| d + 1);
             if depth <= allowed {
                 *list_depth = Some(depth);
-                (style, markdown::marker_len(line))
+                (style, marker)
             } else {
                 // Over-nested: no parent one level up, so render as plain text.
                 *list_depth = None;
@@ -991,7 +1082,7 @@ fn resolve_list(line: &str, list_depth: &mut Option<usize>) -> (markdown::LineSt
             if !line.trim().is_empty() {
                 *list_depth = None;
             }
-            (other, markdown::marker_len(line))
+            (other, marker)
         }
     }
 }
@@ -1961,6 +2052,181 @@ mod tests {
             LIST_INDENT + marker_w,
             "and wrapped lines still hang-indent past it"
         );
+    }
+
+    // --- Task lists ---------------------------------------------------------
+
+    #[test]
+    fn a_task_line_draws_a_checkbox_off_line_and_raw_marker_on_it() {
+        let f = fonts();
+        let src = "- [ ] todo\nx";
+        let r = rope(src);
+        let off = src.find('x').unwrap();
+        let away = Layout::build(&f, &r, LEFT, TOP, 1_000_000, BODY, (off, off));
+        assert_eq!(
+            away.lines()[0].gutter,
+            Gutter::Checkbox { checked: false },
+            "the checkbox stands in once the cursor leaves"
+        );
+        assert!(
+            away.lines()[0].runs[0].visible,
+            "the marker run persists (width-matched under the drawn box)"
+        );
+        let on = Layout::build(&f, &r, LEFT, TOP, 1_000_000, BODY, (0, 0));
+        assert_eq!(
+            on.lines()[0].gutter,
+            Gutter::None,
+            "the raw `- [ ]` shows while editing"
+        );
+        assert!(on.lines()[0].runs[0].visible);
+    }
+
+    #[test]
+    fn a_checked_task_carries_its_state_into_gutter_and_line() {
+        let f = fonts();
+        let src = "- [x] done\nx";
+        let r = rope(src);
+        // Cursor on the trailing body line, so the task line renders.
+        let off = src.len() - 1;
+        let l = Layout::build(&f, &r, LEFT, TOP, 1_000_000, BODY, (off, off));
+        assert_eq!(l.lines()[0].gutter, Gutter::Checkbox { checked: true });
+        assert_eq!(l.lines()[0].task, Some(true), "the line knows it is done");
+        assert_eq!(l.lines()[1].task, None, "body lines are not tasks");
+    }
+
+    #[test]
+    fn a_wrapped_task_item_stamps_task_on_continuations_without_a_second_box() {
+        let f = fonts();
+        let src = "- [x] aaaaa bbbbb\nx";
+        let r = rope(src);
+        // Cursor on the trailing body line, so the task item renders.
+        let off = src.len() - 1;
+        let l = Layout::build(
+            &f,
+            &r,
+            LEFT,
+            TOP,
+            wrap_after(&f, "- [x] aaaaa ") + LIST_INDENT,
+            BODY,
+            (off, off),
+        );
+        let lines = l.lines();
+        assert!(lines.len() >= 3, "the item wraps, then the plain line");
+        assert_eq!(lines[0].gutter, Gutter::Checkbox { checked: true });
+        assert_eq!(
+            lines[1].gutter,
+            Gutter::None,
+            "no second checkbox on the continuation"
+        );
+        assert_eq!(
+            lines[1].task,
+            Some(true),
+            "the continuation still dims and strikes"
+        );
+        let marker_w =
+            render::text_advance(f.face(BODY, FontStyle::Regular), "- [x] ").round() as i32;
+        assert_eq!(
+            lines[1].indent,
+            LIST_INDENT + marker_w,
+            "continuations hang under the text, past the whole task marker"
+        );
+    }
+
+    #[test]
+    fn nested_tasks_follow_list_nesting() {
+        let f = fonts();
+        // A task under a bullet parent renders; an over-nested one is body.
+        let r = rope("- a\n  - [ ] sub\n    - [ ] fine");
+        let l = Layout::build(&f, &r, LEFT, TOP, 1_000_000, BODY, (99, 99));
+        assert_eq!(
+            l.lines()[1].gutter,
+            Gutter::Checkbox { checked: false },
+            "a nested task with a parent draws its box"
+        );
+        assert_eq!(
+            l.lines()[2].gutter,
+            Gutter::Checkbox { checked: false },
+            "each level deeper by one keeps nesting"
+        );
+        let over = rope("- a\n    - [ ] orphan");
+        let l = Layout::build(&f, &over, LEFT, TOP, 1_000_000, BODY, (99, 99));
+        assert_eq!(l.lines()[1].gutter, Gutter::None, "no parent, no box");
+        assert_eq!(l.lines()[1].task, None, "an orphan renders as plain body");
+    }
+
+    #[test]
+    fn checkbox_rect_sits_over_the_brackets_within_the_marker() {
+        let f = fonts();
+        // A nested task under a parent, so its indentation offsets the box.
+        let r = rope("- a\n  - [ ] sub\nx");
+        let off = r.len() - 1;
+        let l = Layout::build(&f, &r, LEFT, TOP, 1_000_000, BODY, (off, off));
+        let line = &l.lines()[1];
+        let rect = l
+            .checkbox_rect(&f, &r, line)
+            .expect("a non-revealed task line has a box");
+        let face = f.face(BODY, FontStyle::Regular);
+        let pre = render::text_advance(face, "  - ");
+        let marker = render::text_advance(face, "  - [ ] ");
+        assert!(
+            rect.x as f32 >= LEFT as f32 + line.indent as f32 + pre - 1.0,
+            "the box starts at or after the brackets (past the indent and dash)"
+        );
+        assert!(
+            (rect.x + rect.w) as f32 <= LEFT as f32 + line.indent as f32 + marker + 1.0,
+            "and ends within the marker's advance (width-matched substitution)"
+        );
+        assert!(rect.w >= 8 && rect.h == rect.w, "a sensible square");
+        let m = f.metrics(BODY);
+        assert!(
+            rect.y >= line.baseline - m.ascent && rect.y + rect.h <= line.baseline + m.descent,
+            "vertically inside the line's box"
+        );
+        // With the cursor on the task line the raw marker shows: no drawn box.
+        let task_start = 4;
+        let on = Layout::build(&f, &r, LEFT, TOP, 1_000_000, BODY, (task_start, task_start));
+        assert!(on.checkbox_rect(&f, &r, &on.lines()[1]).is_none());
+    }
+
+    #[test]
+    fn checkbox_at_hits_the_box_and_only_the_box() {
+        let f = fonts();
+        let src = "- [ ] todo\nx";
+        let r = rope(src);
+        let off = src.find('x').unwrap();
+        let l = Layout::build(&f, &r, LEFT, TOP, 1_000_000, BODY, (off, off));
+        let rect = l
+            .checkbox_rect(&f, &r, &l.lines()[0])
+            .expect("the box exists");
+        let (cx, cy) = ((rect.x + rect.w / 2) as f32, (rect.y + rect.h / 2) as f32);
+        assert_eq!(l.checkbox_at(&f, &r, cx, cy), Some(0), "center hit");
+        assert_eq!(
+            l.checkbox_at(&f, &r, cx + 200.0, cy),
+            None,
+            "the item's text is not the checkbox"
+        );
+        assert_eq!(
+            l.checkbox_at(&f, &r, cx, cy + 200.0),
+            None,
+            "another line is not the checkbox"
+        );
+        // On the revealed line the raw marker shows and clicks edit, not toggle.
+        let on = Layout::build(&f, &r, LEFT, TOP, 1_000_000, BODY, (0, 0));
+        assert_eq!(on.checkbox_at(&f, &r, cx, cy), None);
+    }
+
+    #[test]
+    fn task_reveal_state_does_not_change_vertical_layout() {
+        let f = fonts();
+        let r = rope("- [x] a task long enough to wrap somewhere\nbody");
+        let hidden = Layout::build(&f, &r, LEFT, TOP, 200, BODY, (99, 99));
+        let shown = Layout::build(&f, &r, LEFT, TOP, 200, BODY, (0, 0));
+        assert_eq!(hidden.lines().len(), shown.lines().len());
+        for (h, s) in hidden.lines().iter().zip(shown.lines()) {
+            assert_eq!(h.baseline, s.baseline, "baselines are reveal-independent");
+            assert_eq!((h.start, h.end), (s.start, s.end), "and so are the breaks");
+        }
+        assert_eq!(hidden.text_height(), shown.text_height());
     }
 
     // --- Fenced code blocks -----------------------------------------------

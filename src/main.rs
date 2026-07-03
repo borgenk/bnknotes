@@ -5,15 +5,18 @@ mod app;
 mod browser;
 mod conn;
 mod display;
+mod dmabuf;
 mod error;
 mod ffi;
 mod file;
 mod find;
 mod freetype;
+mod gpu;
 mod grapheme;
 mod image;
 mod layout;
 mod markdown;
+mod parity;
 mod perf;
 mod protocol;
 mod regex;
@@ -23,15 +26,23 @@ mod scroll;
 mod shape;
 mod shm;
 mod text;
+mod vulkan;
 mod wire;
 mod xkb;
 
 fn main() {
-    // `--perf` runs the offline performance harness instead of opening a window;
-    // everything else launches the editor (with an optional file path).
+    // `--perf` runs the offline performance harness, `--gpu-probe` reports
+    // what the compositor offers the GPU presentation path, and `--gpu-parity`
+    // compares CPU and GPU renderings of fixture frames, all without opening
+    // a window; everything else launches the editor (with an optional file
+    // path).
     let args: Vec<String> = std::env::args().skip(1).collect();
     let result = if args.iter().any(|a| a == "--perf") {
         perf::run(&args)
+    } else if args.iter().any(|a| a == "--gpu-probe") {
+        app::gpu_probe()
+    } else if args.iter().any(|a| a == "--gpu-parity") {
+        parity::run()
     } else {
         app::run()
     };

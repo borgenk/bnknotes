@@ -25,11 +25,13 @@ use std::time::{Duration, Instant};
 
 use crate::conn::{Connection, Fill};
 use crate::display::{self, DisplayList, DrawCmd};
+use crate::dmabuf;
 use crate::error::{Error, Result};
 use crate::ffi;
 use crate::file::{self, FileFormat};
 use crate::find::{self, FindState};
 use crate::freetype::{FaceKey, FontStyle, Fonts, Metrics};
+use crate::gpu;
 use crate::grapheme;
 use crate::image::ImageStore;
 use crate::layout::{face_key, image_button_rect, Gutter, ImageUi, Layout, Rect};
@@ -38,12 +40,14 @@ use crate::protocol::{
     self, wl_buffer, wl_callback, wl_compositor, wl_data_device, wl_data_device_manager,
     wl_data_offer, wl_data_source, wl_display, wl_keyboard, wl_pointer, wl_registry, wl_seat,
     wl_shm, wl_shm_pool, wl_surface, wp_cursor_shape_device_v1, wp_cursor_shape_manager_v1,
-    xdg_surface, xdg_toplevel, xdg_wm_base,
+    xdg_surface, xdg_toplevel, xdg_wm_base, zwp_linux_buffer_params_v1,
+    zwp_linux_dmabuf_feedback_v1, zwp_linux_dmabuf_v1,
 };
 use crate::render::{self, Canvas};
 use crate::scroll;
 use crate::shm::Pool;
 use crate::text::TextBuffer;
+use crate::vulkan;
 use crate::wire::{Arg, Message, Reader};
 use crate::xkb::{KeyAction, Xkb};
 
@@ -173,6 +177,14 @@ pub fn run() -> Result<()> {
     State::new(path)?.bring_up()
 }
 
+/// `--gpu-probe`: report what the compositor offers the dmabuf presentation
+/// path (and, in later milestones, what the GPU offers), without opening a
+/// window. This is the same negotiation the editor performs at startup, so a
+/// successful probe means the GPU backend's protocol prerequisites hold.
+pub fn gpu_probe() -> Result<()> {
+    State::new(None)?.probe_dmabuf()
+}
+
 /// Read `path` into buffer text and its on-disk [`FileFormat`]. A path that does
 /// not exist yet is not an error: it opens an empty buffer that a later save
 /// creates, so `bnknotes new-note.md` works.
@@ -254,6 +266,27 @@ struct State {
     pointer: u32,
     data_device_manager: Option<u32>,
     data_device: u32,
+    /// The dmabuf global (None when absent or below v4, which the GPU path
+    /// requires), the version it was bound at, the feedback object created from
+    /// it, and the accumulating feedback the GPU backend consumes. The software
+    /// path never reads these; they are the negotiation half of the GPU path.
+    dmabuf: Option<u32>,
+    dmabuf_version: u32,
+    dmabuf_feedback: u32,
+    dmabuf_fb: dmabuf::FeedbackState,
+    /// The Vulkan backend when active (`None` runs the software wl_shm path):
+    /// the device plus one exportable image per swap slot, sharing the same
+    /// `buffers`/`busy` bookkeeping as the shm path. Activated by
+    /// `BNKNOTES_RENDERER=gpu` while the backend is under construction; the
+    /// default flips to probe-gated GPU when the display-list executor lands.
+    gpu: Option<vulkan::Gpu>,
+    gpu_images: Vec<vulkan::GpuImage>,
+    /// The compositor∩device modifier list images are allocated with,
+    /// computed once at GPU init and reused across resizes.
+    gpu_modifiers: Vec<u64>,
+    /// The GPU path's persistent glyph/emoji atlases (CPU mirrors plus slot
+    /// records); steady-state frames insert nothing and upload nothing.
+    gpu_glyphs: gpu::GlyphCache,
     /// The cursor-shape manager (if the compositor offers it) and the shape
     /// device we create for our pointer. The shape varies by what is under the
     /// pointer: a hand over an image's button, the plain arrow over a picture, the
@@ -431,6 +464,14 @@ impl State {
             pointer: 0,
             data_device_manager: None,
             data_device: 0,
+            dmabuf: None,
+            dmabuf_version: 0,
+            dmabuf_feedback: 0,
+            dmabuf_fb: dmabuf::FeedbackState::default(),
+            gpu: None,
+            gpu_images: Vec::new(),
+            gpu_modifiers: Vec::new(),
+            gpu_glyphs: gpu::GlyphCache::new(),
             cursor_shape_manager: None,
             cursor_shape_device: 0,
             pointer_serial: 0,
@@ -515,6 +556,23 @@ impl State {
         self.seat
             .ok_or_else(|| Error::msg("compositor has no wl_seat"))?;
 
+        // The GPU backend is the default: negotiate over dmabuf
+        // feedback and bring Vulkan up; any failure means the software path,
+        // reported only under stats so a machine without a GPU is not nagged
+        // on every launch. `BNKNOTES_RENDERER=cpu` skips the attempt (the
+        // escape hatch, and what the parity harness compares against).
+        self.request_dmabuf_feedback();
+        if std::env::var_os("BNKNOTES_RENDERER").is_none_or(|v| v != "cpu") {
+            // The GPU path needs the committed feedback (device, modifiers)
+            // before it can allocate buffers, so wait out the burst here.
+            self.roundtrip()?;
+            if let Err(e) = self.init_gpu() {
+                if self.stats {
+                    eprintln!("bnknotes: gpu unavailable, software rendering: {e}");
+                }
+            }
+        }
+
         // Surface stack: wl_surface -> xdg_surface -> xdg_toplevel.
         self.surface = self.alloc_id();
         self.conn.request(
@@ -569,12 +627,71 @@ impl State {
              Ctrl+Backspace/Delete delete a word; Ctrl+A/C/X/V select-all/copy/cut/paste, \
              Ctrl+Z/Y undo/redo, Ctrl+S save; held keys repeat; close to exit"
         );
+        // Name the active renderer, so "is it on the GPU?" never needs a
+        // probe. The live-fallback path prints its own line if this changes.
+        match &self.gpu {
+            Some(gpu) => eprintln!("bnknotes: renderer: gpu ({})", gpu.name()),
+            None => eprintln!("bnknotes: renderer: software (wl_shm)"),
+        }
         self.run_until(|s| s.closed)?;
         Ok(())
     }
 
-    /// Allocate the shm pool and its two buffers at the current size.
+    /// Bring the Vulkan backend up from the committed dmabuf feedback: a
+    /// device matching the compositor's, and a modifier list their common
+    /// ground. Called before `create_buffers`, which then allocates GPU
+    /// images instead of an shm pool.
+    fn init_gpu(&mut self) -> Result<()> {
+        if self.dmabuf.is_none() {
+            return Err(Error::msg("compositor lacks zwp_linux_dmabuf_v1 v4+"));
+        }
+        let fb = self
+            .dmabuf_fb
+            .ready()
+            .ok_or_else(|| Error::msg("dmabuf feedback never committed"))?;
+        let main_device = fb.main_device;
+        let compositor_mods = fb.modifiers_for(dmabuf::DRM_FORMAT_XRGB8888);
+        if compositor_mods.is_empty() {
+            return Err(Error::msg("compositor does not accept XRGB8888 dmabufs"));
+        }
+        let gpu = vulkan::Gpu::new(Some(main_device))?;
+        let mods = gpu.image_modifiers(&compositor_mods);
+        if mods.is_empty() {
+            return Err(Error::msg(
+                "no common DRM modifier between compositor and device",
+            ));
+        }
+        self.gpu_modifiers = mods;
+        self.gpu = Some(gpu);
+        Ok(())
+    }
+
+    /// Drop a failed GPU backend so the software path takes over: destroy its
+    /// buffers and images, the device (its Drop drains the queue), and the
+    /// CPU-side glyph cache. The caller recreates buffers on the shm path.
+    fn drop_gpu_backend(&mut self) {
+        self.destroy_buffers();
+        self.gpu = None;
+        self.gpu_modifiers.clear();
+        self.gpu_glyphs = gpu::GlyphCache::new();
+    }
+
+    /// Allocate presentable buffers at the current size: GPU images exported
+    /// as dmabufs when the Vulkan backend is up, an shm pool otherwise. A GPU
+    /// allocation failure (resize on a dying device) demotes to software
+    /// rather than exiting.
     fn create_buffers(&mut self) -> Result<()> {
+        if self.gpu.is_some() {
+            match self.create_gpu_buffers() {
+                Ok(()) => return Ok(()),
+                Err(e) => {
+                    eprintln!("bnknotes: gpu buffers failed, switching to software: {e}");
+                    // Any half-created image leaks only until the device goes
+                    // down with the backend, right here.
+                    self.drop_gpu_backend();
+                }
+            }
+        }
         let shm = self
             .shm
             .ok_or_else(|| Error::msg("creating buffers before wl_shm was bound"))?;
@@ -629,8 +746,73 @@ impl State {
         Ok(())
     }
 
-    /// Destroy the current buffers and pool, freeing the mapping. The server
-    /// recycles the ids via `delete_id` into our free list.
+    /// The dmabuf twin of the shm `create_buffers`: one exported image per
+    /// swap slot, each wrapped in a wl_buffer via `zwp_linux_buffer_params_v1`
+    /// (`create_immed` is sound because every parameter comes from the
+    /// compositor's own feedback).
+    fn create_gpu_buffers(&mut self) -> Result<()> {
+        let dmabuf_global = self
+            .dmabuf
+            .ok_or_else(|| Error::msg("gpu buffers without zwp_linux_dmabuf_v1"))?;
+        let (w, h) = (self.width, self.height);
+        let mut images = Vec::with_capacity(2);
+        {
+            let Some(gpu) = self.gpu.as_ref() else {
+                return Err(Error::msg("gpu buffers without a gpu backend"));
+            };
+            for _ in 0..2 {
+                images.push(gpu.create_image(w, h, &self.gpu_modifiers)?);
+            }
+        }
+        for (i, img) in images.iter().enumerate() {
+            let params = self.alloc_id();
+            self.conn.request(
+                dmabuf_global,
+                zwp_linux_dmabuf_v1::CREATE_PARAMS,
+                &[Arg::NewId(params)],
+            );
+            let modifier = img.modifier();
+            self.conn.request_with_fd(
+                params,
+                zwp_linux_buffer_params_v1::ADD,
+                &[
+                    Arg::Uint(0), // plane index
+                    Arg::Uint(img.offset()),
+                    Arg::Uint(img.stride()),
+                    Arg::Uint((modifier >> 32) as u32),
+                    Arg::Uint(modifier as u32),
+                ],
+                img.fd(),
+            )?;
+            let buffer = self.alloc_id();
+            self.conn.request(
+                params,
+                zwp_linux_buffer_params_v1::CREATE_IMMED,
+                &[
+                    Arg::NewId(buffer),
+                    Arg::Int(w as i32),
+                    Arg::Int(h as i32),
+                    Arg::Uint(dmabuf::DRM_FORMAT_XRGB8888),
+                    Arg::Uint(0),
+                ],
+            );
+            self.conn
+                .request(params, zwp_linux_buffer_params_v1::DESTROY, &[]);
+            self.buffers[i] = buffer;
+        }
+        self.gpu_images = images;
+        self.busy = [false, false];
+        // Fresh images hold no known frame; force full repaints as the shm
+        // path does (the GPU path repaints fully regardless, but the screen
+        // diff also gates presenting at all).
+        self.buffer_lists = [Rc::default(), Rc::default()];
+        self.present_list = Rc::default();
+        Ok(())
+    }
+
+    /// Destroy the current buffers and their backing (shm pool or GPU
+    /// images). The server recycles the ids via `delete_id` into our free
+    /// list.
     fn destroy_buffers(&mut self) {
         let buffers = self.buffers;
         for b in buffers {
@@ -640,6 +822,14 @@ impl State {
         }
         if self.pool_id != 0 {
             self.conn.request(self.pool_id, wl_shm_pool::DESTROY, &[]);
+        }
+        if let Some(gpu) = &self.gpu {
+            // Nothing may be in flight while images are destroyed; resize is
+            // rare enough that a full drain is the simple correct answer.
+            gpu.wait_idle();
+            for img in self.gpu_images.drain(..) {
+                gpu.destroy_image(img);
+            }
         }
         self.pool = None; // Drop unmaps and closes the fd.
         self.pool_id = 0;
@@ -713,6 +903,20 @@ impl State {
     /// An idle caret blink thus repaints a caret-sized region (often nothing, when
     /// the chosen buffer already holds that state) instead of the whole surface.
     fn render_frame(&mut self) -> Result<bool> {
+        if self.gpu.is_some() {
+            match self.render_frame_gpu() {
+                Ok(done) => return Ok(done),
+                Err(e) => {
+                    // A device lost mid-session (driver update, GPU reset) is
+                    // survivable: rebuild the software path live and repaint.
+                    // Nothing was committed for this frame, so the swap to
+                    // fresh shm buffers is invisible beyond one log line.
+                    eprintln!("bnknotes: gpu rendering failed, switching to software: {e}");
+                    self.drop_gpu_backend();
+                    self.create_buffers()?;
+                }
+            }
+        }
         let Some(idx) = (0..2).find(|&i| !self.busy[i]) else {
             return Ok(false);
         };
@@ -829,6 +1033,125 @@ impl State {
                 .unwrap_or(0.0);
             eprintln!(
                 "[stats] frame {} {:.2}ms paint, {:.1}ms since last | glyphs hit {} miss {} ({:.1}% of {})",
+                self.frame_count,
+                started.elapsed().as_secs_f64() * 1000.0,
+                gap,
+                cache.hits,
+                cache.misses,
+                cache.hit_rate() * 100.0,
+                cache.lookups(),
+            );
+            self.last_present = Some(started);
+        }
+        self.frame_count += 1;
+        Ok(true)
+    }
+
+    /// The GPU frame: build the display list exactly as the software path
+    /// does, keep its identical-frame early-out and screen-damage hints, then
+    /// hand the list to the batcher and the Vulkan renderer. The per-buffer
+    /// diff is skipped: the GPU repaints the full frame every present.
+    fn render_frame_gpu(&mut self) -> Result<bool> {
+        let Some(idx) = (0..2).find(|&i| !self.busy[i]) else {
+            return Ok(false);
+        };
+        let started = self.stats.then(Instant::now);
+        self.ensure_layout();
+        self.scroll_y = scroll::clamp(self.scroll_y, self.content_height, self.height as i32);
+        let (sw, sh) = (self.width as i32, self.height as i32);
+        let find = if self.find.is_open() {
+            Some(FindPaint {
+                query: self.find.query(),
+                replace: self.find.show_replace().then(|| self.find.replacement()),
+                focus_replace: self.find.focus() == find::Field::Replace,
+                selected: self.find.selected(),
+                word: self.find.word(),
+                regex: self.find.regex(),
+                error: self.find.error(),
+                matches: self.find.matches(),
+                current: self.find.current(),
+            })
+        } else {
+            None
+        };
+        let params = PaintParams {
+            width: self.width as usize,
+            height: self.height as usize,
+            scroll_y: self.scroll_y,
+            selection: self.text.selection(),
+            cursor: self.text.cursor(),
+            caret_visible: self.caret_visible,
+            find,
+        };
+        let new_list = {
+            let Some(layout) = self.layout_cache.as_ref() else {
+                return Ok(false);
+            };
+            Rc::new(build_display_list(
+                &self.fonts,
+                layout,
+                self.text.rope(),
+                &params,
+            ))
+        };
+
+        // Nothing changed since the on-screen frame: nothing to present (the
+        // common idle case), exactly as the software path decides it.
+        let screen_dmg = display::damage(&self.present_list, &new_list, sw, sh);
+        if screen_dmg.is_empty() {
+            return Ok(true);
+        }
+
+        {
+            let Some(gpu) = self.gpu.as_mut() else {
+                return Err(Error::msg("gpu frame without a gpu backend"));
+            };
+            let Some(img) = self.gpu_images.get_mut(idx) else {
+                return Err(Error::msg("gpu frame without gpu buffers"));
+            };
+            let known = |key: &gpu::ImageKey| gpu.has_image(key);
+            let frame = gpu::build_frame(
+                &self.fonts,
+                &self.images,
+                &new_list,
+                &mut self.gpu_glyphs,
+                &known,
+            );
+            gpu.render_list(img, &frame, color_f32(BACKGROUND))?;
+        }
+        self.present_list = new_list;
+
+        let buffer = self.buffers[idx];
+        self.conn.request(
+            self.surface,
+            wl_surface::ATTACH,
+            &[Arg::Object(buffer), Arg::Int(0), Arg::Int(0)],
+        );
+        // The GPU repainted everything, but the *screen* change is still just
+        // the diff, so report those regions and let the compositor
+        // recomposite only what moved.
+        for r in &screen_dmg {
+            self.conn.request(
+                self.surface,
+                wl_surface::DAMAGE,
+                &[Arg::Int(r.x), Arg::Int(r.y), Arg::Int(r.w), Arg::Int(r.h)],
+            );
+        }
+        let callback = self.alloc_id();
+        self.conn
+            .request(self.surface, wl_surface::FRAME, &[Arg::NewId(callback)]);
+        self.frame_callback = callback;
+        self.conn.request(self.surface, wl_surface::COMMIT, &[]);
+        self.busy[idx] = true;
+
+        if let Some(started) = started {
+            let cache = self.fonts.cache_stats();
+            let gap = self
+                .last_present
+                .map(|t| started.duration_since(t).as_secs_f64() * 1000.0)
+                .unwrap_or(0.0);
+            eprintln!(
+                "[stats] gpu frame {} {:.2}ms build+submit, {:.1}ms since last | glyphs hit {} miss {} ({:.1}% of {})",
                 self.frame_count,
                 started.elapsed().as_secs_f64() * 1000.0,
                 gap,
@@ -975,12 +1298,179 @@ impl State {
             return Ok(());
         }
 
+        if self.dmabuf_feedback != 0 && msg.object == self.dmabuf_feedback {
+            return self.on_dmabuf_feedback(msg.opcode, &mut r);
+        }
+
         if msg.opcode == wl_buffer::EV_RELEASE {
             if msg.object == self.buffers[0] {
                 self.busy[0] = false;
             } else if msg.object == self.buffers[1] {
                 self.busy[1] = false;
             }
+        }
+        Ok(())
+    }
+
+    /// Ask the dmabuf global for its default feedback. The events accumulate in
+    /// `dmabuf_fb` as they arrive; nothing waits on them.
+    fn request_dmabuf_feedback(&mut self) {
+        let Some(dmabuf) = self.dmabuf else {
+            return;
+        };
+        let id = self.alloc_id();
+        self.conn.request(
+            dmabuf,
+            zwp_linux_dmabuf_v1::GET_DEFAULT_FEEDBACK,
+            &[Arg::NewId(id)],
+        );
+        self.dmabuf_feedback = id;
+    }
+
+    /// One event of a feedback burst; `dmabuf_fb` accumulates and commits.
+    fn on_dmabuf_feedback(&mut self, opcode: u16, r: &mut Reader) -> Result<()> {
+        match opcode {
+            zwp_linux_dmabuf_feedback_v1::EV_FORMAT_TABLE => {
+                let size = r.u32()? as usize;
+                let fd = self.conn.take_fd().ok_or_else(|| {
+                    Error::msg("dmabuf feedback format_table arrived without its fd")
+                })?;
+                if size == 0 {
+                    self.dmabuf_fb.set_table(&[]);
+                    return Ok(());
+                }
+                let ptr = ffi::mmap_ro(fd.as_raw_fd(), size)?;
+                // SAFETY: ptr maps `size` readable bytes from the table fd; the
+                // bytes are copied out before the mapping is released.
+                let bytes = unsafe { core::slice::from_raw_parts(ptr, size) }.to_vec();
+                // SAFETY: ptr/size came from mmap_ro and are not used again.
+                unsafe { ffi::unmap(ptr, size) };
+                self.dmabuf_fb.set_table(&bytes);
+            }
+            zwp_linux_dmabuf_feedback_v1::EV_MAIN_DEVICE => {
+                self.dmabuf_fb.main_device(r.array()?)?;
+            }
+            zwp_linux_dmabuf_feedback_v1::EV_TRANCHE_TARGET_DEVICE => {
+                self.dmabuf_fb.tranche_device(r.array()?)?;
+            }
+            zwp_linux_dmabuf_feedback_v1::EV_TRANCHE_FORMATS => {
+                self.dmabuf_fb.tranche_formats(r.array()?);
+            }
+            zwp_linux_dmabuf_feedback_v1::EV_TRANCHE_FLAGS => {
+                self.dmabuf_fb.tranche_flags(r.u32()?);
+            }
+            zwp_linux_dmabuf_feedback_v1::EV_TRANCHE_DONE => self.dmabuf_fb.tranche_done(),
+            zwp_linux_dmabuf_feedback_v1::EV_DONE => self.dmabuf_fb.done(),
+            _ => {}
+        }
+        Ok(())
+    }
+
+    /// The `--gpu-probe` body: bind the registry, fetch dmabuf feedback, and
+    /// print what the GPU presentation path has to work with.
+    fn probe_dmabuf(&mut self) -> Result<()> {
+        self.registry = self.alloc_id();
+        self.conn.request(
+            protocol::WL_DISPLAY,
+            wl_display::GET_REGISTRY,
+            &[Arg::NewId(self.registry)],
+        );
+        self.roundtrip()?;
+        if self.dmabuf.is_none() {
+            println!(
+                "gpu-probe: compositor lacks zwp_linux_dmabuf_v1 v{}+; \
+                 the GPU path is unavailable (software rendering unaffected)",
+                protocol::VERSION_DMABUF
+            );
+            return Ok(());
+        }
+        println!(
+            "gpu-probe: zwp_linux_dmabuf_v1 bound at v{}",
+            self.dmabuf_version
+        );
+        // The server answers get_default_feedback before the sync that follows
+        // it, so one roundtrip delivers the whole feedback burst.
+        self.request_dmabuf_feedback();
+        self.roundtrip()?;
+        let Some(fb) = self.dmabuf_fb.ready() else {
+            return Err(Error::msg(
+                "compositor never committed dmabuf feedback (no done event)",
+            ));
+        };
+        println!(
+            "gpu-probe: format table: {} format+modifier pairs",
+            self.dmabuf_fb.table_len()
+        );
+        println!(
+            "gpu-probe: main device: {}:{}",
+            dmabuf::dev_major(fb.main_device),
+            dmabuf::dev_minor(fb.main_device)
+        );
+        for (i, t) in fb.tranches.iter().enumerate() {
+            println!(
+                "gpu-probe: tranche {i}: device {}:{}, flags {:#x}, {} pairs",
+                dmabuf::dev_major(t.device),
+                dmabuf::dev_minor(t.device),
+                t.flags,
+                t.formats.len()
+            );
+        }
+        let mods = fb.modifiers_for(dmabuf::DRM_FORMAT_XRGB8888);
+        if mods.is_empty() {
+            println!("gpu-probe: XRGB8888 is not offered; the GPU path needs it");
+            return Ok(());
+        }
+        let rendered: Vec<String> = mods
+            .iter()
+            .map(|&m| {
+                if m == dmabuf::MOD_LINEAR {
+                    "linear".to_string()
+                } else {
+                    format!("{m:#x}")
+                }
+            })
+            .collect();
+        println!("gpu-probe: XRGB8888 modifiers: {}", rendered.join(", "));
+
+        // The Vulkan half: can a device matching the compositor's be brought
+        // up with the extensions the presentation path needs, and can it
+        // actually allocate and export a presentable image? A failure here is
+        // the probe's answer, not an error.
+        let main_device = fb.main_device;
+        let gpu = match vulkan::Gpu::new(Some(main_device)) {
+            Ok(gpu) => gpu,
+            Err(e) => {
+                println!("gpu-probe: vulkan unavailable: {e}");
+                return Ok(());
+            }
+        };
+        println!(
+            "gpu-probe: vulkan device: {} (graphics queue family {})",
+            gpu.name(),
+            gpu.queue_family()
+        );
+        let common = gpu.image_modifiers(&mods);
+        if common.is_empty() {
+            println!("gpu-probe: no common DRM modifier; the GPU path is unavailable");
+            return Ok(());
+        }
+        println!(
+            "gpu-probe: common modifiers: {} of {}",
+            common.len(),
+            mods.len()
+        );
+        match gpu.create_image(64, 64, &common) {
+            Ok(img) => {
+                println!(
+                    "gpu-probe: test image exported: modifier {:#x}, stride {}, offset {}",
+                    img.modifier(),
+                    img.stride(),
+                    img.offset()
+                );
+                gpu.destroy_image(img);
+                println!("gpu-probe: ready (the editor would use the GPU path)");
+            }
+            Err(e) => println!("gpu-probe: image export failed: {e}"),
         }
         Ok(())
     }
@@ -1034,6 +1524,15 @@ impl State {
                     id,
                 );
                 self.cursor_shape_manager = Some(id);
+            }
+            // Only useful at v4+ (the feedback object); an older advertisement
+            // is left unbound and the GPU path simply stays unavailable.
+            protocol::IFACE_DMABUF if version >= protocol::VERSION_DMABUF => {
+                let id = self.alloc_id();
+                let bound = version.min(protocol::VERSION_DMABUF);
+                self.bind(name, interface, bound, id);
+                self.dmabuf = Some(id);
+                self.dmabuf_version = bound;
             }
             _ => {}
         }
@@ -2351,6 +2850,18 @@ impl State {
 /// Whether a clipboard MIME type carries text we can paste.
 fn is_text_mime(mime: &str) -> bool {
     mime.starts_with("text/") || mime == "UTF8_STRING"
+}
+
+/// A 0x00RRGGBB color as the linear-float RGBA a Vulkan clear expects. The
+/// software canvas treats the bytes as display (sRGB-encoded) values, so the
+/// GPU gets the same numbers, not a color-space conversion.
+fn color_f32(color: u32) -> [f32; 4] {
+    [
+        ((color >> 16) & 0xff) as f32 / 255.0,
+        ((color >> 8) & 0xff) as f32 / 255.0,
+        (color & 0xff) as f32 / 255.0,
+        1.0,
+    ]
 }
 
 /// The per-frame inputs [`paint_document`] needs beyond the layout itself: the

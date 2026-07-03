@@ -135,6 +135,38 @@ pub mod xdg_toplevel {
     pub const EV_CLOSE: u16 = 1;
 }
 
+pub mod zwp_linux_dmabuf_v1 {
+    /// Create a params object to assemble one dmabuf-backed wl_buffer.
+    pub const CREATE_PARAMS: u16 = 1;
+    /// Create the feedback object announcing formats, modifiers, and devices
+    /// for dmabuf presentation. Exists since version 4.
+    pub const GET_DEFAULT_FEEDBACK: u16 = 2;
+}
+
+pub mod zwp_linux_buffer_params_v1 {
+    pub const DESTROY: u16 = 0;
+    /// One plane: an fd (ancillary), then `plane_idx`, `offset`, `stride`,
+    /// `modifier_hi`, `modifier_lo`.
+    pub const ADD: u16 = 1;
+    /// Create the wl_buffer without waiting for a `created`/`failed` event;
+    /// valid because the parameters come from the compositor's own feedback.
+    /// Args: `new_id`, `width`, `height`, `format` (DRM fourcc), `flags`.
+    pub const CREATE_IMMED: u16 = 3;
+}
+
+pub mod zwp_linux_dmabuf_feedback_v1 {
+    pub const EV_DONE: u16 = 0;
+    /// An fd (ancillary) holding the format+modifier table, plus its size.
+    pub const EV_FORMAT_TABLE: u16 = 1;
+    /// The compositor's main DRM device, as a dev_t in a wire array.
+    pub const EV_MAIN_DEVICE: u16 = 2;
+    pub const EV_TRANCHE_DONE: u16 = 3;
+    pub const EV_TRANCHE_TARGET_DEVICE: u16 = 4;
+    /// Native-endian u16 indices into the format table, as a wire array.
+    pub const EV_TRANCHE_FORMATS: u16 = 5;
+    pub const EV_TRANCHE_FLAGS: u16 = 6;
+}
+
 pub mod wp_cursor_shape_manager_v1 {
     /// Create a shape device for a `wl_pointer`: `new_id` then the pointer.
     pub const GET_POINTER: u16 = 1;
@@ -159,6 +191,7 @@ pub const IFACE_WM_BASE: &str = "xdg_wm_base";
 pub const IFACE_SEAT: &str = "wl_seat";
 pub const IFACE_DATA_DEVICE_MANAGER: &str = "wl_data_device_manager";
 pub const IFACE_CURSOR_SHAPE_MANAGER: &str = "wp_cursor_shape_manager_v1";
+pub const IFACE_DMABUF: &str = "zwp_linux_dmabuf_v1";
 
 pub const VERSION_COMPOSITOR: u32 = 4;
 pub const VERSION_SHM: u32 = 1;
@@ -167,3 +200,6 @@ pub const VERSION_SEAT: u32 = 5;
 pub const VERSION_DATA_DEVICE_MANAGER: u32 = 3;
 /// We only need the `text` shape, which exists in version 1.
 pub const VERSION_CURSOR_SHAPE_MANAGER: u32 = 1;
+/// Version 4 introduced the feedback object (format table, main device,
+/// tranches), which the GPU path requires; an older advertisement is not bound.
+pub const VERSION_DMABUF: u32 = 4;

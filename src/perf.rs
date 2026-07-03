@@ -274,6 +274,22 @@ fn measure() -> Result<Vec<Sample>> {
         }),
     });
 
+    // The GPU path's CPU-side frame cost: batch the display list into vertices
+    // (glyph lookups against warm atlases, quad emission, batch splitting).
+    // This runs even without a GPU, so the harness can hold it; the GPU-side
+    // frame time is only observable via BNKNOTES_STATS on a live run.
+    let mut glyph_cache = crate::gpu::GlyphCache::new();
+    // Warm the atlases so the steady state (no uploads) is what is measured.
+    let _ = crate::gpu::build_frame(&fonts, &images, &caret_on, &mut glyph_cache, &|_| true);
+    out.push(Sample {
+        name: "gpu_batch_frame",
+        ns: bench(500, || {
+            crate::gpu::build_frame(&fonts, &images, &caret_on, &mut glyph_cache, &|_| true)
+                .vertices
+                .len()
+        }),
+    });
+
     Ok(out)
 }
 

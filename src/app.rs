@@ -920,6 +920,12 @@ struct State {
     // ping-ponged so we only render into a buffer the compositor has released.
     buffers: [u32; 2],
     busy: [bool; 2],
+    /// The `(width, height)` the current buffers were allocated at. A configure
+    /// only records the new surface size; the buffers are reallocated lazily in
+    /// `render_frame` when this no longer matches, so a burst of configures
+    /// during an interactive resize costs one reallocation per painted frame
+    /// rather than one per configure.
+    buffer_size: (u32, u32),
     /// The display list last committed to the compositor, i.e. what is on screen.
     /// The new frame is diffed against this to decide whether to present at all
     /// and which regions to report as damaged.
@@ -933,6 +939,12 @@ struct State {
     pending_sync: Option<u32>,
     /// A compositor-requested size awaiting the next configure ack.
     pending_size: Option<(u32, u32)>,
+    /// The serial of the latest xdg_surface.configure not yet acked. The ack is
+    /// deferred to `render_frame` so it commits together with the buffer sized to
+    /// that configure; acking on arrival lets the compositor reposition an
+    /// anchored (left/top) resize edge a frame before the matching buffer lands,
+    /// which reads as jitter. Only the latest serial needs acking.
+    pending_configure: Option<u32>,
     configured: bool,
     closed: bool,
     /// The content changed and a frame should be drawn.
@@ -1088,11 +1100,13 @@ impl State {
             selection_text_mime: None,
             buffers: [0, 0],
             busy: [false, false],
+            buffer_size: (0, 0),
             present_list: Rc::default(),
             next_id: 2, // 1 is wl_display
             free_ids: Vec::new(),
             pending_sync: None,
             pending_size: None,
+            pending_configure: None,
             configured: false,
             closed: false,
             dirty: true,
@@ -1436,6 +1450,7 @@ impl State {
             self.buffers[i] = buffer;
         }
         self.gpu_images = images;
+        self.buffer_size = (self.width, self.height);
         self.busy = [false, false];
         // Fresh images never carried a release point, so a resize must forget
         // the old buffers' points; their next use starts with no wait.
@@ -1469,22 +1484,44 @@ impl State {
         self.busy = [false, false];
     }
 
-    /// Resize to `(w, h)`: tear down the buffers and rebuild them at the new
-    /// size. A no-op if the size is unchanged.
-    fn apply_resize(&mut self, w: u32, h: u32) -> Result<()> {
+    /// Record a new surface size `(w, h)`. The buffers are NOT reallocated here:
+    /// an interactive resize fires many configures, and reallocating exportable
+    /// dmabuf images on each one is heavy churn (a full GPU drain plus an
+    /// export/import round-trip), enough to upset a compositor's buffer path.
+    /// `render_frame` reallocates lazily when `buffer_size` no longer matches, so
+    /// the churn collapses to one reallocation per painted frame. A no-op if the
+    /// size is unchanged.
+    fn resize_to(&mut self, w: u32, h: u32) {
         if (w, h) == (self.width, self.height) {
-            return Ok(());
+            return;
         }
-        self.destroy_buffers();
         self.width = w;
         self.height = h;
-        self.create_buffers()?;
         // A width change re-wraps and a height change shrinks the viewport; either
         // can push the caret off-screen. Re-reveal the focused pane's caret (this
         // rebuilds its layout at the new column width and re-clamps the scroll).
         self.reveal_active_caret();
         self.dirty = true;
-        Ok(())
+    }
+
+    /// Declare the window geometry, then ack configure `serial`. The geometry is
+    /// the whole surface (no client-side decorations or shadows), and being
+    /// double-buffered surface state it is what the compositor anchors a resize's
+    /// fixed edge to; sending it in the same commit as the ack and the matching
+    /// buffer gives the compositor one atomic, consistent size for the frame, so
+    /// the anchored edge does not drift. Caller commits after this.
+    fn ack_configure(&mut self, serial: u32) {
+        let (w, h) = (self.width as i32, self.height as i32);
+        self.conn.request(
+            self.xdg_surface,
+            xdg_surface::SET_WINDOW_GEOMETRY,
+            &[Arg::Int(0), Arg::Int(0), Arg::Int(w), Arg::Int(h)],
+        );
+        self.conn.request(
+            self.xdg_surface,
+            xdg_surface::ACK_CONFIGURE,
+            &[Arg::Uint(serial)],
+        );
     }
 
     fn roundtrip(&mut self) -> Result<()> {
@@ -1583,6 +1620,14 @@ impl State {
     /// A rendering failure (a device lost mid-session) propagates and ends the
     /// process; there is no software path to fall back to.
     fn render_frame(&mut self) -> Result<bool> {
+        // Reallocate the buffers if the surface was resized since they were made.
+        // Deferring this from every configure to the first frame after them
+        // collapses an interactive resize's dmabuf churn to one reallocation per
+        // painted frame (frame-callback paced), instead of one per configure.
+        if self.buffer_size != (self.width, self.height) {
+            self.destroy_buffers();
+            self.create_buffers()?;
+        }
         let Some(idx) = (0..2).find(|&i| !self.busy[i]) else {
             return Ok(false);
         };
@@ -1594,8 +1639,24 @@ impl State {
         // Nothing changed since the on-screen frame: nothing to present (the
         // common idle case).
         let screen_dmg = display::damage(&self.present_list, &new_list, sw, sh);
+        // Acknowledge the latest configure paired with this commit, so the buffer
+        // the compositor sees is always the one sized to the configure it just
+        // acked; that is what keeps an anchored (left/top) resize edge from
+        // jumping. Taken here so it rides the same flush as the commit below.
+        let ack = self.pending_configure.take();
         if screen_dmg.is_empty() {
+            // Nothing new to draw, but a pending configure must still be acked so
+            // the compositor can finalize a state-only change (e.g. a maximize
+            // that altered no pixels); a bare commit applies it against the
+            // current, already correctly sized buffer.
+            if let Some(serial) = ack {
+                self.ack_configure(serial);
+                self.conn.request(self.surface, wl_surface::COMMIT, &[]);
+            }
             return Ok(true);
+        }
+        if let Some(serial) = ack {
+            self.ack_configure(serial);
         }
 
         // Render, returning the render-done fence under explicit sync (`None`
@@ -1780,14 +1841,11 @@ impl State {
         }
 
         if msg.object == self.xdg_surface && msg.opcode == xdg_surface::EV_CONFIGURE {
-            let serial = r.u32()?;
-            self.conn.request(
-                self.xdg_surface,
-                xdg_surface::ACK_CONFIGURE,
-                &[Arg::Uint(serial)],
-            );
+            // Defer the ack to the frame that commits the matching-size buffer
+            // (see `pending_configure`); keep only the latest serial.
+            self.pending_configure = Some(r.u32()?);
             if let Some((w, h)) = self.pending_size.take() {
-                self.apply_resize(w, h)?;
+                self.resize_to(w, h);
             }
             self.configured = true;
             self.dirty = true;

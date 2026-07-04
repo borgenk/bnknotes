@@ -111,6 +111,7 @@ pub mod xdg_wm_base {
 
 pub mod xdg_surface {
     pub const GET_TOPLEVEL: u16 = 1;
+    pub const SET_WINDOW_GEOMETRY: u16 = 3;
     pub const ACK_CONFIGURE: u16 = 4;
     pub const EV_CONFIGURE: u16 = 0;
 }

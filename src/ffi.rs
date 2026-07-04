@@ -2,14 +2,14 @@
 //! links libc, so these symbols resolve without a `#[link]` attribute; we
 //! declare only the handful we need.
 //!
-//! Three jobs live here:
-//!   1. shm backing memory: `memfd_create` + `ftruncate` + `mmap`.
+//! Four jobs live here:
+//!   1. mapping the keyboard keymap fd the compositor sends: `mmap`/`munmap`.
 //!   2. fd-passing on the Wayland socket: `sendmsg`/`recvmsg` with SCM_RIGHTS
-//!      ancillary data, which is the only way to hand the compositor the shm
-//!      pool fd (and, later, to receive the keyboard keymap fd).
+//!      ancillary data, which is how the compositor hands us the keyboard
+//!      keymap fd (and how we pass dmabuf and syncobj fds back).
 //!   3. runtime library loading (`dlopen`/`dlsym`) for the Vulkan loader, so a
-//!      machine without Vulkan runs the software path instead of failing to
-//!      start (a `#[link]` would make the loader a hard startup dependency).
+//!      machine without Vulkan reports a clean error instead of failing to link
+//!      (a `#[link]` would make the loader a hard startup dependency).
 //!   4. the dma-buf sync-file ioctls, the implicit-sync bridge between the
 //!      GPU backend's explicit fences and the fences other dmabuf users (the
 //!      compositor) observe. Kernel dma-buf core, driver-independent.
@@ -19,7 +19,7 @@
 
 use core::ffi::{c_char, c_int, c_uint, c_ulong, c_void, CStr};
 use std::mem;
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::os::fd::{FromRawFd, OwnedFd, RawFd};
 
 use crate::error::{Error, Result};
 
@@ -28,10 +28,7 @@ use crate::error::{Error, Result};
 // ---------------------------------------------------------------------------
 
 const PROT_READ: c_int = 0x1;
-const PROT_WRITE: c_int = 0x2;
-const MAP_SHARED: c_int = 0x1;
 const MAP_PRIVATE: c_int = 0x2;
-const MFD_CLOEXEC: c_uint = 0x1;
 
 const SOL_SOCKET: c_int = 1;
 const SCM_RIGHTS: c_int = 1;
@@ -111,8 +108,6 @@ struct CmsgHdr {
 // ---------------------------------------------------------------------------
 
 extern "C" {
-    fn memfd_create(name: *const c_char, flags: c_uint) -> c_int;
-    fn ftruncate(fd: c_int, length: i64) -> c_int;
     fn mmap(
         addr: *mut c_void,
         len: usize,
@@ -142,50 +137,8 @@ fn errno() -> c_int {
 }
 
 // ---------------------------------------------------------------------------
-// shm backing memory.
+// Memory mapping (the keyboard keymap fd).
 // ---------------------------------------------------------------------------
-
-/// Create an anonymous, CLOEXEC memory file of `len` bytes. The caller mmaps it
-/// and hands the fd to the compositor via `create_pool`.
-pub fn memfd(len: usize) -> Result<OwnedFd> {
-    let name = b"bnknotes\0";
-    // SAFETY: name is a valid NUL-terminated C string; the call only reads it.
-    let raw = unsafe { memfd_create(name.as_ptr() as *const c_char, MFD_CLOEXEC) };
-    if raw < 0 {
-        return Err(Error::msg(format!(
-            "memfd_create failed: errno {}",
-            errno()
-        )));
-    }
-    // SAFETY: raw is a fresh, owned fd from memfd_create.
-    let fd = unsafe { OwnedFd::from_raw_fd(raw) };
-    // SAFETY: fd is valid; ftruncate only resizes the backing file.
-    let rc = unsafe { ftruncate(fd.as_raw_fd(), len as i64) };
-    if rc < 0 {
-        return Err(Error::msg(format!("ftruncate failed: errno {}", errno())));
-    }
-    Ok(fd)
-}
-
-/// Map `len` bytes of `fd` shared and writable. Returns the base pointer.
-pub fn mmap_shared(fd: RawFd, len: usize) -> Result<*mut u8> {
-    // SAFETY: fd is a valid shm fd sized to at least len; a fresh anonymous
-    // mapping is requested (addr null).
-    let p = unsafe {
-        mmap(
-            core::ptr::null_mut(),
-            len,
-            PROT_READ | PROT_WRITE,
-            MAP_SHARED,
-            fd,
-            0,
-        )
-    };
-    if p as isize == -1 {
-        return Err(Error::msg(format!("mmap failed: errno {}", errno())));
-    }
-    Ok(p as *mut u8)
-}
 
 /// Map `len` bytes of `fd` private and read-only. Used for the keyboard keymap
 /// the compositor sends over wl_keyboard.keymap.
@@ -199,7 +152,7 @@ pub fn mmap_ro(fd: RawFd, len: usize) -> Result<*mut u8> {
     Ok(p as *mut u8)
 }
 
-/// Unmap a mapping previously returned by [`mmap_shared`] or [`mmap_ro`].
+/// Unmap a mapping previously returned by [`mmap_ro`].
 ///
 /// # Safety
 /// `ptr`/`len` must come from a live mapping that is not used again afterwards.
@@ -789,6 +742,7 @@ fn parse_cmsgs(cbuf: &CmsgBuf, controllen: usize, out: &mut Vec<OwnedFd>) {
 mod tests {
     use super::*;
     use core::ffi::c_short;
+    use std::os::fd::AsRawFd;
 
     #[test]
     fn cmsg_math_matches_one_fd() {
@@ -796,21 +750,6 @@ mod tests {
         assert_eq!(cmsg_align(mem::size_of::<CmsgHdr>()), 16);
         assert_eq!(cmsg_len(4), 20);
         assert_eq!(cmsg_space(4), 24);
-    }
-
-    #[test]
-    fn memfd_maps_and_is_writable() {
-        let len = 4096;
-        let fd = memfd(len).expect("memfd");
-        let ptr = mmap_shared(fd.as_raw_fd(), len).expect("mmap");
-        // SAFETY: ptr maps len writable bytes.
-        let slice = unsafe { std::slice::from_raw_parts_mut(ptr, len) };
-        slice[0] = 0xAB;
-        slice[len - 1] = 0xCD;
-        assert_eq!(slice[0], 0xAB);
-        assert_eq!(slice[len - 1], 0xCD);
-        // SAFETY: ptr/len came from mmap_shared and are not used afterwards.
-        unsafe { unmap(ptr, len) };
     }
 
     // The DRM syncobj ioctls talk straight to the kernel, so their request

@@ -1,8 +1,9 @@
 //! A small, deterministic performance harness for the editor's hot paths: full
-//! re-layout, pointer hit-testing, painting a frame, scrolling, highlighting, and
-//! glyph rasterization. It runs CPU-only (no Wayland, no display), times each
-//! scenario, and writes the results to a file so a later run can diff against a
-//! committed baseline and flag regressions.
+//! re-layout, pointer hit-testing, glyph rasterization, batching a frame's
+//! display list into GPU vertices, and image resample/reflow/upload. It runs
+//! CPU-only (no Wayland, no GPU submission), times each scenario, and writes the
+//! results to a file so a later run can diff against a committed baseline and flag
+//! regressions.
 //!
 //! Run `bnknotes --perf` to measure and compare against `perf/baseline.txt`
 //! (writing `perf/latest.txt`); the process exits nonzero if any scenario
@@ -19,14 +20,12 @@ use std::hint::black_box;
 use std::path::Path;
 use std::time::Instant;
 
-use crate::app::{build_display_list, paint_document, PaintParams, FONT_SIZE, MARGIN};
-use crate::display;
+use crate::app::{build_display_list, PaintParams, FONT_SIZE, MARGIN};
 use crate::error::{Error, Result};
 use crate::freetype::Fonts;
 use crate::image::{Image, ImageStore};
 use crate::layout::{ImageUi, Layout};
 use crate::markdown;
-use crate::render::Canvas;
 use crate::rope::Rope;
 
 /// Where the committed baseline lives and where each run records its numbers.
@@ -95,9 +94,7 @@ fn measure() -> Result<Vec<Sample>> {
     // timed `layout_build` below measures the steady re-layout cost (the per-frame
     // cost while editing), not the one-time cold measure of every glyph.
     let layout = Layout::build(&fonts, &rope, MARGIN, MARGIN, wrap, FONT_SIZE, (0, 0));
-    let content_h = layout.text_height() + 2 * MARGIN;
-    let mut buf = vec![0u8; WIDTH * HEIGHT * 4];
-    // The fixture has no images; an empty store satisfies the painter's signature.
+    // An empty store satisfies build_frame's signature; the fixture has no images.
     let images = ImageStore::new(None);
 
     let mut out = Vec::new();
@@ -121,75 +118,8 @@ fn measure() -> Result<Vec<Sample>> {
         }),
     });
 
-    // Paint one frame at the top of the document: steady-state rendering.
-    out.push(Sample {
-        name: "paint_frame",
-        ns: bench(100, || {
-            let mut canvas = Canvas::new(&mut buf, WIDTH, HEIGHT);
-            paint_document(
-                &mut canvas,
-                &fonts,
-                &layout,
-                &rope,
-                &images,
-                &params(0, None),
-            );
-            buf[0]
-        }),
-    });
-
-    // Scroll sweep: paint at successive offsets through the whole document, one
-    // line height apart, so a per-line pathology in paint would show up here.
-    let line_h = fonts.metrics(FONT_SIZE).line_height.max(1);
-    let max_scroll = (content_h - HEIGHT as i32).max(0);
-    let offsets: Vec<i32> = (0..=max_scroll).step_by(line_h as usize).collect();
-    let mut k = 0usize;
-    out.push(Sample {
-        name: "scroll_sweep",
-        ns: bench(200, || {
-            let sy = offsets[k % offsets.len()];
-            k += 1;
-            let mut canvas = Canvas::new(&mut buf, WIDTH, HEIGHT);
-            paint_document(
-                &mut canvas,
-                &fonts,
-                &layout,
-                &rope,
-                &images,
-                &params(sy, None),
-            );
-            buf[0]
-        }),
-    });
-
-    // Highlight sweep: a full drag-select frame. Each step hit-tests the pointer
-    // and then paints a selection that grows line by line across the document, so
-    // both the per-motion hit-test and the selection-rect geometry are measured.
-    let n_lines = rope.len_lines().max(1);
-    let mut k = 0usize;
-    out.push(Sample {
-        name: "highlight_sweep",
-        ns: bench(200, || {
-            let _ = layout.offset_at(&fonts, &rope, (WIDTH / 2) as f32, (HEIGHT / 2) as f32);
-            let end = rope.line_to_byte(k % n_lines);
-            k += 1;
-            let mut canvas = Canvas::new(&mut buf, WIDTH, HEIGHT);
-            paint_document(
-                &mut canvas,
-                &fonts,
-                &layout,
-                &rope,
-                &images,
-                &params(0, Some((0, end))),
-            );
-            buf[0]
-        }),
-    });
-
-    // Paint a frame containing a decoded image, to guard the per-frame image blit.
-    // Bilinear resampling is cached at display size, so the steady cost is a plain
-    // blit of the cached bitmap; the warm-up paint below fills that cache first. A
-    // regression here would mean the resample leaked back into the per-frame path.
+    // A decoded image the editor sizes and uploads to the GPU, reused by the image
+    // scenarios below (reflow at a fresh width, and the GPU texture upload).
     let image_rope = Rope::from_str("# Perf\n\n![pic](perf.png)\n\nbody text under the image\n");
     let image_store = ImageStore::from_decoded(vec![(
         "perf.png".to_string(),
@@ -210,35 +140,10 @@ fn measure() -> Result<Vec<Sample>> {
         &image_store,
         ImageUi::default(),
     );
-    {
-        let mut canvas = Canvas::new(&mut buf, WIDTH, HEIGHT);
-        paint_document(
-            &mut canvas,
-            &fonts,
-            &image_layout,
-            &image_rope,
-            &image_store,
-            &params(0, None),
-        );
-    }
-    out.push(Sample {
-        name: "image_paint",
-        ns: bench(100, || {
-            let mut canvas = Canvas::new(&mut buf, WIDTH, HEIGHT);
-            paint_document(
-                &mut canvas,
-                &fonts,
-                &image_layout,
-                &image_rope,
-                &image_store,
-                &params(0, None),
-            );
-            buf[0]
-        }),
-    });
 
     // Raw glyph rasterization of printable ASCII (the uncached FreeType path), so a
-    // regression in the rasterizer itself is visible independent of the cache.
+    // regression in the rasterizer itself is visible independent of the cache. The
+    // GPU path still rasterizes every glyph once, into its texture atlas.
     let face = fonts.face(FONT_SIZE, crate::freetype::FontStyle::Regular);
     out.push(Sample {
         name: "glyph_raster_ascii",
@@ -251,28 +156,8 @@ fn measure() -> Result<Vec<Sample>> {
         }),
     });
 
-    // The incremental damage path: an idle caret blink. Only the caret toggles
-    // between frames, so the diff against the on-screen frame yields a caret-sized
-    // region and the repaint touches a sliver of the buffer, not the whole surface.
-    // This is what the display list and damage tracking buy, so it should be a
-    // fraction of `paint_frame` above; a regression here means a blink frame stopped
-    // being incremental (e.g. the diff started reporting the whole surface, or the
-    // build itself got expensive).
-    let caret_on = build_display_list(&fonts, &layout, &rope, &params(0, None));
-    let mut caret_off = params(0, None);
-    caret_off.caret_visible = false;
-    out.push(Sample {
-        name: "damage_blink",
-        ns: bench(2000, || {
-            let frame = build_display_list(&fonts, &layout, &rope, &caret_off);
-            let dmg = display::damage(&caret_on, &frame, WIDTH as i32, HEIGHT as i32);
-            let mut canvas = Canvas::new(&mut buf, WIDTH, HEIGHT);
-            for clip in &dmg {
-                display::execute(&mut canvas, &fonts, &[&images], &frame, Some(*clip));
-            }
-            dmg.len()
-        }),
-    });
+    // A full text frame's display list, batched below into GPU vertices.
+    let frame_list = build_display_list(&fonts, &layout, &rope, &params(0, None));
 
     // The GPU path's CPU-side frame cost: batch the display list into vertices
     // (glyph lookups against warm atlases, quad emission, batch splitting).
@@ -280,25 +165,24 @@ fn measure() -> Result<Vec<Sample>> {
     // frame time is only observable via BNKNOTES_STATS on a live run.
     let mut glyph_cache = crate::gpu::GlyphCache::new();
     // Warm the atlases so the steady state (no uploads) is what is measured.
-    let _ = crate::gpu::build_frame(&fonts, &[&images], &caret_on, &mut glyph_cache, &|_| true);
+    let _ = crate::gpu::build_frame(&fonts, &[&images], &frame_list, &mut glyph_cache, &|_| true);
     out.push(Sample {
         name: "gpu_batch_frame",
         ns: bench(500, || {
-            crate::gpu::build_frame(&fonts, &[&images], &caret_on, &mut glyph_cache, &|_| true)
+            crate::gpu::build_frame(&fonts, &[&images], &frame_list, &mut glyph_cache, &|_| true)
                 .vertices
                 .len()
         }),
     });
 
-    // Image resampling: the bilinear downscale the software path runs whenever an
-    // image's display size changes (every drag event of a resize). The GPU path
-    // avoids it entirely (native texture, hardware scaling); this guards the CPU
-    // resampler and the software fallback's resize cost.
+    // Image resampling: the area/bilinear pass that scales a source bitmap to a
+    // display size. It is cached per (source, size), so it runs off the frame path;
+    // this guards the resampler itself (now used for color-emoji glyph strikes).
     let native: Vec<u32> = vec![0xff_30_60_90; 400 * 300];
     out.push(Sample {
         name: "image_resample",
         ns: bench(200, || {
-            crate::render::resample_argb(&native, 400, 300, 200, 150).len()
+            crate::freetype::resample_argb(&native, 400, 300, 200, 150).len()
         }),
     });
 
@@ -509,10 +393,10 @@ mod tests {
 
     #[test]
     fn parse_baseline_reads_pairs_and_skips_comments() {
-        let text = "# a comment\n\nlayout_build\t1234\npaint_frame   5678\n";
+        let text = "# a comment\n\nlayout_build\t1234\ngpu_batch_frame   5678\n";
         let map = parse_baseline(text).expect("valid baseline");
         assert_eq!(map.get("layout_build"), Some(&1234));
-        assert_eq!(map.get("paint_frame"), Some(&5678));
+        assert_eq!(map.get("gpu_batch_frame"), Some(&5678));
         assert_eq!(map.len(), 2);
     }
 
@@ -531,7 +415,7 @@ mod tests {
 
     #[test]
     fn fixture_is_tall_enough_to_scroll() {
-        // Many lines, so the scroll sweep and paint have real work.
+        // Many lines, so the layout and frame-batch scenarios have real work.
         assert!(fixture().lines().count() > 200);
     }
 }

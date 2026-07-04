@@ -17,11 +17,11 @@
 use std::collections::HashMap;
 
 use crate::display::DrawCmd;
+use crate::display::RoundedCorners;
 use crate::freetype::{Face, FaceKey, Fonts};
 use crate::grapheme;
 use crate::image::ImageStore;
 use crate::layout::Rect;
-use crate::render::RoundedCorners;
 
 /// Vertex modes, matching shaders/quad.frag.
 pub const MODE_SOLID: u32 = 0;
@@ -427,8 +427,9 @@ impl Batcher<'_> {
         self.quad(rect, MODE_ROUND, color, [0.0; 2], extra);
     }
 
-    /// Mirror of `Canvas::draw_text`: the ASCII fast path, then grapheme
-    /// clusters routed to the emoji glyph or per-character drawing.
+    /// Emit a run's glyph quads: the ASCII fast path, then grapheme clusters
+    /// routed to the emoji glyph or per-character drawing. The routing mirrors
+    /// `shape::text_advance`, so the quads land where layout measured.
     fn text(&mut self, face_key: FaceKey, x: i32, baseline: i32, text: &str, color: u32) {
         let face = self.fonts.face_for(face_key);
         let mut pen = x as f32;

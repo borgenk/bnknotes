@@ -148,12 +148,10 @@ const VK_IMAGE_LAYOUT_UNDEFINED: u32 = 0;
 const VK_IMAGE_LAYOUT_GENERAL: u32 = 1;
 const VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL: u32 = 2;
 const VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL: u32 = 5;
-const VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL: u32 = 6;
 const VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL: u32 = 7;
 
 const VK_ACCESS_SHADER_READ_BIT: u32 = 0x20;
 const VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT: u32 = 0x100;
-const VK_ACCESS_TRANSFER_READ_BIT: u32 = 0x800;
 const VK_ACCESS_TRANSFER_WRITE_BIT: u32 = 0x1000;
 const VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT: u32 = 0x1;
 const VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT: u32 = 0x80;
@@ -1365,8 +1363,6 @@ type PfnCmdSetScissor = unsafe extern "C" fn(VkCommandBuffer, u32, u32, *const V
 type PfnCmdDraw = unsafe extern "C" fn(VkCommandBuffer, u32, u32, u32, u32);
 type PfnCmdCopyBufferToImage =
     unsafe extern "C" fn(VkCommandBuffer, VkBuffer, VkImage, u32, u32, *const VkBufferImageCopy);
-type PfnCmdCopyImageToBuffer =
-    unsafe extern "C" fn(VkCommandBuffer, VkImage, u32, VkBuffer, u32, *const VkBufferImageCopy);
 
 /// Fetch an instance-level command by name, as a specific pointer type.
 ///
@@ -1492,7 +1488,6 @@ struct DeviceFns {
     cmd_set_scissor: PfnCmdSetScissor,
     cmd_draw: PfnCmdDraw,
     cmd_copy_buffer_to_image: PfnCmdCopyBufferToImage,
-    cmd_copy_image_to_buffer: PfnCmdCopyImageToBuffer,
 }
 
 impl DeviceFns {
@@ -1586,7 +1581,6 @@ impl DeviceFns {
                 cmd_set_scissor: load_device(gdpa, device, c"vkCmdSetScissor")?,
                 cmd_draw: load_device(gdpa, device, c"vkCmdDraw")?,
                 cmd_copy_buffer_to_image: load_device(gdpa, device, c"vkCmdCopyBufferToImage")?,
-                cmd_copy_image_to_buffer: load_device(gdpa, device, c"vkCmdCopyImageToBuffer")?,
             })
         }
     }
@@ -1801,15 +1795,6 @@ impl Gpu {
             .copied()
             .filter(|&m| m != DRM_FORMAT_MOD_INVALID)
             .filter(|&m| self.modifiers.iter().any(|p| p.drm_format_modifier == m))
-            .collect()
-    }
-
-    /// Every modifier this device can render into, for the offline parity
-    /// harness where there is no compositor list to intersect with.
-    pub fn own_modifiers(&self) -> Vec<u64> {
-        self.modifiers
-            .iter()
-            .map(|p| p.drm_format_modifier)
             .collect()
     }
 
@@ -2411,150 +2396,6 @@ impl Gpu {
         self.prepare_frame(img, frame, background)?;
         let wait_acquire = self.import_acquire(img, release_wait)?;
         self.submit_frame_explicit(img, wait_acquire)
-    }
-
-    /// Read the image's pixels back (B,G,R,A byte order, tightly packed).
-    /// Blocks until the copy completes; this is the pixel-parity harness's
-    /// path, never the editor's.
-    pub fn read_pixels(&mut self, img: &mut GpuImage) -> Result<Vec<u8>> {
-        let d = self.device.raw;
-        let f = &self.fns;
-        let len = (img.width * img.height * 4) as usize;
-        // SAFETY: fence is live; bounded wait.
-        check(
-            unsafe { (f.wait_for_fences)(d, 1, &img.fence, 1, FENCE_TIMEOUT_NS) },
-            "vkWaitForFences",
-        )?;
-        // SAFETY: the fence is signaled.
-        check(
-            unsafe { (f.reset_fences)(d, 1, &img.fence) },
-            "vkResetFences",
-        )?;
-        self.grow_host_buffer(
-            &mut img.staging,
-            len,
-            VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
-        )?;
-
-        let begin = VkCommandBufferBeginInfo {
-            s_type: VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
-            p_next: core::ptr::null(),
-            flags: VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
-            p_inheritance_info: core::ptr::null(),
-        };
-        // SAFETY: the pool allows reset-on-begin; the fence was waited.
-        check(
-            unsafe { (f.begin_command_buffer)(img.cmd, &begin) },
-            "vkBeginCommandBuffer",
-        )?;
-        let range = color_range();
-        let (old_layout, src_qf, dst_qf) = self.acquire_params(img);
-        // SAFETY (all cmd_* below): cmd is recording; structs outlive calls.
-        unsafe {
-            let acquire = VkImageMemoryBarrier {
-                s_type: VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
-                p_next: core::ptr::null(),
-                src_access_mask: 0,
-                dst_access_mask: VK_ACCESS_TRANSFER_READ_BIT,
-                old_layout,
-                new_layout: VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                src_queue_family_index: src_qf,
-                dst_queue_family_index: dst_qf,
-                image: img.image,
-                subresource_range: range,
-            };
-            (f.cmd_pipeline_barrier)(
-                img.cmd,
-                VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
-                VK_PIPELINE_STAGE_TRANSFER_BIT,
-                0,
-                0,
-                core::ptr::null(),
-                0,
-                core::ptr::null(),
-                1,
-                &acquire,
-            );
-            let region = VkBufferImageCopy {
-                buffer_offset: 0,
-                buffer_row_length: 0,
-                buffer_image_height: 0,
-                image_subresource: VkImageSubresourceLayers {
-                    aspect_mask: VK_IMAGE_ASPECT_COLOR_BIT,
-                    mip_level: 0,
-                    base_array_layer: 0,
-                    layer_count: 1,
-                },
-                image_offset: VkOffset3D { x: 0, y: 0, z: 0 },
-                image_extent: VkExtent3D {
-                    width: img.width,
-                    height: img.height,
-                    depth: 1,
-                },
-            };
-            (f.cmd_copy_image_to_buffer)(
-                img.cmd,
-                img.image,
-                VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                img.staging.buf,
-                1,
-                &region,
-            );
-            let release = VkImageMemoryBarrier {
-                s_type: VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
-                p_next: core::ptr::null(),
-                src_access_mask: VK_ACCESS_TRANSFER_READ_BIT,
-                dst_access_mask: 0,
-                old_layout: VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                new_layout: VK_IMAGE_LAYOUT_GENERAL,
-                src_queue_family_index: self.queue_family,
-                dst_queue_family_index: VK_QUEUE_FAMILY_FOREIGN,
-                image: img.image,
-                subresource_range: range,
-            };
-            (f.cmd_pipeline_barrier)(
-                img.cmd,
-                VK_PIPELINE_STAGE_TRANSFER_BIT,
-                VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
-                0,
-                0,
-                core::ptr::null(),
-                0,
-                core::ptr::null(),
-                1,
-                &release,
-            );
-        }
-        // SAFETY: cmd is recording.
-        check(
-            unsafe { (f.end_command_buffer)(img.cmd) },
-            "vkEndCommandBuffer",
-        )?;
-        let submit = VkSubmitInfo {
-            s_type: VK_STRUCTURE_TYPE_SUBMIT_INFO,
-            p_next: core::ptr::null(),
-            wait_semaphore_count: 0,
-            p_wait_semaphores: core::ptr::null(),
-            p_wait_dst_stage_mask: core::ptr::null(),
-            command_buffer_count: 1,
-            p_command_buffers: &img.cmd,
-            signal_semaphore_count: 0,
-            p_signal_semaphores: core::ptr::null(),
-        };
-        // SAFETY: queue and cmd are live; submit outlives the call.
-        check(
-            unsafe { (f.queue_submit)(self.queue, 1, &submit, img.fence) },
-            "vkQueueSubmit",
-        )?;
-        // SAFETY: fence is live; the wait leaves it signaled, matching the
-        // signaled-at-rest protocol every entry point expects.
-        check(
-            unsafe { (f.wait_for_fences)(d, 1, &img.fence, 1, FENCE_TIMEOUT_NS) },
-            "vkWaitForFences (readback)",
-        )?;
-        // SAFETY: staging is mapped, at least len bytes, and the GPU is done.
-        let bytes = unsafe { core::slice::from_raw_parts(img.staging.ptr, len) }.to_vec();
-        Ok(bytes)
     }
 
     /// The acquire side of the per-frame ownership dance: where the image is

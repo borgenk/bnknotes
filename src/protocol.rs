@@ -34,17 +34,6 @@ pub mod wl_surface {
     pub const COMMIT: u16 = 6;
 }
 
-pub mod wl_shm {
-    pub const CREATE_POOL: u16 = 0;
-    /// 32-bit little-endian xRGB, no alpha. Always supported by compositors.
-    pub const FORMAT_XRGB8888: u32 = 1;
-}
-
-pub mod wl_shm_pool {
-    pub const CREATE_BUFFER: u16 = 0;
-    pub const DESTROY: u16 = 1;
-}
-
 pub mod wl_buffer {
     pub const DESTROY: u16 = 0;
     pub const EV_RELEASE: u16 = 0;
@@ -207,7 +196,6 @@ pub mod wp_linux_drm_syncobj_surface_v1 {
 // Interface names, as advertised by `wl_registry.global`, and the maximum
 // version we know how to drive.
 pub const IFACE_COMPOSITOR: &str = "wl_compositor";
-pub const IFACE_SHM: &str = "wl_shm";
 pub const IFACE_WM_BASE: &str = "xdg_wm_base";
 pub const IFACE_SEAT: &str = "wl_seat";
 pub const IFACE_DATA_DEVICE_MANAGER: &str = "wl_data_device_manager";
@@ -216,7 +204,6 @@ pub const IFACE_DMABUF: &str = "zwp_linux_dmabuf_v1";
 pub const IFACE_DRM_SYNCOBJ: &str = "wp_linux_drm_syncobj_manager_v1";
 
 pub const VERSION_COMPOSITOR: u32 = 4;
-pub const VERSION_SHM: u32 = 1;
 pub const VERSION_WM_BASE: u32 = 1;
 pub const VERSION_SEAT: u32 = 5;
 pub const VERSION_DATA_DEVICE_MANAGER: u32 = 3;

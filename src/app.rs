@@ -15,7 +15,7 @@
 //! copy, cut, paste (over wl_data_device), and undo/redo; a held key repeats on a
 //! timer. Content taller than the window scrolls (mouse wheel, or automatically
 //! to keep the caret in view), and the window honors compositor resizes by
-//! reallocating its shm buffers. Rendering double-buffers so the compositor never
+//! reallocating its GPU buffers. Rendering double-buffers so the compositor never
 //! reads a frame we are still painting.
 
 use std::collections::BTreeSet;
@@ -40,13 +40,12 @@ use crate::markdown;
 use crate::protocol::{
     self, wl_buffer, wl_callback, wl_compositor, wl_data_device, wl_data_device_manager,
     wl_data_offer, wl_data_source, wl_display, wl_keyboard, wl_pointer, wl_registry, wl_seat,
-    wl_shm, wl_shm_pool, wl_surface, wp_cursor_shape_device_v1, wp_cursor_shape_manager_v1,
+    wl_surface, wp_cursor_shape_device_v1, wp_cursor_shape_manager_v1,
     wp_linux_drm_syncobj_manager_v1, wp_linux_drm_syncobj_surface_v1, xdg_surface, xdg_toplevel,
     xdg_wm_base, zwp_linux_buffer_params_v1, zwp_linux_dmabuf_feedback_v1, zwp_linux_dmabuf_v1,
 };
-use crate::render::{self, Canvas};
 use crate::scroll;
-use crate::shm::Pool;
+use crate::shape;
 use crate::store;
 use crate::text::TextBuffer;
 use crate::tree;
@@ -59,7 +58,7 @@ const INIT_WIDTH: u32 = 800;
 const INIT_HEIGHT: u32 = 600;
 /// Upper bound on either surface dimension, applied to a compositor-supplied
 /// configure size. Far beyond any real display (8K is 7680 wide), it just keeps a
-/// bogus or hostile size from blowing up the shm-pool arithmetic.
+/// bogus or hostile size from blowing up the buffer-size arithmetic.
 const MAX_DIMENSION: u32 = 16384;
 
 /// Background, text, and selection colors (0x00RRGGBB), and the pixel size: a
@@ -831,7 +830,6 @@ struct State {
     // create default to 0 (never valid) until assigned.
     registry: u32,
     compositor: Option<u32>,
-    shm: Option<u32>,
     wm_base: Option<u32>,
     seat: Option<u32>,
     surface: u32,
@@ -843,17 +841,17 @@ struct State {
     data_device: u32,
     /// The dmabuf global (None when absent or below v4, which the GPU path
     /// requires), the version it was bound at, the feedback object created from
-    /// it, and the accumulating feedback the GPU backend consumes. The software
-    /// path never reads these; they are the negotiation half of the GPU path.
+    /// it, and the accumulating feedback the GPU backend consumes. They are the
+    /// negotiation half of the GPU path.
     dmabuf: Option<u32>,
     dmabuf_version: u32,
     dmabuf_feedback: u32,
     dmabuf_fb: dmabuf::FeedbackState,
-    /// The Vulkan backend when active (`None` runs the software wl_shm path):
-    /// the device plus one exportable image per swap slot, sharing the same
-    /// `buffers`/`busy` bookkeeping as the shm path. Activated by
-    /// `BNKNOTES_RENDERER=gpu` while the backend is under construction; the
-    /// default flips to probe-gated GPU when the display-list executor lands.
+    /// The Vulkan backend: the device plus one exportable image per swap slot.
+    /// Always `Some` once `bring_up` succeeds (a missing device hard-exits at
+    /// startup, so the editor never runs without a GPU); it stays an `Option`
+    /// only because it is created mid-bring-up, after the dmabuf feedback the
+    /// device selection needs has been committed.
     gpu: Option<vulkan::Gpu>,
     gpu_images: Vec<vulkan::GpuImage>,
     /// The compositor∩device modifier list images are allocated with,
@@ -918,21 +916,10 @@ struct State {
     selection_offer: u32,
     selection_text_mime: Option<String>,
 
-    // Double-buffered shm: one pool holding two frames, ping-ponged so we only
-    // paint a buffer the compositor has released.
-    pool: Option<Pool>,
-    pool_id: u32,
+    // Double-buffered GPU images: two exportable dmabuf-backed buffers,
+    // ping-ponged so we only render into a buffer the compositor has released.
     buffers: [u32; 2],
     busy: [bool; 2],
-    frame_len: usize,
-    /// The display list each back buffer currently holds, so a repaint diffs the
-    /// new frame against what is already in *that* buffer and clears only the
-    /// changed regions. The two age independently (each is painted on alternate
-    /// frames), which is why damage is tracked per buffer. Reset to empty whenever
-    /// the buffers are recreated, forcing a full repaint of the fresh memory.
-    /// `Rc`: after a paint, the freshly built list is also `present_list`, so
-    /// storing it twice is a refcount bump, not a deep clone of every text run.
-    buffer_lists: [Rc<DisplayList>; 2],
     /// The display list last committed to the compositor, i.e. what is on screen.
     /// The new frame is diffed against this to decide whether to present at all
     /// and which regions to report as damaged.
@@ -1059,7 +1046,6 @@ impl State {
             height: INIT_HEIGHT,
             registry: 0,
             compositor: None,
-            shm: None,
             wm_base: None,
             seat: None,
             surface: 0,
@@ -1100,12 +1086,8 @@ impl State {
             incoming_text_mime: None,
             selection_offer: 0,
             selection_text_mime: None,
-            pool: None,
-            pool_id: 0,
             buffers: [0, 0],
             busy: [false, false],
-            frame_len: 0,
-            buffer_lists: [Rc::default(), Rc::default()],
             present_list: Rc::default(),
             next_id: 2, // 1 is wl_display
             free_ids: Vec::new(),
@@ -1185,27 +1167,17 @@ impl State {
         let wm_base = self
             .wm_base
             .ok_or_else(|| Error::msg("compositor has no xdg_wm_base"))?;
-        self.shm
-            .ok_or_else(|| Error::msg("compositor has no wl_shm"))?;
         self.seat
             .ok_or_else(|| Error::msg("compositor has no wl_seat"))?;
 
-        // The GPU backend is the default: negotiate over dmabuf
-        // feedback and bring Vulkan up; any failure means the software path,
-        // reported only under stats so a machine without a GPU is not nagged
-        // on every launch. `BNKNOTES_RENDERER=cpu` skips the attempt (the
-        // escape hatch, and what the parity harness compares against).
+        // The GPU (Vulkan + dmabuf) is mandatory: negotiate over dmabuf feedback
+        // and bring Vulkan up, or exit with a clear message. There is no software
+        // fallback. The feedback (device, modifiers) must be committed before
+        // init_gpu can allocate, so wait out the burst here first.
         self.request_dmabuf_feedback();
-        if std::env::var_os("BNKNOTES_RENDERER").is_none_or(|v| v != "cpu") {
-            // The GPU path needs the committed feedback (device, modifiers)
-            // before it can allocate buffers, so wait out the burst here.
-            self.roundtrip()?;
-            if let Err(e) = self.init_gpu() {
-                if self.stats {
-                    eprintln!("bnknotes: gpu unavailable, software rendering: {e}");
-                }
-            }
-        }
+        self.roundtrip()?;
+        self.init_gpu()
+            .map_err(|e| Error::msg(format!("requires a Vulkan device; none available: {e}")))?;
 
         // Surface stack: wl_surface -> xdg_surface -> xdg_toplevel.
         self.surface = self.alloc_id();
@@ -1268,11 +1240,10 @@ impl State {
              Ctrl+B toggle tree, Ctrl+\\ toggle 2nd pane, Ctrl+0/1/2 focus tree/A/B, \
              drag splitters to resize; held keys repeat; close to exit"
         );
-        // Name the active renderer, so "is it on the GPU?" never needs a
-        // probe. The live-fallback path prints its own line if this changes.
-        match &self.gpu {
-            Some(gpu) => eprintln!("bnknotes: renderer: gpu ({})", gpu.name()),
-            None => eprintln!("bnknotes: renderer: software (wl_shm)"),
+        // Name the GPU device, so "which GPU?" never needs a probe. The backend
+        // is mandatory (bring_up exits above if it is missing), so it is present.
+        if let Some(gpu) = &self.gpu {
+            eprintln!("bnknotes: renderer: gpu ({})", gpu.name());
         }
         self.run_until(|s| s.closed)?;
         // Remember the layout for next launch: column sizes, tree root and open
@@ -1316,8 +1287,8 @@ impl State {
 
     /// Bring the Vulkan backend up from the committed dmabuf feedback: a
     /// device matching the compositor's, and a modifier list their common
-    /// ground. Called before `create_buffers`, which then allocates GPU
-    /// images instead of an shm pool.
+    /// ground. Called before `create_buffers`, which allocates the exportable
+    /// GPU images. A failure here is fatal (the editor requires a GPU).
     fn init_gpu(&mut self) -> Result<()> {
         if self.dmabuf.is_none() {
             return Err(Error::msg("compositor lacks zwp_linux_dmabuf_v1 v4+"));
@@ -1408,94 +1379,13 @@ impl State {
         Ok(id)
     }
 
-    /// Drop a failed GPU backend so the software path takes over: destroy its
-    /// buffers and images, the device (its Drop drains the queue), and the
-    /// CPU-side glyph cache. The caller recreates buffers on the shm path.
-    fn drop_gpu_backend(&mut self) {
-        self.destroy_buffers();
-        self.gpu = None;
-        self.gpu_modifiers.clear();
-        self.gpu_glyphs = gpu::GlyphCache::new();
-        // Explicit sync belongs to the GPU path; drop it (closing the render
-        // node fd and its syncobjs) so the software fallback carries nothing.
-        self.explicit_sync = None;
-    }
-
-    /// Allocate presentable buffers at the current size: GPU images exported
-    /// as dmabufs when the Vulkan backend is up, an shm pool otherwise. A GPU
-    /// allocation failure (resize on a dying device) demotes to software
-    /// rather than exiting.
+    /// Allocate the two presentable buffers at the current size: one exported
+    /// GPU image per swap slot, each wrapped in a wl_buffer via
+    /// `zwp_linux_buffer_params_v1` (`create_immed` is sound because every
+    /// parameter comes from the compositor's own feedback). A failure (a resize
+    /// on a dying device) propagates and ends the process; there is no software
+    /// path to fall back to.
     fn create_buffers(&mut self) -> Result<()> {
-        if self.gpu.is_some() {
-            match self.create_gpu_buffers() {
-                Ok(()) => return Ok(()),
-                Err(e) => {
-                    eprintln!("bnknotes: gpu buffers failed, switching to software: {e}");
-                    // Any half-created image leaks only until the device goes
-                    // down with the backend, right here.
-                    self.drop_gpu_backend();
-                }
-            }
-        }
-        let shm = self
-            .shm
-            .ok_or_else(|| Error::msg("creating buffers before wl_shm was bound"))?;
-        // Compute the geometry in usize: a u32 `width * 4 * height` wraps near a
-        // ~46k-px square, which would size the pool too small and let the
-        // compositor read past the mapping. The configure path clamps dimensions
-        // to MAX_DIMENSION, so the only remaining bound is the wire's i32 pool-size
-        // argument, which a near-MAX_DIMENSION square could still exceed.
-        let width = self.width as usize;
-        let height = self.height as usize;
-        let stride = width * 4;
-        let frame_len = stride * height;
-        let pool_size = frame_len * 2;
-        if pool_size > i32::MAX as usize {
-            return Err(Error::msg(
-                "requested window size is too large for an shm pool",
-            ));
-        }
-        let pool = Pool::new(pool_size)?;
-        self.frame_len = frame_len;
-        let pool_id = self.alloc_id();
-        self.conn.request_with_fd(
-            shm,
-            wl_shm::CREATE_POOL,
-            &[Arg::NewId(pool_id), Arg::Int(pool_size as i32)],
-            pool.fd(),
-        )?;
-        for i in 0..2 {
-            let buffer = self.alloc_id();
-            self.conn.request(
-                pool_id,
-                wl_shm_pool::CREATE_BUFFER,
-                &[
-                    Arg::NewId(buffer),
-                    Arg::Int((i * frame_len) as i32),
-                    Arg::Int(self.width as i32),
-                    Arg::Int(self.height as i32),
-                    Arg::Int(stride as i32),
-                    Arg::Uint(wl_shm::FORMAT_XRGB8888),
-                ],
-            );
-            self.buffers[i] = buffer;
-        }
-        self.pool = Some(pool);
-        self.pool_id = pool_id;
-        self.busy = [false, false];
-        // The new buffers hold undefined memory and the surface size may have
-        // changed, so no stored frame describes them: clear the damage history to
-        // force the next frame to repaint each buffer (and the screen) in full.
-        self.buffer_lists = [Rc::default(), Rc::default()];
-        self.present_list = Rc::default();
-        Ok(())
-    }
-
-    /// The dmabuf twin of the shm `create_buffers`: one exported image per
-    /// swap slot, each wrapped in a wl_buffer via `zwp_linux_buffer_params_v1`
-    /// (`create_immed` is sound because every parameter comes from the
-    /// compositor's own feedback).
-    fn create_gpu_buffers(&mut self) -> Result<()> {
         let dmabuf_global = self
             .dmabuf
             .ok_or_else(|| Error::msg("gpu buffers without zwp_linux_dmabuf_v1"))?;
@@ -1552,26 +1442,20 @@ impl State {
         if let Some(es) = self.explicit_sync.as_mut() {
             es.buffer_release = [None, None];
         }
-        // Fresh images hold no known frame; force full repaints as the shm
-        // path does (the GPU path repaints fully regardless, but the screen
-        // diff also gates presenting at all).
-        self.buffer_lists = [Rc::default(), Rc::default()];
+        // Fresh images hold no known frame, so forget what was on screen: the
+        // screen diff gates whether the next frame presents at all.
         self.present_list = Rc::default();
         Ok(())
     }
 
-    /// Destroy the current buffers and their backing (shm pool or GPU
-    /// images). The server recycles the ids via `delete_id` into our free
-    /// list.
+    /// Destroy the current buffers and their backing GPU images. The server
+    /// recycles the wl_buffer ids via `delete_id` into our free list.
     fn destroy_buffers(&mut self) {
         let buffers = self.buffers;
         for b in buffers {
             if b != 0 {
                 self.conn.request(b, wl_buffer::DESTROY, &[]);
             }
-        }
-        if self.pool_id != 0 {
-            self.conn.request(self.pool_id, wl_shm_pool::DESTROY, &[]);
         }
         if let Some(gpu) = &self.gpu {
             // Nothing may be in flight while images are destroyed; resize is
@@ -1581,8 +1465,6 @@ impl State {
                 gpu.destroy_image(img);
             }
         }
-        self.pool = None; // Drop unmaps and closes the fd.
-        self.pool_id = 0;
         self.buffers = [0, 0];
         self.busy = [false, false];
     }
@@ -1688,127 +1570,19 @@ impl State {
         Rc::new(list)
     }
 
-    /// Build the current frame, repaint only what changed in a free buffer, and
-    /// present it. Returns false if both buffers are still held by the compositor,
-    /// leaving `dirty` set so the next buffer release retries.
+    /// Build the current frame and present it on the GPU. Returns false if both
+    /// buffers are still held by the compositor, leaving `dirty` set so the next
+    /// buffer release retries.
     ///
-    /// Two diffs over the display list drive the damage tracking:
+    /// The display list is built and diffed against `present_list` (what is on
+    /// screen): an identical frame early-outs (the common idle case), otherwise
+    /// the changed screen regions are reported to the compositor as damage. The
+    /// per-buffer diff the software path used is gone: the GPU repaints the full
+    /// frame every present.
     ///
-    /// - against `present_list` (what is on screen) to decide whether to present at
-    ///   all and which regions to report as damaged to the compositor;
-    /// - against this buffer's last frame to decide which regions to repaint into
-    ///   it, since the two back buffers age independently.
-    ///
-    /// An idle caret blink thus repaints a caret-sized region (often nothing, when
-    /// the chosen buffer already holds that state) instead of the whole surface.
+    /// A rendering failure (a device lost mid-session) propagates and ends the
+    /// process; there is no software path to fall back to.
     fn render_frame(&mut self) -> Result<bool> {
-        if self.gpu.is_some() {
-            match self.render_frame_gpu() {
-                Ok(done) => return Ok(done),
-                Err(e) => {
-                    // A device lost mid-session (driver update, GPU reset) is
-                    // survivable: rebuild the software path live and repaint.
-                    // Nothing was committed for this frame, so the swap to
-                    // fresh shm buffers is invisible beyond one log line.
-                    eprintln!("bnknotes: gpu rendering failed, switching to software: {e}");
-                    self.drop_gpu_backend();
-                    self.create_buffers()?;
-                }
-            }
-        }
-        let Some(idx) = (0..2).find(|&i| !self.busy[i]) else {
-            return Ok(false);
-        };
-        // Time the whole frame (layout reuse/rebuild plus paint) when stats are on.
-        let started = self.stats.then(Instant::now);
-        let width = self.width as usize;
-        let height = self.height as usize;
-        let (sw, sh) = (self.width as i32, self.height as i32);
-        // Compose the frame from every pane (tree, editors) plus the splitters.
-        let new_list = self.build_frame_list();
-
-        // Nothing changed since the on-screen frame: it already shows this content,
-        // so there is nothing to present (the common idle case).
-        let screen_dmg = display::damage(&self.present_list, &new_list, sw, sh);
-        if screen_dmg.is_empty() {
-            return Ok(true);
-        }
-
-        // Repaint only the regions of this buffer that differ from what it already
-        // holds. The background fill at the head of the list clears each clip, then
-        // the rest of the list repaints it, so a clipped region matches a full
-        // repaint exactly.
-        let buf_dmg = display::damage(&self.buffer_lists[idx], &new_list, sw, sh);
-        if !buf_dmg.is_empty() {
-            // Resolve inline images against both panes' stores so a picture
-            // renders in whichever pane it belongs to.
-            let images = [&self.editors[0].images, &self.editors[1].images];
-            let frame_len = self.frame_len;
-            let offset = idx * frame_len;
-            let Some(pool) = self.pool.as_mut() else {
-                return Ok(false);
-            };
-            let frame = &mut pool.data_mut()[offset..offset + frame_len];
-            let mut canvas = Canvas::new(frame, width, height);
-            for clip in &buf_dmg {
-                display::execute(&mut canvas, &self.fonts, &images, &new_list, Some(*clip));
-            }
-        }
-        self.buffer_lists[idx] = Rc::clone(&new_list);
-        self.present_list = new_list;
-
-        let buffer = self.buffers[idx];
-        self.conn.request(
-            self.surface,
-            wl_surface::ATTACH,
-            &[Arg::Object(buffer), Arg::Int(0), Arg::Int(0)],
-        );
-        // Report just the regions that changed on screen, so the compositor
-        // recomposites only those rather than the whole surface.
-        for r in &screen_dmg {
-            self.conn.request(
-                self.surface,
-                wl_surface::DAMAGE,
-                &[Arg::Int(r.x), Arg::Int(r.y), Arg::Int(r.w), Arg::Int(r.h)],
-            );
-        }
-        // Arm a frame callback before committing, so the compositor tells us when
-        // the next frame is due. `run_until` won't draw again until its `done`
-        // clears `frame_callback`, which is what paces redraws to the refresh.
-        let callback = self.alloc_id();
-        self.conn
-            .request(self.surface, wl_surface::FRAME, &[Arg::NewId(callback)]);
-        self.frame_callback = callback;
-        self.conn.request(self.surface, wl_surface::COMMIT, &[]);
-        self.busy[idx] = true;
-
-        if let Some(started) = started {
-            let cache = self.fonts.cache_stats();
-            let gap = self
-                .last_present
-                .map(|t| started.duration_since(t).as_secs_f64() * 1000.0)
-                .unwrap_or(0.0);
-            eprintln!(
-                "[stats] frame {} {:.2}ms paint, {:.1}ms since last | glyphs hit {} miss {} ({:.1}% of {})",
-                self.frame_count,
-                started.elapsed().as_secs_f64() * 1000.0,
-                gap,
-                cache.hits,
-                cache.misses,
-                cache.hit_rate() * 100.0,
-                cache.lookups(),
-            );
-            self.last_present = Some(started);
-        }
-        self.frame_count += 1;
-        Ok(true)
-    }
-
-    /// The GPU frame: build the display list exactly as the software path
-    /// does, keep its identical-frame early-out and screen-damage hints, then
-    /// hand the list to the batcher and the Vulkan renderer. The per-buffer
-    /// diff is skipped: the GPU repaints the full frame every present.
-    fn render_frame_gpu(&mut self) -> Result<bool> {
         let Some(idx) = (0..2).find(|&i| !self.busy[i]) else {
             return Ok(false);
         };
@@ -1818,7 +1592,7 @@ impl State {
         let new_list = self.build_frame_list();
 
         // Nothing changed since the on-screen frame: nothing to present (the
-        // common idle case), exactly as the software path decides it.
+        // common idle case).
         let screen_dmg = display::damage(&self.present_list, &new_list, sw, sh);
         if screen_dmg.is_empty() {
             return Ok(true);
@@ -1826,7 +1600,8 @@ impl State {
 
         // Render, returning the render-done fence under explicit sync (`None`
         // on the bridge path, or when the driver could not export one). Inline
-        // images resolve against both panes' stores (see the software path).
+        // images resolve against both panes' stores, so a picture renders in
+        // whichever pane it belongs to.
         let images = [&self.editors[0].images, &self.editors[1].images];
         let render_done = {
             let Some(gpu) = self.gpu.as_mut() else {
@@ -2027,7 +1802,7 @@ impl State {
                     let _states = r.array()?;
                     // A zero dimension means the compositor leaves it to us. Clamp
                     // to MAX_DIMENSION so the buffer geometry stays well inside the
-                    // shm-pool size arithmetic (see `create_buffers`).
+                    // buffer-size arithmetic (see `create_buffers`).
                     if w > 0 && h > 0 {
                         self.pending_size = Some((w.min(MAX_DIMENSION), h.min(MAX_DIMENSION)));
                     }
@@ -2170,7 +1945,7 @@ impl State {
         if self.dmabuf.is_none() {
             println!(
                 "gpu-probe: compositor lacks zwp_linux_dmabuf_v1 v{}+; \
-                 the GPU path is unavailable (software rendering unaffected)",
+                 the editor cannot run here (it requires the GPU path)",
                 protocol::VERSION_DMABUF
             );
             return Ok(());
@@ -2290,11 +2065,6 @@ impl State {
                     id,
                 );
                 self.compositor = Some(id);
-            }
-            protocol::IFACE_SHM => {
-                let id = self.alloc_id();
-                self.bind(name, interface, version.min(protocol::VERSION_SHM), id);
-                self.shm = Some(id);
             }
             protocol::IFACE_WM_BASE => {
                 let id = self.alloc_id();
@@ -3654,8 +3424,8 @@ fn smart_home_target(line: &str, start: usize, end: usize, cursor: usize) -> usi
 }
 
 /// A 0x00RRGGBB color as the linear-float RGBA a Vulkan clear expects. The
-/// software canvas treats the bytes as display (sRGB-encoded) values, so the
-/// GPU gets the same numbers, not a color-space conversion.
+/// bytes are the display (sRGB-encoded) values as authored, passed through as
+/// the same numbers, not a color-space conversion.
 fn color_f32(color: u32) -> [f32; 4] {
     [
         ((color >> 16) & 0xff) as f32 / 255.0,
@@ -3665,10 +3435,10 @@ fn color_f32(color: u32) -> [f32; 4] {
     ]
 }
 
-/// The per-frame inputs [`paint_document`] needs beyond the layout itself: the
-/// surface size, the scroll offset, the live selection and cursor, and whether
-/// the caret is on this blink. Bundled so the paint signature stays readable and
-/// so the perf harness can drive a paint without a live surface.
+/// The per-frame inputs [`build_display_list`] needs beyond the layout itself:
+/// the surface size, the scroll offset, the live selection and cursor, and
+/// whether the caret is on this blink. Bundled so the build signature stays
+/// readable and so the perf harness can drive a build without a live surface.
 pub(crate) struct PaintParams<'a> {
     pub width: usize,
     pub height: usize,
@@ -3703,22 +3473,6 @@ pub(crate) struct FindPaint<'a> {
     /// Index into `matches` of the current match. It is not highlighted here
     /// because the app mirrors it into the buffer selection.
     pub current: usize,
-}
-
-/// Paint one frame of the document into `canvas`, building the display list and
-/// executing it in full. The convenience used by tests and the perf harness; the
-/// live editor instead diffs the list against the buffer's last frame and repaints
-/// only the changed regions (see [`State::render_frame`]).
-pub(crate) fn paint_document(
-    canvas: &mut Canvas,
-    fonts: &Fonts,
-    layout: &Layout,
-    rope: &crate::rope::Rope,
-    images: &ImageStore,
-    p: &PaintParams,
-) {
-    let list = build_display_list(fonts, layout, rope, p);
-    display::execute(canvas, fonts, &[images], &list, None);
 }
 
 /// A [`DrawCmd::Text`] for `text` from `x` along `baseline` in `face`/`color`,
@@ -3910,10 +3664,10 @@ pub(crate) fn build_display_list(
         let first = i == 0 || !lines[i - 1].code_block;
         let last = i + 1 >= lines.len() || !lines[i + 1].code_block;
         let corners = match (first, last) {
-            (true, true) => render::RoundedCorners::Both,
-            (true, false) => render::RoundedCorners::Top,
-            (false, true) => render::RoundedCorners::Bottom,
-            (false, false) => render::RoundedCorners::None,
+            (true, true) => display::RoundedCorners::Both,
+            (true, false) => display::RoundedCorners::Top,
+            (false, true) => display::RoundedCorners::Bottom,
+            (false, false) => display::RoundedCorners::None,
         };
         list.push(DrawCmd::RoundRect {
             rect: Rect {
@@ -4073,7 +3827,7 @@ pub(crate) fn build_display_list(
             // bar above replaces it). Either keeps the source width, so text never
             // shifts.
             if i == 0 && matches!(run.kind, markdown::SpanKind::Marker) {
-                let advance = render::text_advance(face, &slice).round() as i32;
+                let advance = shape::text_advance(face, &slice).round() as i32;
                 match line.gutter {
                     Gutter::Bullet => {
                         // Place the marker's leading indentation first, so a nested
@@ -4082,9 +3836,8 @@ pub(crate) fn build_display_list(
                         // the muted marker color (MARKER_COLOR), not the body FG.
                         let indent = slice.len() - slice.trim_start().len();
                         let dot_x =
-                            pen + render::text_advance(face, &slice[..indent]).round() as i32;
-                        let end =
-                            (dot_x as f32 + render::text_advance(face, BULLET)).round() as i32;
+                            pen + shape::text_advance(face, &slice[..indent]).round() as i32;
+                        let end = (dot_x as f32 + shape::text_advance(face, BULLET)).round() as i32;
                         list.push(text_cmd(
                             fk,
                             dot_x,
@@ -4141,7 +3894,7 @@ pub(crate) fn build_display_list(
             // emitted in the pre-pass above, beneath the selection; here we only
             // draw the glyphs over them.
             let run_x = pen;
-            let end = (run_x as f32 + render::text_advance(face, &slice)).round() as i32;
+            let end = (run_x as f32 + shape::text_advance(face, &slice)).round() as i32;
             list.push(text_cmd(fk, run_x, baseline, end, color, slice, m));
             pen = end;
             // Inline decorations over the glyphs, each spanning the run's drawn
@@ -4303,9 +4056,9 @@ fn push_find_bar(list: &mut DisplayList, fonts: &Fonts, find: &FindPaint, width:
     } else {
         format!("{}/{}", find.current + 1, find.matches.len())
     };
-    let counter_w = render::text_advance(face, &counter).ceil() as i32;
-    let flag_word_w = render::text_advance(face, "W").ceil() as i32;
-    let flag_regex_w = render::text_advance(face, ".*").ceil() as i32;
+    let counter_w = shape::text_advance(face, &counter).ceil() as i32;
+    let flag_word_w = shape::text_advance(face, "W").ceil() as i32;
+    let flag_regex_w = shape::text_advance(face, ".*").ceil() as i32;
     let gap = pad / 2;
     let tail_w = flag_word_w + gap + flag_regex_w + gap + counter_w;
 
@@ -4314,20 +4067,20 @@ fn push_find_bar(list: &mut DisplayList, fonts: &Fonts, find: &FindPaint, width:
     // remeasure loop is cheap.
     fn tail_that_fits<'t>(face: &crate::freetype::Face, text: &'t str, max: f32) -> &'t str {
         let mut shown = text;
-        while render::text_advance(face, shown) > max && !shown.is_empty() {
+        while shape::text_advance(face, shown) > max && !shown.is_empty() {
             shown = &shown[grapheme::next_boundary(shown, 0)..];
         }
         shown
     }
     let field_max = (width / 3).max(3 * size as i32) as f32;
     let query = tail_that_fits(face, find.query, field_max);
-    let query_w = render::text_advance(face, query).ceil() as i32;
+    let query_w = shape::text_advance(face, query).ceil() as i32;
     let replace = find.replace.map(|r| tail_that_fits(face, r, field_max));
     let replace_w = replace
-        .map(|r| render::text_advance(face, r).ceil() as i32)
+        .map(|r| shape::text_advance(face, r).ceil() as i32)
         .unwrap_or(0);
     let arrow = "→ ";
-    let arrow_w = render::text_advance(face, arrow).ceil() as i32;
+    let arrow_w = shape::text_advance(face, arrow).ceil() as i32;
 
     let rows = 1 + replace.is_some() as i32;
     let replace_row_w = if replace.is_some() {
@@ -4344,7 +4097,7 @@ fn push_find_bar(list: &mut DisplayList, fonts: &Fonts, find: &FindPaint, width:
         rect: Rect { x, y, w, h },
         color: FIND_BG,
         radius: (pad / 2).max(2),
-        corners: render::RoundedCorners::Both,
+        corners: display::RoundedCorners::Both,
     });
 
     // A steady caret (no blink) after the focused field's text: it marks where
@@ -4487,7 +4240,7 @@ fn push_checkbox(list: &mut DisplayList, rect: Rect, checked: bool) {
         rect,
         color: if checked { LINK_COLOR } else { MARKER_COLOR },
         radius,
-        corners: render::RoundedCorners::Both,
+        corners: display::RoundedCorners::Both,
     });
     if checked {
         push_check_mark(list, rect);
@@ -4502,7 +4255,7 @@ fn push_checkbox(list: &mut DisplayList, rect: Rect, checked: bool) {
             },
             color: BACKGROUND,
             radius: (radius - t).max(1),
-            corners: render::RoundedCorners::Both,
+            corners: display::RoundedCorners::Both,
         });
     }
 }
@@ -4577,17 +4330,17 @@ fn push_image_chrome(list: &mut DisplayList, fonts: &Fonts, pic: &Rect) {
         rect: btn,
         color: IMAGE_BUTTON_BG,
         radius: IMAGE_BUTTON_RADIUS,
-        corners: render::RoundedCorners::Both,
+        corners: display::RoundedCorners::Both,
     });
     // Center the glyph in both axes from the code-face metrics.
     let fk = FaceKey::Code { size: FONT_SIZE };
     let face = fonts.face_for(fk);
     let glyph = "</>";
-    let advance = render::text_advance(face, glyph).round() as i32;
+    let advance = shape::text_advance(face, glyph).round() as i32;
     let m = fonts.metrics(FONT_SIZE);
     let gx = btn.x + (btn.w - advance) / 2;
     let gbaseline = btn.y + (btn.h - (m.ascent + m.descent)) / 2 + m.ascent;
-    let gend = (gx as f32 + render::text_advance(face, glyph)).round() as i32;
+    let gend = (gx as f32 + shape::text_advance(face, glyph)).round() as i32;
     list.push(text_cmd(
         fk,
         gx,
@@ -4602,7 +4355,6 @@ fn push_image_chrome(list: &mut DisplayList, fonts: &Fonts, pic: &Rect) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::image::{Image, ImageStore};
     use crate::rope::Rope;
 
     #[test]
@@ -4668,267 +4420,6 @@ mod tests {
             caret_visible: false,
             find: None,
         }
-    }
-
-    /// Painting a *selected* image draws its accent border and its corner button
-    /// panel: end-to-end proof through `paint_document` that the selection chrome
-    /// reaches the canvas (the click that sets the selection is covered by the
-    /// layout hit-test tests).
-    #[test]
-    fn a_selected_image_paints_its_border_and_button() {
-        let fonts = Fonts::new(&markdown::all_sizes(FONT_SIZE)).expect("a default font");
-        let rope = Rope::from_str("![x](cat.png)");
-        // An opaque gray picture, distinct from the border/button colors.
-        let img = Image {
-            pixels: vec![0xff_80_80_80; 60 * 40],
-            width: 60,
-            height: 40,
-        };
-        let store = ImageStore::from_decoded(vec![("cat.png".to_string(), img)]);
-        let (w, h) = (800usize, 600usize);
-        let layout = Layout::build_with_images(
-            &fonts,
-            &rope,
-            MARGIN,
-            MARGIN,
-            w as i32 - 2 * MARGIN,
-            FONT_SIZE,
-            (99, 99), // cursor off the image: it renders as a picture
-            &store,
-            ImageUi {
-                selected: Some(0),
-                raw: None,
-            },
-        );
-        let mut buf = vec![0u8; w * h * 4];
-        let mut canvas = Canvas::new(&mut buf, w, h);
-        paint_document(
-            &mut canvas,
-            &fonts,
-            &layout,
-            &rope,
-            &store,
-            &paint_params(w, h),
-        );
-
-        let has = |color: u32| {
-            buf.chunks_exact(4)
-                .any(|p| u32::from_ne_bytes(p.try_into().unwrap()) & 0x00ff_ffff == color)
-        };
-        assert!(
-            has(IMAGE_BORDER_COLOR),
-            "the accent selection border is painted"
-        );
-        assert!(has(IMAGE_BUTTON_BG), "the corner button panel is painted");
-    }
-
-    /// An idle (unselected) image paints neither border nor button, so the chrome
-    /// only appears on selection.
-    #[test]
-    fn an_idle_image_has_no_selection_chrome() {
-        let fonts = Fonts::new(&markdown::all_sizes(FONT_SIZE)).expect("a default font");
-        let rope = Rope::from_str("![x](cat.png)");
-        let img = Image {
-            pixels: vec![0xff_80_80_80; 60 * 40],
-            width: 60,
-            height: 40,
-        };
-        let store = ImageStore::from_decoded(vec![("cat.png".to_string(), img)]);
-        let (w, h) = (800usize, 600usize);
-        let layout = Layout::build_with_images(
-            &fonts,
-            &rope,
-            MARGIN,
-            MARGIN,
-            w as i32 - 2 * MARGIN,
-            FONT_SIZE,
-            (99, 99),
-            &store,
-            ImageUi::default(),
-        );
-        let mut buf = vec![0u8; w * h * 4];
-        let mut canvas = Canvas::new(&mut buf, w, h);
-        paint_document(
-            &mut canvas,
-            &fonts,
-            &layout,
-            &rope,
-            &store,
-            &paint_params(w, h),
-        );
-        let border = buf
-            .chunks_exact(4)
-            .any(|p| u32::from_ne_bytes(p.try_into().unwrap()) & 0x00ff_ffff == IMAGE_BORDER_COLOR);
-        assert!(!border, "no border without selection");
-    }
-
-    /// Repainting only the damaged regions when going from frame `a` to frame `b`
-    /// must land on exactly the pixels a full repaint of `b` would: the invariant
-    /// the whole damage path rests on, and the one an under-reporting diff breaks.
-    fn assert_incremental_matches_full(
-        fonts: &Fonts,
-        images: &ImageStore,
-        a: &DisplayList,
-        b: &DisplayList,
-        w: usize,
-        h: usize,
-        label: &str,
-    ) {
-        // Reference: b painted from scratch.
-        let mut full = vec![0u8; w * h * 4];
-        {
-            let mut c = Canvas::new(&mut full, w, h);
-            display::execute(&mut c, fonts, &[images], b, None);
-        }
-        // Incremental: a painted in full, then only damage(a, b) repainted with b.
-        let mut inc = vec![0u8; w * h * 4];
-        {
-            let mut c = Canvas::new(&mut inc, w, h);
-            display::execute(&mut c, fonts, &[images], a, None);
-        }
-        let dmg = display::damage(a, b, w as i32, h as i32);
-        {
-            let mut c = Canvas::new(&mut inc, w, h);
-            for clip in &dmg {
-                display::execute(&mut c, fonts, &[images], b, Some(*clip));
-            }
-        }
-        assert!(
-            inc == full,
-            "incremental repaint must match a full repaint: {label}"
-        );
-    }
-
-    #[test]
-    fn executing_a_frame_records_glyph_cache_activity() {
-        // Guards the BNKNOTES_STATS path end to end: drawing real text through the
-        // display list registers glyph-cache lookups on the same Fonts the frame
-        // loop rolls its stats up from, so a non-empty document never reports a
-        // silent zero. A cold first paint is all misses.
-        let fonts = Fonts::new(&markdown::all_sizes(FONT_SIZE)).expect("a default font");
-        let images = ImageStore::new(None);
-        let rope = Rope::from_str("hello world");
-        let (w, h) = (200usize, 80usize);
-        let wrap = w as i32 - 2 * MARGIN;
-        let layout = Layout::build(&fonts, &rope, MARGIN, MARGIN, wrap, FONT_SIZE, (0, 0));
-        let list = build_display_list(&fonts, &layout, &rope, &paint_params(w, h));
-        let mut buf = vec![0u8; w * h * 4];
-        {
-            let mut canvas = Canvas::new(&mut buf, w, h);
-            display::execute(&mut canvas, &fonts, &[&images], &list, None);
-        }
-        let stats = fonts.cache_stats();
-        assert!(
-            stats.lookups() > 0,
-            "drawing text must record glyph-cache lookups, got hits={} misses={}",
-            stats.hits,
-            stats.misses
-        );
-    }
-
-    #[test]
-    fn incremental_repaint_matches_a_full_repaint() {
-        let fonts = Fonts::new(&markdown::all_sizes(FONT_SIZE)).expect("a default font");
-        let images = ImageStore::new(None);
-        let rope =
-            Rope::from_str("# Title\n\nSome *body* text with `code`.\n\nsecond paragraph here\n");
-        let (w, h) = (400usize, 300usize);
-        let wrap = w as i32 - 2 * MARGIN;
-        let far = rope.len().saturating_sub(2); // inside the last paragraph
-
-        // The cursor on the heading reveals its `#` (and pushes the title right);
-        // far away the marker collapses and the title shifts left.
-        let lay_top = Layout::build(&fonts, &rope, MARGIN, MARGIN, wrap, FONT_SIZE, (0, 0));
-        let lay_far = Layout::build(&fonts, &rope, MARGIN, MARGIN, wrap, FONT_SIZE, (far, far));
-
-        let frame =
-            |layout: &Layout, cursor: usize, caret: bool, selection: Option<(usize, usize)>| {
-                build_display_list(
-                    &fonts,
-                    layout,
-                    &rope,
-                    &PaintParams {
-                        width: w,
-                        height: h,
-                        scroll_y: 0,
-                        selection,
-                        cursor,
-                        caret_visible: caret,
-                        find: None,
-                    },
-                )
-            };
-
-        let on_top = frame(&lay_top, 0, true, None);
-        let off_top = frame(&lay_top, 0, false, None);
-        let sel_top = frame(&lay_top, 0, true, Some((0, 5)));
-        let far_frame = frame(&lay_far, far, true, None);
-
-        // Caret blink, a selection appearing, and a cursor move that collapses the
-        // heading marker and shifts its text (both directions): each incremental
-        // repaint must be pixel-identical to painting the target frame from scratch.
-        assert_incremental_matches_full(&fonts, &images, &on_top, &off_top, w, h, "caret blink");
-        assert_incremental_matches_full(
-            &fonts,
-            &images,
-            &on_top,
-            &sel_top,
-            w,
-            h,
-            "selection appears",
-        );
-        assert_incremental_matches_full(
-            &fonts,
-            &images,
-            &on_top,
-            &far_frame,
-            w,
-            h,
-            "cursor leaves heading",
-        );
-        assert_incremental_matches_full(
-            &fonts,
-            &images,
-            &far_frame,
-            &on_top,
-            w,
-            h,
-            "cursor enters heading",
-        );
-
-        // The find bar appearing (panel, query, counter, match highlights, and
-        // the current match as selection) must also diff cleanly, both ways.
-        let mut fs = FindState::new();
-        let text = rope.to_string();
-        fs.open_at(0, &text);
-        let landed = fs.push('e', &text);
-        assert!(landed.is_some(), "the fixture contains an e");
-        let find_frame = build_display_list(
-            &fonts,
-            &lay_top,
-            &rope,
-            &PaintParams {
-                width: w,
-                height: h,
-                scroll_y: 0,
-                selection: landed,
-                cursor: landed.map_or(0, |(_, end)| end),
-                caret_visible: true,
-                find: Some(FindPaint {
-                    query: fs.query(),
-                    replace: None,
-                    focus_replace: false,
-                    selected: false,
-                    word: false,
-                    regex: false,
-                    error: false,
-                    matches: fs.matches(),
-                    current: fs.current(),
-                }),
-            },
-        );
-        assert_incremental_matches_full(&fonts, &images, &on_top, &find_frame, w, h, "find opens");
-        assert_incremental_matches_full(&fonts, &images, &find_frame, &on_top, w, h, "find closes");
     }
 
     #[test]
@@ -5013,26 +4504,6 @@ mod tests {
             }),
             "the done text is struck through"
         );
-    }
-
-    #[test]
-    fn a_checkbox_toggle_repaints_incrementally_to_the_same_pixels() {
-        // Toggling `[ ]` -> `[x]` swaps the box fill and adds the check cells
-        // and strike; the damage diff must repaint exactly to a full repaint.
-        let fonts = Fonts::new(&markdown::all_sizes(FONT_SIZE)).expect("a default font");
-        let images = ImageStore::new(None);
-        let (w, h) = (400usize, 200usize);
-        let wrap = w as i32 - 2 * MARGIN;
-        let frame = |src: &str| {
-            let rope = Rope::from_str(src);
-            let off = src.len() - 1;
-            let layout = Layout::build(&fonts, &rope, MARGIN, MARGIN, wrap, FONT_SIZE, (off, off));
-            build_display_list(&fonts, &layout, &rope, &paint_params(w, h))
-        };
-        let open = frame("- [ ] task text\nx");
-        let done = frame("- [x] task text\nx");
-        assert_incremental_matches_full(&fonts, &images, &open, &done, w, h, "check a task");
-        assert_incremental_matches_full(&fonts, &images, &done, &open, w, h, "uncheck a task");
     }
 
     #[test]

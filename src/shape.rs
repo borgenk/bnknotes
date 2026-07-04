@@ -1,12 +1,16 @@
-//! Cluster shaping backed by the system HarfBuzz (libharfbuzz.so).
+//! Text measurement and cluster shaping.
 //!
-//! The editor renders almost all text one glyph per Unicode scalar and never
-//! touches this module (`render::text_advance` and `draw_text` route ASCII and
-//! simple clusters straight to the per-character caches). Shaping is reserved
-//! for the one case that genuinely needs it: resolving a multi-scalar emoji
-//! cluster (a ZWJ family, a flag's regional-indicator pair, a skin-tone or
-//! keycap sequence) into the single ligature glyph the emoji font's GSUB table
-//! defines, which FreeType alone cannot do.
+//! [`text_advance`] measures a run's pen advance from cached per-glyph metrics
+//! (no rasterization), which is how layout places the caret and hit-tests
+//! clicks. It routes ASCII and simple clusters straight to the per-character
+//! caches; only a multi-scalar emoji cluster reaches the shaper below.
+//!
+//! The shaper is backed by the system HarfBuzz (libharfbuzz.so). The editor
+//! renders almost all text one glyph per Unicode scalar and never touches it;
+//! shaping is reserved for the one case that genuinely needs it: resolving a
+//! multi-scalar emoji cluster (a ZWJ family, a flag's regional-indicator pair, a
+//! skin-tone or keycap sequence) into the single ligature glyph the emoji font's
+//! GSUB table defines, which FreeType alone cannot do.
 //!
 //! The HarfBuzz font is bound to the already-open FreeType face with
 //! `hb_ft_font_create_referenced`, so glyph ids, metrics, and font tables all
@@ -18,6 +22,27 @@
 
 use core::ffi::{c_char, c_int, c_uint, c_void};
 use core::ptr::{self, NonNull};
+
+use crate::freetype::Face;
+use crate::grapheme;
+
+/// Total pen advance of `text` at the face's current pixel size, in pixels.
+/// Measures with metrics only (no rasterization), matching how the renderer
+/// advances the pen, so the caret lands where the next glyph would be drawn.
+/// [`crate::layout`] uses this to place the caret and hit-test clicks.
+///
+/// ASCII, the overwhelming case, skips cluster segmentation entirely; other
+/// text measures per grapheme cluster so an emoji cluster gets its color
+/// glyph's advance, routed identically to how the renderer draws it.
+pub fn text_advance(face: &Face, text: &str) -> f32 {
+    if text.is_ascii() {
+        return text.chars().map(|c| face.advance(c)).sum();
+    }
+    grapheme::graphemes(text)
+        .into_iter()
+        .map(|(_, cluster)| face.cluster_advance(cluster))
+        .sum()
+}
 
 /// One glyph of a shaped cluster: the font glyph id and its pen placement in
 /// pixels at the face's selected size (already divided down from 26.6).
@@ -156,5 +181,35 @@ impl Drop for Shaper {
         // SAFETY: the handle came from hb_ft_font_create_referenced and is
         // destroyed exactly once.
         unsafe { hb_font_destroy(self.font.as_ptr()) };
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn text_advance_is_zero_empty_and_grows_with_length() {
+        let face = Face::open_default(32).expect("a default font");
+        assert_eq!(text_advance(&face, ""), 0.0);
+        let one = text_advance(&face, "m");
+        let two = text_advance(&face, "mm");
+        assert!(one > 0.0);
+        assert!(two > one, "two glyphs advance further than one");
+    }
+
+    #[test]
+    fn text_advance_ascii_fast_path_matches_the_cluster_path() {
+        let face = Face::open_default(32).expect("a default font");
+        let text = "Hello, world 123 <> []";
+        let fast = text_advance(&face, text);
+        let clustered: f32 = grapheme::graphemes(text)
+            .into_iter()
+            .map(|(_, cluster)| face.cluster_advance(cluster))
+            .sum();
+        assert_eq!(
+            fast, clustered,
+            "the ASCII shortcut must not change measurement"
+        );
     }
 }

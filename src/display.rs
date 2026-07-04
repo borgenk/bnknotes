@@ -1,30 +1,28 @@
 //! The frame as data: a flat list of drawing primitives the painter emits and a
-//! consumer executes. This is the display list, and two things hang off it:
+//! backend consumes. This is the display list, and two things hang off it:
 //!
 //! - **Damage tracking**: because a frame is now a value, two frames can be
 //!   compared. [`damage`] diffs the previous frame against the new one and
 //!   returns just the screen rectangles that changed, so an idle caret blink
-//!   repaints a caret-sized region instead of the whole surface, and a keystroke
-//!   repaints the edited line rather than the screen.
-//! - **A second backend later**: [`execute`] is the only code that
-//!   turns commands into pixels (here, the software [`Canvas`]). A GPU consumer
-//!   would execute the same list unchanged.
+//!   presents a caret-sized damaged region instead of the whole surface, and a
+//!   keystroke reports the edited line rather than the screen.
+//! - **A backend-agnostic frame**: the list is turned into pixels by
+//!   the GPU batcher ([`crate::gpu::build_frame`]), which consumes exactly these
+//!   commands. Nothing here is Vulkan-specific.
 //!
 //! Commands are in *screen* space (already shifted by the scroll), so scrolling,
 //! which moves every command, naturally diffs as "everything changed" and falls
 //! back to a full repaint.
 //!
 //! ```text
-//!   layout + params ──build_display_list──▶ DisplayList ──┬─ execute ─▶ pixels
+//!   layout + params ──build_display_list──▶ DisplayList ──┬─ gpu::build_frame ─▶ vertices
 //!                                                         └─ damage(old,new) ─▶ [Rect]
 //! ```
 
 use std::collections::HashMap;
 
-use crate::freetype::{FaceKey, Fonts};
-use crate::image::ImageStore;
+use crate::freetype::FaceKey;
 use crate::layout::Rect;
-use crate::render::{Canvas, RoundedCorners};
 
 /// A frame, as the ordered primitives that draw it. Stacking is the list order:
 /// background first, then panels, selection, glyphs, and the caret last.
@@ -33,6 +31,18 @@ pub type DisplayList = Vec<DrawCmd>;
 /// Beyond this many distinct changed regions, repainting the whole surface is
 /// cheaper than tracking and clipping each one.
 const MAX_DAMAGE_RECTS: usize = 16;
+
+/// Which corners a [`DrawCmd::RoundRect`] rounds. A fenced code block's panel is
+/// drawn as one rounded rectangle: the GPU shader rounds whichever corners this
+/// selects, so a single-line block rounds both ends and a multi-line block rounds
+/// only its first and last rows.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum RoundedCorners {
+    None,
+    Top,
+    Bottom,
+    Both,
+}
 
 /// One drawing primitive in screen (post-scroll) pixels. The set is deliberately
 /// small and low level so a future GPU backend can execute the same list; the
@@ -79,64 +89,6 @@ impl DrawCmd {
             DrawCmd::Text { bounds, .. } => *bounds,
         }
     }
-}
-
-/// Draw `list` into `canvas`, optionally confined to `clip` (a single changed
-/// region). With a clip, the background fill at the head of the list clears the
-/// region and the following commands repaint it, so a clipped run reproduces
-/// exactly the pixels a full repaint would, just within the rectangle. Commands
-/// whose bounds miss the clip are skipped cheaply; the rest are clipped per pixel
-/// by the canvas.
-/// Image commands are resolved against `stores` in order (one per content pane),
-/// so a picture renders whichever pane it belongs to. The first store holding
-/// the path wins; two panes referencing the same relative name from different
-/// directories is the one case this cannot disambiguate.
-pub fn execute(
-    canvas: &mut Canvas,
-    fonts: &Fonts,
-    stores: &[&ImageStore],
-    list: &[DrawCmd],
-    clip: Option<Rect>,
-) {
-    canvas.set_clip(clip.map(|r| (r.x, r.y, r.w, r.h)));
-    for cmd in list {
-        if let Some(c) = clip {
-            if !intersects(cmd.bounds(), c) {
-                continue;
-            }
-        }
-        match cmd {
-            DrawCmd::Fill { rect, color } => {
-                canvas.fill_solid(rect.x, rect.y, rect.w, rect.h, *color);
-            }
-            DrawCmd::RoundRect {
-                rect,
-                color,
-                radius,
-                corners,
-            } => {
-                canvas.fill_round_rect(rect.x, rect.y, rect.w, rect.h, *color, *radius, *corners);
-            }
-            DrawCmd::Text {
-                x,
-                baseline,
-                face,
-                color,
-                text,
-                ..
-            } => {
-                canvas.draw_text(fonts.face_for(*face), *x, *baseline, text, *color);
-            }
-            DrawCmd::Image { rect, path } => {
-                if let Some(store) = stores.iter().find(|s| s.get(path).is_some()) {
-                    let _ = store.with_scaled(path, rect.w as u32, rect.h as u32, |bitmap| {
-                        canvas.blit_argb(rect.x, rect.y, rect.w, rect.h, bitmap);
-                    });
-                }
-            }
-        }
-    }
-    canvas.set_clip(None);
 }
 
 /// The screen regions that differ between the previous frame `old` and the new

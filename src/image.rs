@@ -10,7 +10,6 @@
 //! allocated. The decoders' own built-in dimension cap (16384 square) sits above
 //! that as a hard backstop, so an absurd size is refused even sooner.
 
-use std::cell::RefCell;
 use std::collections::HashMap;
 use std::io::Cursor;
 use std::path::{Path, PathBuf};
@@ -194,23 +193,16 @@ pub struct ImageStore {
     /// Decoded images by raw path. A `None` value is a negative entry: the path
     /// was tried and could not be read or decoded.
     cache: HashMap<String, Option<Image>>,
-    /// Display-size bitmaps by (raw path, width, height): the decoded image
-    /// resampled to the size it is drawn at. Bilinear resampling is expensive, so
-    /// it runs once per (image, size) and every frame just blits the cached bitmap.
-    /// Interior-mutable so the painter (which holds `&self`) can fill it lazily,
-    /// the same pattern the glyph cache uses.
-    scaled: RefCell<HashMap<(String, u32, u32), Vec<u32>>>,
     limits: Limits,
 }
 
 impl ImageStore {
     /// An empty store resolving relative paths against `dir` (or only absolute
-    /// paths when `dir` is `None`). The caches allocate nothing until used.
+    /// paths when `dir` is `None`). The cache allocates nothing until used.
     pub fn new(dir: Option<PathBuf>) -> Self {
         Self {
             dir,
             cache: HashMap::new(),
-            scaled: RefCell::new(HashMap::new()),
             limits: Limits::default(),
         }
     }
@@ -264,33 +256,6 @@ impl ImageStore {
         Some((bytes, mime))
     }
 
-    /// Call `f` with `raw_path`'s decoded image resampled to `w` x `h`, caching the
-    /// resampled bitmap so the expensive bilinear pass runs once per (image, size)
-    /// rather than every frame. The bitmap is borrowed for the duration of `f` (the
-    /// painter blits it there). Returns `None` if the image is not decoded.
-    pub fn with_scaled<R>(
-        &self,
-        raw_path: &str,
-        w: u32,
-        h: u32,
-        f: impl FnOnce(&[u32]) -> R,
-    ) -> Option<R> {
-        let key = (raw_path.to_string(), w, h);
-        if !self.scaled.borrow().contains_key(&key) {
-            let src = self.get(raw_path)?;
-            let bitmap = crate::render::resample_argb(
-                &src.pixels,
-                src.width,
-                src.height,
-                w as i32,
-                h as i32,
-            );
-            self.scaled.borrow_mut().insert(key.clone(), bitmap);
-        }
-        let cache = self.scaled.borrow();
-        cache.get(&key).map(|bitmap| f(bitmap))
-    }
-
     /// A store pre-populated with already-decoded images, bypassing the filesystem:
     /// used by tests and the performance harness.
     pub(crate) fn from_decoded(items: Vec<(String, Image)>) -> Self {
@@ -298,7 +263,6 @@ impl ImageStore {
         Self {
             dir: None,
             cache,
-            scaled: RefCell::new(HashMap::new()),
             limits: Limits::default(),
         }
     }

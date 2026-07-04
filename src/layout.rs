@@ -60,8 +60,8 @@ use crate::freetype::{Face, FaceKey, FontStyle, Fonts};
 use crate::grapheme;
 use crate::image::ImageStore;
 use crate::markdown;
-use crate::render;
 use crate::rope::Rope;
+use crate::shape;
 
 /// Extra highlight width drawn past a line's text when the selection includes
 /// that line's trailing newline, hinting the break itself is selected.
@@ -517,7 +517,7 @@ impl Layout {
             // regular face at this line's size, so it matches the width the marker
             // run itself advances on the first line and the columns line up.
             let block_indent = if block_persists && block_marker > 0 {
-                render::text_advance(fonts.face(size, FontStyle::Regular), &line[..block_marker])
+                shape::text_advance(fonts.face(size, FontStyle::Regular), &line[..block_marker])
                     .round() as i32
             } else {
                 0
@@ -713,8 +713,8 @@ impl Layout {
         let indent = markdown::leading_indent(&marker);
         let brackets = marker.get(indent + 2..indent + 5)?;
         let face = fonts.face(line.size, FontStyle::Regular);
-        let pre = render::text_advance(face, marker.get(..indent + 2)?);
-        let brackets_w = render::text_advance(face, brackets);
+        let pre = shape::text_advance(face, marker.get(..indent + 2)?);
+        let brackets_w = shape::text_advance(face, brackets);
         let m = fonts.metrics(line.size);
         let side = (m.ascent * 4 / 5).max(8);
         let x = self.left + line.indent + (pre + (brackets_w - side as f32) / 2.0).round() as i32;
@@ -887,7 +887,7 @@ impl Layout {
                 let x0 = self.left as f32
                     + line.indent as f32
                     + self.advance_to(fonts, rope, line, run.start);
-                let w = render::text_advance(
+                let w = shape::text_advance(
                     run_face(fonts, line.size, run.kind, line.heading.is_some()),
                     &rope.byte_slice(run.start..run.end),
                 );
@@ -957,7 +957,7 @@ impl Layout {
             let face = run_face(fonts, line.size, run.kind, line.heading.is_some());
             let slice = rope.byte_slice(run.start..run.end);
             for (off, cluster) in grapheme::graphemes(&slice) {
-                let w = render::text_advance(face, cluster);
+                let w = shape::text_advance(face, cluster);
                 if x < acc + w / 2.0 {
                     return run.start + off;
                 }
@@ -990,7 +990,7 @@ impl Layout {
             }
             let end = offset.min(run.end);
             let face = run_face(fonts, line.size, run.kind, line.heading.is_some());
-            x += render::text_advance(face, &rope.byte_slice(run.start..end));
+            x += shape::text_advance(face, &rope.byte_slice(run.start..end));
         }
         x
     }
@@ -1207,7 +1207,7 @@ fn wrap_segments(
         .into_iter()
         .map(|(off, cluster)| {
             let face = run_face(fonts, size, kind_at(spans, off), heading);
-            (off, render::text_advance(face, cluster), cluster == " ")
+            (off, shape::text_advance(face, cluster), cluster == " ")
         })
         .collect();
     if clusters.is_empty() {
@@ -1286,7 +1286,7 @@ mod tests {
     /// splits deterministically into "aaa " and "bbb".
     fn tight_wrap(f: &Fonts) -> i32 {
         let face = f.face(BODY, FontStyle::Regular);
-        (render::text_advance(face, "aaa ") + render::text_advance(face, "b") / 2.0) as i32
+        (shape::text_advance(face, "aaa ") + shape::text_advance(face, "b") / 2.0) as i32
     }
 
     #[test]
@@ -1422,7 +1422,7 @@ mod tests {
         let f = fonts();
         let text = "mmmmmmmmmm"; // one word, no spaces
         let r = rope(text);
-        let wrap = (render::text_advance(f.face(BODY, FontStyle::Regular), "m") * 3.0) as i32;
+        let wrap = (shape::text_advance(f.face(BODY, FontStyle::Regular), "m") * 3.0) as i32;
         let l = Layout::build(&f, &r, 0, 0, wrap, BODY, (0, r.len()));
         let lines = l.lines();
         assert!(lines.len() >= 2, "an unbreakable word still wraps");
@@ -1456,7 +1456,7 @@ mod tests {
         let rects = l.selection_rects(&f, &r, 0, 7);
         assert_eq!(rects.len(), 2, "one rect per visual line");
         let line0_text_w =
-            render::text_advance(f.face(BODY, FontStyle::Regular), "aaa ").round() as i32;
+            shape::text_advance(f.face(BODY, FontStyle::Regular), "aaa ").round() as i32;
         assert!(
             (rects[0].w - line0_text_w).abs() <= 1,
             "a soft wrap adds no newline pad"
@@ -1503,8 +1503,8 @@ mod tests {
         // The same characters measure wider at the heading size, which is what
         // lets clicks and the caret land correctly on a heading line.
         let f = fonts();
-        let body_w = render::text_advance(f.face(BODY, FontStyle::Regular), "Title");
-        let h1_w = render::text_advance(f.face(h1_size(), FontStyle::Regular), "Title");
+        let body_w = shape::text_advance(f.face(BODY, FontStyle::Regular), "Title");
+        let h1_w = shape::text_advance(f.face(h1_size(), FontStyle::Regular), "Title");
         assert!(h1_w > body_w);
     }
 
@@ -1601,7 +1601,7 @@ mod tests {
         let (x_shown, _, _) = shown.caret(&f, &r, 2);
         assert_eq!(x_hidden, LEFT, "collapsed: visible text at the margin");
         let marker_w =
-            render::text_advance(f.face(h1_size(), FontStyle::Regular), "# ").round() as i32;
+            shape::text_advance(f.face(h1_size(), FontStyle::Regular), "# ").round() as i32;
         assert_eq!(x_shown - x_hidden, marker_w, "expanded by the marker width");
     }
 
@@ -1720,7 +1720,7 @@ mod tests {
         let (x_hidden, _, _) = hidden.caret(&f, &r, 1);
         let (x_shown, _, _) = shown.caret(&f, &r, 1);
         assert_eq!(x_hidden, LEFT, "collapsed: code text at the margin");
-        let tick_w = render::text_advance(f.face(BODY, FontStyle::Regular), "`").round() as i32;
+        let tick_w = shape::text_advance(f.face(BODY, FontStyle::Regular), "`").round() as i32;
         assert_eq!(
             x_shown - x_hidden,
             tick_w,
@@ -1846,13 +1846,13 @@ mod tests {
     /// text begins with `prefix` breaks right after it.
     fn wrap_after(f: &Fonts, prefix: &str) -> i32 {
         let face = f.face(BODY, FontStyle::Regular);
-        (render::text_advance(face, prefix) + render::text_advance(face, "b") / 2.0) as i32
+        (shape::text_advance(face, prefix) + shape::text_advance(face, "b") / 2.0) as i32
     }
 
     #[test]
     fn a_wrapped_list_item_hangs_its_continuation_under_the_text() {
         let f = fonts();
-        let marker_w = render::text_advance(f.face(BODY, FontStyle::Regular), "- ").round() as i32;
+        let marker_w = shape::text_advance(f.face(BODY, FontStyle::Regular), "- ").round() as i32;
         let src = "- aaaaa bbbbb";
         let r = rope(src);
         // The list indent narrows the wrap, so widen by it to keep the split.
@@ -2000,7 +2000,7 @@ mod tests {
     #[test]
     fn a_wrapped_quote_keeps_the_bar_without_a_second_marker() {
         let f = fonts();
-        let marker_w = render::text_advance(f.face(BODY, FontStyle::Regular), "> ").round() as i32;
+        let marker_w = shape::text_advance(f.face(BODY, FontStyle::Regular), "> ").round() as i32;
         let src = "> aaaaa bbbbb\nx";
         let r = rope(src);
         let off = src.find('x').unwrap();
@@ -2030,7 +2030,7 @@ mod tests {
     #[test]
     fn an_ordered_item_keeps_a_plain_gutter_but_still_indents() {
         let f = fonts();
-        let marker_w = render::text_advance(f.face(BODY, FontStyle::Regular), "1. ").round() as i32;
+        let marker_w = shape::text_advance(f.face(BODY, FontStyle::Regular), "1. ").round() as i32;
         let r = rope("1. aaaaa bbbbb");
         // Cursor off the line: the number must still show (never substituted).
         let l = Layout::build(
@@ -2131,7 +2131,7 @@ mod tests {
             "the continuation still dims and strikes"
         );
         let marker_w =
-            render::text_advance(f.face(BODY, FontStyle::Regular), "- [x] ").round() as i32;
+            shape::text_advance(f.face(BODY, FontStyle::Regular), "- [x] ").round() as i32;
         assert_eq!(
             lines[1].indent,
             LIST_INDENT + marker_w,
@@ -2173,8 +2173,8 @@ mod tests {
             .checkbox_rect(&f, &r, line)
             .expect("a non-revealed task line has a box");
         let face = f.face(BODY, FontStyle::Regular);
-        let pre = render::text_advance(face, "  - ");
-        let marker = render::text_advance(face, "  - [ ] ");
+        let pre = shape::text_advance(face, "  - ");
+        let marker = shape::text_advance(face, "  - [ ] ");
         assert!(
             rect.x as f32 >= LEFT as f32 + line.indent as f32 + pre - 1.0,
             "the box starts at or after the brackets (past the indent and dash)"
@@ -2772,7 +2772,7 @@ mod tests {
         // Sweep x across the whole line: every hit must land on a cluster
         // boundary (the emoji is bytes 1..5), never inside the cluster, whether
         // the emoji renders in color or as tofu.
-        let end = LEFT as f32 + render::text_advance(face, "a😀b") + 20.0;
+        let end = LEFT as f32 + shape::text_advance(face, "a😀b") + 20.0;
         let mut x = 0.0f32;
         while x < end {
             let off = l.offset_at(&f, &r, x, y);

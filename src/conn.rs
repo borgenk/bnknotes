@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use crate::error::{Error, Result};
 use crate::ffi;
-use crate::wire::{self, Arg, Message};
+use crate::wire::{self, Arg, Message, Reader};
 
 /// The outcome of a [`Connection::fill`]: bytes arrived (0 means the peer
 /// closed), or the read timed out with the socket idle.
@@ -72,7 +72,10 @@ impl Connection {
         self.flush()?;
         let mut msg = Vec::new();
         wire::encode(&mut msg, object, opcode, args);
-        ffi::send_with_fds(self.stream.as_raw_fd(), &msg, &[fd])
+        if let Err(e) = ffi::send_with_fds(self.stream.as_raw_fd(), &msg, &[fd]) {
+            return Err(self.diagnose_send_error(e));
+        }
+        Ok(())
     }
 
     /// Write all queued requests to the socket.
@@ -80,9 +83,56 @@ impl Connection {
         if self.out.is_empty() {
             return Ok(());
         }
-        ffi::send_with_fds(self.stream.as_raw_fd(), &self.out, &[])?;
+        if let Err(e) = ffi::send_with_fds(self.stream.as_raw_fd(), &self.out, &[]) {
+            return Err(self.diagnose_send_error(e));
+        }
         self.out.clear();
         Ok(())
+    }
+
+    /// A send failed (typically `EPIPE`): the compositor closed the socket. On a
+    /// protocol violation it sends `wl_display.error` *then* closes, and because
+    /// we were writing we never read it, so the raw errno only says "peer gone".
+    /// Drain whatever it sent before disconnecting and surface that error, which
+    /// is the real reason. Best-effort: on failure fall back to the send error.
+    fn diagnose_send_error(&mut self, send_err: Error) -> Error {
+        let _ = self
+            .stream
+            .set_read_timeout(Some(Duration::from_millis(200)));
+        let mut buf = [0u8; 4096];
+        loop {
+            let mut fds: Vec<OwnedFd> = Vec::new();
+            match ffi::recv_with_fds(self.stream.as_raw_fd(), &mut buf, &mut fds) {
+                Ok(Some(n)) if n > 0 => self.in_buf.extend_from_slice(&buf[..n]),
+                // 0 bytes = peer closed, None = idle/timeout, Err = reset: stop.
+                _ => break,
+            }
+        }
+        // Scan the buffered stream for wl_display@1.error (event opcode 0), whose
+        // ids are protocol-fixed, so no interface knowledge is needed here.
+        let mut off = self.in_pos;
+        while off + 8 <= self.in_buf.len() {
+            let object = u32::from_ne_bytes(self.in_buf[off..off + 4].try_into().unwrap_or([0; 4]));
+            let word =
+                u32::from_ne_bytes(self.in_buf[off + 4..off + 8].try_into().unwrap_or([0; 4]));
+            let size = (word >> 16) as usize;
+            let opcode = (word & 0xffff) as u16;
+            if size < 8 || off + size > self.in_buf.len() {
+                break;
+            }
+            if object == 1 && opcode == 0 {
+                let mut r = Reader::new(&self.in_buf[off + 8..off + size]);
+                if let (Ok(obj), Ok(code), Ok(msg)) = (r.u32(), r.u32(), r.string()) {
+                    return Error::msg(format!(
+                        "wayland protocol error: object {obj} code {code}: {msg}"
+                    ));
+                }
+            }
+            off += size;
+        }
+        Error::msg(format!(
+            "{send_err}; the compositor closed the connection without sending a protocol error"
+        ))
     }
 
     /// Wait up to `timeout` (or forever if `None`) for more bytes from the

@@ -87,10 +87,14 @@ impl DrawCmd {
 /// exactly the pixels a full repaint would, just within the rectangle. Commands
 /// whose bounds miss the clip are skipped cheaply; the rest are clipped per pixel
 /// by the canvas.
+/// Image commands are resolved against `stores` in order (one per content pane),
+/// so a picture renders whichever pane it belongs to. The first store holding
+/// the path wins; two panes referencing the same relative name from different
+/// directories is the one case this cannot disambiguate.
 pub fn execute(
     canvas: &mut Canvas,
     fonts: &Fonts,
-    images: &ImageStore,
+    stores: &[&ImageStore],
     list: &[DrawCmd],
     clip: Option<Rect>,
 ) {
@@ -124,9 +128,11 @@ pub fn execute(
                 canvas.draw_text(fonts.face_for(*face), *x, *baseline, text, *color);
             }
             DrawCmd::Image { rect, path } => {
-                let _ = images.with_scaled(path, rect.w as u32, rect.h as u32, |bitmap| {
-                    canvas.blit_argb(rect.x, rect.y, rect.w, rect.h, bitmap);
-                });
+                if let Some(store) = stores.iter().find(|s| s.get(path).is_some()) {
+                    let _ = store.with_scaled(path, rect.w as u32, rect.h as u32, |bitmap| {
+                        canvas.blit_argb(rect.x, rect.y, rect.w, rect.h, bitmap);
+                    });
+                }
             }
         }
     }

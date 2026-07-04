@@ -42,12 +42,12 @@ pub fn run() -> Result<()> {
         {
             let mut canvas = Canvas::new(&mut cpu, W as usize, H as usize);
             canvas.fill_solid(0, 0, W as i32, H as i32, BACKGROUND);
-            display::execute(&mut canvas, &fonts, &images, &list, None);
+            display::execute(&mut canvas, &fonts, &[&images], &list, None);
         }
 
         // GPU rendition of the same list.
         let known = |key: &gpu::ImageKey| gpu.has_image(key);
-        let frame = gpu::build_frame(&fonts, &images, &list, &mut cache, &known);
+        let frame = gpu::build_frame(&fonts, &[&images], &list, &mut cache, &known);
         gpu.render_list(&mut img, &frame, color_f32(BACKGROUND))?;
         let gpu_pixels = gpu.read_pixels(&mut img)?;
 

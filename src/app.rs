@@ -18,6 +18,7 @@
 //! reallocating its shm buffers. Rendering double-buffers so the compositor never
 //! reads a frame we are still painting.
 
+use std::collections::BTreeSet;
 use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -46,7 +47,9 @@ use crate::protocol::{
 use crate::render::{self, Canvas};
 use crate::scroll;
 use crate::shm::Pool;
+use crate::store;
 use crate::text::TextBuffer;
+use crate::tree;
 use crate::vulkan;
 use crate::wire::{Arg, Message, Reader};
 use crate::xkb::{KeyAction, Xkb};
@@ -131,6 +134,15 @@ const SOFT_TAB: &str = "    ";
 /// The caret: a thin vertical bar at the cursor position.
 const CARET_COLOR: u32 = 0x00ff_ffff;
 const CARET_WIDTH: i32 = 2;
+
+/// File-tree sidebar and splitter colors and metrics.
+const TREE_BG: u32 = 0x0016_1a1f;
+const TREE_DIR_COLOR: u32 = 0x008c_a0b3;
+const TREE_HOVER_BG: u32 = 0x0028_2c34;
+const SPLITTER_COLOR: u32 = 0x003f_444b;
+/// Inset for tree rows from the column edges, and the per-depth indent step.
+const TREE_PAD: i32 = 6;
+const TREE_INDENT: i32 = 14;
 /// How long the caret stays shown, then hidden, while idle. Activity resets it
 /// to shown, so it never blinks out mid-keystroke.
 const CARET_BLINK: Duration = Duration::from_millis(500);
@@ -216,7 +228,16 @@ fn load(path: &Path) -> Result<(String, FileFormat)> {
 /// exact byte offsets), and the selected / raw-pinned image (by line-start
 /// offset). A scroll, idle redraw, or cursor move within one line leaves all of
 /// these unchanged and reuses the cached layout.
-type LayoutKey = (u64, u32, u32, usize, usize, Option<usize>, Option<usize>);
+type LayoutKey = (
+    u64,
+    i32,
+    i32,
+    u32,
+    usize,
+    usize,
+    Option<usize>,
+    Option<usize>,
+);
 
 /// Client-owned explicit-sync state (`linux-drm-syncobj-v1`), negotiated over a
 /// live GPU backend when the compositor advertises the manager. Two DRM syncobj
@@ -238,29 +259,563 @@ struct ExplicitSync {
     buffer_release: [Option<u64>; 2],
 }
 
+/// Which region holds keyboard focus. Editing keys go to the focused editor;
+/// the file tree takes navigation keys when it is focused.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Focus {
+    Tree,
+    /// Content pane 0 (left/A) or 1 (right/B).
+    Editor(usize),
+}
+
+/// Width of the grab bar between two columns: a few pixels of hit zone, with a
+/// thin divider line drawn down its middle.
+const SPLITTER: i32 = 6;
+
+/// The adjustable column layout. The sidebar has a pixel width; the two content
+/// panes split the remaining width by a ratio. Splitters drag these values.
+struct PaneLayout {
+    tree_width: i32,
+    /// Pane A's share of the content area (right of the tree), clamped 0.1..0.9.
+    split_ratio: f32,
+    tree_visible: bool,
+    second_open: bool,
+}
+
+/// The pixel rectangles the columns and their splitter bars occupy, derived
+/// from the window size and the [`PaneLayout`]. A hidden column is `None`.
+struct Columns {
+    tree: Option<Rect>,
+    /// Editor A is always present; editor B only when `second_open`.
+    editors: [Option<Rect>; 2],
+    /// Grab bars: `[0]` between tree and A, `[1]` between A and B.
+    splitters: [Option<Rect>; 2],
+}
+
+impl PaneLayout {
+    /// Lay the columns out across `width`×`height`. Editor A always takes what is
+    /// left after an optional sidebar and an optional second pane; each column is
+    /// full height, so content stays in its column by construction (no clip).
+    fn columns(&self, width: i32, height: i32) -> Columns {
+        let mut x = 0;
+        let mut tree = None;
+        let mut splitters = [None, None];
+        if self.tree_visible {
+            tree = Some(Rect {
+                x,
+                y: 0,
+                w: self.tree_width,
+                h: height,
+            });
+            x += self.tree_width;
+            splitters[0] = Some(Rect {
+                x,
+                y: 0,
+                w: SPLITTER,
+                h: height,
+            });
+            x += SPLITTER;
+        }
+        let mut editors = [None, None];
+        if self.second_open {
+            let content = (width - x - SPLITTER).max(0);
+            let a_w = ((content as f32 * self.split_ratio) as i32).clamp(0, content);
+            editors[0] = Some(Rect {
+                x,
+                y: 0,
+                w: a_w,
+                h: height,
+            });
+            x += a_w;
+            splitters[1] = Some(Rect {
+                x,
+                y: 0,
+                w: SPLITTER,
+                h: height,
+            });
+            x += SPLITTER;
+            editors[1] = Some(Rect {
+                x,
+                y: 0,
+                w: (width - x).max(0),
+                h: height,
+            });
+        } else {
+            editors[0] = Some(Rect {
+                x,
+                y: 0,
+                w: (width - x).max(0),
+                h: height,
+            });
+        }
+        Columns {
+            tree,
+            editors,
+            splitters,
+        }
+    }
+}
+
+/// What a window position lands on, for routing pointer events to the right
+/// region. Splitters are checked first (they sit in the gaps between columns).
+enum Hit {
+    Splitter(usize),
+    Tree(Rect),
+    Editor(usize, Rect),
+    None,
+}
+
+/// One content pane: an independent editor over its own buffer, carrying its own
+/// file, inline images, memoized layout, scroll, find bar, and the drag/selection
+/// transients a click-drag needs. Two of these live on [`State`].
+struct EditorPane {
+    text: TextBuffer,
+    path: Option<PathBuf>,
+    format: FileFormat,
+    images: ImageStore,
+    selected_image: Option<usize>,
+    raw_image: Option<usize>,
+    find: FindState,
+    scroll_y: i32,
+    content_height: i32,
+    layout_cache: Option<Layout>,
+    layout_key: Option<LayoutKey>,
+    goal_x: Option<f32>,
+    selecting: bool,
+    frozen_reveal: Option<(usize, usize)>,
+    last_click: Option<Instant>,
+    last_click_pos: (f32, f32),
+    click_count: u32,
+    autoscroll: i32,
+    autoscroll_at: Option<Instant>,
+}
+
+impl EditorPane {
+    /// An empty, file-less pane (blank buffer, no images).
+    fn empty() -> Self {
+        Self {
+            text: TextBuffer::new(),
+            path: None,
+            format: FileFormat::default(),
+            images: ImageStore::new(None),
+            selected_image: None,
+            raw_image: None,
+            find: FindState::new(),
+            scroll_y: 0,
+            content_height: 0,
+            layout_cache: None,
+            layout_key: None,
+            goal_x: None,
+            selecting: false,
+            frozen_reveal: None,
+            last_click: None,
+            last_click_pos: (0.0, 0.0),
+            click_count: 0,
+            autoscroll: 0,
+            autoscroll_at: None,
+        }
+    }
+
+    /// Load `path` into a fresh pane, resolving inline images against its
+    /// directory. An unreadable file is an error the caller surfaces.
+    fn open(path: &Path) -> Result<Self> {
+        let (contents, format) = load(path)?;
+        let image_dir = path.parent().map(Path::to_path_buf);
+        Ok(Self {
+            text: TextBuffer::from_text(contents),
+            path: Some(path.to_path_buf()),
+            format,
+            images: ImageStore::new(image_dir),
+            ..Self::empty()
+        })
+    }
+
+    /// The active range for live-preview marker reveal: the live selection (or
+    /// the bare cursor), pinned to `frozen_reveal` while a drag extends a
+    /// selection so the markdown under the pointer does not flip rendered/raw.
+    fn reveal_range(&self) -> (usize, usize) {
+        let cursor = self.text.cursor();
+        match (self.selecting, self.frozen_reveal) {
+            (true, Some(range)) => range,
+            _ => self.text.selection().unwrap_or((cursor, cursor)),
+        }
+    }
+
+    /// The per-image UI state (selected border, pinned raw source) for the layout.
+    fn image_ui(&self) -> ImageUi {
+        ImageUi {
+            selected: self.selected_image,
+            raw: self.raw_image,
+        }
+    }
+
+    /// Decode every standalone `![](path)` line so [`Self::ensure_layout`] can
+    /// size the image lines. A path already attempted is a cache hit.
+    fn scan_images(&mut self) {
+        let rope = self.text.rope();
+        let n = rope.len_lines();
+        for i in 0..n {
+            let ls = rope.line_to_byte(i);
+            let le = if i + 1 < n {
+                rope.line_to_byte(i + 1) - 1
+            } else {
+                rope.line_to_byte(i + 1)
+            };
+            let line = rope.byte_slice(ls..le);
+            if let Some(link) = markdown::standalone_image(&line) {
+                let raw = line[link.path.0..link.path.1].to_string();
+                self.images.ensure(&raw);
+            }
+        }
+    }
+
+    /// Lay the text out into the column `rect`: wrap to its width less a margin
+    /// each side, origin at its top-left plus margin. Memoized on `(version,
+    /// column x, column width, font, active line span, image UI)`, so a scroll or
+    /// idle redraw reuses the cache; only an edit, a cross-line move, or a column
+    /// resize misses. Baking the column's `x` into the layout keeps content in
+    /// its column with no clip.
+    fn ensure_layout(&mut self, fonts: &Fonts, rect: Rect) {
+        let active = self.reveal_range();
+        let active_lines = {
+            let rope = self.text.rope();
+            (rope.byte_to_line(active.0), rope.byte_to_line(active.1))
+        };
+        let key = (
+            self.text.version(),
+            rect.x,
+            rect.w,
+            FONT_SIZE,
+            active_lines.0,
+            active_lines.1,
+            self.selected_image,
+            self.raw_image,
+        );
+        if self.layout_key != Some(key) {
+            let wrap_width = rect.w - 2 * MARGIN;
+            self.scan_images();
+            let layout = Layout::build_with_images(
+                fonts,
+                self.text.rope(),
+                rect.x + MARGIN,
+                rect.y + MARGIN,
+                wrap_width,
+                FONT_SIZE,
+                active,
+                &self.images,
+                self.image_ui(),
+            );
+            self.content_height = layout.text_height() + 2 * MARGIN;
+            self.layout_cache = Some(layout);
+            self.layout_key = Some(key);
+        }
+    }
+
+    /// Scroll by `delta` px within the column `rect`, clamped to the content.
+    /// Returns whether the offset changed (so the caller can mark a repaint).
+    fn scroll_by(&mut self, fonts: &Fonts, rect: Rect, delta: i32) -> bool {
+        self.ensure_layout(fonts, rect);
+        let sy = scroll::clamp(self.scroll_y + delta, self.content_height, rect.h);
+        let moved = sy != self.scroll_y;
+        self.scroll_y = sy;
+        moved
+    }
+
+    /// Scroll the minimum to keep the caret visible after a cursor move; returns
+    /// whether the offset changed.
+    fn scroll_caret_into_view(&mut self, fonts: &Fonts, rect: Rect) -> bool {
+        self.ensure_layout(fonts, rect);
+        let cursor = self.text.cursor();
+        let Some((_, caret_top, caret_h)) = self
+            .layout_cache
+            .as_ref()
+            .map(|l| l.caret(fonts, self.text.rope(), cursor))
+        else {
+            return false;
+        };
+        let sy = scroll::reveal(
+            self.scroll_y,
+            caret_top,
+            caret_h,
+            rect.h,
+            self.content_height,
+            MARGIN,
+        );
+        let moved = sy != self.scroll_y;
+        self.scroll_y = sy;
+        moved
+    }
+
+    /// Move the cursor `dir` lines (-1 up, +1 down), keeping a sticky goal x.
+    fn move_vertical(&mut self, fonts: &Fonts, rect: Rect, dir: i32, extend: bool) -> bool {
+        self.ensure_layout(fonts, rect);
+        let cursor = self.text.cursor();
+        let before_sel = self.text.selection();
+        // Read the cached layout by reference; `goal_x`/`text` are disjoint
+        // fields, so they can be touched while the layout borrow is live.
+        let Some(layout) = self.layout_cache.as_ref() else {
+            return false;
+        };
+        let (caret_x, _, _) = layout.caret(fonts, self.text.rope(), cursor);
+        let goal = self.goal_x.unwrap_or(caret_x as f32);
+        let target = layout.offset_vertical(fonts, self.text.rope(), cursor, dir, goal);
+        self.goal_x = Some(goal);
+        self.text.set_cursor(target, extend);
+        self.text.cursor() != cursor || self.text.selection() != before_sel
+    }
+
+    /// Move the cursor to the start (`to_end = false`) or end of its visual line.
+    fn move_line_edge(&mut self, fonts: &Fonts, rect: Rect, to_end: bool, extend: bool) -> bool {
+        self.ensure_layout(fonts, rect);
+        let cursor = self.text.cursor();
+        let before_sel = self.text.selection();
+        let Some(layout) = self.layout_cache.as_ref() else {
+            return false;
+        };
+        let (start, end) = layout.line_bounds(cursor);
+        let target = if to_end {
+            end
+        } else {
+            // Smart Home. Visual bounds, so it works on wrapped rows too.
+            let line = self.text.rope().byte_slice(start..end);
+            smart_home_target(&line, start, end, cursor)
+        };
+        self.text.set_cursor(target, extend);
+        self.text.cursor() != cursor || self.text.selection() != before_sel
+    }
+
+    /// Move the cursor one column-height up/down, keeping the sticky goal column.
+    fn move_page(&mut self, fonts: &Fonts, rect: Rect, dir: i32, extend: bool) -> bool {
+        self.ensure_layout(fonts, rect);
+        let cursor = self.text.cursor();
+        let before_sel = self.text.selection();
+        let page_lines = self.page_lines(fonts, rect);
+        let Some(layout) = self.layout_cache.as_ref() else {
+            return false;
+        };
+        let (caret_x, _, _) = layout.caret(fonts, self.text.rope(), cursor);
+        let goal = self.goal_x.unwrap_or(caret_x as f32);
+        // Step a line at a time so each hop honors the goal column and the
+        // varying per-line heights; stop early at the first or last line.
+        let mut target = cursor;
+        for _ in 0..page_lines {
+            let next = layout.offset_vertical(fonts, self.text.rope(), target, dir, goal);
+            if next == target {
+                break;
+            }
+            target = next;
+        }
+        self.goal_x = Some(goal);
+        self.text.set_cursor(target, extend);
+        self.text.cursor() != cursor || self.text.selection() != before_sel
+    }
+
+    /// How many visual lines make up a Page Up/Down jump in this column: its
+    /// height in body line-heights, less one row of overlap, at least one.
+    fn page_lines(&self, fonts: &Fonts, rect: Rect) -> usize {
+        let line_height = fonts.metrics(FONT_SIZE).line_height.max(1);
+        (rect.h / line_height - 1).max(1) as usize
+    }
+
+    /// Content-space y for a window y inside this pane's column (the column top
+    /// and this pane's scroll offset removed).
+    fn content_y(&self, rect: Rect, py: f32) -> f32 {
+        py - rect.y as f32 + self.scroll_y as f32
+    }
+
+    /// The byte offset under a window position within this pane's column.
+    fn pointer_offset(&mut self, fonts: &Fonts, rect: Rect, px: f32, py: f32) -> usize {
+        self.ensure_layout(fonts, rect);
+        let y = self.content_y(rect, py);
+        self.layout_cache
+            .as_ref()
+            .map_or(0, |l| l.offset_at(fonts, self.text.rope(), px, y))
+    }
+
+    /// Place the cursor (or, with `extend`, the selection's free end) at a window
+    /// position within this pane's column. Returns whether it moved.
+    fn place_cursor_at(
+        &mut self,
+        fonts: &Fonts,
+        rect: Rect,
+        px: f32,
+        py: f32,
+        extend: bool,
+    ) -> bool {
+        self.ensure_layout(fonts, rect);
+        let y = self.content_y(rect, py);
+        let Some(layout) = self.layout_cache.as_ref() else {
+            return false;
+        };
+        let offset = layout.offset_at(fonts, self.text.rope(), px, y);
+        let before = self.text.cursor();
+        let before_sel = self.text.selection();
+        self.text.set_cursor(offset, extend);
+        self.text.cursor() != before || self.text.selection() != before_sel
+    }
+
+    /// The destination of the openable link under a window position, if its line
+    /// is rendered (markup collapsed) and the scheme is one the browser opens.
+    fn link_under_pointer(
+        &mut self,
+        fonts: &Fonts,
+        rect: Rect,
+        px: f32,
+        py: f32,
+    ) -> Option<String> {
+        let off = self.pointer_offset(fonts, rect, px, py);
+        let (a0, a1) = self.reveal_range();
+        let rope = self.text.rope();
+        let line = rope.byte_to_line(off);
+        let ls = rope.line_to_byte(line);
+        let le = if line + 1 < rope.len_lines() {
+            rope.line_to_byte(line + 1).saturating_sub(1)
+        } else {
+            rope.len()
+        };
+        if a0 <= le && a1 >= ls {
+            return None;
+        }
+        let content = rope.byte_slice(ls..le);
+        let rel = off - ls;
+        let link = markdown::links(&content)
+            .into_iter()
+            .find(|l| l.text.0 <= rel && rel <= l.text.1)?;
+        let dest = content[link.dest.0..link.dest.1].to_string();
+        crate::browser::can_open(&dest).then_some(dest)
+    }
+
+    /// The logical-line start of the rendered task checkbox under a window
+    /// position, if any.
+    fn checkbox_under_pointer(
+        &mut self,
+        fonts: &Fonts,
+        rect: Rect,
+        px: f32,
+        py: f32,
+    ) -> Option<usize> {
+        self.ensure_layout(fonts, rect);
+        let y = self.content_y(rect, py);
+        self.layout_cache
+            .as_ref()?
+            .checkbox_at(fonts, self.text.rope(), px, y)
+    }
+
+    /// Handle a press on an image button (toggles its raw source) or picture
+    /// (selects it). Returns whether it was consumed.
+    fn image_press(&mut self, fonts: &Fonts, rect: Rect, px: f32, py: f32) -> bool {
+        self.ensure_layout(fonts, rect);
+        let y = self.content_y(rect, py);
+        let Some(layout) = self.layout_cache.as_ref() else {
+            return false;
+        };
+        let button = layout.image_button_at(fonts, px, y);
+        let image = layout.image_at(fonts, px, y);
+        if let Some(ls) = button {
+            self.raw_image = if self.raw_image == Some(ls) {
+                None
+            } else {
+                Some(ls)
+            };
+            return true;
+        }
+        if let Some(ls) = image {
+            self.selected_image = Some(ls);
+            self.raw_image = None;
+            let cursor = self.text.cursor();
+            self.text.set_cursor(cursor, false);
+            self.selecting = false;
+            self.frozen_reveal = None;
+            return true;
+        }
+        false
+    }
+
+    /// The pointer shape for a window position within this pane: a hand over a
+    /// link/checkbox/image-button, the arrow over a picture, the I-beam elsewhere.
+    fn cursor_shape_at(&mut self, fonts: &Fonts, rect: Rect, px: f32, py: f32) -> u32 {
+        use wp_cursor_shape_device_v1::{SHAPE_DEFAULT, SHAPE_POINTER, SHAPE_TEXT};
+        let over_link = self.link_under_pointer(fonts, rect, px, py).is_some();
+        let over_checkbox = self.checkbox_under_pointer(fonts, rect, px, py).is_some();
+        self.ensure_layout(fonts, rect);
+        let y = self.content_y(rect, py);
+        match self.layout_cache.as_ref() {
+            _ if over_link || over_checkbox => SHAPE_POINTER,
+            Some(layout) if layout.image_button_at(fonts, px, y).is_some() => SHAPE_POINTER,
+            Some(layout) if layout.image_at(fonts, px, y).is_some() => SHAPE_DEFAULT,
+            _ => SHAPE_TEXT,
+        }
+    }
+
+    /// Arm or disarm drag auto-scroll from the pointer's distance to this
+    /// column's top/bottom edge.
+    fn update_autoscroll(&mut self, rect: Rect, py: f32) {
+        let y = py as i32 - rect.y;
+        let step = if y < AUTOSCROLL_MARGIN {
+            -AUTOSCROLL_STEP
+        } else if y > rect.h - AUTOSCROLL_MARGIN {
+            AUTOSCROLL_STEP
+        } else {
+            0
+        };
+        if step == 0 {
+            self.autoscroll = 0;
+            self.autoscroll_at = None;
+        } else {
+            self.autoscroll = step;
+            self.autoscroll_at.get_or_insert_with(Instant::now);
+        }
+    }
+}
+
+/// The file-tree sidebar: the directory model plus its own scroll and the row
+/// the pointer last hovered (for highlight). Rows come from [`tree::Tree`].
+struct TreePane {
+    tree: tree::Tree,
+    scroll_y: i32,
+    content_height: i32,
+    /// The row the pointer last hovered (mouse highlight).
+    hovered: Option<usize>,
+    /// The keyboard-selected row, moved by Up/Down and acted on by Enter while
+    /// the tree holds focus.
+    selected: usize,
+}
+
+/// Build an editor pane from a saved path, restoring its caret and scroll.
+/// Best-effort: an unreadable or missing file yields an empty pane (logged, not
+/// fatal) so a moved-away note never stops the editor opening. `set_cursor`
+/// clamps the offset into the (possibly changed) file.
+fn restore_editor(path: Option<&Path>, saved: &store::PaneSession) -> EditorPane {
+    let mut pane = match path {
+        Some(p) => EditorPane::open(p).unwrap_or_else(|e| {
+            eprintln!("bnknotes: could not reopen {}: {e}", p.display());
+            EditorPane::empty()
+        }),
+        None => EditorPane::empty(),
+    };
+    pane.text.set_cursor(saved.cursor as usize, false);
+    pane.scroll_y = saved.scroll_y.max(0);
+    pane
+}
+
 struct State {
     conn: Connection,
     /// The font opened at every size the styles need (body and heading sizes),
     /// so each line can render at its own size.
     fonts: Fonts,
     xkb: Xkb,
-    text: TextBuffer,
-    /// The file backing the buffer, if any, and the on-disk conventions to
-    /// reproduce when saving it.
-    path: Option<PathBuf>,
-    format: FileFormat,
-    /// Decoded inline images, keyed by their `![](path)` destination, with
-    /// relative paths resolved against the document's directory. Refreshed on each
-    /// layout rebuild and borrowed by the painter to blit the pictures.
-    images: ImageStore,
-    /// The image (by its logical line's start offset) the user has selected: it
-    /// draws a border and corner button, and `Ctrl+C` copies it. `None` when no
-    /// image is selected. Cleared by any keyboard action or a click off the image.
-    selected_image: Option<usize>,
-    /// The image (by line start) whose raw `![alt](path)` source is pinned open by
-    /// its corner button, shown above the picture even with the cursor away. The
-    /// cursor-on-line reveal is separate; this survives until cleared.
-    raw_image: Option<usize>,
+    /// The two content panes (editor A and B) and the file-tree sidebar, laid
+    /// out as adjustable full-height columns. `focus` selects which region takes
+    /// keyboard input; a click moves focus (and, on a splitter, starts a drag).
+    editors: [EditorPane; 2],
+    tree: TreePane,
+    panes: PaneLayout,
+    focus: Focus,
+    /// The editor last given focus, so a file opened from the tree (which takes
+    /// focus itself) lands in the content pane the user was last editing.
+    last_editor: usize,
+    /// While a splitter is dragged, which one: 0 = tree|A edge, 1 = A|B edge.
+    drag_splitter: Option<usize>,
     /// The toplevel title last sent, so it is only re-set when it changes.
     title: String,
     /// The modified flag the current `title` reflects, so `refresh_title` can skip
@@ -325,54 +880,20 @@ struct State {
     pointer_serial: u32,
     cursor_shape: u32,
 
-    // Pointer state: latest position (surface-local pixels) and whether a left
-    // button drag is currently extending a selection.
+    // Pointer state: latest position in surface-local pixels. Which pane the
+    // pointer falls in (and any in-progress drag) is resolved per-pane at use;
+    // the per-editor drag/selection transients live on `EditorPane`.
     pointer_x: f32,
     pointer_y: f32,
-    selecting: bool,
-    /// While a drag is extending a selection, the active range used for marker
-    /// reveal is frozen to this (the press point), so dragging across the document
-    /// does not keep flipping headings/lists/code between rendered and raw markdown
-    /// under the pointer. The live selection still highlights; only the reveal is
-    /// pinned. Cleared on button release, when reveal catches up to the final
-    /// selection. Pinning it also keeps the layout cache key constant for the whole
-    /// drag, so no re-layout happens per motion event.
-    frozen_reveal: Option<(usize, usize)>,
-    /// Click chaining for double/triple-click: when the last left press fired,
-    /// where, and how many have chained so far (1 = single, 2 = double, ...).
-    last_click: Option<Instant>,
-    last_click_pos: (f32, f32),
-    click_count: u32,
-    /// Auto-scroll while drag-selecting at an edge: pixels per tick (0 = off,
-    /// sign = direction) and when the next tick is due.
-    autoscroll: i32,
-    autoscroll_at: Option<Instant>,
-    /// Sticky x for vertical motion, so repeated Up/Down keep a column.
-    goal_x: Option<f32>,
-    /// The find bar (Ctrl+F). While open the keyboard drives its query and the
-    /// current match is mirrored into the buffer selection.
-    find: FindState,
-    /// How far the viewport is scrolled down the document, in pixels.
-    scroll_y: i32,
     /// Caret blink: whether the caret is currently shown, and when it next
-    /// toggles. Activity (`bump_caret`) resets it to shown.
+    /// toggles. Activity (`bump_caret`) resets it to shown. Applies to the
+    /// focused editor's caret; other panes draw a dimmed, static caret.
     caret_visible: bool,
     caret_blink_at: Option<Instant>,
     /// Whether the surface holds the keyboard focus (`wl_keyboard.enter` to
     /// `leave`). The caret only blinks (and only wakes the loop on its timer)
     /// while focused; an unfocused window hides the caret and stays idle.
     focused: bool,
-
-    /// Memoized layout, reused until its inputs change. The key is the content
-    /// version, the surface width, and the active (cursor/selection) range, the
-    /// only things the layout's geometry depends on; a scroll or idle redraw
-    /// reuses it instead of re-wrapping and re-measuring the whole document.
-    layout_cache: Option<Layout>,
-    layout_key: Option<LayoutKey>,
-    /// The laid-out document's pixel height plus top and bottom margins, refreshed
-    /// whenever the layout is rebuilt. Cached so the scroll path can clamp without
-    /// cloning the whole layout just to read its extent.
-    content_height: i32,
 
     // Key auto-repeat. The compositor sends one press; the client repeats the
     // held key on a timer until it is released.
@@ -458,31 +979,80 @@ impl State {
         // Open the font at every size the styles use, so headings can render
         // larger than body text without re-opening mid-frame.
         let fonts = Fonts::new(&markdown::all_sizes(FONT_SIZE))?;
-        // Load the file (if one was named) before showing the window, so a read
-        // error surfaces as a clean startup failure instead of an empty editor.
-        let (text, format) = match &path {
-            Some(p) => {
-                let (contents, format) = load(p)?;
-                (TextBuffer::from_text(contents), format)
-            }
-            None => (TextBuffer::new(), FileFormat::default()),
+        // The saved layout: window/column sizes, tree root and open folders, and
+        // each pane's last file with its caret and scroll. Missing or corrupt
+        // falls back to the first-run default without failing.
+        let session = store::load();
+
+        // Resolve the tree root: a directory argument roots there, a file roots
+        // at its parent, and no argument uses the last session's root or the
+        // working directory. A file argument also opens into editor A.
+        let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        let (root, cli_file) = match &path {
+            Some(p) if p.is_dir() => (p.clone(), None),
+            Some(p) => (
+                p.parent()
+                    .map(Path::to_path_buf)
+                    .unwrap_or_else(|| cwd.clone()),
+                Some(p.clone()),
+            ),
+            None => (
+                session
+                    .tree_root
+                    .clone()
+                    .filter(|r| r.is_dir())
+                    .unwrap_or(cwd),
+                None,
+            ),
         };
-        // Inline images resolve relative paths against the document's directory.
-        // An unsaved buffer has none, so only absolute paths resolve there.
-        let image_dir = path
-            .as_deref()
-            .and_then(Path::parent)
-            .map(Path::to_path_buf);
+
+        // Editor A: the file argument wins; otherwise restore the session's
+        // pane A. Editor B always restores from the session (empty if none).
+        let editor_a = match &cli_file {
+            Some(p) => restore_editor(Some(p), &store::PaneSession::default()),
+            None => restore_editor(session.panes[0].path.as_deref(), &session.panes[0]),
+        };
+        let editor_b = restore_editor(session.panes[1].path.as_deref(), &session.panes[1]);
+
+        let expanded: BTreeSet<PathBuf> = session.expanded.iter().cloned().collect();
+        let tree = TreePane {
+            tree: tree::Tree::new(root, expanded),
+            scroll_y: 0,
+            content_height: 0,
+            hovered: None,
+            selected: 0,
+        };
+        let panes = PaneLayout {
+            tree_width: session.tree_width as i32,
+            split_ratio: session.split_ratio,
+            tree_visible: session.tree_visible,
+            second_open: session.second_open,
+        };
+        // A file argument focuses its pane; otherwise the saved focus, guarded so
+        // it never points at a hidden region.
+        let focus = if cli_file.is_some() {
+            Focus::Editor(0)
+        } else {
+            match session.focus {
+                store::Focus::Tree if panes.tree_visible => Focus::Tree,
+                store::Focus::PaneB if panes.second_open => Focus::Editor(1),
+                store::Focus::Tree | store::Focus::PaneA | store::Focus::PaneB => Focus::Editor(0),
+            }
+        };
+
         Ok(Self {
             conn,
             fonts,
             xkb: Xkb::new()?,
-            text,
-            path,
-            format,
-            images: ImageStore::new(image_dir),
-            selected_image: None,
-            raw_image: None,
+            editors: [editor_a, editor_b],
+            tree,
+            panes,
+            focus,
+            last_editor: match focus {
+                Focus::Editor(i) => i,
+                Focus::Tree => 0,
+            },
+            drag_splitter: None,
             title: String::new(),
             title_modified: None,
             width: INIT_WIDTH,
@@ -515,22 +1085,9 @@ impl State {
             cursor_shape: 0,
             pointer_x: 0.0,
             pointer_y: 0.0,
-            selecting: false,
-            frozen_reveal: None,
-            last_click: None,
-            last_click_pos: (0.0, 0.0),
-            click_count: 0,
-            autoscroll: 0,
-            autoscroll_at: None,
-            goal_x: None,
-            find: FindState::new(),
-            scroll_y: 0,
             caret_visible: true,
             caret_blink_at: None,
             focused: false,
-            layout_cache: None,
-            layout_key: None,
-            content_height: 0,
             repeat_delay: Duration::from_millis(DEFAULT_REPEAT_DELAY_MS),
             repeat_interval: Some(Duration::from_secs(1) / DEFAULT_REPEAT_RATE),
             repeat_key: None,
@@ -572,6 +1129,44 @@ impl State {
             self.next_id += 1;
             id
         })
+    }
+
+    /// The editor pane that currently takes keyboard input. Falls back to editor
+    /// 0 when the tree holds focus, a harmless default since the edit paths that
+    /// call this only run while an editor is focused.
+    fn active_editor(&self) -> usize {
+        match self.focus {
+            Focus::Editor(i) => i,
+            Focus::Tree => 0,
+        }
+    }
+
+    /// The column rectangle for editor `i` at the current window size, or an
+    /// empty rect when that pane is hidden (only editor 1 can be).
+    fn editor_rect(&self, i: usize) -> Rect {
+        self.columns().editors[i].unwrap_or(Rect {
+            x: 0,
+            y: 0,
+            w: 0,
+            h: 0,
+        })
+    }
+
+    /// The current column layout for this window size.
+    fn columns(&self) -> Columns {
+        self.panes.columns(self.width as i32, self.height as i32)
+    }
+
+    /// Ensure the focused editor's layout is current, then keep its caret on
+    /// screen and repaint if that scrolled. The routed equivalent of the old
+    /// `scroll_caret_into_view`, for the many call sites that acted on "the
+    /// current editor".
+    fn reveal_active_caret(&mut self) {
+        let i = self.active_editor();
+        let rect = self.editor_rect(i);
+        if self.editors[i].scroll_caret_into_view(&self.fonts, rect) {
+            self.dirty = true;
+        }
     }
 
     fn bring_up(&mut self) -> Result<()> {
@@ -669,7 +1264,9 @@ impl State {
              click/drag, Shift+click extends, double/triple-click select word/line; \
              Ctrl+Backspace/Delete delete a word, Ctrl+Shift+K deletes a line; \
              Ctrl+A/C/X/V select-all/copy/cut/paste, \
-             Ctrl+Z/Y undo/redo, Ctrl+S save; held keys repeat; close to exit"
+             Ctrl+Z/Y undo/redo, Ctrl+S save; \
+             Ctrl+B toggle tree, Ctrl+\\ toggle 2nd pane, Ctrl+0/1/2 focus tree/A/B, \
+             drag splitters to resize; held keys repeat; close to exit"
         );
         // Name the active renderer, so "is it on the GPU?" never needs a
         // probe. The live-fallback path prints its own line if this changes.
@@ -678,7 +1275,43 @@ impl State {
             None => eprintln!("bnknotes: renderer: software (wl_shm)"),
         }
         self.run_until(|s| s.closed)?;
+        // Remember the layout for next launch: column sizes, tree root and open
+        // folders, and each pane's file with its caret and scroll.
+        self.save_session();
         Ok(())
+    }
+
+    /// The current layout as a persistable session (see [`crate::store`]).
+    fn current_session(&self) -> store::Session {
+        let focus = match self.focus {
+            Focus::Tree => store::Focus::Tree,
+            Focus::Editor(1) => store::Focus::PaneB,
+            Focus::Editor(_) => store::Focus::PaneA,
+        };
+        let pane = |i: usize| store::PaneSession {
+            path: self.editors[i].path.clone(),
+            cursor: self.editors[i].text.cursor() as u64,
+            scroll_y: self.editors[i].scroll_y,
+        };
+        store::Session {
+            window: (self.width, self.height),
+            tree_width: self.panes.tree_width.max(0) as u32,
+            split_ratio: self.panes.split_ratio,
+            tree_visible: self.panes.tree_visible,
+            second_open: self.panes.second_open,
+            focus,
+            tree_root: Some(self.tree.tree.root().to_path_buf()),
+            expanded: self.tree.tree.expanded_dirs(),
+            panes: [pane(0), pane(1)],
+        }
+    }
+
+    /// Persist the layout, reporting (not failing) if the state file cannot be
+    /// written; a lost layout must never take the editor down.
+    fn save_session(&self) {
+        if let Err(e) = store::save(&self.current_session()) {
+            eprintln!("bnknotes: could not save layout: {e}");
+        }
     }
 
     /// Bring the Vulkan backend up from the committed dmabuf feedback: a
@@ -965,9 +1598,9 @@ impl State {
         self.height = h;
         self.create_buffers()?;
         // A width change re-wraps and a height change shrinks the viewport; either
-        // can push the caret off-screen. Re-reveal it (this rebuilds the layout at
-        // the new width and re-clamps the scroll) instead of leaving a stale offset.
-        self.scroll_caret_into_view();
+        // can push the caret off-screen. Re-reveal the focused pane's caret (this
+        // rebuilds its layout at the new column width and re-clamps the scroll).
+        self.reveal_active_caret();
         self.dirty = true;
         Ok(())
     }
@@ -1010,6 +1643,51 @@ impl State {
         }
     }
 
+    /// Compose the whole window's display list: the file tree, then each visible
+    /// editor pane built into its column, then the splitter bars. Refreshes each
+    /// pane's layout and clamps its scroll first, so the list matches the current
+    /// column sizes. Tree first so an editor's background covers any overhanging
+    /// filename; splitters last so they cover the inter-column gaps.
+    fn build_frame_list(&mut self) -> Rc<DisplayList> {
+        let cols = self.columns();
+        let mut list: DisplayList = Vec::new();
+        if let Some(rect) = cols.tree {
+            let focused = self.focus == Focus::Tree;
+            push_tree(&mut list, &self.fonts, &mut self.tree, rect, focused);
+        }
+        for i in 0..self.editors.len() {
+            let Some(rect) = cols.editors[i] else {
+                continue;
+            };
+            self.editors[i].ensure_layout(&self.fonts, rect);
+            let ch = self.editors[i].content_height;
+            self.editors[i].scroll_y = scroll::clamp(self.editors[i].scroll_y, ch, rect.h);
+            let focused = self.focus == Focus::Editor(i);
+            let params = PaintParams {
+                width: rect.w as usize,
+                height: rect.h as usize,
+                scroll_y: self.editors[i].scroll_y,
+                selection: self.editors[i].text.selection(),
+                cursor: self.editors[i].text.cursor(),
+                // Only the focused pane blinks a caret; others show none.
+                caret_visible: focused && self.caret_visible,
+                find: build_find_paint(&self.editors[i].find),
+            };
+            if let Some(layout) = self.editors[i].layout_cache.as_ref() {
+                list.append(&mut build_display_list(
+                    &self.fonts,
+                    layout,
+                    self.editors[i].text.rope(),
+                    &params,
+                ));
+            }
+        }
+        for s in cols.splitters.into_iter().flatten() {
+            push_splitter(&mut list, s);
+        }
+        Rc::new(list)
+    }
+
     /// Build the current frame, repaint only what changed in a free buffer, and
     /// present it. Returns false if both buffers are still held by the compositor,
     /// leaving `dirty` set so the next buffer release retries.
@@ -1043,50 +1721,11 @@ impl State {
         };
         // Time the whole frame (layout reuse/rebuild plus paint) when stats are on.
         let started = self.stats.then(Instant::now);
-        // Build (or reuse) the layout up front, then build the frame *by reference*
-        // off the cached layout, so a frame never clones the document's visual lines.
-        self.ensure_layout();
-        // Keep the scroll offset valid for the current content and window size.
-        self.scroll_y = scroll::clamp(self.scroll_y, self.content_height, self.height as i32);
         let width = self.width as usize;
         let height = self.height as usize;
         let (sw, sh) = (self.width as i32, self.height as i32);
-        let find = if self.find.is_open() {
-            Some(FindPaint {
-                query: self.find.query(),
-                replace: self.find.show_replace().then(|| self.find.replacement()),
-                focus_replace: self.find.focus() == find::Field::Replace,
-                selected: self.find.selected(),
-                word: self.find.word(),
-                regex: self.find.regex(),
-                error: self.find.error(),
-                matches: self.find.matches(),
-                current: self.find.current(),
-            })
-        } else {
-            None
-        };
-        let params = PaintParams {
-            width,
-            height,
-            scroll_y: self.scroll_y,
-            selection: self.text.selection(),
-            cursor: self.text.cursor(),
-            caret_visible: self.caret_visible,
-            find,
-        };
-
-        let new_list = {
-            let Some(layout) = self.layout_cache.as_ref() else {
-                return Ok(false);
-            };
-            Rc::new(build_display_list(
-                &self.fonts,
-                layout,
-                self.text.rope(),
-                &params,
-            ))
-        };
+        // Compose the frame from every pane (tree, editors) plus the splitters.
+        let new_list = self.build_frame_list();
 
         // Nothing changed since the on-screen frame: it already shows this content,
         // so there is nothing to present (the common idle case).
@@ -1101,6 +1740,9 @@ impl State {
         // repaint exactly.
         let buf_dmg = display::damage(&self.buffer_lists[idx], &new_list, sw, sh);
         if !buf_dmg.is_empty() {
+            // Resolve inline images against both panes' stores so a picture
+            // renders in whichever pane it belongs to.
+            let images = [&self.editors[0].images, &self.editors[1].images];
             let frame_len = self.frame_len;
             let offset = idx * frame_len;
             let Some(pool) = self.pool.as_mut() else {
@@ -1109,13 +1751,7 @@ impl State {
             let frame = &mut pool.data_mut()[offset..offset + frame_len];
             let mut canvas = Canvas::new(frame, width, height);
             for clip in &buf_dmg {
-                display::execute(
-                    &mut canvas,
-                    &self.fonts,
-                    &self.images,
-                    &new_list,
-                    Some(*clip),
-                );
+                display::execute(&mut canvas, &self.fonts, &images, &new_list, Some(*clip));
             }
         }
         self.buffer_lists[idx] = Rc::clone(&new_list);
@@ -1177,44 +1813,9 @@ impl State {
             return Ok(false);
         };
         let started = self.stats.then(Instant::now);
-        self.ensure_layout();
-        self.scroll_y = scroll::clamp(self.scroll_y, self.content_height, self.height as i32);
         let (sw, sh) = (self.width as i32, self.height as i32);
-        let find = if self.find.is_open() {
-            Some(FindPaint {
-                query: self.find.query(),
-                replace: self.find.show_replace().then(|| self.find.replacement()),
-                focus_replace: self.find.focus() == find::Field::Replace,
-                selected: self.find.selected(),
-                word: self.find.word(),
-                regex: self.find.regex(),
-                error: self.find.error(),
-                matches: self.find.matches(),
-                current: self.find.current(),
-            })
-        } else {
-            None
-        };
-        let params = PaintParams {
-            width: self.width as usize,
-            height: self.height as usize,
-            scroll_y: self.scroll_y,
-            selection: self.text.selection(),
-            cursor: self.text.cursor(),
-            caret_visible: self.caret_visible,
-            find,
-        };
-        let new_list = {
-            let Some(layout) = self.layout_cache.as_ref() else {
-                return Ok(false);
-            };
-            Rc::new(build_display_list(
-                &self.fonts,
-                layout,
-                self.text.rope(),
-                &params,
-            ))
-        };
+        // Compose the frame from every pane (tree, editors) plus the splitters.
+        let new_list = self.build_frame_list();
 
         // Nothing changed since the on-screen frame: nothing to present (the
         // common idle case), exactly as the software path decides it.
@@ -1224,7 +1825,9 @@ impl State {
         }
 
         // Render, returning the render-done fence under explicit sync (`None`
-        // on the bridge path, or when the driver could not export one).
+        // on the bridge path, or when the driver could not export one). Inline
+        // images resolve against both panes' stores (see the software path).
+        let images = [&self.editors[0].images, &self.editors[1].images];
         let render_done = {
             let Some(gpu) = self.gpu.as_mut() else {
                 return Err(Error::msg("gpu frame without a gpu backend"));
@@ -1235,7 +1838,7 @@ impl State {
             let known = |key: &gpu::ImageKey| gpu.has_image(key);
             let frame = gpu::build_frame(
                 &self.fonts,
-                &self.images,
+                &images,
                 &new_list,
                 &mut self.gpu_glyphs,
                 &known,
@@ -1818,129 +2421,188 @@ impl State {
     }
 
     fn apply_action(&mut self, action: KeyAction) -> Result<()> {
+        // Window-level pane management, handled before any editor routing: toggle
+        // the sidebar/second pane, or move focus between regions.
+        match action {
+            KeyAction::ToggleTree => {
+                self.panes.tree_visible = !self.panes.tree_visible;
+                if !self.panes.tree_visible && self.focus == Focus::Tree {
+                    self.focus = Focus::Editor(self.last_editor);
+                }
+                self.dirty = true;
+                self.save_session();
+                return Ok(());
+            }
+            KeyAction::ToggleSecondPane => {
+                self.panes.second_open = !self.panes.second_open;
+                if !self.panes.second_open && self.focus == Focus::Editor(1) {
+                    self.focus = Focus::Editor(0);
+                    self.last_editor = 0;
+                }
+                self.refresh_title();
+                self.dirty = true;
+                self.save_session();
+                return Ok(());
+            }
+            KeyAction::FocusTree => {
+                if self.panes.tree_visible {
+                    self.focus = Focus::Tree;
+                    self.dirty = true;
+                }
+                return Ok(());
+            }
+            KeyAction::FocusPaneA => {
+                self.focus = Focus::Editor(0);
+                self.last_editor = 0;
+                self.refresh_title();
+                self.dirty = true;
+                return Ok(());
+            }
+            KeyAction::FocusPaneB => {
+                if self.panes.second_open {
+                    self.focus = Focus::Editor(1);
+                    self.last_editor = 1;
+                    self.refresh_title();
+                    self.dirty = true;
+                }
+                return Ok(());
+            }
+            _ => {}
+        }
+        // With the tree focused, keys navigate the sidebar (the pane keys above
+        // still move focus out); nothing reaches an editor.
+        if self.focus == Focus::Tree {
+            self.tree_key(action);
+            return Ok(());
+        }
         // Any keyboard action but Copy drops an image selection and its pinned raw
         // source (using the keyboard means the user has left the image widget). A
         // revealed source the caret sits in stays shown via the cursor-on-line
         // reveal. Copy must see the selection to choose image-vs-text, so it is
         // exempt. Repaint so the border and button disappear immediately.
+        // Keyboard input goes to the focused editor; `rect` is its column, for
+        // the motion methods that need the viewport.
+        let i = self.active_editor();
+        let rect = self.editor_rect(i);
         if !matches!(action, KeyAction::Copy)
-            && (self.selected_image.is_some() || self.raw_image.is_some())
+            && (self.editors[i].selected_image.is_some() || self.editors[i].raw_image.is_some())
         {
-            self.selected_image = None;
-            self.raw_image = None;
+            self.editors[i].selected_image = None;
+            self.editors[i].raw_image = None;
             self.dirty = true;
         }
         let extend = self.xkb.shift_active();
         // With the find bar open the keyboard drives the query, not the buffer,
         // so a stray shortcut cannot edit the document mid-search (replacements
         // go through the bar's own Enter handling).
-        if self.find.is_open() {
+        if self.editors[i].find.is_open() {
             self.handle_find_key(action);
             return Ok(());
         }
         if matches!(action, KeyAction::Find | KeyAction::Replace) {
-            let text = self.text.text();
-            let cursor = self.text.cursor();
+            let text = self.editors[i].text.text();
+            let cursor = self.editors[i].text.cursor();
             let target = if action == KeyAction::Find {
-                self.find.open_at(cursor, &text)
+                self.editors[i].find.open_at(cursor, &text)
             } else {
-                self.find.open_replace_at(cursor, &text)
+                self.editors[i].find.open_replace_at(cursor, &text)
             };
             self.land_on_match(target);
             return Ok(());
         }
+        let ed = &mut self.editors[i];
         let changed = match action {
             KeyAction::Char(c) => {
                 let mut encoded = [0u8; 4];
-                self.text.insert_str(c.encode_utf8(&mut encoded));
-                self.goal_x = None;
+                ed.text.insert_str(c.encode_utf8(&mut encoded));
+                ed.goal_x = None;
                 true
             }
             KeyAction::Enter => {
-                self.goal_x = None;
-                self.text.enter()
+                ed.goal_x = None;
+                ed.text.enter()
             }
             // On a list item, Tab nests it one level deeper and Shift+Tab one
             // shallower. Anywhere else, Tab inserts a soft tab and Shift+Tab is a
             // no-op (there is nothing to dedent).
             KeyAction::Tab => {
-                self.goal_x = None;
-                if self.text.cursor_on_list_item() {
-                    self.text.nest_list_item(extend)
+                ed.goal_x = None;
+                if ed.text.cursor_on_list_item() {
+                    ed.text.nest_list_item(extend)
                 } else if extend {
                     false
                 } else {
-                    self.text.insert_str(SOFT_TAB);
+                    ed.text.insert_str(SOFT_TAB);
                     true
                 }
             }
             KeyAction::Backspace => {
-                self.goal_x = None;
-                self.text.backspace()
+                ed.goal_x = None;
+                ed.text.backspace()
             }
             KeyAction::Delete => {
-                self.goal_x = None;
-                self.text.delete_forward()
+                ed.goal_x = None;
+                ed.text.delete_forward()
             }
             KeyAction::DeleteWordBack => {
-                self.goal_x = None;
-                self.text.delete_word_back()
+                ed.goal_x = None;
+                ed.text.delete_word_back()
             }
             KeyAction::DeleteWordForward => {
-                self.goal_x = None;
-                self.text.delete_word_forward()
+                ed.goal_x = None;
+                ed.text.delete_word_forward()
             }
             KeyAction::DeleteLine => {
-                self.goal_x = None;
-                self.text.delete_line()
+                ed.goal_x = None;
+                ed.text.delete_line()
             }
             KeyAction::Left => {
-                self.goal_x = None;
-                self.text.move_left(extend)
+                ed.goal_x = None;
+                ed.text.move_left(extend)
             }
             KeyAction::Right => {
-                self.goal_x = None;
-                self.text.move_right(extend)
+                ed.goal_x = None;
+                ed.text.move_right(extend)
             }
             KeyAction::WordLeft => {
-                self.goal_x = None;
-                self.text.move_word_left(extend)
+                ed.goal_x = None;
+                ed.text.move_word_left(extend)
             }
             KeyAction::WordRight => {
-                self.goal_x = None;
-                self.text.move_word_right(extend)
+                ed.goal_x = None;
+                ed.text.move_word_right(extend)
             }
-            KeyAction::Up => self.move_vertical(-1, extend),
-            KeyAction::Down => self.move_vertical(1, extend),
-            KeyAction::PageUp => self.move_page(-1, extend),
-            KeyAction::PageDown => self.move_page(1, extend),
+            KeyAction::Up => ed.move_vertical(&self.fonts, rect, -1, extend),
+            KeyAction::Down => ed.move_vertical(&self.fonts, rect, 1, extend),
+            KeyAction::PageUp => ed.move_page(&self.fonts, rect, -1, extend),
+            KeyAction::PageDown => ed.move_page(&self.fonts, rect, 1, extend),
             KeyAction::Home => {
-                self.goal_x = None;
-                self.move_line_edge(false, extend)
+                ed.goal_x = None;
+                ed.move_line_edge(&self.fonts, rect, false, extend)
             }
             KeyAction::End => {
-                self.goal_x = None;
-                self.move_line_edge(true, extend)
+                ed.goal_x = None;
+                ed.move_line_edge(&self.fonts, rect, true, extend)
             }
             KeyAction::DocStart => {
-                self.goal_x = None;
-                self.text.move_doc_start(extend)
+                ed.goal_x = None;
+                ed.text.move_doc_start(extend)
             }
             KeyAction::DocEnd => {
-                self.goal_x = None;
-                self.text.move_doc_end(extend)
+                ed.goal_x = None;
+                ed.text.move_doc_end(extend)
             }
             KeyAction::SelectAll => {
-                self.text.select_all();
+                ed.text.select_all();
                 true
             }
             KeyAction::Undo => {
-                self.goal_x = None;
-                self.text.undo()
+                ed.goal_x = None;
+                ed.text.undo()
             }
             KeyAction::Redo => {
-                self.goal_x = None;
-                self.text.redo()
+                ed.goal_x = None;
+                ed.text.redo()
             }
             // The clipboard actions manage their own redraw and may do I/O over a
             // pipe to another app. As with Save, an I/O failure (e.g. a peer that
@@ -1949,7 +2611,7 @@ impl State {
             // propagated out of the loop. With an image selected, Copy puts the
             // picture on the clipboard instead of text.
             KeyAction::Copy => {
-                let result = if self.selected_image.is_some() {
+                let result = if self.editors[i].selected_image.is_some() {
                     self.copy_selected_image()
                 } else {
                     self.copy_selection()
@@ -1986,14 +2648,21 @@ impl State {
             // With no find bar, Escape collapses a selection to a bare cursor;
             // with nothing selected there is nothing to leave.
             KeyAction::Escape => {
-                if self.text.selection().is_some() {
-                    self.text.set_cursor(self.text.cursor(), false);
+                if self.editors[i].text.selection().is_some() {
+                    let c = self.editors[i].text.cursor();
+                    self.editors[i].text.set_cursor(c, false);
                     true
                 } else {
                     false
                 }
             }
-            KeyAction::None => false,
+            // Handled before this match (returned early); listed for exhaustiveness.
+            KeyAction::ToggleTree
+            | KeyAction::ToggleSecondPane
+            | KeyAction::FocusTree
+            | KeyAction::FocusPaneA
+            | KeyAction::FocusPaneB
+            | KeyAction::None => false,
         };
         if changed {
             self.after_edit();
@@ -2017,35 +2686,37 @@ impl State {
         let shift = self.xkb.shift_active();
         let ctrl = self.xkb.ctrl_active();
         let alt = self.xkb.alt_active();
+        // The find bar belongs to the focused editor.
+        let i = self.active_editor();
         let target = match action {
             KeyAction::Char(c) if alt => {
-                let text = self.text.text();
+                let text = self.editors[i].text.text();
                 match c.to_ascii_lowercase() {
-                    'w' => self.find.toggle_word(&text),
-                    'r' => self.find.toggle_regex(&text),
+                    'w' => self.editors[i].find.toggle_word(&text),
+                    'r' => self.editors[i].find.toggle_regex(&text),
                     _ => return,
                 }
             }
             KeyAction::Char(c) => {
-                let text = self.text.text();
-                self.find.push(c, &text)
+                let text = self.editors[i].text.text();
+                self.editors[i].find.push(c, &text)
             }
             KeyAction::Backspace => {
-                let text = self.text.text();
-                self.find.pop(&text)
+                let text = self.editors[i].text.text();
+                self.editors[i].find.pop(&text)
             }
             KeyAction::Tab => {
-                self.find.toggle_focus();
+                self.editors[i].find.toggle_focus();
                 None
             }
             KeyAction::SelectAll => {
-                self.find.select_all();
+                self.editors[i].find.select_all();
                 None
             }
             KeyAction::Paste => match self.clipboard_text() {
                 Ok(Some(pasted)) => {
-                    let text = self.text.text();
-                    self.find.push_str(&pasted, &text)
+                    let text = self.editors[i].text.text();
+                    self.editors[i].find.push_str(&pasted, &text)
                 }
                 Ok(None) => None,
                 Err(e) => {
@@ -2057,21 +2728,22 @@ impl State {
                 self.replace_all_matches();
                 return;
             }
-            KeyAction::Enter if shift => self.find.prev(),
+            KeyAction::Enter if shift => self.editors[i].find.prev(),
             KeyAction::Enter
-                if self.find.show_replace() && self.find.focus() == find::Field::Replace =>
+                if self.editors[i].find.show_replace()
+                    && self.editors[i].find.focus() == find::Field::Replace =>
             {
                 self.replace_current_match();
                 return;
             }
-            KeyAction::Enter => self.find.next(),
+            KeyAction::Enter => self.editors[i].find.next(),
             KeyAction::Replace => {
-                let text = self.text.text();
-                let cursor = self.text.cursor();
-                self.find.open_replace_at(cursor, &text)
+                let text = self.editors[i].text.text();
+                let cursor = self.editors[i].text.cursor();
+                self.editors[i].find.open_replace_at(cursor, &text)
             }
             KeyAction::Escape | KeyAction::Find => {
-                self.find.close();
+                self.editors[i].find.close();
                 self.dirty = true;
                 return;
             }
@@ -2084,9 +2756,10 @@ impl State {
     /// target, just repaint so the bar reflects its state.
     fn land_on_match(&mut self, target: Option<(usize, usize)>) {
         if let Some((start, end)) = target {
-            self.text.select_range(start, end);
+            let i = self.active_editor();
+            self.editors[i].text.select_range(start, end);
             self.bump_caret();
-            self.scroll_caret_into_view();
+            self.reveal_active_caret();
         }
         self.dirty = true;
     }
@@ -2095,29 +2768,32 @@ impl State {
     /// next match, rescanning from just past the inserted text so a
     /// replacement containing the query is not immediately re-matched.
     fn replace_current_match(&mut self) {
-        let Some((start, end)) = self.find.current_match() else {
+        let i = self.active_editor();
+        let Some((start, end)) = self.editors[i].find.current_match() else {
             self.dirty = true;
             return;
         };
-        let with = self.find.replacement().to_string();
-        self.text.select_range(start, end);
-        self.text.insert_str(&with);
+        let with = self.editors[i].find.replacement().to_string();
+        self.editors[i].text.select_range(start, end);
+        self.editors[i].text.insert_str(&with);
         self.after_edit();
-        let text = self.text.text();
-        let target = self.find.refresh(&text, start + with.len());
+        let text = self.editors[i].text.text();
+        let target = self.editors[i].find.refresh(&text, start + with.len());
         self.land_on_match(target);
     }
 
     /// Replace every match with the bar's replacement in one undo step.
     fn replace_all_matches(&mut self) {
-        let ranges = self.find.matches().to_vec();
-        let with = self.find.replacement().to_string();
-        if !self.text.replace_ranges(&ranges, &with) {
+        let i = self.active_editor();
+        let ranges = self.editors[i].find.matches().to_vec();
+        let with = self.editors[i].find.replacement().to_string();
+        if !self.editors[i].text.replace_ranges(&ranges, &with) {
             return;
         }
         self.after_edit();
-        let text = self.text.text();
-        let target = self.find.refresh(&text, self.text.cursor());
+        let text = self.editors[i].text.text();
+        let cursor = self.editors[i].text.cursor();
+        let target = self.editors[i].find.refresh(&text, cursor);
         self.land_on_match(target);
     }
 
@@ -2126,7 +2802,7 @@ impl State {
     fn after_edit(&mut self) {
         self.dirty = true;
         self.bump_caret();
-        self.scroll_caret_into_view();
+        self.reveal_active_caret();
         self.refresh_title();
     }
 
@@ -2134,23 +2810,25 @@ impl State {
     /// original on-disk format. A buffer with no file (started without a path)
     /// has nowhere to go yet, so it reports that and stays put.
     fn save(&mut self) -> Result<()> {
-        let Some(path) = self.path.clone() else {
+        let i = self.active_editor();
+        let Some(path) = self.editors[i].path.clone() else {
             eprintln!("bnknotes: no file to save to; start bnknotes with a path");
             return Ok(());
         };
-        let bytes = file::encode(&self.text.text(), &self.format);
+        let bytes = file::encode(&self.editors[i].text.text(), &self.editors[i].format);
         file::save_atomic(&path, &bytes)?;
-        self.text.mark_saved();
+        self.editors[i].text.mark_saved();
         self.refresh_title();
         eprintln!("bnknotes: saved {}", path.display());
         Ok(())
     }
 
-    /// The toplevel title: the file's name (or just the app name for an unnamed
-    /// buffer), with a leading dot when there are unsaved changes.
+    /// The toplevel title: the focused editor's file name (or just the app name
+    /// for an unnamed buffer), with a leading dot when it has unsaved changes.
     fn window_title(&self) -> String {
-        let modified = if self.text.is_modified() { "• " } else { "" };
-        match self.path.as_ref().and_then(|p| p.file_name()) {
+        let ed = &self.editors[self.active_editor()];
+        let modified = if ed.text.is_modified() { "• " } else { "" };
+        match ed.path.as_ref().and_then(|p| p.file_name()) {
             Some(name) => format!("{modified}{} - bnknotes", name.to_string_lossy()),
             None => format!("{modified}bnknotes"),
         }
@@ -2162,7 +2840,7 @@ impl State {
         // The title depends only on the modified flag and the (session-fixed)
         // filename, so a cursor move that left the modified state untouched cannot
         // change it: skip the format!+compare on that common path.
-        let modified = self.text.is_modified();
+        let modified = self.editors[self.active_editor()].text.is_modified();
         if self.title_modified == Some(modified) {
             return;
         }
@@ -2176,79 +2854,6 @@ impl State {
             self.title = desired;
         }
         self.title_modified = Some(modified);
-    }
-
-    /// Move the cursor `dir` lines (-1 up, +1 down), keeping a sticky goal x.
-    fn move_vertical(&mut self, dir: i32, extend: bool) -> bool {
-        self.ensure_layout();
-        let cursor = self.text.cursor();
-        let before_sel = self.text.selection();
-        // Read the cached layout by reference; `goal_x`/`text` are disjoint fields,
-        // so they can be touched while the layout borrow is live.
-        let Some(layout) = self.layout_cache.as_ref() else {
-            return false;
-        };
-        let (caret_x, _, _) = layout.caret(&self.fonts, self.text.rope(), cursor);
-        let goal = self.goal_x.unwrap_or(caret_x as f32);
-        let target = layout.offset_vertical(&self.fonts, self.text.rope(), cursor, dir, goal);
-        self.goal_x = Some(goal);
-        self.text.set_cursor(target, extend);
-        self.text.cursor() != cursor || self.text.selection() != before_sel
-    }
-
-    /// Move the cursor to the start (`to_end = false`) or end of its line.
-    fn move_line_edge(&mut self, to_end: bool, extend: bool) -> bool {
-        self.ensure_layout();
-        let cursor = self.text.cursor();
-        let before_sel = self.text.selection();
-        let Some(layout) = self.layout_cache.as_ref() else {
-            return false;
-        };
-        let (start, end) = layout.line_bounds(cursor);
-        let target = if to_end {
-            end
-        } else {
-            // Smart Home. Visual bounds, so it works on wrapped rows too.
-            let line = self.text.rope().byte_slice(start..end);
-            smart_home_target(&line, start, end, cursor)
-        };
-        self.text.set_cursor(target, extend);
-        self.text.cursor() != cursor || self.text.selection() != before_sel
-    }
-
-    /// Move the cursor one viewport height up (`dir = -1`) or down (`dir = 1`),
-    /// keeping the sticky goal column, like a run of Up/Down. The view follows
-    /// via the caret-reveal scroll in `after_edit`. Returns whether it moved.
-    fn move_page(&mut self, dir: i32, extend: bool) -> bool {
-        self.ensure_layout();
-        let cursor = self.text.cursor();
-        let before_sel = self.text.selection();
-        let page_lines = self.page_lines();
-        let Some(layout) = self.layout_cache.as_ref() else {
-            return false;
-        };
-        let (caret_x, _, _) = layout.caret(&self.fonts, self.text.rope(), cursor);
-        let goal = self.goal_x.unwrap_or(caret_x as f32);
-        // Step a line at a time so each hop honors the goal column and the
-        // varying per-line heights; stop early at the first or last line.
-        let mut target = cursor;
-        for _ in 0..page_lines {
-            let next = layout.offset_vertical(&self.fonts, self.text.rope(), target, dir, goal);
-            if next == target {
-                break;
-            }
-            target = next;
-        }
-        self.goal_x = Some(goal);
-        self.text.set_cursor(target, extend);
-        self.text.cursor() != cursor || self.text.selection() != before_sel
-    }
-
-    /// How many visual lines make up a Page Up/Down jump: the window height in
-    /// body line-heights, less one row of overlap for continuity, at least one.
-    fn page_lines(&self) -> usize {
-        let line_height = self.fonts.metrics(FONT_SIZE).line_height.max(1);
-        (self.height as i32 / line_height - 1).max(1) as usize
     }
 
     fn on_pointer(&mut self, opcode: u16, r: &mut Reader) -> Result<()> {
@@ -2268,14 +2873,24 @@ impl State {
                 let _time = r.u32()?;
                 self.pointer_x = r.fixed()?;
                 self.pointer_y = r.fixed()?;
-                if self.selecting {
-                    // Drag extends the selection from the press point, and arms
-                    // auto-scroll when the pointer sits at a vertical edge.
-                    self.place_cursor_at(self.pointer_x, self.pointer_y, true);
-                    self.update_autoscroll();
+                let (px, py) = (self.pointer_x, self.pointer_y);
+                if let Some(s) = self.drag_splitter {
+                    self.drag_splitter_to(s, px);
                 } else {
-                    // Match the pointer shape to whatever is now under it.
-                    self.update_cursor_shape();
+                    let i = self.active_editor();
+                    if matches!(self.focus, Focus::Editor(_)) && self.editors[i].selecting {
+                        // Drag extends the focused editor's selection from the press
+                        // point, arming auto-scroll at the column's vertical edges.
+                        let rect = self.editor_rect(i);
+                        if self.editors[i].place_cursor_at(&self.fonts, rect, px, py, true) {
+                            self.dirty = true;
+                        }
+                        self.bump_caret();
+                        self.editors[i].update_autoscroll(rect, py);
+                    } else {
+                        self.update_cursor_shape();
+                        self.update_tree_hover();
+                    }
                 }
             }
             wl_pointer::EV_BUTTON => {
@@ -2285,13 +2900,18 @@ impl State {
                 let state = r.u32()?;
                 if button == wl_pointer::BTN_LEFT {
                     if state == wl_pointer::BUTTON_STATE_PRESSED {
-                        self.goal_x = None;
                         self.on_left_press();
                     } else {
-                        self.selecting = false;
-                        self.stop_autoscroll();
+                        // A splitter drag just ended: persist the new column sizes.
+                        if self.drag_splitter.take().is_some() {
+                            self.save_session();
+                        }
+                        let i = self.active_editor();
+                        self.editors[i].selecting = false;
+                        self.editors[i].autoscroll = 0;
+                        self.editors[i].autoscroll_at = None;
                         // Drag over: let the reveal catch up to the final selection.
-                        if self.frozen_reveal.take().is_some() {
+                        if self.editors[i].frozen_reveal.take().is_some() {
                             self.dirty = true;
                         }
                     }
@@ -2302,7 +2922,18 @@ impl State {
                 let axis = r.u32()?;
                 let value = r.fixed()?;
                 if axis == wl_pointer::AXIS_VERTICAL_SCROLL {
-                    self.scroll_by((value * SCROLL_FACTOR).round() as i32);
+                    let delta = (value * SCROLL_FACTOR).round() as i32;
+                    let (px, py) = (self.pointer_x, self.pointer_y);
+                    // Scroll whichever pane the pointer is over, not just the focused one.
+                    match self.hit_test(px, py) {
+                        Hit::Editor(i, rect) => {
+                            if self.editors[i].scroll_by(&self.fonts, rect, delta) {
+                                self.dirty = true;
+                            }
+                        }
+                        Hit::Tree(rect) => self.scroll_tree(rect, delta),
+                        _ => {}
+                    }
                 }
             }
             _ => {} // leave, frame, axis_source, and friends
@@ -2310,24 +2941,166 @@ impl State {
         Ok(())
     }
 
-    /// Place the cursor (or, with `extend`, the selection's free end) at a click
-    /// or drag position in surface-local pixels. The window y is shifted into
-    /// content space by the scroll offset before hit-testing.
-    fn place_cursor_at(&mut self, x: f32, y: f32, extend: bool) {
-        // Hit-test against the cached layout by reference; the hot drag path must
-        // not clone or rebuild it. The reveal pin keeps the cache valid throughout.
-        self.ensure_layout();
-        let Some(layout) = self.layout_cache.as_ref() else {
-            return;
+    /// What the window position `(px, py)` lands on. Splitters win over columns
+    /// since they sit in the gaps; columns are full height, so only x decides.
+    fn hit_test(&self, px: f32, py: f32) -> Hit {
+        let _ = py;
+        let x = px as i32;
+        let cols = self.columns();
+        for (s, rect) in cols.splitters.iter().enumerate() {
+            if let Some(r) = rect {
+                if x >= r.x && x < r.x + r.w {
+                    return Hit::Splitter(s);
+                }
+            }
+        }
+        if let Some(r) = cols.tree {
+            if x >= r.x && x < r.x + r.w {
+                return Hit::Tree(r);
+            }
+        }
+        for (i, rect) in cols.editors.iter().enumerate() {
+            if let Some(r) = rect {
+                if x >= r.x && x < r.x + r.w {
+                    return Hit::Editor(i, *r);
+                }
+            }
+        }
+        Hit::None
+    }
+
+    /// Drag splitter `s` so its column edge follows window x `px`: splitter 0
+    /// resizes the sidebar, splitter 1 the A/B content split. Clamped to keep
+    /// every column usable.
+    fn drag_splitter_to(&mut self, s: usize, px: f32) {
+        let x = px as i32;
+        let w = self.width as i32;
+        if s == 0 {
+            self.panes.tree_width = x.clamp(120, (w - 2 * SPLITTER - 120).max(120));
+        } else {
+            let base = if self.panes.tree_visible {
+                self.panes.tree_width + SPLITTER
+            } else {
+                0
+            };
+            let content = (w - base - SPLITTER).max(1) as f32;
+            let a = (x - base) as f32 / content;
+            self.panes.split_ratio = a.clamp(0.1, 0.9);
+        }
+        self.dirty = true;
+    }
+
+    /// Update the tree's hovered row from the pointer, repainting if it changed.
+    fn update_tree_hover(&mut self) {
+        let (px, py) = (self.pointer_x, self.pointer_y);
+        let hovered = match self.hit_test(px, py) {
+            Hit::Tree(rect) => self.tree_row_at(rect, py),
+            _ => None,
         };
-        let offset = layout.offset_at(&self.fonts, self.text.rope(), x, y + self.scroll_y as f32);
-        let before = self.text.cursor();
-        let before_sel = self.text.selection();
-        self.text.set_cursor(offset, extend);
-        self.bump_caret();
-        if self.text.cursor() != before || self.text.selection() != before_sel {
+        if hovered != self.tree.hovered {
+            self.tree.hovered = hovered;
             self.dirty = true;
         }
+    }
+
+    /// The tree row index at window y `py` within the tree column, if any.
+    fn tree_row_at(&self, rect: Rect, py: f32) -> Option<usize> {
+        let row_h = self.fonts.metrics(FONT_SIZE).line_height.max(1);
+        let y = py as i32 - rect.y + self.tree.scroll_y - TREE_PAD;
+        if y < 0 {
+            return None;
+        }
+        let idx = (y / row_h) as usize;
+        (idx < self.tree.tree.rows().len()).then_some(idx)
+    }
+
+    /// Scroll the tree column by `delta`, clamped, repainting if it moved.
+    fn scroll_tree(&mut self, rect: Rect, delta: i32) {
+        let sy = scroll::clamp(self.tree.scroll_y + delta, self.tree.content_height, rect.h);
+        if sy != self.tree.scroll_y {
+            self.tree.scroll_y = sy;
+            self.dirty = true;
+        }
+    }
+
+    /// Open `path` into the last-focused content pane and focus it. An unreadable
+    /// file is reported without disturbing the current pane.
+    fn open_file(&mut self, path: &Path) {
+        match EditorPane::open(path) {
+            Ok(pane) => {
+                let i = self.last_editor;
+                self.editors[i] = pane;
+                self.focus = Focus::Editor(i);
+                self.refresh_title();
+                self.dirty = true;
+                self.save_session();
+            }
+            Err(e) => eprintln!("bnknotes: cannot open {}: {e}", path.display()),
+        }
+    }
+
+    /// The tree column rectangle, or an empty rect when the sidebar is hidden.
+    fn tree_rect(&self) -> Rect {
+        self.columns().tree.unwrap_or(Rect {
+            x: 0,
+            y: 0,
+            w: 0,
+            h: 0,
+        })
+    }
+
+    /// Scroll the tree so its selected row is on screen.
+    fn reveal_tree_selection(&mut self) {
+        let row_h = self.fonts.metrics(FONT_SIZE).line_height.max(1);
+        let rect = self.tree_rect();
+        let top = TREE_PAD + self.tree.selected as i32 * row_h;
+        self.tree.scroll_y = scroll::reveal(
+            self.tree.scroll_y,
+            top,
+            row_h,
+            rect.h,
+            self.tree.content_height,
+            TREE_PAD,
+        );
+    }
+
+    /// Keyboard navigation while the tree holds focus: Up/Down move the selected
+    /// row, Left/Right collapse/expand a folder, Enter toggles a folder or opens
+    /// a file into the last-focused editor.
+    fn tree_key(&mut self, action: KeyAction) {
+        let n = self.tree.tree.rows().len();
+        if n == 0 {
+            return;
+        }
+        let last = n - 1;
+        let sel = self.tree.selected.min(last);
+        self.tree.selected = sel;
+        match action {
+            KeyAction::Up => self.tree.selected = sel.saturating_sub(1),
+            KeyAction::Down => self.tree.selected = (sel + 1).min(last),
+            KeyAction::Left | KeyAction::Right | KeyAction::Enter => {
+                let row = &self.tree.tree.rows()[sel];
+                let (is_dir, expanded, path) = (row.is_dir, row.expanded, row.path.clone());
+                if matches!(action, KeyAction::Enter) && !is_dir {
+                    self.open_file(&path);
+                    return;
+                }
+                let toggle = match action {
+                    KeyAction::Left => is_dir && expanded,
+                    KeyAction::Right => is_dir && !expanded,
+                    KeyAction::Enter => is_dir,
+                    _ => false,
+                };
+                if !toggle {
+                    return;
+                }
+                self.tree.tree.toggle(&path);
+                self.save_session();
+            }
+            _ => return,
+        }
+        self.dirty = true;
+        self.reveal_tree_selection();
     }
 
     /// Create the cursor-shape device for our pointer, if the compositor offers
@@ -2363,19 +3136,13 @@ impl State {
     /// text. Only re-requests when the shape changes, so it is cheap to call on
     /// every motion event. Uses the cached layout (no clone).
     fn update_cursor_shape(&mut self) {
-        use wp_cursor_shape_device_v1::{SHAPE_DEFAULT, SHAPE_POINTER, SHAPE_TEXT};
-        // A rendered link or task checkbox reads as clickable: the hand pointer,
-        // the same affordance the image button uses. Checked first so they win
-        // over the I-beam.
-        let over_link = self.link_under_pointer().is_some();
-        let over_checkbox = self.checkbox_under_pointer().is_some();
-        self.ensure_layout();
-        let (x, y) = (self.pointer_x, self.pointer_y + self.scroll_y as f32);
-        let shape = match self.layout_cache.as_ref() {
-            _ if over_link || over_checkbox => SHAPE_POINTER,
-            Some(layout) if layout.image_button_at(&self.fonts, x, y).is_some() => SHAPE_POINTER,
-            Some(layout) if layout.image_at(&self.fonts, x, y).is_some() => SHAPE_DEFAULT,
-            _ => SHAPE_TEXT,
+        use wp_cursor_shape_device_v1::{SHAPE_DEFAULT, SHAPE_EW_RESIZE};
+        let (px, py) = (self.pointer_x, self.pointer_y);
+        let shape = match self.hit_test(px, py) {
+            Hit::Splitter(_) => SHAPE_EW_RESIZE,
+            Hit::Tree(_) => SHAPE_DEFAULT,
+            Hit::Editor(i, rect) => self.editors[i].cursor_shape_at(&self.fonts, rect, px, py),
+            Hit::None => SHAPE_DEFAULT,
         };
         if shape != self.cursor_shape {
             self.cursor_shape = shape;
@@ -2383,249 +3150,164 @@ impl State {
         }
     }
 
-    /// Handle a left press that landed on an image's picture or its toggle button,
-    /// returning whether it was consumed (so the normal text-click path is skipped).
-    /// The button toggles the raw source; the picture selects the image (arming
-    /// `Ctrl+C` to copy it) without moving the text caret, so the source does not
-    /// auto-reveal.
-    fn on_image_press(&mut self) -> bool {
-        let (x, y) = (self.pointer_x, self.pointer_y + self.scroll_y as f32);
-        self.ensure_layout();
-        // Query both hits up front (each a copyable `Option<usize>`) so the layout
-        // borrow ends before the mutations below, which touch other `State` fields.
-        let Some(layout) = self.layout_cache.as_ref() else {
-            return false;
-        };
-        let button = layout.image_button_at(&self.fonts, x, y);
-        let image = layout.image_at(&self.fonts, x, y);
-        if let Some(ls) = button {
-            self.raw_image = if self.raw_image == Some(ls) {
-                None
-            } else {
-                Some(ls)
-            };
-            self.dirty = true;
-            return true;
+    /// Handle a left-button press: route it to whatever it landed on. A splitter
+    /// starts a drag-resize, a tree row expands a folder or opens a file, and an
+    /// editor column takes focus and then handles the click as a text press.
+    fn on_left_press(&mut self) {
+        let (px, py) = (self.pointer_x, self.pointer_y);
+        match self.hit_test(px, py) {
+            Hit::Splitter(s) => self.drag_splitter = Some(s),
+            Hit::Tree(rect) => self.tree_press(rect, py),
+            Hit::Editor(i, rect) => {
+                self.focus = Focus::Editor(i);
+                self.last_editor = i;
+                self.editor_press(i, rect, px, py);
+            }
+            Hit::None => {}
         }
-        if let Some(ls) = image {
-            self.selected_image = Some(ls);
-            self.raw_image = None;
-            // Collapse any text selection so a copy targets the image, and leave
-            // the caret where it is (off the image) so its source stays hidden.
-            let cursor = self.text.cursor();
-            self.text.set_cursor(cursor, false);
-            self.selecting = false;
-            self.frozen_reveal = None;
-            self.dirty = true;
-            return true;
-        }
-        false
     }
 
-    /// Handle a left-button press: chain it into the click count and act on it.
-    /// A single click places the cursor (extending the selection if Shift is
-    /// held) and starts a drag; a double-click selects the word under the
-    /// pointer; a triple (or more) selects the whole logical line.
-    fn on_left_press(&mut self) {
-        // A click in the document takes the focus back from the find bar; the
-        // click itself then places the cursor (or selects) as usual.
-        if self.find.is_open() {
-            self.find.close();
+    /// A press in the tree: focus the sidebar, then toggle a folder's expansion
+    /// or open a file into the last-focused editor.
+    fn tree_press(&mut self, rect: Rect, py: f32) {
+        self.focus = Focus::Tree;
+        let Some(idx) = self.tree_row_at(rect, py) else {
+            self.dirty = true;
+            return;
+        };
+        let Some(row) = self.tree.tree.rows().get(idx) else {
+            return;
+        };
+        let path = row.path.clone();
+        if row.is_dir {
+            self.tree.tree.toggle(&path);
+            self.dirty = true;
+            self.save_session();
+        } else {
+            self.open_file(&path);
+        }
+    }
+
+    /// A text press in editor `i`'s column: chain the click count and act on it,
+    /// after handling image/checkbox/rule/link interactions. Routed from
+    /// [`Self::on_left_press`] once the pane is chosen and focused.
+    fn editor_press(&mut self, i: usize, rect: Rect, px: f32, py: f32) {
+        let shift = self.xkb.shift_active();
+        // A click takes focus back from this editor's find bar.
+        if self.editors[i].find.is_open() {
+            self.editors[i].find.close();
             self.dirty = true;
         }
-        // Image interactions take precedence over text: a click on a selected
-        // image's button toggles its raw source, a click on a picture selects it.
-        if self.on_image_press() {
+        self.editors[i].goal_x = None;
+        // Image interactions win over text.
+        if self.editors[i].image_press(&self.fonts, rect, px, py) {
+            self.dirty = true;
+            self.bump_caret();
             return;
         }
-        // Any other click deselects the image and unpins its raw source; if the
-        // click lands in a revealed source line, the cursor-on-line reveal keeps
-        // that source shown, otherwise it hides (matching "click away to dismiss").
-        self.selected_image = None;
-        self.raw_image = None;
-
-        // A plain click on a rendered task checkbox toggles it in place, one
-        // undo step, without moving the caret (the line is not revealed, so
-        // there is no raw marker under the pointer to edit). Shift-click falls
-        // through so it can still extend a selection across a task line.
-        if !self.xkb.shift_active() {
-            if let Some(ls) = self.checkbox_under_pointer() {
-                if self.text.toggle_task(ls) {
+        self.editors[i].selected_image = None;
+        self.editors[i].raw_image = None;
+        // A plain click on a rendered task checkbox toggles it without moving the
+        // caret. Shift-click falls through so it can extend a selection.
+        if !shift {
+            if let Some(ls) = self.editors[i].checkbox_under_pointer(&self.fonts, rect, px, py) {
+                if self.editors[i].text.toggle_task(ls) {
                     self.dirty = true;
                 }
+                self.bump_caret();
                 return;
             }
         }
-
+        // Click chaining for double/triple-click.
         let now = Instant::now();
-        let (lx, ly) = self.last_click_pos;
-        let near = (self.pointer_x - lx).abs() <= MULTI_CLICK_RADIUS
-            && (self.pointer_y - ly).abs() <= MULTI_CLICK_RADIUS;
+        let (lx, ly) = self.editors[i].last_click_pos;
+        let near = (px - lx).abs() <= MULTI_CLICK_RADIUS && (py - ly).abs() <= MULTI_CLICK_RADIUS;
         let chained = near
-            && self
+            && self.editors[i]
                 .last_click
                 .is_some_and(|t| now.saturating_duration_since(t) <= MULTI_CLICK_INTERVAL);
-        self.click_count = if chained { self.click_count + 1 } else { 1 };
-        self.last_click = Some(now);
-        self.last_click_pos = (self.pointer_x, self.pointer_y);
-
-        // A plain click on a rendered horizontal rule selects the whole rule line
-        // (cursor at its end) rather than dropping a caret between its `---`
-        // markers. Shift-click falls through so it can still extend a selection
-        // across one.
-        if !self.xkb.shift_active() {
-            let cy = self.pointer_y + self.scroll_y as f32;
-            self.ensure_layout();
-            let rule = self
+        self.editors[i].click_count = if chained {
+            self.editors[i].click_count + 1
+        } else {
+            1
+        };
+        self.editors[i].last_click = Some(now);
+        self.editors[i].last_click_pos = (px, py);
+        // A plain click on a rendered horizontal rule selects the whole rule line.
+        if !shift {
+            self.editors[i].ensure_layout(&self.fonts, rect);
+            let cy = self.editors[i].content_y(rect, py);
+            let rule = self.editors[i]
                 .layout_cache
                 .as_ref()
                 .and_then(|l| l.rule_at(&self.fonts, cy));
             if let Some((start, end)) = rule {
-                self.text.select_range(start, end);
-                self.selecting = false;
+                self.editors[i].text.select_range(start, end);
+                self.editors[i].selecting = false;
                 self.dirty = true;
                 self.bump_caret();
                 return;
             }
         }
-
-        // A plain click on a link while it is rendered (its `[..](..)` markup
-        // collapsed because the cursor is on another line) follows the link instead
-        // of dropping a caret; once the cursor is on the line the markup shows and
-        // clicks edit normally. Gated to an un-chained, unmodified press so a
-        // double-click cannot open it twice.
-        if !chained && !self.xkb.shift_active() {
-            if let Some(dest) = self.link_under_pointer() {
-                // If the browser genuinely cannot launch, fall through so the click
-                // still places a caret rather than doing nothing.
+        // A plain, un-chained click on a rendered link follows it.
+        if !chained && !shift {
+            if let Some(dest) = self.editors[i].link_under_pointer(&self.fonts, rect, px, py) {
                 if crate::browser::open_url(&dest).is_ok() {
-                    self.selecting = false;
+                    self.editors[i].selecting = false;
                     return;
                 }
             }
         }
-
-        match self.click_count {
+        match self.editors[i].click_count {
             1 => {
-                let extend = self.xkb.shift_active();
-                self.place_cursor_at(self.pointer_x, self.pointer_y, extend);
-                self.selecting = true;
+                self.editors[i].place_cursor_at(&self.fonts, rect, px, py, shift);
+                self.editors[i].selecting = true;
                 // Pin marker reveal to the press point for the whole drag.
-                let c = self.text.cursor();
-                self.frozen_reveal = Some(self.text.selection().unwrap_or((c, c)));
+                let c = self.editors[i].text.cursor();
+                let reveal = self.editors[i].text.selection().unwrap_or((c, c));
+                self.editors[i].frozen_reveal = Some(reveal);
             }
             2 => {
-                let offset = self.pointer_offset();
-                self.text.select_word_at(offset);
+                let offset = self.editors[i].pointer_offset(&self.fonts, rect, px, py);
+                self.editors[i].text.select_word_at(offset);
                 self.dirty = true;
             }
             _ => {
-                let offset = self.pointer_offset();
-                self.text.select_line_at(offset);
+                let offset = self.editors[i].pointer_offset(&self.fonts, rect, px, py);
+                self.editors[i].text.select_line_at(offset);
                 self.dirty = true;
             }
         }
         self.bump_caret();
     }
 
-    /// The destination of the openable link under the pointer, if any. A link
-    /// qualifies only when its line is *rendered* (the reveal range does not touch
-    /// it, so its `[..](..)` markup is collapsed), the pointer is over its text, and
-    /// the destination has a scheme the browser will open. On the active line
-    /// (markup shown for editing) this is `None`, so clicks there edit normally.
-    /// Drives both following a click and the clickable pointer shape on hover.
-    fn link_under_pointer(&mut self) -> Option<String> {
-        let off = self.pointer_offset();
-        let (a0, a1) = self.reveal_range();
-        let rope = self.text.rope();
-        let line = rope.byte_to_line(off);
-        let ls = rope.line_to_byte(line);
-        // The logical line spans `ls` up to (but not including) its trailing '\n'.
-        let le = if line + 1 < rope.len_lines() {
-            rope.line_to_byte(line + 1).saturating_sub(1)
-        } else {
-            rope.len()
-        };
-        // A revealed line shows its markup, so a click there should edit, not follow.
-        if a0 <= le && a1 >= ls {
-            return None;
-        }
-        let content = rope.byte_slice(ls..le);
-        let rel = off - ls;
-        let link = markdown::links(&content)
-            .into_iter()
-            .find(|l| l.text.0 <= rel && rel <= l.text.1)?;
-        let dest = content[link.dest.0..link.dest.1].to_string();
-        crate::browser::can_open(&dest).then_some(dest)
-    }
-
-    /// The logical-line start of the rendered task checkbox under the pointer,
-    /// if any. Like [`Self::link_under_pointer`], only a line whose checkbox is
-    /// drawn qualifies (the cursor's own line shows its raw `- [ ]`, where
-    /// clicks edit); the layout's gutter already encodes that, so the hit-test
-    /// is the whole check. Drives the click toggle and the pointer shape.
-    fn checkbox_under_pointer(&mut self) -> Option<usize> {
-        self.ensure_layout();
-        let (x, y) = (self.pointer_x, self.pointer_y + self.scroll_y as f32);
-        self.layout_cache
-            .as_ref()?
-            .checkbox_at(&self.fonts, self.text.rope(), x, y)
-    }
-
-    /// The byte offset under the pointer, mapping its window position into
-    /// content space by the current scroll.
-    fn pointer_offset(&mut self) -> usize {
-        self.ensure_layout();
-        let (x, y) = (self.pointer_x, self.pointer_y + self.scroll_y as f32);
-        self.layout_cache.as_ref().map_or(0, |layout| {
-            layout.offset_at(&self.fonts, self.text.rope(), x, y)
-        })
-    }
-
-    /// Arm or disarm drag auto-scroll from the pointer's distance to a vertical
-    /// edge: past the top scrolls up, past the bottom scrolls down, anywhere in
-    /// between turns it off.
-    fn update_autoscroll(&mut self) {
-        let y = self.pointer_y as i32;
-        let step = if y < AUTOSCROLL_MARGIN {
-            -AUTOSCROLL_STEP
-        } else if y > self.height as i32 - AUTOSCROLL_MARGIN {
-            AUTOSCROLL_STEP
-        } else {
-            0
-        };
-        if step == 0 {
-            self.stop_autoscroll();
-        } else {
-            self.autoscroll = step;
-            // Fire the first tick promptly; later ticks follow the interval.
-            self.autoscroll_at.get_or_insert_with(Instant::now);
-        }
-    }
-
-    fn stop_autoscroll(&mut self) {
-        self.autoscroll = 0;
-        self.autoscroll_at = None;
-    }
-
-    /// While drag-selecting with the pointer held in an edge zone, scroll a step
-    /// and re-extend the selection to the (stationary) pointer, on the auto-
-    /// scroll interval. A no-op when not auto-scrolling.
+    /// While drag-selecting with the pointer held in a column's edge zone, scroll
+    /// a step and re-extend the focused editor's selection to the (stationary)
+    /// pointer, on the auto-scroll interval. A no-op when not auto-scrolling.
     fn fire_autoscroll(&mut self) {
-        if self.autoscroll == 0 || !self.selecting {
-            self.stop_autoscroll();
+        let i = self.active_editor();
+        if self.editors[i].autoscroll == 0 || !self.editors[i].selecting {
+            self.editors[i].autoscroll = 0;
+            self.editors[i].autoscroll_at = None;
             return;
         }
-        let Some(at) = self.autoscroll_at else {
+        let Some(at) = self.editors[i].autoscroll_at else {
             return;
         };
         let now = Instant::now();
         if at > now {
             return;
         }
-        self.scroll_by(self.autoscroll);
-        self.place_cursor_at(self.pointer_x, self.pointer_y, true);
-        self.autoscroll_at = Some(now + AUTOSCROLL_INTERVAL);
+        let rect = self.editor_rect(i);
+        let step = self.editors[i].autoscroll;
+        let (px, py) = (self.pointer_x, self.pointer_y);
+        if self.editors[i].scroll_by(&self.fonts, rect, step) {
+            self.dirty = true;
+        }
+        if self.editors[i].place_cursor_at(&self.fonts, rect, px, py, true) {
+            self.dirty = true;
+        }
+        self.editors[i].autoscroll_at = Some(now + AUTOSCROLL_INTERVAL);
     }
 
     // --- Caret blink ------------------------------------------------------
@@ -2711,8 +3393,10 @@ impl State {
             at.saturating_duration_since(now)
                 .max(Duration::from_millis(1))
         };
-        let autoscroll = (self.autoscroll != 0 && self.selecting)
-            .then_some(self.autoscroll_at)
+        // Auto-scroll only ever runs in the focused editor (the one being dragged).
+        let ed = &self.editors[self.active_editor()];
+        let autoscroll = (ed.autoscroll != 0 && ed.selecting)
+            .then_some(ed.autoscroll_at)
             .flatten()
             .map(until);
         // Only wake for the caret while focused, matching `fire_caret_blink`: a
@@ -2790,21 +3474,23 @@ impl State {
         Ok(())
     }
 
-    /// Put the current selection on the clipboard. No-op without a selection.
+    /// Put the focused editor's selection on the clipboard. No-op without one.
     fn copy_selection(&mut self) -> Result<()> {
-        if let Some(text) = self.text.selected_text() {
+        let i = self.active_editor();
+        if let Some(text) = self.editors[i].text.selected_text() {
             self.set_clipboard(text.into_bytes(), CLIPBOARD_MIMES.to_vec());
         }
         Ok(())
     }
 
-    /// Copy the selection, then delete it.
+    /// Copy the focused editor's selection, then delete it.
     fn cut_selection(&mut self) -> Result<()> {
-        let Some(text) = self.text.selected_text() else {
+        let i = self.active_editor();
+        let Some(text) = self.editors[i].text.selected_text() else {
             return Ok(());
         };
         self.set_clipboard(text.into_bytes(), CLIPBOARD_MIMES.to_vec());
-        if self.text.backspace() {
+        if self.editors[i].text.backspace() {
             self.after_edit();
         }
         Ok(())
@@ -2814,22 +3500,23 @@ impl State {
     /// type (`image/png`/`image/jpeg`), so it can be pasted into other apps. No-op
     /// if nothing is selected or the file can no longer be read.
     fn copy_selected_image(&mut self) -> Result<()> {
-        let Some(ls) = self.selected_image else {
+        let i = self.active_editor();
+        let Some(ls) = self.editors[i].selected_image else {
             return Ok(());
         };
-        let Some(raw) = self.image_path_at(ls) else {
+        let Some(raw) = self.image_path_at(i, ls) else {
             return Ok(());
         };
-        if let Some((bytes, mime)) = self.images.read_source(&raw) {
+        if let Some((bytes, mime)) = self.editors[i].images.read_source(&raw) {
             self.set_clipboard(bytes, vec![mime]);
         }
         Ok(())
     }
 
-    /// The raw destination path of the image whose logical line starts at `ls`, or
-    /// `None` if that line is no longer a standalone image.
-    fn image_path_at(&self, ls: usize) -> Option<String> {
-        let rope = self.text.rope();
+    /// The raw destination path of the image whose logical line starts at `ls` in
+    /// editor `i`, or `None` if that line is no longer a standalone image.
+    fn image_path_at(&self, i: usize, ls: usize) -> Option<String> {
+        let rope = self.editors[i].text.rope();
         let line_idx = rope.byte_to_line(ls);
         let n = rope.len_lines();
         let le = if line_idx + 1 < n {
@@ -2919,151 +3606,15 @@ impl State {
         // the buffer only ever holds '\n' (file load normalizes the same way), so
         // normalize here too rather than let a stray '\r' into the rope.
         let text = file::normalize_newlines(text);
-        self.text.insert_str(&text);
+        let i = self.active_editor();
+        self.editors[i].text.insert_str(&text);
         self.dirty = true;
-        self.scroll_caret_into_view();
+        self.reveal_active_caret();
     }
 
     /// Scroll the viewport by `delta` pixels (positive = down), clamped to the
     /// document. The hottest input path (one call per wheel event), so it reads
     /// the cached content height instead of cloning the layout.
-    fn scroll_by(&mut self, delta: i32) {
-        self.ensure_layout();
-        let sy = scroll::clamp(
-            self.scroll_y + delta,
-            self.content_height,
-            self.height as i32,
-        );
-        if sy != self.scroll_y {
-            self.scroll_y = sy;
-            self.dirty = true;
-        }
-    }
-
-    /// Scroll the minimum needed to keep the caret visible after a cursor move.
-    fn scroll_caret_into_view(&mut self) {
-        self.ensure_layout();
-        let cursor = self.text.cursor();
-        let Some((_, caret_top, caret_h)) = self
-            .layout_cache
-            .as_ref()
-            .map(|l| l.caret(&self.fonts, self.text.rope(), cursor))
-        else {
-            return;
-        };
-        let sy = scroll::reveal(
-            self.scroll_y,
-            caret_top,
-            caret_h,
-            self.height as i32,
-            self.content_height,
-            MARGIN,
-        );
-        if sy != self.scroll_y {
-            self.scroll_y = sy;
-            self.dirty = true;
-        }
-    }
-
-    /// The active range used for live-preview marker reveal: the live selection
-    /// (or the bare cursor when there is none), except while a drag is extending a
-    /// selection, when it is pinned to [`Self::frozen_reveal`] so the markdown
-    /// under the pointer does not flip between rendered and raw as the drag sweeps
-    /// across it. The highlight itself always tracks the live selection; only the
-    /// reveal is pinned.
-    fn reveal_range(&self) -> (usize, usize) {
-        let cursor = self.text.cursor();
-        match (self.selecting, self.frozen_reveal) {
-            (true, Some(range)) => range,
-            _ => self.text.selection().unwrap_or((cursor, cursor)),
-        }
-    }
-
-    /// Lay out the current text, wrapping to the window width less a margin on
-    /// each side, and cache the result with its content height. Per-line metrics
-    /// come from the font set during the build. The reveal range (see
-    /// [`Self::reveal_range`]) is the active range, so a heading the caret is
-    /// editing keeps its `#` markers while the rest collapse them.
-    ///
-    /// Memoized on `(version, width, font size, active line span, image UI)`: the
-    /// geometry depends on nothing else, so a scroll or idle redraw is a no-op here
-    /// and reuses the cache. The marker reveal depends only on *which logical
-    /// lines* the active range touches, so the key uses the range's line span, not
-    /// its raw byte offsets: a cursor move within one line then reuses the cache
-    /// instead of rebuilding. Only an edit, a move onto another line, or a resize
-    /// misses. Pinning the reveal during a drag keeps this key constant too.
-    fn ensure_layout(&mut self) {
-        let active = self.reveal_range();
-        // Key on the active range's logical line span (equivalent to the
-        // build's per-line `on_line` reveal test) so within-line motion is a cache
-        // hit. The image UI state (a selection border, a pinned source stacked
-        // above the picture) and FONT_SIZE are part of the key too, so a future
-        // zoom or font change cannot serve stale geometry.
-        let active_lines = {
-            let rope = self.text.rope();
-            (rope.byte_to_line(active.0), rope.byte_to_line(active.1))
-        };
-        let key = (
-            self.text.version(),
-            self.width,
-            FONT_SIZE,
-            active_lines.0,
-            active_lines.1,
-            self.selected_image,
-            self.raw_image,
-        );
-        if self.layout_key != Some(key) {
-            let wrap_width = self.width as i32 - 2 * MARGIN;
-            // Decode any newly referenced images before laying out, so an image
-            // line gets its real height on the first build (no second pass). A
-            // hit is free, so unchanged images cost only a cheap rescan.
-            self.scan_images();
-            let layout = Layout::build_with_images(
-                &self.fonts,
-                self.text.rope(),
-                MARGIN,
-                MARGIN,
-                wrap_width,
-                FONT_SIZE,
-                active,
-                &self.images,
-                self.image_ui(),
-            );
-            self.content_height = layout.text_height() + 2 * MARGIN;
-            self.layout_cache = Some(layout);
-            self.layout_key = Some(key);
-        }
-    }
-
-    /// The current per-image UI state, for the layout.
-    fn image_ui(&self) -> ImageUi {
-        ImageUi {
-            selected: self.selected_image,
-            raw: self.raw_image,
-        }
-    }
-
-    /// Ensure every standalone `![](path)` line in the buffer has had its image
-    /// decoded and cached, so [`Self::ensure_layout`] can size the image lines.
-    /// Runs only on a layout rebuild; a path already attempted is a cache hit.
-    fn scan_images(&mut self) {
-        let rope = self.text.rope();
-        let n = rope.len_lines();
-        for i in 0..n {
-            let ls = rope.line_to_byte(i);
-            let le = if i + 1 < n {
-                rope.line_to_byte(i + 1) - 1
-            } else {
-                rope.line_to_byte(i + 1)
-            };
-            let line = rope.byte_slice(ls..le);
-            if let Some(link) = markdown::standalone_image(&line) {
-                let raw = line[link.path.0..link.path.1].to_string();
-                self.images.ensure(&raw);
-            }
-        }
-    }
-
     fn bind(&mut self, name: u32, interface: &str, version: u32, id: u32) {
         self.conn.request(
             self.registry,
@@ -3167,7 +3718,7 @@ pub(crate) fn paint_document(
     p: &PaintParams,
 ) {
     let list = build_display_list(fonts, layout, rope, p);
-    display::execute(canvas, fonts, images, &list, None);
+    display::execute(canvas, fonts, &[images], &list, None);
 }
 
 /// A [`DrawCmd::Text`] for `text` from `x` along `baseline` in `face`/`color`,
@@ -3209,6 +3760,105 @@ fn text_cmd(
 /// the layout and rope, with no Wayland or `State` dependency. Off-screen lines
 /// and spans are skipped, so the list (and the cost) track the viewport, not the
 /// document.
+/// The painter's view of an open find bar, or `None` when it is closed.
+fn build_find_paint(find: &FindState) -> Option<FindPaint<'_>> {
+    if !find.is_open() {
+        return None;
+    }
+    Some(FindPaint {
+        query: find.query(),
+        replace: find.show_replace().then(|| find.replacement()),
+        focus_replace: find.focus() == find::Field::Replace,
+        selected: find.selected(),
+        word: find.word(),
+        regex: find.regex(),
+        error: find.error(),
+        matches: find.matches(),
+        current: find.current(),
+    })
+}
+
+/// Draw a splitter grab bar: its gap cleared to the background with a thin
+/// divider line down the center. Drawn last, over any content that overhangs.
+fn push_splitter(list: &mut DisplayList, rect: Rect) {
+    list.push(DrawCmd::Fill {
+        rect,
+        color: BACKGROUND,
+    });
+    list.push(DrawCmd::Fill {
+        rect: Rect {
+            x: rect.x + rect.w / 2,
+            y: rect.y,
+            w: 1,
+            h: rect.h,
+        },
+        color: SPLITTER_COLOR,
+    });
+}
+
+/// Draw the file-tree sidebar into its column `rect`: a darker background, then
+/// each visible row (a folder marker plus the name), indented by depth and
+/// offset by the tree's own scroll. Updates `content_height` for scroll
+/// clamping. Rows do not wrap; a long name that overhangs is covered by the
+/// editor's own background, which is drawn after this.
+fn push_tree(
+    list: &mut DisplayList,
+    fonts: &Fonts,
+    tree: &mut TreePane,
+    rect: Rect,
+    focused: bool,
+) {
+    list.push(DrawCmd::Fill {
+        rect,
+        color: TREE_BG,
+    });
+    let m = fonts.metrics(FONT_SIZE);
+    let row_h = m.line_height.max(1);
+    let rows = tree.tree.rows();
+    tree.content_height = rows.len() as i32 * row_h + 2 * TREE_PAD;
+    tree.scroll_y = scroll::clamp(tree.scroll_y, tree.content_height, rect.h);
+    let face = FaceKey::Prose {
+        size: FONT_SIZE,
+        style: FontStyle::Regular,
+    };
+    let text_right = rect.x + rect.w - TREE_PAD;
+    for (i, row) in rows.iter().enumerate() {
+        let top = rect.y + TREE_PAD + i as i32 * row_h - tree.scroll_y;
+        if top + row_h <= rect.y || top >= rect.y + rect.h {
+            continue;
+        }
+        // The keyboard-selected row (while the tree is focused) reads as a
+        // selection; a mouse-hovered row gets a subtler tint.
+        let highlight = if focused && tree.selected == i {
+            Some(SELECTION_COLOR)
+        } else if tree.hovered == Some(i) {
+            Some(TREE_HOVER_BG)
+        } else {
+            None
+        };
+        if let Some(color) = highlight {
+            list.push(DrawCmd::Fill {
+                rect: Rect {
+                    x: rect.x,
+                    y: top,
+                    w: rect.w,
+                    h: row_h,
+                },
+                color,
+            });
+        }
+        let x = rect.x + TREE_PAD + row.depth as i32 * TREE_INDENT;
+        let baseline = top + m.ascent;
+        let (marker, color) = if row.is_dir {
+            (if row.expanded { "▾ " } else { "▸ " }, TREE_DIR_COLOR)
+        } else {
+            ("", FOREGROUND)
+        };
+        let label = format!("{marker}{}", row.name);
+        list.push(text_cmd(face, x, baseline, text_right, color, label, m));
+    }
+}
+
 pub(crate) fn build_display_list(
     fonts: &Fonts,
     layout: &Layout,
@@ -3217,6 +3867,10 @@ pub(crate) fn build_display_list(
 ) -> DisplayList {
     let (width, scroll_y) = (p.width, p.scroll_y);
     let view_h = p.height as i32;
+    // The content's left edge (the column's inner margin). Text, panels, and
+    // images hang off this so a pane's content sits in its own column; the
+    // background clears from the column's outer edge, `MARGIN` to its left.
+    let left = layout.left();
     // Roughly a few commands per visual line (panel, runs, decorations) plus the
     // background and caret; one upfront allocation beats growing the list mid-build.
     let mut list: DisplayList = Vec::with_capacity(layout.lines().len() * 3 + 8);
@@ -3225,7 +3879,7 @@ pub(crate) fn build_display_list(
     // before the rest of the list draws over it.
     list.push(DrawCmd::Fill {
         rect: Rect {
-            x: 0,
+            x: left - MARGIN,
             y: 0,
             w: width as i32,
             h: view_h,
@@ -3263,7 +3917,7 @@ pub(crate) fn build_display_list(
         };
         list.push(DrawCmd::RoundRect {
             rect: Rect {
-                x: MARGIN,
+                x: left,
                 y: top,
                 w: panel_w,
                 h,
@@ -3346,7 +4000,7 @@ pub(crate) fn build_display_list(
             let box_top = baseline - m.ascent;
             if box_top < view_h && box_top + img.box_height() > 0 {
                 let pic = Rect {
-                    x: MARGIN + line.indent,
+                    x: left + line.indent,
                     y: box_top + (img.box_height() - img.height) / 2,
                     w: img.width,
                     h: img.height,
@@ -3375,7 +4029,7 @@ pub(crate) fn build_display_list(
         if matches!(line.gutter, Gutter::QuoteBar { .. }) {
             list.push(DrawCmd::Fill {
                 rect: Rect {
-                    x: MARGIN,
+                    x: left,
                     y: baseline - m.ascent,
                     w: QUOTE_BAR_WIDTH,
                     h: m.line_height,
@@ -3389,7 +4043,7 @@ pub(crate) fn build_display_list(
             let mid = baseline - m.ascent + m.line_height / 2;
             list.push(DrawCmd::Fill {
                 rect: Rect {
-                    x: MARGIN,
+                    x: left,
                     y: mid - RULE_THICKNESS / 2,
                     w: (width as i32 - 2 * MARGIN).max(0),
                     h: RULE_THICKNESS,
@@ -3403,7 +4057,7 @@ pub(crate) fn build_display_list(
         // A completed task's text reads dim and struck through, over the whole
         // item (wrapped continuations included), so done items scan as done.
         let done = line.task == Some(true);
-        let mut pen = MARGIN + line.indent;
+        let mut pen = left + line.indent;
         for (i, run) in line.runs.iter().enumerate() {
             if !run.visible {
                 continue;
@@ -3952,6 +4606,44 @@ mod tests {
     use crate::rope::Rope;
 
     #[test]
+    fn columns_lay_out_tree_and_two_editors_with_splitters() {
+        let panes = PaneLayout {
+            tree_width: 200,
+            split_ratio: 0.5,
+            tree_visible: true,
+            second_open: true,
+        };
+        let cols = panes.columns(1000, 700);
+        let tree = cols.tree.expect("tree shown");
+        assert_eq!((tree.x, tree.w, tree.h), (0, 200, 700));
+        assert_eq!(cols.splitters[0].expect("tree splitter").x, 200);
+        let a = cols.editors[0].expect("editor A");
+        let b = cols.editors[1].expect("editor B");
+        assert_eq!(a.x, 200 + SPLITTER);
+        assert_eq!(cols.splitters[1].expect("content splitter").x, a.x + a.w);
+        // The content area splits evenly, and every column is full height.
+        assert!((a.w - b.w).abs() <= 1);
+        assert_eq!(a.h, 700);
+        assert_eq!(a.x + a.w + SPLITTER + b.w, 1000);
+    }
+
+    #[test]
+    fn columns_hide_tree_and_second_pane_when_off() {
+        let panes = PaneLayout {
+            tree_width: 200,
+            split_ratio: 0.5,
+            tree_visible: false,
+            second_open: false,
+        };
+        let cols = panes.columns(1000, 700);
+        assert!(cols.tree.is_none());
+        assert!(cols.splitters[0].is_none() && cols.splitters[1].is_none());
+        let a = cols.editors[0].expect("editor A");
+        assert_eq!((a.x, a.w), (0, 1000));
+        assert!(cols.editors[1].is_none());
+    }
+
+    #[test]
     fn smart_home_toggles_between_first_glyph_and_line_start() {
         // "    foo" occupying bytes [10, 17); its indent ends at byte 14.
         let (line, start, end) = ("    foo", 10, 17);
@@ -4086,19 +4778,19 @@ mod tests {
         let mut full = vec![0u8; w * h * 4];
         {
             let mut c = Canvas::new(&mut full, w, h);
-            display::execute(&mut c, fonts, images, b, None);
+            display::execute(&mut c, fonts, &[images], b, None);
         }
         // Incremental: a painted in full, then only damage(a, b) repainted with b.
         let mut inc = vec![0u8; w * h * 4];
         {
             let mut c = Canvas::new(&mut inc, w, h);
-            display::execute(&mut c, fonts, images, a, None);
+            display::execute(&mut c, fonts, &[images], a, None);
         }
         let dmg = display::damage(a, b, w as i32, h as i32);
         {
             let mut c = Canvas::new(&mut inc, w, h);
             for clip in &dmg {
-                display::execute(&mut c, fonts, images, b, Some(*clip));
+                display::execute(&mut c, fonts, &[images], b, Some(*clip));
             }
         }
         assert!(
@@ -4123,7 +4815,7 @@ mod tests {
         let mut buf = vec![0u8; w * h * 4];
         {
             let mut canvas = Canvas::new(&mut buf, w, h);
-            display::execute(&mut canvas, &fonts, &images, &list, None);
+            display::execute(&mut canvas, &fonts, &[&images], &list, None);
         }
         let stats = fonts.cache_stats();
         assert!(

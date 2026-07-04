@@ -181,6 +181,8 @@ pub mod wp_cursor_shape_device_v1 {
     pub const SHAPE_DEFAULT: u32 = 1;
     pub const SHAPE_POINTER: u32 = 4;
     pub const SHAPE_TEXT: u32 = 9;
+    /// A left-right resize arrow, shown over a column splitter.
+    pub const SHAPE_EW_RESIZE: u32 = 26;
 }
 
 // Explicit sync (`linux-drm-syncobj-v1`, version 1). The client owns two

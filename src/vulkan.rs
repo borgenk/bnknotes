@@ -185,7 +185,7 @@ const VK_BLEND_FACTOR_SRC_ALPHA: u32 = 6;
 const VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA: u32 = 7;
 const VK_BLEND_OP_ADD: u32 = 0;
 const VK_COLOR_COMPONENT_RGBA: u32 = 0xf;
-const VK_FILTER_NEAREST: u32 = 0;
+const VK_FILTER_LINEAR: u32 = 1;
 const VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE: u32 = 2;
 const VK_VERTEX_INPUT_RATE_VERTEX: u32 = 0;
 const VK_SUBPASS_CONTENTS_INLINE: u32 = 0;
@@ -3820,13 +3820,15 @@ fn fill_renderer(r: &mut Renderer, fns: &DeviceFns, device: VkDevice) -> Result<
     }
     pipeline_result?;
 
-    // Sampler (texelFetch ignores filtering, but the binding needs one).
+    // Linear filtering: the glyph and emoji paths use texelFetch (which ignores
+    // it) so they are unaffected, while the image path samples with texture(),
+    // where linear filtering scales a native-size image smoothly to its quad.
     let sampler_info = VkSamplerCreateInfo {
         s_type: VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO,
         p_next: core::ptr::null(),
         flags: 0,
-        mag_filter: VK_FILTER_NEAREST,
-        min_filter: VK_FILTER_NEAREST,
+        mag_filter: VK_FILTER_LINEAR,
+        min_filter: VK_FILTER_LINEAR,
         mipmap_mode: 0,
         address_mode_u: VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
         address_mode_v: VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,

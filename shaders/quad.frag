@@ -1,8 +1,9 @@
 // The one fragment shader. Modes (src/gpu.rs): 0 solid fill, 1 glyph coverage
 // from the R8 atlas, 2 emoji from the BGRA atlas, 3 an image texture,
-// 4 rounded-rect coverage. Texture reads are texelFetch at integer coords so a
-// 1:1 quad reproduces its source texels exactly (no sampler filtering between
-// this path and the software blitter's pixels).
+// 4 rounded-rect coverage. Glyph and emoji reads are texelFetch at integer
+// coords so a 1:1 atlas quad reproduces its source texels exactly. An image
+// samples with texture() and normalized UVs so the GPU (linear sampler) scales
+// its native-size texture to the display quad, keeping resize cheap and smooth.
 #version 450
 
 layout(location = 0) in vec2 v_uv;
@@ -47,7 +48,10 @@ void main() {
     } else if (v_mode == 2u) {
         out_color = texelFetch(emoji_atlas, ivec2(v_uv), 0);
     } else if (v_mode == 3u) {
-        out_color = texelFetch(image_tex, ivec2(v_uv), 0);
+        // Image: normalized UVs sample the native-size texture, so the GPU
+        // scales it to the quad (linear filtering) rather than the CPU
+        // re-resampling on every resize. Glyph/emoji paths keep texelFetch.
+        out_color = texture(image_tex, v_uv);
     } else {
         float cov = round_coverage(v_uv, v_extra.xy, v_extra.z, uint(v_extra.w));
         out_color = vec4(v_color.rgb, v_color.a * cov);

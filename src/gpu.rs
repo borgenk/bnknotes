@@ -287,7 +287,7 @@ impl GlyphCache {
 /// coordinates.
 pub fn build_frame(
     fonts: &Fonts,
-    images: &ImageStore,
+    stores: &[&ImageStore],
     list: &[DrawCmd],
     cache: &mut GlyphCache,
     known_images: &dyn Fn(&ImageKey) -> bool,
@@ -297,7 +297,7 @@ pub fn build_frame(
         let emoji_gen = cache.emoji.generation;
         let mut b = Batcher {
             fonts,
-            images,
+            stores,
             cache,
             vertices: Vec::new(),
             batches: Vec::new(),
@@ -329,7 +329,7 @@ pub fn build_frame(
 
 struct Batcher<'a> {
     fonts: &'a Fonts,
-    images: &'a ImageStore,
+    stores: &'a [&'a ImageStore],
     cache: &'a mut GlyphCache,
     vertices: Vec<Vertex>,
     batches: Vec<Batch>,
@@ -578,34 +578,42 @@ impl Batcher<'_> {
         if rect.w <= 0 || rect.h <= 0 {
             return;
         }
-        let key: ImageKey = (path.to_string(), rect.w as u32, rect.h as u32);
-        if !(self.known_images)(&key) && !self.image_uploads.iter().any(|(k, _)| *k == key) {
-            let Some(bitmap) =
-                self.images
-                    .with_scaled(path, rect.w as u32, rect.h as u32, |bitmap| bitmap.to_vec())
-            else {
-                return;
-            };
-            self.image_uploads.push((key.clone(), bitmap));
-        }
-        let key_for_batch = key.clone();
-        self.quad(rect, MODE_IMAGE, 0, [0.0, 0.0], [0.0; 4]);
-        // `quad` appended to the `None` batch; retag the six vertices it just
-        // wrote as an image batch instead.
-        let Some(last) = self.batches.last_mut() else {
+        // Upload the image at its native size, keyed by that size (constant per
+        // image), and let the GPU sampler scale it to the quad. A resize reuses
+        // the same texture, so no CPU resample or re-upload happens per drag.
+        // Resolve against whichever pane's store holds it.
+        let Some(img) = self.stores.iter().find_map(|s| s.get(path)) else {
             return;
         };
-        if last.image.is_none() && last.count > 6 {
-            last.count -= 6;
-            let start = self.vertices.len() as u32 - 6;
-            self.batches.push(Batch {
-                start,
-                count: 6,
-                image: Some(key_for_batch),
-            });
-        } else if last.image.is_none() && last.count == 6 {
-            last.image = Some(key_for_batch);
+        let key: ImageKey = (path.to_string(), img.width, img.height);
+        if !(self.known_images)(&key) && !self.image_uploads.iter().any(|(k, _)| *k == key) {
+            self.image_uploads.push((key.clone(), img.pixels.clone()));
         }
+        // Normalized UVs so texture() samples the whole native texture across the
+        // display rect (quad.frag mode 3).
+        let (x0, y0) = (rect.x as f32, rect.y as f32);
+        let (x1, y1) = ((rect.x + rect.w) as f32, (rect.y + rect.h) as f32);
+        let v = |x: f32, y: f32, u: f32, w: f32| Vertex {
+            pos: [x, y],
+            uv: [u, w],
+            color: [0.0; 4],
+            extra: [0.0; 4],
+            mode: MODE_IMAGE,
+        };
+        let start = self.vertices.len() as u32;
+        self.vertices.extend_from_slice(&[
+            v(x0, y0, 0.0, 0.0),
+            v(x1, y0, 1.0, 0.0),
+            v(x0, y1, 0.0, 1.0),
+            v(x1, y0, 1.0, 0.0),
+            v(x1, y1, 1.0, 1.0),
+            v(x0, y1, 0.0, 1.0),
+        ]);
+        self.batches.push(Batch {
+            start,
+            count: 6,
+            image: Some(key),
+        });
     }
 }
 
@@ -666,7 +674,7 @@ mod tests {
             },
             color: 0x00ff_0000,
         }];
-        let f = build_frame(&fonts, &images, &list, &mut cache, &|_| false);
+        let f = build_frame(&fonts, &[&images], &list, &mut cache, &|_| false);
         assert_eq!(f.vertices.len(), 6);
         assert_eq!(f.batches.len(), 1);
         assert_eq!(
@@ -704,14 +712,14 @@ mod tests {
             color: 0x00ff_ffff,
             text: "abcabc".to_string(),
         }];
-        let f1 = build_frame(&fonts, &images, &list, &mut cache, &|_| false);
+        let f1 = build_frame(&fonts, &[&images], &list, &mut cache, &|_| false);
         assert!(f1.glyph_upload.is_some(), "first frame uploads new glyphs");
         assert!(
             !f1.vertices.is_empty(),
             "glyph quads were emitted ({} vertices)",
             f1.vertices.len()
         );
-        let f2 = build_frame(&fonts, &images, &list, &mut cache, &|_| false);
+        let f2 = build_frame(&fonts, &[&images], &list, &mut cache, &|_| false);
         assert!(f2.glyph_upload.is_none(), "steady state uploads nothing");
         assert_eq!(f1.vertices, f2.vertices, "same list, same geometry");
     }
@@ -748,7 +756,7 @@ mod tests {
                 text: "hi".to_string(),
             },
         ];
-        let f = build_frame(&fonts, &images, &list, &mut cache, &|_| false);
+        let f = build_frame(&fonts, &[&images], &list, &mut cache, &|_| false);
         assert_eq!(
             f.batches.len(),
             1,
@@ -775,7 +783,7 @@ mod tests {
             radius: 4,
             corners: RoundedCorners::Top,
         }];
-        let f = build_frame(&fonts, &images, &list, &mut cache, &|_| false);
+        let f = build_frame(&fonts, &[&images], &list, &mut cache, &|_| false);
         assert_eq!(f.vertices.len(), 6);
         let v = &f.vertices[0];
         assert_eq!(v.mode, MODE_ROUND);
@@ -800,7 +808,7 @@ mod tests {
             radius: 0,
             corners: RoundedCorners::Both,
         }];
-        let f = build_frame(&fonts, &images, &list, &mut cache, &|_| false);
+        let f = build_frame(&fonts, &[&images], &list, &mut cache, &|_| false);
         assert!(f.vertices.iter().all(|v| v.mode == MODE_SOLID));
     }
 
@@ -834,15 +842,17 @@ mod tests {
             },
             fill,
         ];
-        let f = build_frame(&fonts, &images, &list, &mut cache, &|_| false);
+        let f = build_frame(&fonts, &[&images], &list, &mut cache, &|_| false);
         assert_eq!(f.batches.len(), 3, "solid / image / solid: {:?}", f.batches);
-        let key = ("tiny.png".to_string(), 8, 8);
+        // The texture is uploaded at the image's native 2x2 size (the GPU scales
+        // it to the 8x8 quad); the key is that native size, so a resize reuses it.
+        let key = ("tiny.png".to_string(), 2, 2);
         assert_eq!(f.batches[1].image.as_ref(), Some(&key));
         assert_eq!(f.image_uploads.len(), 1);
         assert_eq!(f.image_uploads[0].0, key);
-        assert_eq!(f.image_uploads[0].1.len(), 64, "8x8 resampled bitmap");
+        assert_eq!(f.image_uploads[0].1.len(), 4, "2x2 native bitmap");
         // A renderer that already has the texture gets no upload.
-        let f2 = build_frame(&fonts, &images, &list, &mut cache, &|k| *k == key);
+        let f2 = build_frame(&fonts, &[&images], &list, &mut cache, &|k| *k == key);
         assert!(f2.image_uploads.is_empty());
         assert_eq!(f2.batches.len(), 3, "batches still split around the image");
     }
@@ -861,7 +871,7 @@ mod tests {
             },
             path: "nope.png".to_string(),
         }];
-        let f = build_frame(&fonts, &images, &list, &mut cache, &|_| false);
+        let f = build_frame(&fonts, &[&images], &list, &mut cache, &|_| false);
         assert!(f.vertices.is_empty());
         assert!(f.batches.is_empty());
         assert!(f.image_uploads.is_empty());
@@ -888,7 +898,7 @@ mod tests {
             color: 0x00ff_ffff,
             text: "😀".to_string(),
         }];
-        let f = build_frame(&fonts, &images, &list, &mut cache, &|_| false);
+        let f = build_frame(&fonts, &[&images], &list, &mut cache, &|_| false);
         // With an emoji font installed the cluster takes MODE_EMOJI; without
         // one it renders as per-character glyphs. Either way it must not
         // crash, and with color output there must be an emoji upload.

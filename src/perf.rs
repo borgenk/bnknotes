@@ -268,7 +268,7 @@ fn measure() -> Result<Vec<Sample>> {
             let dmg = display::damage(&caret_on, &frame, WIDTH as i32, HEIGHT as i32);
             let mut canvas = Canvas::new(&mut buf, WIDTH, HEIGHT);
             for clip in &dmg {
-                display::execute(&mut canvas, &fonts, &images, &frame, Some(*clip));
+                display::execute(&mut canvas, &fonts, &[&images], &frame, Some(*clip));
             }
             dmg.len()
         }),
@@ -280,13 +280,65 @@ fn measure() -> Result<Vec<Sample>> {
     // frame time is only observable via BNKNOTES_STATS on a live run.
     let mut glyph_cache = crate::gpu::GlyphCache::new();
     // Warm the atlases so the steady state (no uploads) is what is measured.
-    let _ = crate::gpu::build_frame(&fonts, &images, &caret_on, &mut glyph_cache, &|_| true);
+    let _ = crate::gpu::build_frame(&fonts, &[&images], &caret_on, &mut glyph_cache, &|_| true);
     out.push(Sample {
         name: "gpu_batch_frame",
         ns: bench(500, || {
-            crate::gpu::build_frame(&fonts, &images, &caret_on, &mut glyph_cache, &|_| true)
+            crate::gpu::build_frame(&fonts, &[&images], &caret_on, &mut glyph_cache, &|_| true)
                 .vertices
                 .len()
+        }),
+    });
+
+    // Image resampling: the bilinear downscale the software path runs whenever an
+    // image's display size changes (every drag event of a resize). The GPU path
+    // avoids it entirely (native texture, hardware scaling); this guards the CPU
+    // resampler and the software fallback's resize cost.
+    let native: Vec<u32> = vec![0xff_30_60_90; 400 * 300];
+    out.push(Sample {
+        name: "image_resample",
+        ns: bench(200, || {
+            crate::render::resample_argb(&native, 400, 300, 200, 150).len()
+        }),
+    });
+
+    // Re-laying-out a document containing an image at a fresh width, as a splitter
+    // or window resize does on every drag event (the layout build has no cache).
+    out.push(Sample {
+        name: "layout_reflow_image",
+        ns: bench(200, || {
+            Layout::build_with_images(
+                &fonts,
+                &image_rope,
+                MARGIN,
+                MARGIN,
+                wrap - 40,
+                FONT_SIZE,
+                (0, 0),
+                &image_store,
+                ImageUi::default(),
+            )
+            .text_height()
+        }),
+    });
+
+    // The GPU frame build for an image the renderer does not yet hold: it uploads
+    // the native texture (`known_images` = false forces it each call). After the
+    // resize fix this is paid once per image, not once per drag event, because the
+    // key is the native size rather than the changing display size.
+    let image_list = build_display_list(&fonts, &image_layout, &image_rope, &params(0, None));
+    out.push(Sample {
+        name: "image_upload_gpu",
+        ns: bench(200, || {
+            crate::gpu::build_frame(
+                &fonts,
+                &[&image_store],
+                &image_list,
+                &mut glyph_cache,
+                &|_| false,
+            )
+            .image_uploads
+            .len()
         }),
     });
 

@@ -645,6 +645,13 @@ impl Layout {
         self.text_height
     }
 
+    /// The x of the content's left edge (the column's left margin), which the
+    /// painter uses as the origin for text, panels, and images so a pane's
+    /// content sits in its own column rather than at the window's left margin.
+    pub fn left(&self) -> i32 {
+        self.left
+    }
+
     /// The byte range `(start, end)` of the visual line containing `offset`,
     /// for Home/End motion.
     pub fn line_bounds(&self, offset: usize) -> (usize, usize) {

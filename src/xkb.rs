@@ -143,6 +143,13 @@ pub enum KeyAction {
     Replace,
     /// Leave a transient mode such as the find bar (Escape).
     Escape,
+    /// Pane management: toggle the file tree (Ctrl+B), toggle the second content
+    /// pane (Ctrl+\), and focus the tree / editor A / editor B (Ctrl+0/1/2).
+    ToggleTree,
+    ToggleSecondPane,
+    FocusTree,
+    FocusPaneA,
+    FocusPaneB,
     None,
 }
 
@@ -453,6 +460,11 @@ impl Xkb {
             0x78 => KeyAction::Cut,                               // x
             0x76 => KeyAction::Paste,                             // v
             0x6B if self.shift_active() => KeyAction::DeleteLine, // Ctrl+Shift+K
+            0x62 => KeyAction::ToggleTree,                        // b: toggle sidebar
+            0x5C => KeyAction::ToggleSecondPane,                  // backslash: split
+            0x30 => KeyAction::FocusTree,                         // 0: focus tree
+            0x31 => KeyAction::FocusPaneA,                        // 1: focus editor A
+            0x32 => KeyAction::FocusPaneB,                        // 2: focus editor B
             // Ctrl+Z undoes; Ctrl+Shift+Z and Ctrl+Y redo.
             0x7A if self.shift_active() => KeyAction::Redo, // Z
             0x7A => KeyAction::Undo,                        // z

@@ -113,6 +113,8 @@ pub enum KeyAction {
     /// Delete to the previous/next word boundary (Ctrl+Backspace / Ctrl+Delete).
     DeleteWordBack,
     DeleteWordForward,
+    /// Delete the whole line(s) the cursor or selection touches (Ctrl+Shift+K).
+    DeleteLine,
     Left,
     Right,
     Up,
@@ -443,13 +445,14 @@ impl Xkb {
             sym
         };
         match sym {
-            0x61 => KeyAction::SelectAll, // a
-            0x63 => KeyAction::Copy,      // c
-            0x66 => KeyAction::Find,      // f
-            0x68 => KeyAction::Replace,   // h
-            0x73 => KeyAction::Save,      // s
-            0x78 => KeyAction::Cut,       // x
-            0x76 => KeyAction::Paste,     // v
+            0x61 => KeyAction::SelectAll,                         // a
+            0x63 => KeyAction::Copy,                              // c
+            0x66 => KeyAction::Find,                              // f
+            0x68 => KeyAction::Replace,                           // h
+            0x73 => KeyAction::Save,                              // s
+            0x78 => KeyAction::Cut,                               // x
+            0x76 => KeyAction::Paste,                             // v
+            0x6B if self.shift_active() => KeyAction::DeleteLine, // Ctrl+Shift+K
             // Ctrl+Z undoes; Ctrl+Shift+Z and Ctrl+Y redo.
             0x7A if self.shift_active() => KeyAction::Redo, // Z
             0x7A => KeyAction::Undo,                        // z

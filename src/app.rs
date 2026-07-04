@@ -667,7 +667,8 @@ impl State {
             "bnknotes: type to edit; Enter, Tab, arrows/Home/End, PageUp/Down, \
              Ctrl+arrows by word, Ctrl+Home/End to ends, Shift selects; \
              click/drag, Shift+click extends, double/triple-click select word/line; \
-             Ctrl+Backspace/Delete delete a word; Ctrl+A/C/X/V select-all/copy/cut/paste, \
+             Ctrl+Backspace/Delete delete a word, Ctrl+Shift+K deletes a line; \
+             Ctrl+A/C/X/V select-all/copy/cut/paste, \
              Ctrl+Z/Y undo/redo, Ctrl+S save; held keys repeat; close to exit"
         );
         // Name the active renderer, so "is it on the GPU?" never needs a
@@ -1884,6 +1885,10 @@ impl State {
             KeyAction::DeleteWordForward => {
                 self.goal_x = None;
                 self.text.delete_word_forward()
+            }
+            KeyAction::DeleteLine => {
+                self.goal_x = None;
+                self.text.delete_line()
             }
             KeyAction::Left => {
                 self.goal_x = None;

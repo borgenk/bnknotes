@@ -548,14 +548,46 @@ impl TextBuffer {
         self.set_selection(start, end);
     }
 
-    /// Select the whole logical line containing `offset`, including its trailing
-    /// newline if it has one, for a triple-click. The rope's line index gives the
-    /// bounds directly: the line's start and the next line's start.
+    /// Select the visible content of the logical line containing `offset`, for a
+    /// triple-click. Deliberately *excludes* the trailing newline: the selection
+    /// then matches what is on screen (no phantom cell past the last glyph), and
+    /// the cursor stays at the line's end, so a following Backspace clears the
+    /// line and leaves it empty instead of eating the break and merging into the
+    /// line below. Removing the line itself is the explicit Ctrl+Shift+K
+    /// ([`Self::delete_line`]). The buffer only ever holds `\n` (line endings are
+    /// normalized on load), so one byte is stripped.
     pub fn select_line_at(&mut self, offset: usize) {
         let line = self.text.byte_to_line(offset.min(self.text.len()));
         let start = self.text.line_to_byte(line);
-        let end = self.text.line_to_byte(line + 1);
+        let mut end = self.text.line_to_byte(line + 1);
+        if end > start && self.text.byte_slice(end - 1..end) == "\n" {
+            end -= 1;
+        }
         self.set_selection(start, end);
+    }
+
+    /// Delete the whole logical line(s) the cursor or selection touches, newline
+    /// included, as one undo step (Ctrl+Shift+K). Triple-click deliberately
+    /// selects only a line's content ([`Self::select_line_at`]), so this is the
+    /// gesture for removing the line itself. When the span reaches the end of the
+    /// buffer with no trailing newline (the final line, or an empty last line),
+    /// the preceding newline is consumed instead so no blank line is left behind.
+    pub fn delete_line(&mut self) -> bool {
+        let (lo, hi) = self.selection().unwrap_or((self.cursor, self.cursor));
+        let first = self.text.byte_to_line(lo);
+        let last = self.text.byte_to_line(hi);
+        let start = self.text.line_to_byte(first);
+        let end = self.text.line_to_byte(last + 1);
+        // A span ending in a newline already carries its own terminator; one that
+        // does not can only be the buffer's end, so eat the preceding newline to
+        // avoid leaving an empty line where the deleted one was.
+        let has_terminator = end > start && self.text.byte_slice(end - 1..end) == "\n";
+        let start = if !has_terminator && start > 0 {
+            start - 1
+        } else {
+            start
+        };
+        self.delete_range(start, end)
     }
 
     /// Select the half-open byte range `[start, end)`, anchor at `start` and
@@ -1752,11 +1784,14 @@ mod tests {
     }
 
     #[test]
-    fn triple_click_selects_the_logical_line_with_its_newline() {
+    fn triple_click_selects_the_line_content_without_its_newline() {
         let mut b = TextBuffer::new();
         b.insert_str("first\nsecond\nthird");
         b.select_line_at(8); // inside "second"
-        assert_eq!(b.selected_text().as_deref(), Some("second\n"));
+        assert_eq!(b.selected_text().as_deref(), Some("second"));
+        // The cursor stays on the line (at its end), not on the line below, so a
+        // following Backspace clears the line rather than merging it upward.
+        assert_eq!(b.cursor(), "first\nsecond".len());
     }
 
     #[test]
@@ -1765,6 +1800,35 @@ mod tests {
         b.insert_str("first\nlast");
         b.select_line_at(8); // inside "last"
         assert_eq!(b.selected_text().as_deref(), Some("last"));
+    }
+
+    #[test]
+    fn delete_line_removes_a_middle_line_and_its_newline() {
+        let mut b = TextBuffer::new();
+        b.insert_str("first\nsecond\nthird");
+        b.set_selection(8, 8); // cursor inside "second", no selection
+        assert!(b.delete_line());
+        assert_eq!(b.text(), "first\nthird");
+        assert_eq!(b.cursor(), "first\n".len());
+    }
+
+    #[test]
+    fn delete_line_on_the_last_line_leaves_no_blank_line() {
+        let mut b = TextBuffer::new();
+        b.insert_str("first\nlast");
+        b.set_selection(8, 8); // cursor inside "last"
+        assert!(b.delete_line());
+        assert_eq!(b.text(), "first");
+        assert_eq!(b.cursor(), "first".len());
+    }
+
+    #[test]
+    fn delete_line_spans_every_line_the_selection_touches() {
+        let mut b = TextBuffer::new();
+        b.insert_str("one\ntwo\nthree\nfour");
+        b.set_selection(2, 9); // inside "one" through inside "three"
+        assert!(b.delete_line());
+        assert_eq!(b.text(), "four");
     }
 
     #[test]

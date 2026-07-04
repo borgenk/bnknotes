@@ -20,13 +20,14 @@ use std::hint::black_box;
 use std::path::Path;
 use std::time::Instant;
 
-use crate::app::{build_display_list, PaintParams, FONT_SIZE, MARGIN};
 use crate::error::{Error, Result};
 use crate::freetype::Fonts;
 use crate::image::{Image, ImageStore};
 use crate::layout::{ImageUi, Layout};
 use crate::markdown;
+use crate::paint::{build_display_list, PaintParams};
 use crate::rope::Rope;
+use crate::theme::{FONT_SIZE, MARGIN};
 
 /// Where the committed baseline lives and where each run records its numbers.
 const BASELINE_PATH: &str = "perf/baseline.txt";

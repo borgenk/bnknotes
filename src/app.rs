@@ -964,6 +964,10 @@ impl State {
         self.width = w;
         self.height = h;
         self.create_buffers()?;
+        // A width change re-wraps and a height change shrinks the viewport; either
+        // can push the caret off-screen. Re-reveal it (this rebuilds the layout at
+        // the new width and re-clamps the scroll) instead of leaving a stale offset.
+        self.scroll_caret_into_view();
         self.dirty = true;
         Ok(())
     }
@@ -1976,10 +1980,19 @@ impl State {
                 }
                 false
             }
-            // Handled before this match: Find/Replace open the bar, and all
-            // three are consumed by the bar while it is open. With no bar
-            // there is nothing for Escape to leave.
-            KeyAction::Find | KeyAction::Replace | KeyAction::Escape => false,
+            // Handled before this match: Find/Replace open the bar, and while
+            // it is open the bar consumes them (and Escape, to close itself).
+            KeyAction::Find | KeyAction::Replace => false,
+            // With no find bar, Escape collapses a selection to a bare cursor;
+            // with nothing selected there is nothing to leave.
+            KeyAction::Escape => {
+                if self.text.selection().is_some() {
+                    self.text.set_cursor(self.text.cursor(), false);
+                    true
+                } else {
+                    false
+                }
+            }
             KeyAction::None => false,
         };
         if changed {
@@ -2192,7 +2205,13 @@ impl State {
             return false;
         };
         let (start, end) = layout.line_bounds(cursor);
-        let target = if to_end { end } else { start };
+        let target = if to_end {
+            end
+        } else {
+            // Smart Home. Visual bounds, so it works on wrapped rows too.
+            let line = self.text.rope().byte_slice(start..end);
+            smart_home_target(&line, start, end, cursor)
+        };
         self.text.set_cursor(target, extend);
         self.text.cursor() != cursor || self.text.selection() != before_sel
     }
@@ -2896,7 +2915,11 @@ impl State {
         if text.is_empty() {
             return;
         }
-        self.text.insert_str(text);
+        // Pasted text can carry CRLF or lone CR (from another app or platform);
+        // the buffer only ever holds '\n' (file load normalizes the same way), so
+        // normalize here too rather than let a stray '\r' into the rope.
+        let text = file::normalize_newlines(text);
+        self.text.insert_str(&text);
         self.dirty = true;
         self.scroll_caret_into_view();
     }
@@ -3060,6 +3083,23 @@ impl State {
 /// Whether a clipboard MIME type carries text we can paste.
 fn is_text_mime(mime: &str) -> bool {
     mime.starts_with("text/") || mime == "UTF8_STRING"
+}
+
+/// The Smart Home target within a visual line spanning bytes `[start, end)`
+/// whose text is `line`: the first non-whitespace character, or the line start
+/// when the cursor is already there (a second press) or the line has no leading
+/// content to skip. Pure so the toggle is unit-tested without a layout.
+fn smart_home_target(line: &str, start: usize, end: usize, cursor: usize) -> usize {
+    let ws = line
+        .bytes()
+        .take_while(|&b| b == b' ' || b == b'\t')
+        .count();
+    let first_non_ws = start + ws;
+    if cursor != first_non_ws && first_non_ws < end {
+        first_non_ws
+    } else {
+        start
+    }
 }
 
 /// A 0x00RRGGBB color as the linear-float RGBA a Vulkan clear expects. The
@@ -3910,6 +3950,21 @@ mod tests {
     use super::*;
     use crate::image::{Image, ImageStore};
     use crate::rope::Rope;
+
+    #[test]
+    fn smart_home_toggles_between_first_glyph_and_line_start() {
+        // "    foo" occupying bytes [10, 17); its indent ends at byte 14.
+        let (line, start, end) = ("    foo", 10, 17);
+        // From the line end, jump to the first non-whitespace character.
+        assert_eq!(smart_home_target(line, start, end, end), 14);
+        // Already there (a second press): fall back to column 0.
+        assert_eq!(smart_home_target(line, start, end, 14), start);
+        // No indent: the first press already lands on the start.
+        assert_eq!(smart_home_target("foo", 0, 3, 3), 0);
+        // Blank and all-whitespace lines: only the start to go to.
+        assert_eq!(smart_home_target("", 5, 5, 5), 5);
+        assert_eq!(smart_home_target("   ", 0, 3, 3), 0);
+    }
 
     fn paint_params(width: usize, height: usize) -> PaintParams<'static> {
         PaintParams {

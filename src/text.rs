@@ -227,7 +227,21 @@ impl TextBuffer {
         // Continue the list only while editing the item's content; with the
         // cursor before or within the marker a plain newline is what is meant.
         if marker_len == 0 || self.cursor < ls + marker_len {
-            self.insert_str("\n");
+            // Auto-indent a plain newline: the new line inherits this line's
+            // leading whitespace (capped at the cursor), so indented prose and
+            // code keep their indent. Only for non-list lines; a continued list
+            // carries its indent in the marker, and a cursor inside a marker
+            // means a deliberate plain break.
+            let indent = if marker_len == 0 {
+                inherited_indent(&line, self.cursor - ls)
+            } else {
+                ""
+            };
+            if indent.is_empty() {
+                self.insert_str("\n");
+            } else {
+                self.insert_str(&format!("\n{indent}"));
+            }
             return true;
         }
         match markdown::next_item_marker(&line) {
@@ -833,6 +847,18 @@ impl TextBuffer {
 
 /// Whether `line` is a list item (bullet, ordered, or task, perhaps indented),
 /// the lines Tab nests and `enter` continues.
+/// The leading whitespace of `line` (spaces and tabs), capped at `col` bytes,
+/// for inheriting a line's indent onto the next line on Enter. Capping at the
+/// cursor keeps a break inside the indent from over-indenting, and a break at
+/// column 0 from indenting at all.
+fn inherited_indent(line: &str, col: usize) -> &str {
+    let ws = line
+        .bytes()
+        .take_while(|&b| b == b' ' || b == b'\t')
+        .count();
+    &line[..ws.min(col)]
+}
+
 fn is_list(line: &str) -> bool {
     matches!(
         markdown::style_of(line),
@@ -1157,6 +1183,34 @@ mod tests {
         b.enter();
         assert_eq!(b.text(), "# h\n");
         assert_eq!(b.cursor(), 4);
+    }
+
+    #[test]
+    fn enter_inherits_the_line_indent() {
+        let mut b = TextBuffer::new();
+        b.insert_str("    foo"); // four-space indent, cursor at end
+        b.enter();
+        b.insert_str("bar");
+        assert_eq!(b.text(), "    foo\n    bar");
+    }
+
+    #[test]
+    fn enter_at_column_zero_adds_no_indent() {
+        let mut b = TextBuffer::new();
+        b.insert_str("    foo");
+        b.set_selection(0, 0); // cursor before the indent
+        b.enter();
+        assert_eq!(b.text(), "\n    foo");
+    }
+
+    #[test]
+    fn enter_within_the_indent_caps_at_the_cursor() {
+        let mut b = TextBuffer::new();
+        b.insert_str("    foo");
+        b.set_selection(2, 2); // between the second and third indent space
+        b.enter();
+        // Two spaces stay on the old line; the new line inherits only two.
+        assert_eq!(b.text(), "  \n    foo");
     }
 
     #[test]

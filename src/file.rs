@@ -113,8 +113,9 @@ fn detect_line_ending(s: &str) -> LineEnding {
 }
 
 /// Rewrite every `"\r\n"` and lone `'\r'` as `'\n'`, so the buffer never holds a
-/// carriage return regardless of the source file's (possibly mixed) endings.
-fn normalize_newlines(s: &str) -> String {
+/// carriage return regardless of the source's (possibly mixed) endings. Applied
+/// both on file load and on paste, the two ways foreign text enters the buffer.
+pub fn normalize_newlines(s: &str) -> String {
     s.replace("\r\n", "\n").replace('\r', "\n")
 }
 

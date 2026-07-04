@@ -183,6 +183,25 @@ pub mod wp_cursor_shape_device_v1 {
     pub const SHAPE_TEXT: u32 = 9;
 }
 
+// Explicit sync (`linux-drm-syncobj-v1`, version 1). The client owns two
+// timelines (acquire, release); the manager makes surface + timeline objects,
+// and the surface carries the per-commit acquire/release points. No events.
+pub mod wp_linux_drm_syncobj_manager_v1 {
+    /// Attach explicit sync to a `wl_surface`: `new_id`, then the surface.
+    pub const GET_SURFACE: u16 = 1;
+    /// Import a DRM syncobj timeline: `new_id`, then the syncobj fd (ancillary).
+    pub const IMPORT_TIMELINE: u16 = 2;
+}
+
+pub mod wp_linux_drm_syncobj_surface_v1 {
+    /// The buffer in this commit must not be read until this timeline point
+    /// signals: the `timeline` object, then the u64 point as `hi`, `lo`.
+    pub const SET_ACQUIRE_POINT: u16 = 1;
+    /// The compositor signals this point when done reading the buffer: the
+    /// `timeline` object, then the u64 point as `hi`, `lo`.
+    pub const SET_RELEASE_POINT: u16 = 2;
+}
+
 // Interface names, as advertised by `wl_registry.global`, and the maximum
 // version we know how to drive.
 pub const IFACE_COMPOSITOR: &str = "wl_compositor";
@@ -192,6 +211,7 @@ pub const IFACE_SEAT: &str = "wl_seat";
 pub const IFACE_DATA_DEVICE_MANAGER: &str = "wl_data_device_manager";
 pub const IFACE_CURSOR_SHAPE_MANAGER: &str = "wp_cursor_shape_manager_v1";
 pub const IFACE_DMABUF: &str = "zwp_linux_dmabuf_v1";
+pub const IFACE_DRM_SYNCOBJ: &str = "wp_linux_drm_syncobj_manager_v1";
 
 pub const VERSION_COMPOSITOR: u32 = 4;
 pub const VERSION_SHM: u32 = 1;
@@ -203,3 +223,5 @@ pub const VERSION_CURSOR_SHAPE_MANAGER: u32 = 1;
 /// Version 4 introduced the feedback object (format table, main device,
 /// tranches), which the GPU path requires; an older advertisement is not bound.
 pub const VERSION_DMABUF: u32 = 4;
+/// Explicit sync is a single version; we drive only what version 1 defines.
+pub const VERSION_DRM_SYNCOBJ: u32 = 1;

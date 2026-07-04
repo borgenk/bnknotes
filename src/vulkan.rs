@@ -1655,6 +1655,9 @@ pub struct Gpu {
     modifiers: Vec<VkDrmFormatModifierPropertiesEXT>,
     /// Property flags per memory type index, for allocation.
     memory_type_flags: Vec<u32>,
+    /// The chosen device's DRM render-node minor, for opening a fd to create
+    /// explicit-sync sync objects. `None` if the device exposes no render node.
+    render_node: Option<u32>,
     // Drop order is field order: the device before the instance, the instance
     // before the loader library. The underscored two are pure keep-alives.
     device: Device,
@@ -1704,7 +1707,7 @@ impl Gpu {
             unsafe { load(gipa, instance.raw, c"vkGetPhysicalDeviceFormatProperties2") }?;
 
         let physicals = enumerate_physicals(enumerate, instance.raw)?;
-        let (physical, name, queue_family) = pick_device(
+        let (physical, name, queue_family, render_node) = pick_device(
             get_props2,
             enumerate_exts,
             get_queue_families,
@@ -1764,6 +1767,7 @@ impl Gpu {
             renderer,
             modifiers,
             memory_type_flags,
+            render_node,
             device,
             _instance: instance,
             _lib: lib,
@@ -1774,6 +1778,13 @@ impl Gpu {
     /// The marketing name of the chosen device (for diagnostics).
     pub fn name(&self) -> &str {
         &self.name
+    }
+
+    /// The DRM render node minor of the chosen device (`/dev/dri/renderD<minor>`),
+    /// where explicit sync opens a fd to create its sync objects. `None` when the
+    /// device exposes no render node.
+    pub fn render_node(&self) -> Option<u32> {
+        self.render_node
     }
 
     pub fn queue_family(&self) -> u32 {
@@ -2299,14 +2310,12 @@ impl Gpu {
         }
     }
 
-    /// Render one frame into `img`: upload whatever the frame data carries
-    /// (new glyphs, a grown atlas, new image textures), then draw the batches
-    /// over a clear to `background`. Waits for the image's previous
-    /// submission, wires the compositor's read fences in (acquire) and the
-    /// render-done fence out (release) through the dmabuf, and submits.
-    /// Returns with the frame in flight; the caller may attach/commit
-    /// immediately.
-    pub fn render_list(
+    /// Upload the frame's textures and vertices and record its command buffer,
+    /// after waiting out the image's previous submission. The sync strategy
+    /// (implicit bridge or explicit points) is layered on by the caller, which
+    /// then submits; on return the command buffer is recorded but not yet in
+    /// flight.
+    fn prepare_frame(
         &mut self,
         img: &mut GpuImage,
         frame: &FrameData,
@@ -2364,11 +2373,44 @@ impl Gpu {
             }
         }
 
+        self.record_frame(img, frame, &uploads, background)?;
+        Ok(())
+    }
+
+    /// Render `img` and present it under the implicit-sync bridge: acquire from the
+    /// dmabuf's read fences, release the render fence back into the dmabuf (CPU wait
+    /// if the bridge is unavailable). The fallback path for compositors that do not
+    /// offer explicit sync. Returns with the frame in flight; the caller may
+    /// attach/commit immediately.
+    pub fn render_list(
+        &mut self,
+        img: &mut GpuImage,
+        frame: &FrameData,
+        background: [f32; 4],
+    ) -> Result<()> {
+        self.prepare_frame(img, frame, background)?;
         // Acquire: the compositor's unfinished reads become a wait semaphore.
         let wait_acquire = self.import_read_fences(img)?;
-
-        self.record_frame(img, frame, &uploads, background)?;
         self.submit_frame(img, wait_acquire)
+    }
+
+    /// Render `img` and present it under explicit sync: wait on `release_wait`
+    /// (the compositor's release point for this buffer's previous frame, `None`
+    /// on first use) instead of the dmabuf's implicit fences, and return the
+    /// render-done sync file for the caller to publish as this frame's acquire
+    /// point. `Ok(None)` means the driver could not export a fence, so the frame
+    /// was CPU-waited to completion and the caller must set no points on the
+    /// commit (the buffer is already safe to read).
+    pub fn render_list_explicit(
+        &mut self,
+        img: &mut GpuImage,
+        frame: &FrameData,
+        background: [f32; 4],
+        release_wait: Option<OwnedFd>,
+    ) -> Result<Option<OwnedFd>> {
+        self.prepare_frame(img, frame, background)?;
+        let wait_acquire = self.import_acquire(img, release_wait)?;
+        self.submit_frame_explicit(img, wait_acquire)
     }
 
     /// Read the image's pixels back (B,G,R,A byte order, tightly packed).
@@ -2533,9 +2575,10 @@ impl Gpu {
         }
     }
 
-    /// Submit `img`'s recorded command buffer with the acquire/release
-    /// semaphores and bridge the render fence into the dmabuf.
-    fn submit_frame(&self, img: &mut GpuImage, wait_acquire: bool) -> Result<()> {
+    /// Submit `img`'s recorded command buffer: wait on its acquire semaphore
+    /// when `wait_acquire`, signal its release semaphore and fence. Sync out
+    /// (bridge or explicit) is layered on by the callers below.
+    fn submit_only(&self, img: &mut GpuImage, wait_acquire: bool) -> Result<()> {
         let f = &self.fns;
         let wait_stage: u32 = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
         let submit = VkSubmitInfo {
@@ -2556,25 +2599,64 @@ impl Gpu {
             "vkQueueSubmit",
         )?;
         img.used = true;
+        Ok(())
+    }
 
-        // Release: the render-done fence rides the dmabuf so the compositor
-        // waits for it. If the bridge is unavailable, wait on the CPU instead;
-        // a slow correct frame beats a torn one.
+    /// Submit under the implicit-sync bridge: after the submit, the render-done
+    /// fence rides the dmabuf so the compositor waits for it. If the bridge is
+    /// unavailable, wait on the CPU instead; a slow correct frame beats a torn
+    /// one.
+    fn submit_frame(&self, img: &mut GpuImage, wait_acquire: bool) -> Result<()> {
+        self.submit_only(img, wait_acquire)?;
         if !self.export_render_fence(img)? {
-            // SAFETY: fence is live; bounded wait as above.
+            // SAFETY: fence is live; the timeout bounds a broken driver.
             check(
-                unsafe { (f.wait_for_fences)(self.device.raw, 1, &img.fence, 1, FENCE_TIMEOUT_NS) },
+                unsafe {
+                    (self.fns.wait_for_fences)(self.device.raw, 1, &img.fence, 1, FENCE_TIMEOUT_NS)
+                },
                 "vkWaitForFences (bridge fallback)",
             )?;
         }
         Ok(())
     }
 
-    /// Import the dmabuf's current read/write fences as a temporary payload of
-    /// the acquire semaphore. Returns whether the submission should wait on it.
-    fn import_read_fences(&self, img: &GpuImage) -> Result<bool> {
-        let Some(sync) = crate::ffi::dmabuf_export_sync_file(img.fd())? else {
-            return Ok(false); // No bridge: trust wl_buffer.release alone.
+    /// Submit under explicit sync: after the submit, hand back the render-done
+    /// sync file so the caller can publish it as this frame's acquire point. If
+    /// the driver cannot export one, CPU-wait to completion and return `None` so
+    /// the caller commits with no sync points.
+    fn submit_frame_explicit(
+        &self,
+        img: &mut GpuImage,
+        wait_acquire: bool,
+    ) -> Result<Option<OwnedFd>> {
+        self.submit_only(img, wait_acquire)?;
+        match self.render_done_fence(img)? {
+            Some(fd) => Ok(Some(fd)),
+            None => {
+                // SAFETY: fence is live; the timeout bounds a broken driver.
+                check(
+                    unsafe {
+                        (self.fns.wait_for_fences)(
+                            self.device.raw,
+                            1,
+                            &img.fence,
+                            1,
+                            FENCE_TIMEOUT_NS,
+                        )
+                    },
+                    "vkWaitForFences (explicit fallback)",
+                )?;
+                Ok(None)
+            }
+        }
+    }
+
+    /// Import `sync` (a sync file) as a temporary payload of the acquire
+    /// semaphore so the submission waits on it; `None` arms no wait. Returns
+    /// whether a wait was armed. Consumes `sync` (Vulkan owns it on success).
+    fn import_acquire(&self, img: &GpuImage, sync: Option<OwnedFd>) -> Result<bool> {
+        let Some(sync) = sync else {
+            return Ok(false);
         };
         let raw = sync.as_raw_fd();
         let info = VkImportSemaphoreFdInfoKHR {
@@ -2597,10 +2679,15 @@ impl Gpu {
         }
     }
 
-    /// Export the just-submitted release semaphore as a sync file and attach
-    /// it to the dmabuf as its write fence. Returns false when the kernel or
-    /// driver cannot bridge, in which case the caller must CPU-wait.
-    fn export_render_fence(&self, img: &GpuImage) -> Result<bool> {
+    /// The implicit-sync bridge's acquire: the dmabuf's current read/write
+    /// fences become the acquire wait.
+    fn import_read_fences(&self, img: &GpuImage) -> Result<bool> {
+        self.import_acquire(img, crate::ffi::dmabuf_export_sync_file(img.fd())?)
+    }
+
+    /// Export the just-submitted release semaphore as a sync file. `None` when
+    /// the driver cannot, in which case the caller must CPU-wait.
+    fn render_done_fence(&self, img: &GpuImage) -> Result<Option<OwnedFd>> {
         let info = VkSemaphoreGetFdInfoKHR {
             s_type: VK_STRUCTURE_TYPE_SEMAPHORE_GET_FD_INFO_KHR,
             p_next: core::ptr::null(),
@@ -2612,10 +2699,19 @@ impl Gpu {
         // which is what a sync-fd export requires.
         let r = unsafe { (self.fns.get_semaphore_fd)(self.device.raw, &info, &mut raw) };
         if r != VK_SUCCESS || raw < 0 {
-            return Ok(false);
+            return Ok(None);
         }
         // SAFETY: the driver handed us ownership of this sync-file fd.
-        let sync = unsafe { OwnedFd::from_raw_fd(raw) };
+        Ok(Some(unsafe { OwnedFd::from_raw_fd(raw) }))
+    }
+
+    /// The implicit-sync bridge's release: attach the render-done fence to the
+    /// dmabuf as its write fence so the compositor waits for it. Returns false
+    /// when the kernel or driver cannot bridge.
+    fn export_render_fence(&self, img: &GpuImage) -> Result<bool> {
+        let Some(sync) = self.render_done_fence(img)? else {
+            return Ok(false);
+        };
         crate::ffi::dmabuf_import_sync_file(img.fd(), sync.as_raw_fd())
     }
 
@@ -4084,7 +4180,7 @@ fn pick_device(
     get_queue_families: PfnGetPhysicalDeviceQueueFamilyProperties,
     physicals: &[VkPhysicalDevice],
     main_device: Option<u64>,
-) -> Result<(VkPhysicalDevice, String, u32)> {
+) -> Result<(VkPhysicalDevice, String, u32, Option<u32>)> {
     let want = main_device.map(|dev| {
         (
             i64::from(crate::dmabuf::dev_major(dev)),
@@ -4172,7 +4268,10 @@ fn pick_device(
             seen.push(format!("{name} (no graphics queue)"));
             continue;
         };
-        return Ok((physical, name, queue_family));
+        // The render node (no DRM master needed) is where explicit sync creates
+        // its syncobjs; `None` when the device exposes no render node.
+        let render_minor = (drm.has_render != 0).then_some(drm.render_minor as u32);
+        return Ok((physical, name, queue_family, render_minor));
     }
 
     let target = match want {

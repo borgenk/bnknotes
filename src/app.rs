@@ -18,7 +18,7 @@
 //! reallocating its shm buffers. Rendering double-buffers so the compositor never
 //! reads a frame we are still painting.
 
-use std::os::fd::AsRawFd;
+use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::time::{Duration, Instant};
@@ -40,8 +40,8 @@ use crate::protocol::{
     self, wl_buffer, wl_callback, wl_compositor, wl_data_device, wl_data_device_manager,
     wl_data_offer, wl_data_source, wl_display, wl_keyboard, wl_pointer, wl_registry, wl_seat,
     wl_shm, wl_shm_pool, wl_surface, wp_cursor_shape_device_v1, wp_cursor_shape_manager_v1,
-    xdg_surface, xdg_toplevel, xdg_wm_base, zwp_linux_buffer_params_v1,
-    zwp_linux_dmabuf_feedback_v1, zwp_linux_dmabuf_v1,
+    wp_linux_drm_syncobj_manager_v1, wp_linux_drm_syncobj_surface_v1, xdg_surface, xdg_toplevel,
+    xdg_wm_base, zwp_linux_buffer_params_v1, zwp_linux_dmabuf_feedback_v1, zwp_linux_dmabuf_v1,
 };
 use crate::render::{self, Canvas};
 use crate::scroll;
@@ -218,6 +218,26 @@ fn load(path: &Path) -> Result<(String, FileFormat)> {
 /// these unchanged and reuses the cached layout.
 type LayoutKey = (u64, u32, u32, usize, usize, Option<usize>, Option<usize>);
 
+/// Client-owned explicit-sync state (`linux-drm-syncobj-v1`), negotiated over a
+/// live GPU backend when the compositor advertises the manager. Two DRM syncobj
+/// timelines the compositor shares: we signal `acquire` with each frame's
+/// render-done fence, and it signals `release` when done reading a buffer. A
+/// scratch binary syncobj carries the sync-file transfers. `point` increments
+/// per present; `buffer_release[i]` is the release point last published for
+/// buffer slot `i`, so that slot's next reuse waits on it. Dropping this closes
+/// the render-node fd, which frees every syncobj created on it.
+struct ExplicitSync {
+    drm: OwnedFd,
+    acquire_syncobj: u32,
+    release_syncobj: u32,
+    scratch: u32,
+    acquire_timeline: u32,
+    release_timeline: u32,
+    surface: u32,
+    point: u64,
+    buffer_release: [Option<u64>; 2],
+}
+
 struct State {
     conn: Connection,
     /// The font opened at every size the styles need (body and heading sizes),
@@ -287,6 +307,13 @@ struct State {
     /// The GPU path's persistent glyph/emoji atlases (CPU mirrors plus slot
     /// records); steady-state frames insert nothing and upload nothing.
     gpu_glyphs: gpu::GlyphCache,
+    /// The explicit-sync manager global (`wp_linux_drm_syncobj_manager_v1`) when
+    /// the compositor offers it; `None` means the GPU path uses the implicit-sync
+    /// bridge.
+    drm_syncobj_manager: Option<u32>,
+    /// Active explicit-sync objects, negotiated once a GPU backend is up and the
+    /// manager is present. `None` keeps the bridge.
+    explicit_sync: Option<ExplicitSync>,
     /// The cursor-shape manager (if the compositor offers it) and the shape
     /// device we create for our pointer. The shape varies by what is under the
     /// pointer: a hand over an image's button, the plain arrow over a picture, the
@@ -415,6 +442,14 @@ struct State {
     frame_count: u64,
     /// When the previous frame was presented, for the inter-frame gap in stats.
     last_present: Option<Instant>,
+    /// Explicit-sync accounting for the stats line: frames that published a real
+    /// render-done fence as the acquire point, versus frames where the driver
+    /// could not export one so the GPU path CPU-waited the frame to completion
+    /// instead. A climbing `cpu_wait` count means explicit sync negotiated but is
+    /// degrading to a synchronous wait (fence export is the usual suspect on some
+    /// drivers); both stay at zero on the implicit-sync bridge.
+    explicit_fence_frames: u64,
+    explicit_cpu_wait_frames: u64,
 }
 
 impl State {
@@ -472,6 +507,8 @@ impl State {
             gpu_images: Vec::new(),
             gpu_modifiers: Vec::new(),
             gpu_glyphs: gpu::GlyphCache::new(),
+            drm_syncobj_manager: None,
+            explicit_sync: None,
             cursor_shape_manager: None,
             cursor_shape_device: 0,
             pointer_serial: 0,
@@ -524,6 +561,8 @@ impl State {
             stats: std::env::var_os("BNKNOTES_STATS").is_some(),
             frame_count: 0,
             last_present: None,
+            explicit_fence_frames: 0,
+            explicit_cpu_wait_frames: 0,
         })
     }
 
@@ -614,6 +653,10 @@ impl State {
         }
 
         self.create_buffers()?;
+        // With buffers and a surface in place, negotiate explicit sync if the
+        // compositor offers it and the GPU path is live; otherwise the bridge
+        // stays. Best-effort: any failure leaves the bridge running.
+        self.init_explicit_sync();
 
         // Empty commit to get the initial configure; the first frame is drawn
         // by the loop once `configured` is set.
@@ -666,6 +709,71 @@ impl State {
         Ok(())
     }
 
+    /// Negotiate explicit sync (`linux-drm-syncobj-v1`) when a GPU backend is
+    /// live and the compositor advertises the manager. Best-effort: on any
+    /// failure the GPU path keeps the implicit-sync bridge, which is why this
+    /// returns nothing and only logs under stats.
+    fn init_explicit_sync(&mut self) {
+        let Some(manager) = self.drm_syncobj_manager else {
+            return;
+        };
+        let Some(minor) = self.gpu.as_ref().and_then(vulkan::Gpu::render_node) else {
+            return; // No GPU backend, or the device exposes no render node.
+        };
+        match self.negotiate_explicit_sync(manager, minor) {
+            Ok(es) => self.explicit_sync = Some(es),
+            Err(e) => {
+                if self.stats {
+                    eprintln!("bnknotes: explicit sync unavailable, using the sync bridge: {e}");
+                }
+            }
+        }
+    }
+
+    /// Create the two client-owned timelines plus a scratch syncobj, share the
+    /// timelines with the compositor, and attach explicit sync to the surface.
+    fn negotiate_explicit_sync(&mut self, manager: u32, minor: u32) -> Result<ExplicitSync> {
+        let drm = ffi::open_drm_render_node(minor)?;
+        let fd = drm.as_raw_fd();
+        let acquire_syncobj = ffi::drm_syncobj_create(fd, false)?;
+        let release_syncobj = ffi::drm_syncobj_create(fd, false)?;
+        let scratch = ffi::drm_syncobj_create(fd, false)?;
+        let acquire_timeline = self.import_timeline(manager, fd, acquire_syncobj)?;
+        let release_timeline = self.import_timeline(manager, fd, release_syncobj)?;
+        let surface = self.alloc_id();
+        self.conn.request(
+            manager,
+            wp_linux_drm_syncobj_manager_v1::GET_SURFACE,
+            &[Arg::NewId(surface), Arg::Object(self.surface)],
+        );
+        Ok(ExplicitSync {
+            drm,
+            acquire_syncobj,
+            release_syncobj,
+            scratch,
+            acquire_timeline,
+            release_timeline,
+            surface,
+            point: 0,
+            buffer_release: [None, None],
+        })
+    }
+
+    /// Export `syncobj` as a DRM syncobj fd and import it into the compositor as
+    /// a timeline object; returns the protocol object id. The fd is sent inline,
+    /// so the local `OwnedFd` can drop on return.
+    fn import_timeline(&mut self, manager: u32, drm: RawFd, syncobj: u32) -> Result<u32> {
+        let fd = ffi::drm_syncobj_export_fd(drm, syncobj)?;
+        let id = self.alloc_id();
+        self.conn.request_with_fd(
+            manager,
+            wp_linux_drm_syncobj_manager_v1::IMPORT_TIMELINE,
+            &[Arg::NewId(id)],
+            fd.as_raw_fd(),
+        )?;
+        Ok(id)
+    }
+
     /// Drop a failed GPU backend so the software path takes over: destroy its
     /// buffers and images, the device (its Drop drains the queue), and the
     /// CPU-side glyph cache. The caller recreates buffers on the shm path.
@@ -674,6 +782,9 @@ impl State {
         self.gpu = None;
         self.gpu_modifiers.clear();
         self.gpu_glyphs = gpu::GlyphCache::new();
+        // Explicit sync belongs to the GPU path; drop it (closing the render
+        // node fd and its syncobjs) so the software fallback carries nothing.
+        self.explicit_sync = None;
     }
 
     /// Allocate presentable buffers at the current size: GPU images exported
@@ -802,6 +913,11 @@ impl State {
         }
         self.gpu_images = images;
         self.busy = [false, false];
+        // Fresh images never carried a release point, so a resize must forget
+        // the old buffers' points; their next use starts with no wait.
+        if let Some(es) = self.explicit_sync.as_mut() {
+            es.buffer_release = [None, None];
+        }
         // Fresh images hold no known frame; force full repaints as the shm
         // path does (the GPU path repaints fully regardless, but the screen
         // diff also gates presenting at all).
@@ -1102,7 +1218,9 @@ impl State {
             return Ok(true);
         }
 
-        {
+        // Render, returning the render-done fence under explicit sync (`None`
+        // on the bridge path, or when the driver could not export one).
+        let render_done = {
             let Some(gpu) = self.gpu.as_mut() else {
                 return Err(Error::msg("gpu frame without a gpu backend"));
             };
@@ -1117,8 +1235,27 @@ impl State {
                 &mut self.gpu_glyphs,
                 &known,
             );
-            gpu.render_list(img, &frame, color_f32(BACKGROUND))?;
-        }
+            match self.explicit_sync.as_ref() {
+                Some(es) => {
+                    // Wait on the compositor's release of this buffer's previous
+                    // frame; nothing to wait on the first time the slot is used.
+                    let release_wait = match es.buffer_release[idx] {
+                        Some(p) => Some(ffi::drm_syncobj_point_to_sync_file(
+                            es.drm.as_raw_fd(),
+                            es.release_syncobj,
+                            p,
+                            es.scratch,
+                        )?),
+                        None => None,
+                    };
+                    gpu.render_list_explicit(img, &frame, color_f32(BACKGROUND), release_wait)?
+                }
+                None => {
+                    gpu.render_list(img, &frame, color_f32(BACKGROUND))?;
+                    None
+                }
+            }
+        };
         self.present_list = new_list;
 
         let buffer = self.buffers[idx];
@@ -1127,6 +1264,43 @@ impl State {
             wl_surface::ATTACH,
             &[Arg::Object(buffer), Arg::Int(0), Arg::Int(0)],
         );
+        // Explicit sync: publish this frame's render-done fence as the acquire
+        // point and claim a release point, so the compositor waits before
+        // reading and signals when done (the buffer's next reuse waits on it).
+        // With no exportable fence the frame was CPU-waited: set no points.
+        match (render_done, self.explicit_sync.as_mut()) {
+            (Some(fence), Some(es)) => {
+                es.point += 1;
+                let p = es.point;
+                ffi::drm_syncobj_sync_file_to_point(
+                    es.drm.as_raw_fd(),
+                    fence.as_raw_fd(),
+                    es.acquire_syncobj,
+                    p,
+                    es.scratch,
+                )?;
+                es.buffer_release[idx] = Some(p);
+                let (hi, lo) = ((p >> 32) as u32, p as u32);
+                let (sync_surface, acquire_tl, release_tl) =
+                    (es.surface, es.acquire_timeline, es.release_timeline);
+                self.conn.request(
+                    sync_surface,
+                    wp_linux_drm_syncobj_surface_v1::SET_ACQUIRE_POINT,
+                    &[Arg::Object(acquire_tl), Arg::Uint(hi), Arg::Uint(lo)],
+                );
+                self.conn.request(
+                    sync_surface,
+                    wp_linux_drm_syncobj_surface_v1::SET_RELEASE_POINT,
+                    &[Arg::Object(release_tl), Arg::Uint(hi), Arg::Uint(lo)],
+                );
+                self.explicit_fence_frames += 1;
+            }
+            (None, Some(es)) => {
+                es.buffer_release[idx] = None;
+                self.explicit_cpu_wait_frames += 1;
+            }
+            _ => {}
+        }
         // The GPU repainted everything, but the *screen* change is still just
         // the diff, so report those regions and let the compositor
         // recomposite only what moved.
@@ -1150,8 +1324,16 @@ impl State {
                 .last_present
                 .map(|t| started.duration_since(t).as_secs_f64() * 1000.0)
                 .unwrap_or(0.0);
+            let sync = if self.explicit_sync.is_some() {
+                format!(
+                    "explicit-sync {} fence/{} cpu-wait",
+                    self.explicit_fence_frames, self.explicit_cpu_wait_frames
+                )
+            } else {
+                "implicit-sync bridge".to_string()
+            };
             eprintln!(
-                "[stats] gpu frame {} {:.2}ms build+submit, {:.1}ms since last | glyphs hit {} miss {} ({:.1}% of {})",
+                "[stats] gpu frame {} {:.2}ms build+submit, {:.1}ms since last | glyphs hit {} miss {} ({:.1}% of {}) | {}",
                 self.frame_count,
                 started.elapsed().as_secs_f64() * 1000.0,
                 gap,
@@ -1159,6 +1341,7 @@ impl State {
                 cache.misses,
                 cache.hit_rate() * 100.0,
                 cache.lookups(),
+                sync,
             );
             self.last_present = Some(started);
         }
@@ -1388,6 +1571,16 @@ impl State {
             "gpu-probe: zwp_linux_dmabuf_v1 bound at v{}",
             self.dmabuf_version
         );
+        match self.drm_syncobj_manager {
+            Some(_) => println!(
+                "gpu-probe: {} present: explicit sync available",
+                protocol::IFACE_DRM_SYNCOBJ
+            ),
+            None => println!(
+                "gpu-probe: {} absent: GPU path uses the implicit-sync bridge",
+                protocol::IFACE_DRM_SYNCOBJ
+            ),
+        }
         // The server answers get_default_feedback before the sync that follows
         // it, so one roundtrip delivers the whole feedback burst.
         self.request_dmabuf_feedback();
@@ -1533,6 +1726,18 @@ impl State {
                 self.bind(name, interface, bound, id);
                 self.dmabuf = Some(id);
                 self.dmabuf_version = bound;
+            }
+            // Explicit sync: bound only to be wired up
+            // once a GPU backend exists; absent it, the bridge path is used.
+            protocol::IFACE_DRM_SYNCOBJ => {
+                let id = self.alloc_id();
+                self.bind(
+                    name,
+                    interface,
+                    version.min(protocol::VERSION_DRM_SYNCOBJ),
+                    id,
+                );
+                self.drm_syncobj_manager = Some(id);
             }
             _ => {}
         }

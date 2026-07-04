@@ -496,6 +496,220 @@ pub fn dmabuf_import_sync_file(dmabuf: RawFd, sync: RawFd) -> Result<bool> {
 }
 
 // ---------------------------------------------------------------------------
+// DRM sync objects (explicit sync, wp_linux_drm_syncobj_v1).
+// ---------------------------------------------------------------------------
+
+/// `struct drm_syncobj_create`: the kernel writes `handle`.
+#[repr(C)]
+struct DrmSyncobjCreate {
+    handle: u32,
+    flags: u32,
+}
+
+/// `struct drm_syncobj_handle`: trades a syncobj `handle` for a shareable `fd`
+/// (export) or the reverse. The kernel's `drm.h` carries the timeline `point`
+/// field, so the struct is 24 bytes, not the classic 16; [`drm_iowr`] takes the
+/// size from here so the ioctl encoding can never drift from the ABI.
+#[repr(C)]
+struct DrmSyncobjHandle {
+    handle: u32,
+    flags: u32,
+    fd: c_int,
+    pad: u32,
+    point: u64,
+}
+
+/// `struct drm_syncobj_transfer`: copy the fence at (`src_handle`, `src_point`)
+/// to (`dst_handle`, `dst_point`), moving between timeline points and the
+/// point-0 of a binary syncobj.
+#[repr(C)]
+struct DrmSyncobjTransfer {
+    src_handle: u32,
+    dst_handle: u32,
+    src_point: u64,
+    dst_point: u64,
+    flags: u32,
+    pad: u32,
+}
+
+/// `DRM_SYNCOBJ_CREATE_SIGNALED`: start the object already signaled.
+const DRM_SYNCOBJ_CREATE_SIGNALED: u32 = 1;
+/// `DRM_SYNCOBJ_{HANDLE_TO_FD_FLAGS_EXPORT,FD_TO_HANDLE_FLAGS_IMPORT}_SYNC_FILE`:
+/// read/write a sync file at the binary syncobj's point 0 rather than moving the
+/// syncobj object itself. Both directions use the same flag value.
+const DRM_SYNCOBJ_SYNC_FILE: u32 = 1;
+
+/// `DRM_IOWR('d', nr, struct)`: the DRM ioctl request encoding. Deriving the
+/// size from `size_of` means a struct edit updates the ioctl number with it.
+const fn drm_iowr(nr: u32, size: usize) -> c_ulong {
+    const DIR_READ_WRITE: c_ulong = 3 << 30;
+    const DRM_TYPE: c_ulong = 0x64 << 8; // 'd'
+    DIR_READ_WRITE | ((size as c_ulong) << 16) | DRM_TYPE | nr as c_ulong
+}
+
+const DRM_IOCTL_SYNCOBJ_CREATE: c_ulong = drm_iowr(0xBF, mem::size_of::<DrmSyncobjCreate>());
+const DRM_IOCTL_SYNCOBJ_HANDLE_TO_FD: c_ulong = drm_iowr(0xC1, mem::size_of::<DrmSyncobjHandle>());
+const DRM_IOCTL_SYNCOBJ_FD_TO_HANDLE: c_ulong = drm_iowr(0xC2, mem::size_of::<DrmSyncobjHandle>());
+const DRM_IOCTL_SYNCOBJ_TRANSFER: c_ulong = drm_iowr(0xCC, mem::size_of::<DrmSyncobjTransfer>());
+
+/// Open the GPU's DRM render node (`/dev/dri/renderD<minor>`) read-write, for
+/// creating the sync objects that back explicit sync. Render nodes need no DRM
+/// master, so a plain client can open one.
+pub fn open_drm_render_node(minor: u32) -> Result<OwnedFd> {
+    let path = format!("/dev/dri/renderD{minor}");
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&path)
+        .map_err(|e| Error::msg(format!("open {path}: {e}")))?;
+    Ok(OwnedFd::from(file))
+}
+
+/// Create a DRM sync object on `drm` (a render-node fd); returns its handle.
+/// `signaled` starts it already signaled.
+pub fn drm_syncobj_create(drm: RawFd, signaled: bool) -> Result<u32> {
+    let mut arg = DrmSyncobjCreate {
+        handle: 0,
+        flags: if signaled {
+            DRM_SYNCOBJ_CREATE_SIGNALED
+        } else {
+            0
+        },
+    };
+    // SAFETY: arg is a live, correctly laid out drm_syncobj_create; the kernel
+    // writes handle on success.
+    let rc = unsafe { ioctl(drm, DRM_IOCTL_SYNCOBJ_CREATE, &mut arg) };
+    if rc != 0 {
+        return Err(Error::msg(format!(
+            "DRM_IOCTL_SYNCOBJ_CREATE failed: errno {}",
+            errno()
+        )));
+    }
+    Ok(arg.handle)
+}
+
+/// Import `sync_file` as the fence at `handle`'s point 0 (a binary syncobj).
+fn drm_syncobj_import_sync_file(drm: RawFd, handle: u32, sync_file: RawFd) -> Result<()> {
+    let mut arg = DrmSyncobjHandle {
+        handle,
+        flags: DRM_SYNCOBJ_SYNC_FILE,
+        fd: sync_file,
+        pad: 0,
+        point: 0,
+    };
+    // SAFETY: arg is a live drm_syncobj_handle; the kernel reads handle and fd.
+    let rc = unsafe { ioctl(drm, DRM_IOCTL_SYNCOBJ_FD_TO_HANDLE, &mut arg) };
+    if rc != 0 {
+        return Err(Error::msg(format!(
+            "DRM_IOCTL_SYNCOBJ_FD_TO_HANDLE (import sync file) failed: errno {}",
+            errno()
+        )));
+    }
+    Ok(())
+}
+
+/// Export the fence at `handle`'s point 0 (a binary syncobj) as a sync file.
+fn drm_syncobj_export_sync_file(drm: RawFd, handle: u32) -> Result<OwnedFd> {
+    let mut arg = DrmSyncobjHandle {
+        handle,
+        flags: DRM_SYNCOBJ_SYNC_FILE,
+        fd: -1,
+        pad: 0,
+        point: 0,
+    };
+    // SAFETY: arg is a live drm_syncobj_handle; the kernel writes fd on success.
+    let rc = unsafe { ioctl(drm, DRM_IOCTL_SYNCOBJ_HANDLE_TO_FD, &mut arg) };
+    if rc != 0 {
+        return Err(Error::msg(format!(
+            "DRM_IOCTL_SYNCOBJ_HANDLE_TO_FD (export sync file) failed: errno {}",
+            errno()
+        )));
+    }
+    // SAFETY: the kernel handed us ownership of this sync-file fd.
+    Ok(unsafe { OwnedFd::from_raw_fd(arg.fd) })
+}
+
+/// Copy the fence at (`src`, `src_point`) to (`dst`, `dst_point`).
+fn drm_syncobj_transfer(
+    drm: RawFd,
+    src: u32,
+    src_point: u64,
+    dst: u32,
+    dst_point: u64,
+) -> Result<()> {
+    let arg = DrmSyncobjTransfer {
+        src_handle: src,
+        dst_handle: dst,
+        src_point,
+        dst_point,
+        flags: 0,
+        pad: 0,
+    };
+    // SAFETY: arg is a live drm_syncobj_transfer; the kernel only reads it.
+    let rc = unsafe { ioctl(drm, DRM_IOCTL_SYNCOBJ_TRANSFER, &arg) };
+    if rc != 0 {
+        return Err(Error::msg(format!(
+            "DRM_IOCTL_SYNCOBJ_TRANSFER failed: errno {}",
+            errno()
+        )));
+    }
+    Ok(())
+}
+
+/// Export sync object `handle` as a shareable DRM syncobj fd (the object itself,
+/// not a sync file), to hand a whole timeline to the compositor over
+/// `wp_linux_drm_syncobj_manager_v1.import_timeline`.
+pub fn drm_syncobj_export_fd(drm: RawFd, handle: u32) -> Result<OwnedFd> {
+    let mut arg = DrmSyncobjHandle {
+        handle,
+        flags: 0,
+        fd: -1,
+        pad: 0,
+        point: 0,
+    };
+    // SAFETY: arg is a live, correctly laid out drm_syncobj_handle; the kernel
+    // writes fd on success.
+    let rc = unsafe { ioctl(drm, DRM_IOCTL_SYNCOBJ_HANDLE_TO_FD, &mut arg) };
+    if rc != 0 {
+        return Err(Error::msg(format!(
+            "DRM_IOCTL_SYNCOBJ_HANDLE_TO_FD failed: errno {}",
+            errno()
+        )));
+    }
+    // SAFETY: the kernel handed us ownership of this syncobj fd.
+    Ok(unsafe { OwnedFd::from_raw_fd(arg.fd) })
+}
+
+/// Publish `sync_file` (a render-done fence) at timeline `point` of `timeline`,
+/// via the caller-owned binary `scratch` syncobj: import into scratch point 0,
+/// then transfer to the timeline point. The compositor then waits on this point
+/// as the frame's acquire fence.
+pub fn drm_syncobj_sync_file_to_point(
+    drm: RawFd,
+    sync_file: RawFd,
+    timeline: u32,
+    point: u64,
+    scratch: u32,
+) -> Result<()> {
+    drm_syncobj_import_sync_file(drm, scratch, sync_file)?;
+    drm_syncobj_transfer(drm, scratch, 0, timeline, point)
+}
+
+/// Export timeline `point` of `timeline` as a sync file, via the caller-owned
+/// binary `scratch` syncobj: transfer the point to scratch point 0, then export
+/// it. Used to turn the compositor's release point into a fence the next render
+/// into that buffer waits on.
+pub fn drm_syncobj_point_to_sync_file(
+    drm: RawFd,
+    timeline: u32,
+    point: u64,
+    scratch: u32,
+) -> Result<OwnedFd> {
+    drm_syncobj_transfer(drm, timeline, point, scratch, 0)?;
+    drm_syncobj_export_sync_file(drm, scratch)
+}
+
+// ---------------------------------------------------------------------------
 // Runtime library loading.
 // ---------------------------------------------------------------------------
 
@@ -574,6 +788,7 @@ fn parse_cmsgs(cbuf: &CmsgBuf, controllen: usize, out: &mut Vec<OwnedFd>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use core::ffi::c_short;
 
     #[test]
     fn cmsg_math_matches_one_fd() {
@@ -596,5 +811,109 @@ mod tests {
         assert_eq!(slice[len - 1], 0xCD);
         // SAFETY: ptr/len came from mmap_shared and are not used afterwards.
         unsafe { unmap(ptr, len) };
+    }
+
+    // The DRM syncobj ioctls talk straight to the kernel, so their request
+    // numbers must match `DRM_IOWR(0xNN, struct)` exactly. These are computed
+    // from the struct sizes; pin them against the values a C compiler emits
+    // from the kernel's `drm.h`, where drm_syncobj_handle carries the timeline
+    // `point` field (24 bytes).
+    #[test]
+    fn drm_syncobj_ioctl_numbers_match_the_abi() {
+        assert_eq!(mem::size_of::<DrmSyncobjCreate>(), 8);
+        assert_eq!(mem::size_of::<DrmSyncobjHandle>(), 24);
+        assert_eq!(mem::size_of::<DrmSyncobjTransfer>(), 32);
+        assert_eq!(DRM_IOCTL_SYNCOBJ_CREATE, 0xC008_64BF);
+        assert_eq!(DRM_IOCTL_SYNCOBJ_HANDLE_TO_FD, 0xC018_64C1);
+        assert_eq!(DRM_IOCTL_SYNCOBJ_FD_TO_HANDLE, 0xC018_64C2);
+        assert_eq!(DRM_IOCTL_SYNCOBJ_TRANSFER, 0xC020_64CC);
+    }
+
+    // Kernel readiness check for the round-trip test below. A sync file's fd
+    // becomes POLLIN-readable exactly when its fence has signaled, so a
+    // zero-timeout poll reads the fence state without waiting. Test-only, so the
+    // binding stays here rather than widening the module's production surface.
+    const POLLIN: c_short = 0x0001;
+
+    #[repr(C)]
+    struct PollFd {
+        fd: c_int,
+        events: c_short,
+        revents: c_short,
+    }
+
+    extern "C" {
+        fn poll(fds: *mut PollFd, nfds: c_ulong, timeout: c_int) -> c_int;
+    }
+
+    /// Whether `fd` (a sync file) currently carries a signaled fence.
+    fn fd_is_signaled(fd: RawFd) -> bool {
+        let mut pfd = PollFd {
+            fd,
+            events: POLLIN,
+            revents: 0,
+        };
+        // SAFETY: one live PollFd; poll reads events and writes revents only.
+        let n = unsafe { poll(&mut pfd, 1, 0) };
+        n > 0 && (pfd.revents & POLLIN) != 0
+    }
+
+    /// Open the first usable DRM render node, or `None` when the machine has
+    /// none (a GPU-less box), so the round-trip test skips rather than fails.
+    /// Drives the production `open_drm_render_node` on the way.
+    fn open_any_render_node() -> Option<OwnedFd> {
+        for entry in std::fs::read_dir("/dev/dri").ok()?.flatten() {
+            let minor = entry
+                .file_name()
+                .to_str()
+                .and_then(|n| n.strip_prefix("renderD"))
+                .and_then(|n| n.parse::<u32>().ok());
+            if let Some(minor) = minor {
+                if let Ok(fd) = open_drm_render_node(minor) {
+                    return Some(fd);
+                }
+            }
+        }
+        None
+    }
+
+    // A real round-trip against the kernel's DRM syncobj interface: push a
+    // signaled fence into a timeline point and pull it back out, the exact
+    // plumbing the present path uses to publish a frame's acquire fence and
+    // later read a buffer's release fence. No compositor, no GPU submission.
+    // Skips on a machine with no render node, where there is nothing to drive.
+    #[test]
+    fn drm_syncobj_round_trips_a_fence_through_a_timeline_point() {
+        let Some(drm) = open_any_render_node() else {
+            eprintln!("bnknotes: no DRM render node; skipping syncobj round-trip");
+            return;
+        };
+        let fd = drm.as_raw_fd();
+
+        // A syncobj born signaled must export an already-signaled sync file;
+        // this also covers create(signaled) and export_sync_file on their own.
+        let src = drm_syncobj_create(fd, true).expect("create signaled syncobj");
+        let signaled = drm_syncobj_export_sync_file(fd, src).expect("export sync file");
+        assert!(
+            fd_is_signaled(signaled.as_raw_fd()),
+            "a syncobj created signaled must export a signaled fence",
+        );
+
+        // Publish that fence at a timeline point, then read the point back as a
+        // fresh sync file; it must survive both transfers still signaled. This
+        // exercises import_sync_file, transfer both directions (binary point 0
+        // to a timeline point and back), and export_sync_file.
+        let timeline = drm_syncobj_create(fd, false).expect("create timeline syncobj");
+        let scratch = drm_syncobj_create(fd, false).expect("create scratch syncobj");
+        const POINT: u64 = 42;
+        drm_syncobj_sync_file_to_point(fd, signaled.as_raw_fd(), timeline, POINT, scratch)
+            .expect("publish fence to timeline point");
+        let round_tripped = drm_syncobj_point_to_sync_file(fd, timeline, POINT, scratch)
+            .expect("read timeline point back as a sync file");
+        assert!(
+            fd_is_signaled(round_tripped.as_raw_fd()),
+            "the fence must stay signaled across the timeline round-trip",
+        );
+        // Dropping `drm` closes the render node, freeing every syncobj on it.
     }
 }

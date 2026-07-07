@@ -384,23 +384,52 @@ pub struct Span {
     pub kind: SpanKind,
 }
 
+// Per-byte inline-markup flags, packed one `u16` per content byte so the inline
+// parser needs a single line-length buffer instead of a dozen bool masks.
+const F_CODE_MARKER: u16 = 1 << 0;
+const F_CODE_CONTENT: u16 = 1 << 1;
+const F_IN_CODE: u16 = 1 << 2;
+const F_LINK_MARKER: u16 = 1 << 3;
+const F_LINK_TEXT: u16 = 1 << 4;
+const F_IN_LINK: u16 = 1 << 5;
+const F_EM_MARKER: u16 = 1 << 6;
+const F_BOLD: u16 = 1 << 7;
+const F_ITALIC: u16 = 1 << 8;
+const F_STRIKE: u16 = 1 << 9;
+/// A byte inside a code span or a link is inert for emphasis.
+const F_INERT: u16 = F_IN_CODE | F_IN_LINK;
+
+/// Reusable scratch for [`inline_spans_append`], so parsing a line's inline
+/// markup allocates nothing once the buffers have grown. `flags` is the packed
+/// per-byte mask; the rest are the parser's small working lists. The layout pools
+/// one of these across a build.
+#[derive(Default)]
+pub struct InlineScratch {
+    flags: Vec<u16>,
+    links: Vec<LinkSpan>,
+    delims: Vec<Delim>,
+    pairs: Vec<(usize, usize)>,
+    open_stack: Vec<usize>,
+}
+
 /// Split `content` into a contiguous list of inline spans covering `[0, len)`,
 /// recognizing code spans, inline links, and `*`/`_`/`~~` emphasis. Text between
 /// and around markup becomes `Text(..)` spans, so the result has no gaps. Empty
 /// input yields no spans. The owning wrapper over [`inline_spans_append`]; the
-/// layout reads spans through the appending form to pool the buffer, so this is
+/// layout reads spans through the appending form to pool the buffers, so this is
 /// used only by tests.
 #[cfg(test)]
 pub fn inline_spans(content: &str) -> Vec<Span> {
+    let mut scratch = InlineScratch::default();
     let mut out = Vec::new();
-    inline_spans_append(content, &mut out);
+    inline_spans_append(content, &mut scratch, &mut out);
     out
 }
 
 /// Append `content`'s inline spans, content-relative and tiling `[0, len)`, to
 /// `out` without clearing it, so a caller can reuse a pooled buffer across lines.
 /// [`inline_spans`] is the owning wrapper.
-pub fn inline_spans_append(content: &str, out: &mut Vec<Span>) {
+pub fn inline_spans_append(content: &str, scratch: &mut InlineScratch, out: &mut Vec<Span>) {
     let bytes = content.as_bytes();
     let n = bytes.len();
     if n == 0 {
@@ -424,46 +453,71 @@ pub fn inline_spans_append(content: &str, out: &mut Vec<Span>) {
         return;
     }
 
-    // Code spans first, since they bind tighter than emphasis. `in_code` marks every
-    // byte a `*`/`_` (or a link bracket) would be inert inside.
-    let (is_code_marker, is_code_content, in_code) = code_masks(content);
+    // Split the scratch so each layer borrows the buffers it needs independently;
+    // all are cleared and refilled, so a warmed pool allocates nothing here.
+    let InlineScratch {
+        flags,
+        links,
+        delims,
+        pairs,
+        open_stack,
+    } = scratch;
+    flags.clear();
+    flags.resize(n, 0);
+
+    // Code spans first: they bind tighter than emphasis, and their bytes are inert
+    // for the `*`/`_`/link markup below.
+    code_masks_into(content, flags);
 
     // Then inline links `[text](dest)`. The `[`, `]`, and `(dest)` are markers
     // (hidden off the active line like any other markup); the text styles as a
     // link. The whole link is inert for emphasis. An image `![..](..)` is left
     // alone (its `!` guards it) and reference links `[text][id]` are not handled.
-    let mut is_link_marker = vec![false; n];
-    let mut is_link_text = vec![false; n];
-    let mut in_link = vec![false; n];
-    for l in link_spans(bytes, &in_code) {
-        is_link_marker[l.open] = true; // `[`
-        is_link_text[l.open + 1..l.rb].fill(true); // text
-        is_link_marker[l.rb..=l.rp].fill(true); // `]` .. `)`
-        in_link[l.open..=l.rp].fill(true);
+    links.clear();
+    link_spans_into(bytes, flags, links);
+    for l in &*links {
+        flags[l.open] |= F_LINK_MARKER; // `[`
+        for f in &mut flags[l.open + 1..l.rb] {
+            *f |= F_LINK_TEXT; // text
+        }
+        for f in &mut flags[l.rb..=l.rp] {
+            *f |= F_LINK_MARKER; // `]` .. `)`
+        }
+        for f in &mut flags[l.open..=l.rp] {
+            *f |= F_IN_LINK;
+        }
     }
 
     // Then emphasis and strikethrough. Pair `*`/`_`/`~~` delimiter runs that
     // lie outside both code and links, then flag the matched delimiters as markers
     // and stamp bold/italic/strike over the text between.
-    let inert: Vec<bool> = (0..n).map(|b| in_code[b] || in_link[b]).collect();
-    let delims = emphasis_delims(content, &inert);
-    let mut is_em_marker = vec![false; n];
-    let mut is_bold = vec![false; n];
-    let mut is_italic = vec![false; n];
-    let mut is_strike = vec![false; n];
-    for (open, close) in match_delims(&delims) {
-        is_em_marker[delims[open].start..delims[open].end].fill(true);
-        is_em_marker[delims[close].start..delims[close].end].fill(true);
+    delims.clear();
+    emphasis_delims_into(content, flags, delims);
+    pairs.clear();
+    match_delims_into(delims, pairs, open_stack);
+    for &(open, close) in &*pairs {
+        for f in &mut flags[delims[open].start..delims[open].end] {
+            *f |= F_EM_MARKER;
+        }
+        for f in &mut flags[delims[close].start..delims[close].end] {
+            *f |= F_EM_MARKER;
+        }
         let (text_start, text_end) = (delims[open].end, delims[close].start);
         if delims[open].ch == b'~' {
-            is_strike[text_start..text_end].fill(true);
+            for f in &mut flags[text_start..text_end] {
+                *f |= F_STRIKE;
+            }
         } else {
             // A run of 1 is italic, 2 is bold, 3 is both.
             let bold = delims[open].len != 1;
             let italic = delims[open].len != 2;
-            for b in text_start..text_end {
-                is_bold[b] |= bold;
-                is_italic[b] |= italic;
+            for f in &mut flags[text_start..text_end] {
+                if bold {
+                    *f |= F_BOLD;
+                }
+                if italic {
+                    *f |= F_ITALIC;
+                }
             }
         }
     }
@@ -472,16 +526,17 @@ pub fn inline_spans_append(content: &str, out: &mut Vec<Span>) {
     // spans tile the content with no gaps and no redundant splits. Markers win,
     // then code, then a link's text, then strikethrough, then plain emphasis.
     let kind_at = |b: usize| -> SpanKind {
-        if is_code_marker[b] || is_em_marker[b] || is_link_marker[b] {
+        let fl = flags[b];
+        if fl & (F_CODE_MARKER | F_EM_MARKER | F_LINK_MARKER) != 0 {
             SpanKind::Marker
-        } else if is_code_content[b] {
+        } else if fl & F_CODE_CONTENT != 0 {
             SpanKind::Text(Emphasis::Code)
-        } else if is_link_text[b] {
+        } else if fl & F_LINK_TEXT != 0 {
             SpanKind::Text(Emphasis::Link)
-        } else if is_strike[b] {
+        } else if fl & F_STRIKE != 0 {
             SpanKind::Text(Emphasis::Strikethrough)
         } else {
-            SpanKind::Text(match (is_bold[b], is_italic[b]) {
+            SpanKind::Text(match (fl & F_BOLD != 0, fl & F_ITALIC != 0) {
                 (true, true) => Emphasis::BoldItalic,
                 (true, false) => Emphasis::Bold,
                 (false, true) => Emphasis::Italic,
@@ -521,24 +576,23 @@ struct Delim {
     can_close: bool,
 }
 
-/// Collect the emphasis and strikethrough delimiter runs of `content`, skipping
-/// any byte flagged in `inert` (inside a code span or a link). An `*`/`_` run of
-/// one to three is kept; a `~` run is kept only when it is exactly `~~` (so a lone
-/// `~` in prose stays literal). Other lengths are dropped.
-fn emphasis_delims(content: &str, inert: &[bool]) -> Vec<Delim> {
+/// Collect the emphasis and strikethrough delimiter runs of `content` into `out`,
+/// skipping any byte flagged `F_INERT` in `flags` (inside a code span or a link).
+/// An `*`/`_` run of one to three is kept; a `~` run is kept only when it is
+/// exactly `~~` (so a lone `~` in prose stays literal). Other lengths are dropped.
+fn emphasis_delims_into(content: &str, flags: &[u16], out: &mut Vec<Delim>) {
     let bytes = content.as_bytes();
     let n = bytes.len();
-    let mut delims = Vec::new();
     let mut i = 0;
     while i < n {
         let ch = bytes[i];
-        if inert[i] || !matches!(ch, b'*' | b'_' | b'~') {
+        if flags[i] & F_INERT != 0 || !matches!(ch, b'*' | b'_' | b'~') {
             i += 1;
             continue;
         }
         let start = i;
         let mut end = i;
-        while end < n && bytes[end] == ch && !inert[end] {
+        while end < n && bytes[end] == ch && flags[end] & F_INERT == 0 {
             end += 1;
         }
         let len = end - start;
@@ -553,7 +607,7 @@ fn emphasis_delims(content: &str, inert: &[bool]) -> Vec<Delim> {
             let before = content[..start].chars().next_back();
             let after = content[end..].chars().next();
             let (can_open, can_close) = flanking(ch, before, after);
-            delims.push(Delim {
+            out.push(Delim {
                 start,
                 end,
                 ch,
@@ -564,15 +618,17 @@ fn emphasis_delims(content: &str, inert: &[bool]) -> Vec<Delim> {
         }
         i = end;
     }
-    delims
 }
 
 /// Pair delimiter runs into `(opener, closer)` index tuples, matching the same
 /// character and length innermost-first with a stack. Unmatched runs are dropped
 /// (they stay literal text). A run that can both open and close prefers closing.
-fn match_delims(delims: &[Delim]) -> Vec<(usize, usize)> {
-    let mut pairs = Vec::new();
-    let mut open_stack: Vec<usize> = Vec::new();
+fn match_delims_into(
+    delims: &[Delim],
+    pairs: &mut Vec<(usize, usize)>,
+    open_stack: &mut Vec<usize>,
+) {
+    open_stack.clear();
     for (idx, delim) in delims.iter().enumerate() {
         if delim.can_close {
             if let Some(pos) = open_stack
@@ -589,7 +645,6 @@ fn match_delims(delims: &[Delim]) -> Vec<(usize, usize)> {
             open_stack.push(idx);
         }
     }
-    pairs
 }
 
 /// Whether a delimiter run of `ch` can open and/or close emphasis, from the
@@ -619,8 +674,8 @@ fn flanking(ch: u8, before: Option<char>, after: Option<char>) -> (bool, bool) {
 /// The index of the first `target` byte at or after `from` that is not inside a
 /// code span, or `None`. Used to find a link's `]` and `)` while skipping any that
 /// sit in inline code.
-fn find_byte(bytes: &[u8], from: usize, target: u8, in_code: &[bool]) -> Option<usize> {
-    (from..bytes.len()).find(|&i| bytes[i] == target && !in_code[i])
+fn find_byte(bytes: &[u8], from: usize, target: u8, flags: &[u16]) -> Option<usize> {
+    (from..bytes.len()).find(|&i| bytes[i] == target && flags[i] & F_IN_CODE == 0)
 }
 
 /// The byte index just past the run of backticks starting at `start` (which must
@@ -652,17 +707,13 @@ fn find_code_closer(bytes: &[u8], from: usize, fence: usize) -> Option<(usize, u
     None
 }
 
-/// Flag the code-span bytes of `content`: the fence backticks (`is_marker`), the
-/// span interior (`is_content`), and every byte inside a span (`in_code`, which
-/// keeps other markup inert). Returned as `(is_marker, is_content, in_code)`, all
-/// `content.len()` long. The single source so [`inline_spans`] and [`links`] agree
-/// on where code lies.
-fn code_masks(content: &str) -> (Vec<bool>, Vec<bool>, Vec<bool>) {
+/// Flag the code-span bytes of `content` into `flags`: the fence backticks
+/// (`F_CODE_MARKER`), the span interior (`F_CODE_CONTENT`), and every byte inside
+/// a span (`F_IN_CODE`, which keeps other markup inert). The single source so
+/// [`inline_spans_append`] and [`links`] agree on where code lies.
+fn code_masks_into(content: &str, flags: &mut [u16]) {
     let bytes = content.as_bytes();
     let n = bytes.len();
-    let mut is_marker = vec![false; n];
-    let mut is_content = vec![false; n];
-    let mut in_code = vec![false; n];
     let mut i = 0;
     while i < n {
         if bytes[i] != b'`' {
@@ -678,21 +729,17 @@ fn code_masks(content: &str) -> (Vec<bool>, Vec<bool>, Vec<bool>) {
             i = after_open;
             continue;
         };
-        for b in open..after_open {
-            is_marker[b] = true;
-            in_code[b] = true;
+        for f in &mut flags[open..after_open] {
+            *f |= F_CODE_MARKER | F_IN_CODE;
         }
-        for b in after_open..close {
-            is_content[b] = true;
-            in_code[b] = true;
+        for f in &mut flags[after_open..close] {
+            *f |= F_CODE_CONTENT | F_IN_CODE;
         }
-        for b in close..after_close {
-            is_marker[b] = true;
-            in_code[b] = true;
+        for f in &mut flags[close..after_close] {
+            *f |= F_CODE_MARKER | F_IN_CODE;
         }
         i = after_close;
     }
-    (is_marker, is_content, in_code)
 }
 
 /// The bracket indices of one inline link, into the scanned content.
@@ -710,17 +757,16 @@ struct LinkSpan {
 /// destination; an image `![..](..)` is skipped (its `!` guards it) and reference
 /// links `[text][id]` are ignored (no `(` follows the `]`). The first `]`/`)`
 /// outside code close the text/dest, so nested brackets are not handled.
-fn link_spans(bytes: &[u8], in_code: &[bool]) -> Vec<LinkSpan> {
+fn link_spans_into(bytes: &[u8], flags: &[u16], out: &mut Vec<LinkSpan>) {
     let n = bytes.len();
-    let mut out = Vec::new();
     let mut i = 0;
     while i < n {
-        if bytes[i] != b'[' || in_code[i] || (i > 0 && bytes[i - 1] == b'!') {
+        if bytes[i] != b'[' || flags[i] & F_IN_CODE != 0 || (i > 0 && bytes[i - 1] == b'!') {
             i += 1;
             continue;
         }
         let open = i;
-        let Some(rb) = find_byte(bytes, open + 1, b']', in_code) else {
+        let Some(rb) = find_byte(bytes, open + 1, b']', flags) else {
             i = open + 1;
             continue;
         };
@@ -729,7 +775,7 @@ fn link_spans(bytes: &[u8], in_code: &[bool]) -> Vec<LinkSpan> {
             i = rb + 1;
             continue;
         }
-        let Some(rp) = find_byte(bytes, rb + 2, b')', in_code) else {
+        let Some(rp) = find_byte(bytes, rb + 2, b')', flags) else {
             i = rb + 2;
             continue;
         };
@@ -741,7 +787,6 @@ fn link_spans(bytes: &[u8], in_code: &[bool]) -> Vec<LinkSpan> {
         out.push(LinkSpan { open, rb, rp });
         i = rp + 1;
     }
-    out
 }
 
 /// One inline link `[text](dest)` located in a line, as byte ranges into that
@@ -761,8 +806,12 @@ pub struct Link {
 /// the pointer clicks. A `[x](y)` inside a code span is skipped, matching the
 /// renderer.
 pub fn links(content: &str) -> Vec<Link> {
-    let (.., in_code) = code_masks(content);
-    link_spans(content.as_bytes(), &in_code)
+    let bytes = content.as_bytes();
+    let mut flags = vec![0u16; bytes.len()];
+    code_masks_into(content, &mut flags);
+    let mut spans = Vec::new();
+    link_spans_into(bytes, &flags, &mut spans);
+    spans
         .into_iter()
         .map(|l| Link {
             text: (l.open + 1, l.rb),

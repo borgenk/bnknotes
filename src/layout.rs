@@ -894,6 +894,9 @@ struct LayoutScratch {
     clusters: Vec<(usize, f32, bool)>,
     /// The wrapped visual segments' byte ranges, produced by [`wrap_segments`].
     segments: Vec<(usize, usize)>,
+    /// The inline parser's own reusable buffers, so classifying a line's markup
+    /// allocates nothing after warmup (see [`markdown::InlineScratch`]).
+    inline: markdown::InlineScratch,
     /// The flattened run pool for a full/window build: each line appends its runs
     /// here and records the range. The finished build moves this into the
     /// [`Layout`]. Stays empty on the measure-only path (the index build).
@@ -1033,7 +1036,7 @@ fn lay_line(
             // Resolve list nesting across lines: an item deeper than one past the
             // previous item has no parent and renders as body.
             let (style, marker) = resolve_list(&line, list_depth);
-            line_spans_into(&line, marker, &mut pool.spans);
+            line_spans_into(&line, marker, &mut pool.inline, &mut pool.spans);
             (
                 style,
                 markdown::font_size(style, body_size),
@@ -1778,7 +1781,12 @@ fn resolve_list(line: &str, list_depth: &mut Option<usize>) -> (markdown::LineSt
 /// a caller can suppress it, e.g. an over-nested list item that renders as plain
 /// body text gets `marker == 0`. Reuses the pooled `out` buffer rather than
 /// allocating a fresh Vec per line.
-fn line_spans_into(line: &str, marker: usize, out: &mut Vec<markdown::Span>) {
+fn line_spans_into(
+    line: &str,
+    marker: usize,
+    inline: &mut markdown::InlineScratch,
+    out: &mut Vec<markdown::Span>,
+) {
     out.clear();
     if marker > 0 {
         out.push(markdown::Span {
@@ -1790,7 +1798,7 @@ fn line_spans_into(line: &str, marker: usize, out: &mut Vec<markdown::Span>) {
     // Append the content's spans (content-relative), then shift them past the
     // marker in place, so no intermediate Vec is allocated for them.
     let base = out.len();
-    markdown::inline_spans_append(&line[marker..], out);
+    markdown::inline_spans_append(&line[marker..], inline, out);
     for span in &mut out[base..] {
         span.start += marker;
         span.end += marker;

@@ -908,6 +908,130 @@ fn rendered_as_code() {
     BLOCK.repeat(13)
 }
 
+// ---------------------------------------------------------------------------
+// Load bench: the real file-open pipeline, timed stage by stage.
+// ---------------------------------------------------------------------------
+
+/// Measure opening `path` the way the editor does, stage by stage: read the
+/// bytes off disk, decode them ([`crate::file::decode`]: BOM strip, UTF-8
+/// validation, newline normalization), build the rope, build the line-metrics
+/// index (the O(document) cost the first frame pays), and lay out the opening
+/// viewport. This is the whole synchronous open path minus the window system,
+/// so a large-file stall can be pinned to a stage. Invoked as
+/// `--load-bench <path>`.
+pub fn run_load_bench(args: &[String]) -> Result<()> {
+    let path = args
+        .iter()
+        .position(|a| a == "--load-bench")
+        .and_then(|i| args.get(i + 1))
+        .ok_or_else(|| Error::msg("usage: --load-bench <path>"))?;
+
+    let fonts = Fonts::new(&markdown::all_sizes(FONT_SIZE))?;
+    let wrap = WIDTH as i32 - 2 * MARGIN;
+    let images = ImageStore::new(None);
+
+    eprintln!("bnknotes load-bench: {path}\n");
+    println!("  {:<14}{:>10}{:>17}", "stage", "time", "throughput");
+
+    let t = Instant::now();
+    let bytes = std::fs::read(path).map_err(|e| Error::msg(format!("read {path}: {e}")))?;
+    let n = bytes.len();
+    let read_ns = t.elapsed().as_nanos() as u64;
+    report_stage("read (disk)", read_ns, n);
+
+    let t = Instant::now();
+    let (text, _format) = crate::file::decode(&bytes)?;
+    let decode_ns = t.elapsed().as_nanos() as u64;
+    report_stage("decode", decode_ns, n);
+
+    let t = Instant::now();
+    let rope = Rope::from_str(&text);
+    let rope_ns = t.elapsed().as_nanos() as u64;
+    report_stage("rope build", rope_ns, n);
+
+    // The image pre-scan the editor runs before building the index: a sequential
+    // pass over every line looking for a standalone `![](...)`. Cheap per line (no
+    // glyph work), but still O(document), so it counts toward a large-file open.
+    let lines = rope.len_lines();
+    let t = Instant::now();
+    let mut image_lines = 0usize;
+    for i in 0..lines {
+        let ls = rope.line_to_byte(i);
+        let le = if i + 1 < lines {
+            rope.line_to_byte(i + 1) - 1
+        } else {
+            rope.line_to_byte(i + 1)
+        };
+        if markdown::standalone_image(&rope.slice(ls..le).as_cow()).is_some() {
+            image_lines += 1;
+        }
+    }
+    let scan_ns = t.elapsed().as_nanos() as u64;
+    report_stage("scan images", scan_ns, n);
+
+    let t = Instant::now();
+    let _index_seq = LineIndex::build(&fonts, &rope, wrap, FONT_SIZE, &images);
+    let index_seq_ns = t.elapsed().as_nanos() as u64;
+    report_stage("index (1 core)", index_seq_ns, n);
+
+    // An optional positional arg after the path overrides the worker count, so the
+    // memory/speed knee can be swept.
+    let threads = args
+        .iter()
+        .position(|a| a == "--load-bench")
+        .and_then(|i| args.get(i + 2))
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or_else(|| {
+            std::thread::available_parallelism()
+                .map(|p| p.get())
+                .unwrap_or(1)
+        });
+    let t = Instant::now();
+    let index = LineIndex::build_parallel(&fonts, &rope, wrap, FONT_SIZE, &images, threads);
+    let index_ns = t.elapsed().as_nanos() as u64;
+    report_stage(&format!("index ({threads} cores)"), index_ns, n);
+
+    let band = 60.min(index.len());
+    let t = Instant::now();
+    let window = Layout::build_window(
+        &fonts,
+        &rope,
+        MARGIN,
+        MARGIN,
+        wrap,
+        FONT_SIZE,
+        (0, 0),
+        &images,
+        ImageUi::default(),
+        &index,
+        0,
+        band,
+    );
+    let window_ns = t.elapsed().as_nanos() as u64;
+    report_stage("first window", window_ns, n);
+
+    let total = read_ns + decode_ns + rope_ns + scan_ns + index_ns + window_ns;
+    println!("  {:<14}{:>10}", "TOTAL", human_time(total));
+    println!(
+        "\n  {} on disk, {lines} lines ({image_lines} image), {} visual rows in the first window, RSS {}",
+        human_bytes(n as u64),
+        window.lines().len(),
+        human_bytes(sys::current_rss_bytes()),
+    );
+    Ok(())
+}
+
+/// Print one load-bench stage: its wall-clock time and throughput over `bytes`.
+fn report_stage(label: &str, ns: u64, bytes: usize) {
+    let secs = ns as f64 / 1e9;
+    let mbps = if secs > 0.0 {
+        bytes as f64 / secs / 1e6
+    } else {
+        0.0
+    };
+    println!("  {label:<14}{:>10}{:>12.0} MB/s", human_time(ns), mbps);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

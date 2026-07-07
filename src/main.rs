@@ -43,6 +43,8 @@ fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let result = if args.iter().any(|a| a == "--perf-lab") {
         perf::run_lab(&args)
+    } else if args.iter().any(|a| a == "--load-bench") {
+        perf::run_load_bench(&args)
     } else if args.iter().any(|a| a == "--perf") {
         perf::run(&args)
     } else if args.iter().any(|a| a == "--gpu-probe") {

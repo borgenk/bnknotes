@@ -753,9 +753,12 @@ const EMOJI_FONTS: &[&str] = &[
     "/usr/share/fonts/truetype/noto/NotoColorEmoji.ttf",
 ];
 
-/// A cache keyed by (cluster bytes, target pixel size). `None` records that
-/// the font cannot form the cluster, so the miss is not re-shaped every frame.
-type ClusterCache<T> = RefCell<HashMap<(Box<str>, u32), Option<T>>>;
+/// A cache of cluster results, keyed by target pixel size then by cluster bytes.
+/// Splitting on the size (a cheap `u32` key) lets the inner lookup borrow the
+/// cluster `&str` directly (`Box<str>: Borrow<str>`), so a cache *hit* allocates
+/// nothing; only a miss boxes the cluster to insert it. `None` records that the
+/// font cannot form the cluster, so the miss is not re-shaped every frame.
+type ClusterCache<T> = RefCell<HashMap<u32, HashMap<Box<str>, Option<T>>>>;
 
 /// The color emoji font: a bitmap-strike (CBDT) face plus a HarfBuzz shaper
 /// over it. The shaper is what turns a multi-scalar cluster (ZWJ family, flag,
@@ -813,14 +816,17 @@ impl EmojiFont {
     /// font cannot form the cluster. Cached; filled by shaping only, no bitmap
     /// is decoded.
     fn advance(&self, cluster: &str, target: u32) -> Option<f32> {
-        *self
-            .advances
-            .borrow_mut()
-            .entry((cluster.into(), target))
-            .or_insert_with(|| {
-                let glyphs = self.shaped(cluster)?;
-                Some(glyphs.iter().map(|g| g.x_advance).sum::<f32>() * self.scale(target))
-            })
+        let mut cache = self.advances.borrow_mut();
+        let by_cluster = cache.entry(target).or_default();
+        // Borrow the cluster to probe: a hit returns without boxing it.
+        if let Some(&hit) = by_cluster.get(cluster) {
+            return hit;
+        }
+        let advance = self
+            .shaped(cluster)
+            .map(|glyphs| glyphs.iter().map(|g| g.x_advance).sum::<f32>() * self.scale(target));
+        by_cluster.insert(cluster.into(), advance);
+        advance
     }
 
     /// Run `f` over the cached color glyph for `cluster` at `target` pixels,
@@ -833,21 +839,20 @@ impl EmojiFont {
         target: u32,
         f: impl FnOnce(&ColorGlyph) -> R,
     ) -> Option<R> {
-        use std::collections::hash_map::Entry;
         let mut cache = self.glyphs.borrow_mut();
+        let by_cluster = cache.entry(target).or_default();
         // `raster` reads only FreeType and shaper state, never this cache, so
         // filling a miss while the cache is borrowed cannot reenter this borrow.
-        let glyph = match cache.entry((cluster.into(), target)) {
-            Entry::Occupied(e) => {
-                self.hits.set(self.hits.get() + 1);
-                e.into_mut()
-            }
-            Entry::Vacant(e) => {
-                self.misses.set(self.misses.get() + 1);
-                e.insert(self.raster(cluster, target))
-            }
-        };
-        glyph.as_ref().map(f)
+        // Probe by borrow first (a hit allocates nothing), box the cluster only to
+        // insert a miss.
+        if by_cluster.contains_key(cluster) {
+            self.hits.set(self.hits.get() + 1);
+        } else {
+            self.misses.set(self.misses.get() + 1);
+            let glyph = self.raster(cluster, target);
+            by_cluster.insert(cluster.into(), glyph);
+        }
+        by_cluster.get(cluster).and_then(|g| g.as_ref()).map(f)
     }
 
     /// This font's cluster-cache hit and miss counts, folded into the frame

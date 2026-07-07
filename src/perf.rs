@@ -949,19 +949,13 @@ pub fn run_load_bench(args: &[String]) -> Result<()> {
     let rope_ns = t.elapsed().as_nanos() as u64;
     report_stage("rope build", rope_ns, n);
 
-    // The image pre-scan the editor runs before building the index: a sequential
-    // pass over every line looking for a standalone `![](...)`. Cheap per line (no
-    // glyph work), but still O(document), so it counts toward a large-file open.
+    // The image pre-scan the editor runs before building the index: one walk over
+    // every line looking for a standalone `![](...)`. Cheap per line (no glyph
+    // work), but O(document), so it counts toward a large-file open.
     let lines = rope.len_lines();
     let t = Instant::now();
     let mut image_lines = 0usize;
-    for i in 0..lines {
-        let ls = rope.line_to_byte(i);
-        let le = if i + 1 < lines {
-            rope.line_to_byte(i + 1) - 1
-        } else {
-            rope.line_to_byte(i + 1)
-        };
+    for (ls, le, _) in rope.lines() {
         if markdown::standalone_image(&rope.slice(ls..le).as_cow()).is_some() {
             image_lines += 1;
         }

@@ -167,6 +167,25 @@ impl Rope {
         newlines_before(&self.root, byte)
     }
 
+    /// Iterate the logical lines in order, walking the leaf stream once
+    /// (O(bytes)) instead of an O(log n) descent per line. Each item is
+    /// `(start, content_end, has_newline)`: the line's byte range excluding its
+    /// terminating `'\n'`, and whether one is present. Yields exactly
+    /// [`len_lines`](Self::len_lines) items, including the final (possibly empty)
+    /// line after a trailing newline. A whole-document scan (image detection, a
+    /// full index build) reads lines this way rather than calling
+    /// [`line_to_byte`](Self::line_to_byte) per index, which re-walks the tree.
+    pub fn lines(&self) -> Lines<'_> {
+        Lines {
+            leaves: Leaves::forward(&self.root),
+            cur: &[],
+            abs: 0,
+            line_start: 0,
+            total: self.root.bytes,
+            done: false,
+        }
+    }
+
     /// The number of leading bytes this rope shares with `other`. Walks both
     /// leaf-byte streams from the front (no allocation, at byte-comparison speed),
     /// so diffing an edited document against its previous version is cheap; the
@@ -342,6 +361,55 @@ impl<'a> Iterator for Chunks<'a> {
             }
         }
         None
+    }
+}
+
+/// A streaming iterator over the rope's logical lines; see [`Rope::lines`]. It
+/// walks the leaf stream once, splitting on `'\n'`, so reading every line is
+/// O(bytes) rather than O(lines x log n).
+pub struct Lines<'a> {
+    leaves: Leaves<'a>,
+    /// The not-yet-scanned bytes of the current leaf.
+    cur: &'a [u8],
+    /// Absolute byte offset of `cur`'s first byte within the rope.
+    abs: usize,
+    /// Absolute byte offset where the line now being built started.
+    line_start: usize,
+    /// The rope's length, i.e. the content end of the final line.
+    total: usize,
+    /// Whether the final (newline-less) line has already been emitted.
+    done: bool,
+}
+
+impl Iterator for Lines<'_> {
+    /// `(start, content_end, has_newline)`, all absolute byte offsets.
+    type Item = (usize, usize, bool);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.done {
+            return None;
+        }
+        loop {
+            if let Some(nl) = self.cur.iter().position(|&b| b == b'\n') {
+                let line = (self.line_start, self.abs + nl, true);
+                let consumed = nl + 1;
+                self.cur = &self.cur[consumed..];
+                self.abs += consumed;
+                self.line_start = self.abs;
+                return Some(line);
+            }
+            // No newline left in this leaf: it is all part of the current line.
+            self.abs += self.cur.len();
+            match self.leaves.next() {
+                Some(s) => self.cur = s.as_bytes(),
+                None => {
+                    // Stream exhausted: the final line runs to the rope's end and
+                    // has no terminating newline.
+                    self.done = true;
+                    return Some((self.line_start, self.total, false));
+                }
+            }
+        }
     }
 }
 
@@ -836,6 +904,46 @@ mod tests {
         let r = Rope::from_str(&big);
         for at in [0, 999, 1024, 2048, 3999] {
             assert_eq!(r.byte(at), Some(big.as_bytes()[at]));
+        }
+    }
+
+    #[test]
+    fn lines_iterates_every_logical_line_once() {
+        // Oracle: split on '\n', each newline ends a line, plus a final
+        // (possibly empty) newline-less line, so there are always newlines+1 lines.
+        fn naive(s: &str) -> Vec<(usize, usize, bool)> {
+            let mut out = Vec::new();
+            let mut start = 0;
+            for (i, b) in s.bytes().enumerate() {
+                if b == b'\n' {
+                    out.push((start, i, true));
+                    start = i + 1;
+                }
+            }
+            out.push((start, s.len(), false));
+            out
+        }
+        let cases: Vec<String> = vec![
+            "".into(),
+            "single line no newline".into(),
+            "a\n".into(),
+            "a\nbb\n\nc".into(),
+            "trailing\n\n".into(),
+            "héllo\n😀\n日本語".into(),
+            "lorem ipsum dolor sit amet ".repeat(400), // multi-leaf, no newlines
+            "line\n".repeat(3000),                     // multi-leaf, many lines
+        ];
+        for s in &cases {
+            let s = s.as_str();
+            let r = Rope::from_str(s);
+            let got: Vec<_> = r.lines().collect();
+            assert_eq!(got, naive(s), "lines (len {})", s.len());
+            assert_eq!(got.len(), r.len_lines(), "one item per logical line");
+            // Each range reconstructs its line and starts where line_to_byte says.
+            for (i, &(start, end, _)) in got.iter().enumerate() {
+                assert_eq!(start, r.line_to_byte(i), "line {i} start");
+                assert_eq!(r.byte_slice(start..end), s[start..end], "line {i} bytes");
+            }
         }
     }
 

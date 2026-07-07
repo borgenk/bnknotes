@@ -287,14 +287,7 @@ impl EditorPane {
     /// size the image lines. A path already attempted is a cache hit.
     pub(crate) fn scan_images(&mut self) {
         let rope = self.text.rope();
-        let n = rope.len_lines();
-        for i in 0..n {
-            let ls = rope.line_to_byte(i);
-            let le = if i + 1 < n {
-                rope.line_to_byte(i + 1) - 1
-            } else {
-                rope.line_to_byte(i + 1)
-            };
+        for (ls, le, _) in rope.lines() {
             let line = rope.slice(ls..le).as_cow();
             if let Some(link) = markdown::standalone_image(&line) {
                 let raw = line[link.path.0..link.path.1].to_string();

@@ -395,6 +395,22 @@ pub fn inline_spans(content: &str) -> Vec<Span> {
         return Vec::new();
     }
 
+    // Fast path: content with none of the inline-markup bytes has no code span,
+    // emphasis, strikethrough, or link, so every byte resolves to `Regular` and the
+    // whole thing coalesces to a single plain run. Returning it directly skips the
+    // dozen per-line mask allocations below, and this is the shape of ordinary
+    // prose, most lines of most documents.
+    if !bytes
+        .iter()
+        .any(|&b| matches!(b, b'`' | b'*' | b'_' | b'~' | b'['))
+    {
+        return vec![Span {
+            start: 0,
+            end: n,
+            kind: SpanKind::Text(Emphasis::Regular),
+        }];
+    }
+
     // Code spans first, since they bind tighter than emphasis. `in_code` marks every
     // byte a `*`/`_` (or a link bracket) would be inert inside.
     let (is_code_marker, is_code_content, in_code) = code_masks(content);

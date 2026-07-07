@@ -56,6 +56,8 @@
 //! hides its `#`, so an unfocused block reads without visible fences; the panel
 //! still draws those rows, leaving blank top and bottom padding.
 
+use std::ops::Range;
+
 use crate::freetype::{Face, FaceKey, FontStyle, Fonts};
 use crate::grapheme;
 use crate::image::ImageStore;
@@ -107,10 +109,14 @@ pub struct VisualLine {
     pub hard: bool,
     /// The pixel size this line renders at; selects the face and metrics.
     pub size: u32,
-    /// The line's inline runs in display order, tiling `[start, end)` (an empty
-    /// line has none). Each is a styled stretch of text or a delimiter marker;
-    /// a hidden marker (`!visible`) is collapsed to zero width.
-    pub runs: Vec<Run>,
+    /// The line's inline runs, as a half-open range into the [`Layout`]'s shared
+    /// `runs` pool (resolve with [`Layout::run_slice`]). In display order, tiling
+    /// `[start, end)`; an empty line has an empty range. Each run is a styled
+    /// stretch of text or a delimiter marker; a hidden marker (`!visible`) is
+    /// collapsed to zero width. Flattening every line's runs into one pool per
+    /// build means laying out a line appends to it rather than allocating a `Vec`
+    /// per visual row.
+    pub runs: Range<u32>,
     /// Pixels the line's content (its runs, caret, and selection) is inset past
     /// `left`, for the hanging indent of a wrapped list or quote item: `0` on the
     /// marker-bearing first line (whose marker run fills the gutter inline) and on
@@ -295,6 +301,10 @@ pub struct Rect {
 #[derive(Clone)]
 pub struct Layout {
     lines: Vec<VisualLine>,
+    /// Every visual line's runs, flattened into one pool; each [`VisualLine`]'s
+    /// `runs` range indexes into this. One allocation per build instead of one
+    /// per visual row.
+    runs: Vec<Run>,
     left: i32,
     /// Total height of the text block in pixels (the sum of every visual line's
     /// line height), for the scroll extent.
@@ -400,6 +410,7 @@ impl Layout {
         }
         Self {
             lines,
+            runs: pool.runs,
             left,
             text_height: box_top - top,
         }
@@ -466,6 +477,7 @@ impl Layout {
         }
         Self {
             lines,
+            runs: pool.runs,
             left,
             text_height: box_top - start_top,
         }
@@ -473,6 +485,12 @@ impl Layout {
 
     pub fn lines(&self) -> &[VisualLine] {
         &self.lines
+    }
+
+    /// The inline runs of `line`, resolved from the shared `runs` pool. `line`
+    /// must belong to this layout (its `runs` range indexes this pool).
+    pub fn run_slice(&self, line: &VisualLine) -> &[Run] {
+        &self.runs[line.runs.start as usize..line.runs.end as usize]
     }
 
     /// Total height of the laid-out text block in pixels, for sizing the
@@ -544,7 +562,7 @@ impl Layout {
         }
         // The block marker is the line's first run: `<indent>- [c] `. A wrap so
         // narrow it splits the marker mid-way (degenerate) just draws no box.
-        let run = line.runs.first()?;
+        let run = self.run_slice(line).first()?;
         let marker = rope.slice(run.start..run.end).as_cow();
         let indent = markdown::leading_indent(&marker);
         let brackets = marker.get(indent + 2..indent + 5)?;
@@ -714,7 +732,7 @@ impl Layout {
                 continue;
             }
             let m = fonts.metrics(line.size);
-            for run in &line.runs {
+            for run in self.run_slice(line) {
                 if !run.visible
                     || !matches!(run.kind, markdown::SpanKind::Text(markdown::Emphasis::Code))
                 {
@@ -785,7 +803,7 @@ impl Layout {
     fn hit_line(&self, fonts: &Fonts, rope: &Rope, line: &VisualLine, x: f32) -> usize {
         let mut acc = self.left as f32 + line.indent as f32;
         let mut drew_text = false;
-        for run in &line.runs {
+        for run in self.run_slice(line) {
             if !run.visible {
                 continue;
             }
@@ -818,7 +836,7 @@ impl Layout {
     /// nothing. An `offset` at or past the line's end measures the whole line.
     fn advance_to(&self, fonts: &Fonts, rope: &Rope, line: &VisualLine, offset: usize) -> f32 {
         let mut x = 0.0;
-        for run in &line.runs {
+        for run in self.run_slice(line) {
             // Runs are ordered, so once a run starts at or past `offset` the rest
             // do too; hidden runs add nothing.
             if !run.visible || offset <= run.start {
@@ -876,6 +894,10 @@ struct LayoutScratch {
     clusters: Vec<(usize, f32, bool)>,
     /// The wrapped visual segments' byte ranges, produced by [`wrap_segments`].
     segments: Vec<(usize, usize)>,
+    /// The flattened run pool for a full/window build: each line appends its runs
+    /// here and records the range. The finished build moves this into the
+    /// [`Layout`]. Stays empty on the measure-only path (the index build).
+    runs: Vec<Run>,
 }
 
 /// Lay out one logical line `[ls, le)` starting at content-space top `box_top`,
@@ -958,7 +980,7 @@ fn lay_line(
                         baseline: y + fonts.metrics(body_size).ascent,
                         hard: has_newline,
                         size: body_size,
-                        runs: Vec::new(),
+                        runs: 0..0,
                         indent: 0,
                         gutter: Gutter::None,
                         code_block: false,
@@ -1086,7 +1108,8 @@ fn lay_line(
         &mut pool.segments,
     );
     let last = pool.segments.len() - 1;
-    for (k, &(start, end)) in pool.segments.iter().enumerate() {
+    for k in 0..pool.segments.len() {
+        let (start, end) = pool.segments[k];
         // Every segment carries the shared left inset (`seg_pad`); wrapped
         // continuations add the marker's width on top so their text hangs under the
         // first line's text.
@@ -1104,6 +1127,21 @@ fn lay_line(
             markdown::LineStyle::Quote if !revealed => Gutter::QuoteBar { marker: k == 0 },
             _ => Gutter::None,
         };
+        // Append this segment's runs to the shared pool and record their range; the
+        // measure-only path (the index build) wants no runs, leaving an empty range.
+        let runs_start = pool.runs.len() as u32;
+        if !measure_only {
+            clip_runs_into(
+                &pool.spans,
+                start,
+                end,
+                ls,
+                revealed,
+                block_marker,
+                block_persists,
+                &mut pool.runs,
+            );
+        }
         out.push(VisualLine {
             start: ls + start,
             end: ls + end,
@@ -1112,19 +1150,7 @@ fn lay_line(
             // hard break.
             hard: k == last && has_newline,
             size,
-            runs: if measure_only {
-                Vec::new()
-            } else {
-                clip_runs(
-                    &pool.spans,
-                    start,
-                    end,
-                    ls,
-                    revealed,
-                    block_marker,
-                    block_persists,
-                )
-            },
+            runs: runs_start..pool.runs.len() as u32,
             indent,
             gutter,
             code_block,
@@ -1146,7 +1172,7 @@ fn lay_line(
             baseline: y + metrics.ascent,
             hard: false,
             size: body_size,
-            runs: Vec::new(),
+            runs: 0..0,
             indent: 0,
             gutter: Gutter::None,
             code_block: false,
@@ -1798,7 +1824,8 @@ fn code_block_spans_into(line: &str, delimiter: bool, out: &mut Vec<markdown::Sp
 /// a revealed line, except the block marker (the leading `[0, block_marker)`
 /// bytes) when `block_persists`: a list bullet or quote `>` stays on screen even
 /// off the active line. Empty overlaps are dropped, so the runs tile the segment.
-fn clip_runs(
+#[allow(clippy::too_many_arguments)]
+fn clip_runs_into(
     spans: &[markdown::Span],
     seg_start: usize,
     seg_end: usize,
@@ -1806,8 +1833,8 @@ fn clip_runs(
     revealed: bool,
     block_marker: usize,
     block_persists: bool,
-) -> Vec<Run> {
-    let mut runs = Vec::new();
+    out: &mut Vec<Run>,
+) {
     for span in spans {
         let s = span.start.max(seg_start);
         let e = span.end.min(seg_end);
@@ -1823,14 +1850,13 @@ fn clip_runs(
         } else {
             !is_marker || revealed
         };
-        runs.push(Run {
+        out.push(Run {
             start: ls + s,
             end: ls + e,
             kind: span.kind,
             visible,
         });
     }
-    runs
 }
 
 /// Greedily word-wrap the logical `line` to `wrap_width` pixels, returning the
@@ -1988,8 +2014,8 @@ mod tests {
                 image: v
                     .image
                     .map(|im| (im.path_start, im.path_end, im.width, im.height, im.selected)),
-                runs: v
-                    .runs
+                runs: l
+                    .run_slice(v)
                     .iter()
                     .map(|r| (r.start, r.end, r.kind, r.visible))
                     .collect(),
@@ -2491,8 +2517,8 @@ mod tests {
 
     /// Whether `line`'s leading marker run is collapsed. Asserts the line starts
     /// with a marker run, which every heading line in these tests does.
-    fn marker_hidden(line: &VisualLine) -> bool {
-        let run = line.runs.first().expect("a heading line has runs");
+    fn marker_hidden(l: &Layout, line: &VisualLine) -> bool {
+        let run = l.run_slice(line).first().expect("a heading line has runs");
         assert!(
             matches!(run.kind, markdown::SpanKind::Marker),
             "the first run is the heading marker"
@@ -2505,10 +2531,12 @@ mod tests {
         let f = fonts();
         let body_off = "# Title\nbody".find("body").unwrap();
         let l = heading_and_body(&f, (body_off, body_off));
-        assert!(marker_hidden(&l.lines()[0]), "the '# ' marker collapses");
         assert!(
-            l.lines()[1]
-                .runs
+            marker_hidden(&l, &l.lines()[0]),
+            "the '# ' marker collapses"
+        );
+        assert!(
+            l.run_slice(&l.lines()[1])
                 .iter()
                 .all(|r| matches!(r.kind, markdown::SpanKind::Text(_))),
             "body has no marker to hide"
@@ -2520,7 +2548,10 @@ mod tests {
         let f = fonts();
         // Cursor inside "Title".
         let l = heading_and_body(&f, (4, 4));
-        assert!(!marker_hidden(&l.lines()[0]), "markers stay while editing");
+        assert!(
+            !marker_hidden(&l, &l.lines()[0]),
+            "markers stay while editing"
+        );
     }
 
     #[test]
@@ -2528,7 +2559,7 @@ mod tests {
         let f = fonts();
         // Cursor at offset 7, right before the '\n': still on the heading line.
         let l = heading_and_body(&f, (7, 7));
-        assert!(!marker_hidden(&l.lines()[0]));
+        assert!(!marker_hidden(&l, &l.lines()[0]));
     }
 
     #[test]
@@ -2537,7 +2568,7 @@ mod tests {
         // Select the whole buffer: the heading is within it, so it reveals.
         let l = heading_and_body(&f, (0, "# Title\nbody".len()));
         assert!(
-            !marker_hidden(&l.lines()[0]),
+            !marker_hidden(&l, &l.lines()[0]),
             "a selected heading shows markers"
         );
     }
@@ -2548,7 +2579,7 @@ mod tests {
         let r = rope("# Title");
         // No cursor on the line, so the markers hide.
         let l = Layout::build(&f, &r, LEFT, TOP, 1_000_000, BODY, (99, 99));
-        assert!(marker_hidden(&l.lines()[0]));
+        assert!(marker_hidden(&l, &l.lines()[0]));
         // A click at the far left lands at the start of the visible text
         // ("Title", offset 2), never inside the collapsed "# ".
         let off = l.offset_at(&f, &r, -100.0, l.lines()[0].baseline as f32);
@@ -2594,7 +2625,11 @@ mod tests {
         let r = rope("a `b` c");
         // Cursor on the line: every run is shown.
         let l = Layout::build(&f, &r, LEFT, TOP, 1_000_000, BODY, (0, 0));
-        let kinds: Vec<_> = l.lines()[0].runs.iter().map(|run| run.kind).collect();
+        let kinds: Vec<_> = l
+            .run_slice(&l.lines()[0])
+            .iter()
+            .map(|run| run.kind)
+            .collect();
         assert_eq!(
             kinds,
             vec![
@@ -2606,7 +2641,7 @@ mod tests {
             ]
         );
         assert!(
-            l.lines()[0].runs.iter().all(|run| run.visible),
+            l.run_slice(&l.lines()[0]).iter().all(|run| run.visible),
             "all runs shown on the active line"
         );
     }
@@ -2621,14 +2656,14 @@ mod tests {
         let l = Layout::build(&f, &r, LEFT, TOP, 1_000_000, BODY, (off, off));
         let line = &l.lines()[0];
         assert!(
-            line.runs
+            l.run_slice(line)
                 .iter()
                 .filter(|run| matches!(run.kind, markdown::SpanKind::Marker))
                 .all(|run| !run.visible),
             "the backticks collapse off the line"
         );
         assert!(
-            line.runs
+            l.run_slice(line)
                 .iter()
                 .filter(|run| matches!(
                     run.kind,
@@ -2706,7 +2741,11 @@ mod tests {
         let l = Layout::build(&f, &r, LEFT, TOP, 1_000_000, BODY, (0, 0));
         let line = &l.lines()[0];
         assert_eq!(line.size, h1_size(), "still an H1 line");
-        let runs: Vec<_> = line.runs.iter().map(|run| (run.start, run.kind)).collect();
+        let runs: Vec<_> = l
+            .run_slice(line)
+            .iter()
+            .map(|run| (run.start, run.kind))
+            .collect();
         assert_eq!(
             runs,
             vec![
@@ -2718,7 +2757,10 @@ mod tests {
                 (9, markdown::SpanKind::Text(markdown::Emphasis::Regular)), // " c"
             ]
         );
-        assert!(line.runs.iter().all(|run| run.visible), "active: all shown");
+        assert!(
+            l.run_slice(line).iter().all(|run| run.visible),
+            "active: all shown"
+        );
     }
 
     #[test]
@@ -2731,14 +2773,14 @@ mod tests {
         let l = Layout::build(&f, &r, LEFT, TOP, 1_000_000, BODY, (off, off));
         let line = &l.lines()[0];
         assert!(
-            line.runs
+            l.run_slice(line)
                 .iter()
                 .filter(|run| matches!(run.kind, markdown::SpanKind::Marker))
                 .all(|run| !run.visible),
             "every marker (heading and emphasis) collapses off the line"
         );
         assert!(
-            line.runs
+            l.run_slice(line)
                 .iter()
                 .filter(|run| matches!(
                     run.kind,
@@ -2759,7 +2801,10 @@ mod tests {
         // Cursor on the second line, so a heading would hide its marker.
         let off = src.find('x').unwrap();
         let l = Layout::build(&f, &r, LEFT, TOP, 1_000_000, BODY, (off, off));
-        let bullet = l.lines()[0].runs.first().expect("a bullet line has runs");
+        let bullet = l
+            .run_slice(&l.lines()[0])
+            .first()
+            .expect("a bullet line has runs");
         assert!(
             matches!(bullet.kind, markdown::SpanKind::Marker),
             "the line starts with the bullet marker"
@@ -2777,7 +2822,7 @@ mod tests {
         let r = rope(src);
         let off = src.find('x').unwrap();
         let l = Layout::build(&f, &r, LEFT, TOP, 1_000_000, BODY, (off, off));
-        let runs = &l.lines()[0].runs;
+        let runs = l.run_slice(&l.lines()[0]);
         let quote = runs.first().expect("a quote line has runs");
         assert!(
             matches!(quote.kind, markdown::SpanKind::Marker) && quote.visible,
@@ -2870,7 +2915,7 @@ mod tests {
             "a nested item with a parent renders as a bullet"
         );
         assert_eq!(child.indent, LIST_INDENT, "and carries the list indent");
-        let marker = child.runs.first().expect("a marker run");
+        let marker = l.run_slice(child).first().expect("a marker run");
         assert!(matches!(marker.kind, markdown::SpanKind::Marker));
         assert_eq!(
             marker.end - marker.start,
@@ -2889,7 +2934,7 @@ mod tests {
         assert_eq!(over.gutter, Gutter::None, "no bullet without a parent");
         assert_eq!(over.indent, 0, "and not given the list indent");
         assert!(
-            over.runs
+            l.run_slice(over)
                 .iter()
                 .all(|run| matches!(run.kind, markdown::SpanKind::Text(_))),
             "the whole line is plain body text, no marker"
@@ -2915,7 +2960,7 @@ mod tests {
             "the third item still renders as a list item"
         );
         assert_eq!(third.indent, LIST_INDENT, "and carries the list indent");
-        let marker = third.runs.first().expect("a marker run");
+        let marker = l.run_slice(third).first().expect("a marker run");
         assert_eq!(
             marker.end - marker.start,
             4,
@@ -3042,7 +3087,7 @@ mod tests {
             "the checkbox stands in once the cursor leaves"
         );
         assert!(
-            away.lines()[0].runs[0].visible,
+            away.run_slice(&away.lines()[0])[0].visible,
             "the marker run persists (width-matched under the drawn box)"
         );
         let on = Layout::build(&f, &r, LEFT, TOP, 1_000_000, BODY, (0, 0));
@@ -3051,7 +3096,7 @@ mod tests {
             Gutter::None,
             "the raw `- [ ]` shows while editing"
         );
-        assert!(on.lines()[0].runs[0].visible);
+        assert!(on.run_slice(&on.lines()[0])[0].visible);
     }
 
     #[test]
@@ -3208,7 +3253,7 @@ mod tests {
     fn first_kinds(l: &Layout) -> Vec<Option<markdown::SpanKind>> {
         l.lines()
             .iter()
-            .map(|line| line.runs.first().map(|r| r.kind))
+            .map(|line| l.run_slice(line).first().map(|r| r.kind))
             .collect()
     }
 
@@ -3245,9 +3290,9 @@ mod tests {
         let inner = &l.lines()[1];
         assert!(inner.code_block);
         assert_eq!(inner.size, BODY, "no heading scaling inside a code block");
-        assert_eq!(inner.runs.len(), 1);
+        assert_eq!(l.run_slice(inner).len(), 1);
         assert_eq!(
-            inner.runs[0].kind,
+            l.run_slice(inner)[0].kind,
             markdown::SpanKind::Text(markdown::Emphasis::Code),
             "the '#' is code, not a heading marker"
         );
@@ -3278,8 +3323,8 @@ mod tests {
     }
 
     /// The first run of a line (its fence marker, for fence lines).
-    fn first_run(line: &VisualLine) -> &Run {
-        line.runs.first().expect("a fence line has a run")
+    fn first_run<'a>(l: &'a Layout, line: &VisualLine) -> &'a Run {
+        l.run_slice(line).first().expect("a fence line has a run")
     }
 
     #[test]
@@ -3290,23 +3335,29 @@ mod tests {
         // Cursor on the trailing body line: both fence lines are off-cursor.
         let off = src.find("body").unwrap();
         let away = Layout::build(&f, &r, LEFT, TOP, 1_000_000, BODY, (off, off));
-        let (open, close) = (first_run(&away.lines()[0]), first_run(&away.lines()[2]));
+        let (open, close) = (
+            first_run(&away, &away.lines()[0]),
+            first_run(&away, &away.lines()[2]),
+        );
         assert!(matches!(open.kind, markdown::SpanKind::Marker) && !open.visible);
         assert!(
             matches!(close.kind, markdown::SpanKind::Marker) && !close.visible,
             "both ``` fences collapse when the cursor is outside the block"
         );
         // The code line between always shows, fence or no fence.
-        assert!(away.lines()[1].runs.iter().all(|run| run.visible));
+        assert!(away
+            .run_slice(&away.lines()[1])
+            .iter()
+            .all(|run| run.visible));
         // Cursor on the opening fence line reveals only that fence (per-line, like
         // a heading): the closing fence on another line stays hidden.
         let on = Layout::build(&f, &r, LEFT, TOP, 1_000_000, BODY, (0, 0));
         assert!(
-            first_run(&on.lines()[0]).visible,
+            first_run(&on, &on.lines()[0]).visible,
             "the ``` shows on its line"
         );
         assert!(
-            !first_run(&on.lines()[2]).visible,
+            !first_run(&on, &on.lines()[2]).visible,
             "the closing fence is on another line, still hidden"
         );
     }
@@ -3435,7 +3486,7 @@ mod tests {
         let line = &away.lines()[1];
         assert!(line.rule, "the rule draws when the cursor is elsewhere");
         assert!(
-            line.runs.iter().all(|run| !run.visible),
+            away.run_slice(line).iter().all(|run| !run.visible),
             "the raw --- is collapsed off the line"
         );
         // Cursor on the --- line: it shows the editable dashes, no rule.
@@ -3444,7 +3495,7 @@ mod tests {
         let line = &on.lines()[1];
         assert!(!line.rule, "no rule while the cursor edits the line");
         assert!(
-            line.runs
+            on.run_slice(line)
                 .iter()
                 .any(|run| run.visible && matches!(run.kind, markdown::SpanKind::Marker)),
             "the raw --- shows for editing"
@@ -3523,7 +3574,7 @@ mod tests {
         assert!(!img.selected, "not selected by default");
         assert_eq!(r.byte_slice(img.path_start..img.path_end), "cat.png");
         assert!(
-            l.lines()[0].runs.is_empty(),
+            l.run_slice(&l.lines()[0]).is_empty(),
             "no source text for an idle image"
         );
     }
@@ -3537,7 +3588,7 @@ mod tests {
         let l = layout_img(&f, &r, (0, 0), &s, ImageUi::default());
         assert!(l.lines()[0].image.is_none(), "row 0 is the editable source");
         assert!(
-            !l.lines()[0].runs.is_empty(),
+            !l.run_slice(&l.lines()[0]).is_empty(),
             "the raw markdown is laid out"
         );
         assert!(
@@ -3601,7 +3652,7 @@ mod tests {
             "an undecodable image is never a picture box, just editable source"
         );
         assert!(
-            !l.lines()[0].runs.is_empty(),
+            !l.run_slice(&l.lines()[0]).is_empty(),
             "the source is laid out as text"
         );
     }

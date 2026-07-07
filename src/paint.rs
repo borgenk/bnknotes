@@ -406,7 +406,7 @@ pub(crate) fn build_display_list(
         // item (wrapped continuations included), so done items scan as done.
         let done = line.task == Some(true);
         let mut pen = left + line.indent;
-        for (i, run) in line.runs.iter().enumerate() {
+        for (i, run) in layout.run_slice(line).iter().enumerate() {
             if !run.visible {
                 continue;
             }

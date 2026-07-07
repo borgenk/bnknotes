@@ -28,6 +28,7 @@
 //! only ever uses grapheme-cluster boundaries), exactly as `String` slicing
 //! assumes today.
 
+use std::borrow::Cow;
 use std::fmt;
 use std::ops::Range;
 use std::rc::Rc;
@@ -107,17 +108,38 @@ impl Rope {
         self.root = balance(concat(l, r));
     }
 
-    /// Copy out the bytes in `range` as a `String` (assumed `char`-aligned). The
-    /// rope is not contiguous, so callers materialize the (short) slice they
-    /// need, e.g. a single visual line.
-    pub fn byte_slice(&self, range: Range<usize>) -> String {
+    /// A borrowed view of the bytes in `range` (assumed `char`-aligned), without
+    /// copying. The bounds are clamped into the rope. See [`RopeSlice`] for how
+    /// to borrow a contiguous `&str` (single-leaf ranges) or materialize the
+    /// rest; this is the allocation-free entry point layout reads lines through.
+    pub fn slice(&self, range: Range<usize>) -> RopeSlice<'_> {
         let start = range.start.min(self.root.bytes);
-        let end = range.end.min(self.root.bytes);
-        let mut out = String::with_capacity(end.saturating_sub(start));
-        if start < end {
-            append_range(&self.root, start, end, &mut out);
+        let end = range.end.min(self.root.bytes).max(start);
+        RopeSlice {
+            root: &self.root,
+            start,
+            end,
         }
+    }
+
+    /// Copy out the bytes in `range` as an owned `String` (assumed
+    /// `char`-aligned). Prefer [`slice`](Self::slice) where a borrow suffices;
+    /// this is the shorthand for the cases that genuinely need owned bytes
+    /// (clipboard text, a stored image path).
+    pub fn byte_slice(&self, range: Range<usize>) -> String {
+        let slice = self.slice(range);
+        let mut out = String::with_capacity(slice.end - slice.start);
+        slice.append_to(&mut out);
         out
+    }
+
+    /// The single byte at offset `at`, or `None` past the end. Reads one byte
+    /// without materializing a slice, for the "is this a newline?" style checks.
+    pub fn byte(&self, at: usize) -> Option<u8> {
+        if at >= self.root.bytes {
+            return None;
+        }
+        Some(byte_at(&self.root, at))
     }
 
     /// The byte offset where line `line` begins (line 0 at byte 0). `line` at or
@@ -212,6 +234,141 @@ impl Rope {
             b = &b[..b.len() - n];
         }
         matched
+    }
+}
+
+/// A borrowed, read-only view into a byte range of a [`Rope`]. It holds no copy
+/// of the text: just a reference to the rope's tree and a `[start, end)` byte
+/// range, so producing one is O(1) and allocation-free.
+///
+/// Because the rope stores text in separate leaf chunks, a slice is contiguous
+/// in memory only when it falls inside a single leaf. [`as_str`](Self::as_str)
+/// hands back the borrow in that case (the common one for a single line) and
+/// `None` when the range straddles a chunk boundary; [`as_cow`](Self::as_cow)
+/// wraps that decision up, borrowing when it can and copying only when it must.
+/// [`chunks`](Self::chunks) walks the pieces in order without allocating.
+#[derive(Clone, Copy)]
+pub struct RopeSlice<'a> {
+    root: &'a Rc<Inner>,
+    start: usize,
+    end: usize,
+}
+
+impl<'a> RopeSlice<'a> {
+    /// The slice as a contiguous `&str`, or `None` when it spans more than one
+    /// leaf. A single logical line usually lives in one leaf, so layout takes
+    /// the borrow and never allocates for it.
+    pub fn as_str(&self) -> Option<&'a str> {
+        single_leaf(self.root, self.start, self.end)
+    }
+
+    /// The slice as a `Cow<str>`: borrowed when it is contiguous (no
+    /// allocation), owned only when it straddles a chunk boundary. `Cow<str>`
+    /// derefs and indexes like `&str`, so callers use it in place of an owned
+    /// line without caring which case they got.
+    pub fn as_cow(&self) -> Cow<'a, str> {
+        match self.as_str() {
+            Some(s) => Cow::Borrowed(s),
+            None => Cow::Owned(self.to_string()),
+        }
+    }
+
+    /// Iterate the slice's text as the contiguous `&str` pieces it spans, in
+    /// order, without allocating. One piece when the slice is single-leaf.
+    pub fn chunks(&self) -> Chunks<'a> {
+        Chunks {
+            stack: vec![(self.root, 0)],
+            start: self.start,
+            end: self.end,
+        }
+    }
+
+    /// Append the slice's bytes to `out`, reusing the caller's buffer instead of
+    /// allocating a fresh `String`.
+    pub fn append_to(&self, out: &mut String) {
+        if self.start < self.end {
+            append_range(self.root, self.start, self.end, out);
+        }
+    }
+}
+
+impl fmt::Display for RopeSlice<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for chunk in self.chunks() {
+            f.write_str(chunk)?;
+        }
+        Ok(())
+    }
+}
+
+/// An iterator over the contiguous `&str` pieces of a [`RopeSlice`], left to
+/// right, trimmed to the slice's byte range. Subtrees outside the range are
+/// pruned, so it visits only the leaves the slice actually touches.
+pub struct Chunks<'a> {
+    /// Each entry is a subtree and its absolute start offset within the rope.
+    stack: Vec<(&'a Rc<Inner>, usize)>,
+    start: usize,
+    end: usize,
+}
+
+impl<'a> Iterator for Chunks<'a> {
+    type Item = &'a str;
+
+    fn next(&mut self) -> Option<&'a str> {
+        while let Some((node, off)) = self.stack.pop() {
+            // Skip a subtree that lies wholly before or after the range.
+            if off + node.bytes <= self.start || off >= self.end {
+                continue;
+            }
+            match &node.kind {
+                Kind::Leaf(s) => {
+                    let lo = self.start.saturating_sub(off);
+                    let hi = (self.end - off).min(s.len());
+                    if lo < hi {
+                        return Some(&s[lo..hi]);
+                    }
+                }
+                Kind::Branch(l, r) => {
+                    // Push right then left so the left child pops (yields) first.
+                    self.stack.push((r, off + l.bytes));
+                    self.stack.push((l, off));
+                }
+            }
+        }
+        None
+    }
+}
+
+/// The bytes `[start, end)` of `node` as one `&str`, or `None` if they span more
+/// than one leaf. `start`/`end` are relative to `node`.
+fn single_leaf(node: &Inner, start: usize, end: usize) -> Option<&str> {
+    match &node.kind {
+        Kind::Leaf(s) => Some(&s[start..end]),
+        Kind::Branch(l, r) => {
+            let lb = l.bytes;
+            if end <= lb {
+                single_leaf(l, start, end)
+            } else if start >= lb {
+                single_leaf(r, start - lb, end - lb)
+            } else {
+                None
+            }
+        }
+    }
+}
+
+/// The byte at offset `at` within `node` (`at < node.bytes`, guaranteed by the
+/// descent, so the leaf index is in bounds).
+fn byte_at(node: &Inner, at: usize) -> u8 {
+    match &node.kind {
+        Kind::Leaf(s) => s.as_bytes()[at],
+        Kind::Branch(l, r) => {
+            if at < l.bytes {
+                byte_at(l, at)
+            } else {
+                byte_at(r, at - l.bytes)
+            }
+        }
     }
 }
 
@@ -616,6 +773,64 @@ mod tests {
         assert_eq!(r.byte_slice(6..11), "world");
         assert_eq!(r.byte_slice(0..r.len()), "hello world");
         assert_eq!(r.byte_slice(3..3), "");
+    }
+
+    #[test]
+    fn slice_borrows_within_a_leaf_and_copies_across_one() {
+        // A short rope lives in a single leaf: every slice is contiguous, so
+        // as_str borrows and as_cow is Borrowed (no allocation).
+        let r = Rope::from_str("hello world");
+        assert_eq!(r.slice(0..5).as_str(), Some("hello"));
+        assert!(matches!(r.slice(6..11).as_cow(), Cow::Borrowed("world")));
+
+        // A rope past MAX_LEAF spans several leaves. A slice inside one leaf
+        // still borrows; one crossing a leaf boundary has no contiguous &str,
+        // so as_str is None and as_cow copies, but both round-trip the bytes.
+        let big = "abcdefghij".repeat(400); // 4000 bytes, > MAX_LEAF
+        let r = Rope::from_str(&big);
+        let mut saw_borrow = false;
+        let mut saw_copy = false;
+        for start in (0..big.len()).step_by(97) {
+            let end = (start + 300).min(big.len());
+            let slice = r.slice(start..end);
+            assert_eq!(slice.to_string(), big[start..end], "slice bytes");
+            assert_eq!(slice.as_cow(), big[start..end], "as_cow bytes");
+            match slice.as_str() {
+                Some(s) => {
+                    saw_borrow = true;
+                    assert_eq!(s, &big[start..end]);
+                }
+                None => saw_copy = true,
+            }
+        }
+        assert!(saw_borrow, "some slices fall inside a single leaf");
+        assert!(saw_copy, "some slices straddle a leaf boundary");
+    }
+
+    #[test]
+    fn chunks_concatenate_to_the_slice() {
+        let big = "The quick brown fox. ".repeat(300);
+        let r = Rope::from_str(&big);
+        let slice = r.slice(50..2500);
+        let joined: String = slice.chunks().collect();
+        assert_eq!(joined, big[50..2500]);
+        // An empty slice yields no chunks.
+        assert_eq!(r.slice(10..10).chunks().count(), 0);
+    }
+
+    #[test]
+    fn byte_reads_single_bytes_and_bounds() {
+        let r = Rope::from_str("a\nb");
+        assert_eq!(r.byte(0), Some(b'a'));
+        assert_eq!(r.byte(1), Some(b'\n'));
+        assert_eq!(r.byte(2), Some(b'b'));
+        assert_eq!(r.byte(3), None, "past the end is None");
+        // Reads the right byte deep inside a multi-leaf rope.
+        let big: String = (0..4000).map(|i| (b'0' + (i % 10) as u8) as char).collect();
+        let r = Rope::from_str(&big);
+        for at in [0, 999, 1024, 2048, 3999] {
+            assert_eq!(r.byte(at), Some(big.as_bytes()[at]));
+        }
     }
 
     #[test]

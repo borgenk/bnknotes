@@ -574,7 +574,7 @@ impl TextBuffer {
         let line = self.text.byte_to_line(offset.min(self.text.len()));
         let start = self.text.line_to_byte(line);
         let mut end = self.text.line_to_byte(line + 1);
-        if end > start && self.text.byte_slice(end - 1..end) == "\n" {
+        if end > start && self.text.byte(end - 1) == Some(b'\n') {
             end -= 1;
         }
         self.set_selection(start, end);
@@ -595,7 +595,7 @@ impl TextBuffer {
         // A span ending in a newline already carries its own terminator; one that
         // does not can only be the buffer's end, so eat the preceding newline to
         // avoid leaving an empty line where the deleted one was.
-        let has_terminator = end > start && self.text.byte_slice(end - 1..end) == "\n";
+        let has_terminator = end > start && self.text.byte(end - 1) == Some(b'\n');
         let start = if !has_terminator && start > 0 {
             start - 1
         } else {

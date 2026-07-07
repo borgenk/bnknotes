@@ -288,7 +288,7 @@ impl EditorPane {
             } else {
                 rope.line_to_byte(i + 1)
             };
-            let line = rope.byte_slice(ls..le);
+            let line = rope.slice(ls..le).as_cow();
             if let Some(link) = markdown::standalone_image(&line) {
                 let raw = line[link.path.0..link.path.1].to_string();
                 self.images.ensure(&raw);
@@ -551,7 +551,7 @@ impl EditorPane {
             end
         } else {
             // Smart Home. Visual bounds, so it works on wrapped rows too.
-            let line = self.text.rope().byte_slice(start..end);
+            let line = self.text.rope().slice(start..end).as_cow();
             smart_home_target(&line, start, end, cursor)
         };
         self.text.set_cursor(target, extend);
@@ -679,7 +679,7 @@ impl EditorPane {
         if a0 <= le && a1 >= ls {
             return None;
         }
-        let content = rope.byte_slice(ls..le);
+        let content = rope.slice(ls..le).as_cow();
         let rel = off - ls;
         let link = markdown::links(&content)
             .into_iter()

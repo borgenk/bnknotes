@@ -122,7 +122,7 @@ impl State {
         } else {
             rope.line_to_byte(line_idx + 1)
         };
-        let line = rope.byte_slice(ls..le);
+        let line = rope.slice(ls..le).as_cow();
         let link = markdown::standalone_image(&line)?;
         Some(line[link.path.0..link.path.1].to_string())
     }

@@ -539,7 +539,7 @@ impl Layout {
         // The block marker is the line's first run: `<indent>- [c] `. A wrap so
         // narrow it splits the marker mid-way (degenerate) just draws no box.
         let run = line.runs.first()?;
-        let marker = rope.byte_slice(run.start..run.end);
+        let marker = rope.slice(run.start..run.end).as_cow();
         let indent = markdown::leading_indent(&marker);
         let brackets = marker.get(indent + 2..indent + 5)?;
         let face = fonts.face(line.size, FontStyle::Regular);
@@ -719,7 +719,7 @@ impl Layout {
                     + self.advance_to(fonts, rope, line, run.start);
                 let w = shape::text_advance(
                     run_face(fonts, line.size, run.kind, line.heading.is_some()),
-                    &rope.byte_slice(run.start..run.end),
+                    &rope.slice(run.start..run.end).as_cow(),
                 );
                 rects.push(Rect {
                     x: x0.round() as i32,
@@ -785,8 +785,8 @@ impl Layout {
             }
             drew_text = true;
             let face = run_face(fonts, line.size, run.kind, line.heading.is_some());
-            let slice = rope.byte_slice(run.start..run.end);
-            for (off, cluster) in grapheme::graphemes(&slice) {
+            let text = rope.slice(run.start..run.end).as_cow();
+            for (off, cluster) in grapheme::graphemes(&text) {
                 let w = shape::text_advance(face, cluster);
                 if x < acc + w / 2.0 {
                     return run.start + off;
@@ -820,7 +820,7 @@ impl Layout {
             }
             let end = offset.min(run.end);
             let face = run_face(fonts, line.size, run.kind, line.heading.is_some());
-            x += shape::text_advance(face, &rope.byte_slice(run.start..end));
+            x += shape::text_advance(face, &rope.slice(run.start..end).as_cow());
         }
         x
     }
@@ -883,7 +883,7 @@ fn lay_line(
     // Running box top within this logical line; the return value is how far it
     // advanced past the incoming `box_top`.
     let mut y = box_top;
-    let line = rope.byte_slice(ls..le);
+    let line = rope.slice(ls..le).as_cow();
     // Whether the cursor/selection touches this logical line: the same reveal test
     // headings use, applied to fence lines too.
     let on_line = active.0 <= le && active.1 >= ls;

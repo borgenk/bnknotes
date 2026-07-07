@@ -167,6 +167,13 @@ impl Rope {
         newlines_before(&self.root, byte)
     }
 
+    /// The heap bytes this rope holds: every leaf's `String` capacity plus each
+    /// node's `Arc` allocation (two atomic counters and the `Inner`). Walks the
+    /// tree, so it is for the memory report, not a hot path.
+    pub fn heap_bytes(&self) -> usize {
+        node_heap_bytes(&self.root)
+    }
+
     /// Iterate the logical lines in order, walking the leaf stream once
     /// (O(bytes)) instead of an O(log n) descent per line. Each item is
     /// `(start, content_end, has_newline)`: the line's byte range excluding its
@@ -720,6 +727,18 @@ fn newlines_before(node: &Inner, byte: usize) -> usize {
 
 fn bytecount_nl(s: &str) -> usize {
     crate::bytes::count_byte(s.as_bytes(), b'\n')
+}
+
+/// Heap bytes of `node` and its subtree: each node is an `Arc` allocation (two
+/// atomic counters plus the `Inner`, which inlines a leaf `String`'s 24-byte
+/// header or the two child pointers), and a leaf adds its `String` capacity.
+fn node_heap_bytes(node: &Inner) -> usize {
+    let mut total = 2 * std::mem::size_of::<usize>() + std::mem::size_of::<Inner>();
+    match &node.kind {
+        Kind::Leaf(s) => total += s.capacity(),
+        Kind::Branch(l, r) => total += node_heap_bytes(l) + node_heap_bytes(r),
+    }
+    total
 }
 
 #[cfg(test)]

@@ -46,6 +46,8 @@ fn main() {
         perf::run_lab(&args)
     } else if args.iter().any(|a| a == "--load-bench") {
         perf::run_load_bench(&args)
+    } else if args.iter().any(|a| a == "--mem-report") {
+        perf::run_mem_report(&args)
     } else if args.iter().any(|a| a == "--perf") {
         perf::run(&args)
     } else if args.iter().any(|a| a == "--gpu-probe") {

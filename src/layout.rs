@@ -1653,6 +1653,13 @@ impl LineIndex {
         self.recs.len()
     }
 
+    /// The heap bytes the index holds: the per-line records and their prefix-sum
+    /// tops. For the memory report.
+    pub fn heap_bytes(&self) -> usize {
+        self.recs.capacity() * std::mem::size_of::<LineRec>()
+            + self.tops.capacity() * std::mem::size_of::<i32>()
+    }
+
     /// Total content height, including any image sources the overlay reveals.
     pub fn content_height(&self, adjust: &RevealAdjust) -> i32 {
         self.tops[self.recs.len()] + adjust.total()

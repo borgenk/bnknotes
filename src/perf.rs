@@ -1026,6 +1026,79 @@ fn report_stage(label: &str, ns: u64, bytes: usize) {
     println!("  {label:<14}{:>10}{:>12.0} MB/s", human_time(ns), mbps);
 }
 
+// ---------------------------------------------------------------------------
+// Memory report: the retained footprint of an open document, by component.
+// ---------------------------------------------------------------------------
+
+/// Open `path` and report the memory it retains, broken down by the structures
+/// that scale with the file, so caps can be set against real numbers. Rope and
+/// index heap are computed exactly; RSS shows what the process actually holds,
+/// including the transient decode peak. Invoked as `--mem-report <path>`.
+pub fn run_mem_report(args: &[String]) -> Result<()> {
+    let path = args
+        .iter()
+        .position(|a| a == "--mem-report")
+        .and_then(|i| args.get(i + 1))
+        .ok_or_else(|| Error::msg("usage: --mem-report <path>"))?;
+
+    let fonts = Fonts::new(&markdown::all_sizes(FONT_SIZE))?;
+    let wrap = WIDTH as i32 - 2 * MARGIN;
+    let images = ImageStore::new(None);
+
+    // Build the document as an open does, then free the transient decode buffers
+    // so the current RSS reflects the steady state.
+    let bytes = std::fs::read(path).map_err(|e| Error::msg(format!("read {path}: {e}")))?;
+    let file_bytes = bytes.len();
+    let (text, _format) = crate::file::decode(&bytes)?;
+    drop(bytes);
+    let rope = Rope::from_str(&text);
+    drop(text);
+    let threads = std::thread::available_parallelism()
+        .map(|p| p.get())
+        .unwrap_or(1);
+    let index = LineIndex::build_parallel(&fonts, &rope, wrap, FONT_SIZE, &images, threads);
+
+    let peak = sys::peak_rss_bytes();
+    let rope_heap = rope.heap_bytes();
+    let index_heap = index.heap_bytes();
+    let lines = rope.len_lines();
+    let retained = rope_heap + index_heap;
+    // The one uncapped, file-variable structure: a query matching every byte would
+    // hold that many (start, end) pairs.
+    let find_worst = rope.len() * std::mem::size_of::<(usize, usize)>();
+
+    eprintln!("bnknotes mem-report: {path}\n");
+    println!("  {:<16}{:>12}   note", "component", "heap");
+    report_mem("rope", rope_heap as u64, "document text + tree");
+    report_mem(
+        "line index",
+        index_heap as u64,
+        &format!("16 B x {lines} lines"),
+    );
+    report_mem(
+        "= retained",
+        retained as u64,
+        "steady state, scales with the file",
+    );
+    println!();
+    report_mem(
+        "peak on open",
+        peak,
+        "incl. ~2x-decode + per-worker font sets, freed after",
+    );
+    println!(
+        "\n  {} on disk, {lines} lines\n  find worst case: every byte a match = {} of (start,end) pairs, UNBOUNDED",
+        human_bytes(file_bytes as u64),
+        human_bytes(find_worst as u64),
+    );
+    Ok(())
+}
+
+/// Print one memory-report line: a component's heap and a note.
+fn report_mem(label: &str, bytes: u64, note: &str) {
+    println!("  {label:<16}{:>12}   {note}", human_bytes(bytes));
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

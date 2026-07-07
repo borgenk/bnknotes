@@ -1129,6 +1129,58 @@ fn lay_line(
 /// base geometry the [`LineIndex`] measures, reveal-independent by construction.
 const NO_REVEAL: (usize, usize) = (usize::MAX, usize::MAX);
 
+/// Below this line count, [`LineIndex::build_parallel`] just builds sequentially:
+/// the per-worker font open and thread hand-off cost more than the work saved.
+const PARALLEL_MIN_LINES: usize = 20_000;
+
+/// One worker's output in [`LineIndex::build_parallel`]: the `LineRec`s it
+/// measured for its chunk (speculatively, from ground entry state) and the entry
+/// state it ended in, which the stitch pass checks against the true carry.
+struct ChunkOut {
+    recs: Vec<LineRec>,
+    end_fence: Option<usize>,
+    end_depth: Option<usize>,
+}
+
+/// Measure logical lines `[lo, hi)` of `rope` into `LineRec`s, starting from
+/// ground entry state (no fence, no list), and report the entry state left at the
+/// end. Runs on a worker thread with that thread's own `fonts`.
+#[allow(clippy::too_many_arguments)]
+fn measure_chunk(
+    fonts: &Fonts,
+    rope: &Rope,
+    lo: usize,
+    hi: usize,
+    n: usize,
+    wrap_width: i32,
+    body_size: u32,
+    images: &ImageStore,
+) -> ChunkOut {
+    let mut fence: Option<usize> = None;
+    let mut list_depth: Option<usize> = None;
+    let mut scratch: Vec<VisualLine> = Vec::new();
+    let mut recs = Vec::with_capacity(hi - lo);
+    for i in lo..hi {
+        recs.push(LineIndex::measure_line(
+            fonts,
+            rope,
+            i,
+            n,
+            wrap_width,
+            body_size,
+            images,
+            &mut fence,
+            &mut list_depth,
+            &mut scratch,
+        ));
+    }
+    ChunkOut {
+        recs,
+        end_fence: fence,
+        end_depth: list_depth,
+    }
+}
+
 /// One logical line's contribution to the document's vertical geometry.
 #[derive(Clone, Copy, PartialEq, Debug)]
 struct LineRec {
@@ -1313,6 +1365,120 @@ impl LineIndex {
                 &mut list_depth,
                 &mut scratch,
             ));
+        }
+        Self::from_recs(recs)
+    }
+
+    /// Build the index across up to `threads` worker threads, for a large
+    /// document where the sequential [`build`](Self::build) would stall (a huge
+    /// file open, a resize on a long file). Each worker lays out a contiguous
+    /// chunk of lines with its own [`Fonts`] (FreeType faces are not shareable),
+    /// speculating that its chunk begins in ground state (no open code fence, no
+    /// list). A short sequential pass then stitches the chunks in order, accepting
+    /// a chunk whose ground-state guess held and re-measuring only the rare chunk
+    /// a fence or list carried across its boundary. Plain prose starts every chunk
+    /// in ground state, so nothing is re-measured and the build scales with the
+    /// core count.
+    ///
+    /// The result is field-for-field identical to [`build`](Self::build) (a golden
+    /// test pins this); only the scheduling differs. Falls back to a sequential
+    /// build for a small document, a single thread, or if a worker cannot open its
+    /// own fonts.
+    pub fn build_parallel(
+        fonts: &Fonts,
+        rope: &Rope,
+        wrap_width: i32,
+        body_size: u32,
+        images: &ImageStore,
+        threads: usize,
+    ) -> Self {
+        let n = rope.len_lines();
+        let threads = threads.max(1);
+        if threads == 1 || n < PARALLEL_MIN_LINES {
+            return Self::build(fonts, rope, wrap_width, body_size, images);
+        }
+        Self::build_chunked(fonts, rope, wrap_width, body_size, images, threads)
+    }
+
+    /// The chunked build behind [`build_parallel`](Self::build_parallel), without
+    /// the small-document threshold, so a test can force many small chunks to
+    /// exercise the stitch and fence/list fix-up paths.
+    fn build_chunked(
+        fonts: &Fonts,
+        rope: &Rope,
+        wrap_width: i32,
+        body_size: u32,
+        images: &ImageStore,
+        threads: usize,
+    ) -> Self {
+        let n = rope.len_lines();
+        let chunk = n.div_ceil(threads);
+        let ranges: Vec<(usize, usize)> = (0..threads)
+            .map(|t| (t * chunk, ((t + 1) * chunk).min(n)))
+            .filter(|&(lo, hi)| lo < hi)
+            .collect();
+
+        // Measure every chunk from ground state. The main thread takes the first
+        // chunk with the caller's fonts; each other chunk gets a worker that opens
+        // its own fonts (`None` if it cannot, which forces the fallback below).
+        let outs: Vec<Option<ChunkOut>> = std::thread::scope(|s| {
+            let handles: Vec<_> = ranges
+                .iter()
+                .skip(1)
+                .map(|&(lo, hi)| {
+                    s.spawn(move || {
+                        let fonts = Fonts::new(&markdown::all_sizes(body_size)).ok()?;
+                        Some(measure_chunk(
+                            &fonts, rope, lo, hi, n, wrap_width, body_size, images,
+                        ))
+                    })
+                })
+                .collect();
+            let (lo0, hi0) = ranges[0];
+            let mut outs = vec![Some(measure_chunk(
+                fonts, rope, lo0, hi0, n, wrap_width, body_size, images,
+            ))];
+            for h in handles {
+                outs.push(h.join().ok().flatten());
+            }
+            outs
+        });
+
+        // A worker that could not open fonts leaves a hole; rather than a partial
+        // index, fall back to a full sequential build.
+        if outs.iter().any(Option::is_none) {
+            return Self::build(fonts, rope, wrap_width, body_size, images);
+        }
+        let outs: Vec<ChunkOut> = outs.into_iter().flatten().collect();
+
+        // Stitch in order: accept a chunk whose ground-state guess matched its true
+        // entry state, and re-measure (sequentially, with the caller's fonts) any
+        // chunk a fence or list carried into.
+        let mut recs: Vec<LineRec> = Vec::with_capacity(n);
+        let mut fence: Option<usize> = None;
+        let mut list_depth: Option<usize> = None;
+        let mut scratch: Vec<VisualLine> = Vec::new();
+        for (out, &(lo, hi)) in outs.iter().zip(&ranges) {
+            if fence.is_none() && list_depth.is_none() {
+                recs.extend_from_slice(&out.recs);
+                fence = out.end_fence;
+                list_depth = out.end_depth;
+            } else {
+                for i in lo..hi {
+                    recs.push(Self::measure_line(
+                        fonts,
+                        rope,
+                        i,
+                        n,
+                        wrap_width,
+                        body_size,
+                        images,
+                        &mut fence,
+                        &mut list_depth,
+                        &mut scratch,
+                    ));
+                }
+            }
         }
         Self::from_recs(recs)
     }
@@ -1998,6 +2164,36 @@ mod tests {
                 "records after {needle:?} -> {repl:?}"
             );
             assert_eq!(index.tops, rebuilt.tops, "prefix sums after {needle:?}");
+        }
+    }
+
+    #[test]
+    fn parallel_index_matches_the_sequential_build() {
+        // The parallel build must be field-for-field identical to the sequential
+        // one. Forcing a high chunk count (`build_chunked` skips the size
+        // threshold) puts several chunks inside each fixture, so the fence/list
+        // fix-up path runs on the fenced and nested-list fixtures where a code
+        // fence or list carries across a chunk boundary (a stitch bug that reused
+        // stale ground-state chunks would surface as mismatched heights).
+        let f = fonts();
+        let no_images = ImageStore::new(None);
+        for r in oracle_docs() {
+            for &w in ORACLE_WIDTHS {
+                let seq = LineIndex::build(&f, &r, w, BODY, &no_images);
+                for threads in [2, 3, 7, 32] {
+                    let par = LineIndex::build_chunked(&f, &r, w, BODY, &no_images, threads);
+                    assert_eq!(
+                        par.recs,
+                        seq.recs,
+                        "records (width {w}, {threads} chunks, {} lines)",
+                        r.len_lines()
+                    );
+                    assert_eq!(
+                        par.tops, seq.tops,
+                        "prefix sums (width {w}, {threads} chunks)"
+                    );
+                }
+            }
         }
     }
 

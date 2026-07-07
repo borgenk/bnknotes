@@ -3,10 +3,15 @@
 //! The editor's buffer was one `String`, where every insert or delete memmoves
 //! the tail and every undo snapshot clones the whole text. A rope replaces that:
 //! edits, byte indexing, and line lookup are O(log n), and the tree is
-//! *persistent*, its nodes are shared through `Rc`, so cloning a rope (what an
+//! *persistent*, its nodes are shared through `Arc`, so cloning a rope (what an
 //! undo snapshot does) is O(1) and shares every untouched chunk with the
 //! original. An edit copies only the O(log n) nodes on the path from the root to
-//! the touched leaf; the rest stay shared between the old and new versions.
+//! the touched leaf; the rest stay shared between the old and new versions. The
+//! sharing is via `Arc` rather than `Rc` so a snapshot is `Send + Sync`: a
+//! background or parallel layout pass can read a rope from another thread, which
+//! is what the parallel line-index build relies on. The atomic refcount costs a
+//! few nanoseconds per clone/drop, invisible next to how rarely the editor
+//! snapshots.
 //!
 //! Leaves hold up to [`MAX_LEAF`] bytes; every node caches its subtree's byte
 //! and newline counts, so a byte offset or a line number finds its leaf without
@@ -31,7 +36,7 @@
 use std::borrow::Cow;
 use std::fmt;
 use std::ops::Range;
-use std::rc::Rc;
+use std::sync::Arc;
 
 /// Maximum bytes in a leaf chunk. Large enough that a note lives in a handful of
 /// leaves, small enough that splitting a leaf copies little.
@@ -50,13 +55,14 @@ struct Inner {
 
 enum Kind {
     Leaf(String),
-    Branch(Rc<Inner>, Rc<Inner>),
+    Branch(Arc<Inner>, Arc<Inner>),
 }
 
-/// A rope. Cloning is O(1): it bumps the root's refcount and shares the tree.
+/// A rope. Cloning is O(1): it bumps the root's atomic refcount and shares the
+/// tree, and is `Send + Sync` so a snapshot can be read from another thread.
 #[derive(Clone)]
 pub struct Rope {
-    root: Rc<Inner>,
+    root: Arc<Inner>,
 }
 
 impl Rope {
@@ -166,7 +172,7 @@ impl Rope {
     /// so diffing an edited document against its previous version is cheap; the
     /// shared-root fast path makes an untouched document O(1).
     pub fn common_prefix_len(&self, other: &Rope) -> usize {
-        if Rc::ptr_eq(&self.root, &other.root) {
+        if Arc::ptr_eq(&self.root, &other.root) {
             return self.root.bytes;
         }
         let mut ia = Leaves::forward(&self.root);
@@ -249,7 +255,7 @@ impl Rope {
 /// [`chunks`](Self::chunks) walks the pieces in order without allocating.
 #[derive(Clone, Copy)]
 pub struct RopeSlice<'a> {
-    root: &'a Rc<Inner>,
+    root: &'a Arc<Inner>,
     start: usize,
     end: usize,
 }
@@ -306,7 +312,7 @@ impl fmt::Display for RopeSlice<'_> {
 /// pruned, so it visits only the leaves the slice actually touches.
 pub struct Chunks<'a> {
     /// Each entry is a subtree and its absolute start offset within the rope.
-    stack: Vec<(&'a Rc<Inner>, usize)>,
+    stack: Vec<(&'a Arc<Inner>, usize)>,
     start: usize,
     end: usize,
 }
@@ -375,21 +381,21 @@ fn byte_at(node: &Inner, at: usize) -> u8 {
 /// A lazy left-to-right or right-to-left iterator over a subtree's leaf strings,
 /// for streaming byte comparison without materializing the text.
 struct Leaves<'a> {
-    stack: Vec<&'a Rc<Inner>>,
+    stack: Vec<&'a Arc<Inner>>,
     /// When true, yield leaves right-to-left (the stack pushes the left child last
     /// so the right child pops first).
     reverse: bool,
 }
 
 impl<'a> Leaves<'a> {
-    fn forward(root: &'a Rc<Inner>) -> Self {
+    fn forward(root: &'a Arc<Inner>) -> Self {
         Leaves {
             stack: vec![root],
             reverse: false,
         }
     }
 
-    fn backward(root: &'a Rc<Inner>) -> Self {
+    fn backward(root: &'a Arc<Inner>) -> Self {
         Leaves {
             stack: vec![root],
             reverse: true,
@@ -435,8 +441,8 @@ impl fmt::Display for Rope {
 
 // --- Node construction -------------------------------------------------------
 
-fn leaf(s: String) -> Rc<Inner> {
-    Rc::new(Inner {
+fn leaf(s: String) -> Arc<Inner> {
+    Arc::new(Inner {
         bytes: s.len(),
         newlines: bytecount_nl(&s),
         height: 1,
@@ -444,8 +450,8 @@ fn leaf(s: String) -> Rc<Inner> {
     })
 }
 
-fn branch(l: Rc<Inner>, r: Rc<Inner>) -> Rc<Inner> {
-    Rc::new(Inner {
+fn branch(l: Arc<Inner>, r: Arc<Inner>) -> Arc<Inner> {
+    Arc::new(Inner {
         bytes: l.bytes + r.bytes,
         newlines: l.newlines + r.newlines,
         height: 1 + l.height.max(r.height),
@@ -455,7 +461,7 @@ fn branch(l: Rc<Inner>, r: Rc<Inner>) -> Rc<Inner> {
 
 /// Join two subtrees. Adjacent small leaves merge into one, so an edit does not
 /// fragment the tree into many tiny chunks; otherwise a plain branch.
-fn concat(l: Rc<Inner>, r: Rc<Inner>) -> Rc<Inner> {
+fn concat(l: Arc<Inner>, r: Arc<Inner>) -> Arc<Inner> {
     if l.bytes == 0 {
         return r;
     }
@@ -475,7 +481,7 @@ fn concat(l: Rc<Inner>, r: Rc<Inner>) -> Rc<Inner> {
 
 /// Split `node` into the subtrees holding `[0, at)` and `[at, len)`. `at` is a
 /// byte offset on a `char` boundary.
-fn split(node: &Rc<Inner>, at: usize) -> (Rc<Inner>, Rc<Inner>) {
+fn split(node: &Arc<Inner>, at: usize) -> (Arc<Inner>, Arc<Inner>) {
     match &node.kind {
         Kind::Leaf(s) => {
             debug_assert!(
@@ -501,7 +507,7 @@ fn split(node: &Rc<Inner>, at: usize) -> (Rc<Inner>, Rc<Inner>) {
 
 /// Build a balanced subtree from `s`, chunking it into `char`-aligned leaves of
 /// at most [`MAX_LEAF`] bytes.
-fn build(s: &str) -> Rc<Inner> {
+fn build(s: &str) -> Arc<Inner> {
     if s.len() <= MAX_LEAF {
         return leaf(s.to_string());
     }
@@ -519,7 +525,7 @@ fn build(s: &str) -> Rc<Inner> {
 }
 
 /// Combine ordered leaves into a balanced tree by recursive halving.
-fn combine(leaves: &[Rc<Inner>]) -> Rc<Inner> {
+fn combine(leaves: &[Arc<Inner>]) -> Arc<Inner> {
     match leaves.len() {
         0 => leaf(String::new()),
         1 => leaves[0].clone(),
@@ -534,7 +540,7 @@ fn combine(leaves: &[Rc<Inner>]) -> Rc<Inner> {
 
 /// Keep the tree from degenerating: a subtree tall relative to its size is
 /// rebuilt balanced from its leaves. Shallow trees are always left alone.
-fn balance(node: Rc<Inner>) -> Rc<Inner> {
+fn balance(node: Arc<Inner>) -> Arc<Inner> {
     if node.height <= 2 || node.bytes as u64 >= fib(node.height + 2) {
         node
     } else {
@@ -544,7 +550,7 @@ fn balance(node: Rc<Inner>) -> Rc<Inner> {
     }
 }
 
-fn collect_leaves(node: &Rc<Inner>, out: &mut Vec<Rc<Inner>>) {
+fn collect_leaves(node: &Arc<Inner>, out: &mut Vec<Arc<Inner>>) {
     match &node.kind {
         Kind::Leaf(_) => out.push(node.clone()),
         Kind::Branch(l, r) => {

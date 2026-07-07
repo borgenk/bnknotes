@@ -74,6 +74,13 @@ type LayoutKey = (
 /// move or a scroll reuses the index and only the visible window rebuilds.
 type IndexKey = (u64, i32, i32, u32);
 
+/// Cap on worker threads for a parallel index build. Bounds the transient memory
+/// of the per-worker font sets (each worker opens its own FreeType faces).
+const INDEX_MAX_THREADS: usize = 16;
+/// Lines of work to justify one extra worker's font open. Below one worker's
+/// worth the build stays sequential; a huge document scales up to the cap.
+const LINES_PER_WORKER: usize = 50_000;
+
 /// Which region holds keyboard focus. Editing keys go to the focused editor;
 /// the file tree takes navigation keys when it is focused.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -350,12 +357,23 @@ impl EditorPane {
                 );
                 self.line_index = Some(index);
             } else {
-                self.line_index = Some(LineIndex::build(
+                // A first build or a resize: no prior index to re-measure against,
+                // so build in full, in parallel for a large document (a huge file
+                // open or a resize on a long one). Worker count scales with the
+                // work and caps out, so a modest document does not pay to open a
+                // dozen font sets.
+                let cores = std::thread::available_parallelism()
+                    .map(|p| p.get())
+                    .unwrap_or(1);
+                let threads = (self.text.rope().len_lines() / LINES_PER_WORKER)
+                    .clamp(1, INDEX_MAX_THREADS.min(cores));
+                self.line_index = Some(LineIndex::build_parallel(
                     fonts,
                     self.text.rope(),
                     wrap_width,
                     FONT_SIZE,
                     &self.images,
+                    threads,
                 ));
             }
             self.prev_rope = Some(self.text.rope().clone());

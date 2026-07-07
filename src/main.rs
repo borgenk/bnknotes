@@ -4,6 +4,7 @@
 mod alloc;
 mod app;
 mod browser;
+mod bytes;
 mod conn;
 mod corpus;
 mod display;

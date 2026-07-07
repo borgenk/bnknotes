@@ -116,7 +116,34 @@ fn detect_line_ending(s: &str) -> LineEnding {
 /// carriage return regardless of the source's (possibly mixed) endings. Applied
 /// both on file load and on paste, the two ways foreign text enters the buffer.
 pub fn normalize_newlines(s: &str) -> String {
-    s.replace("\r\n", "\n").replace('\r', "\n")
+    // No carriage return means the text is already LF-normalized: one copy, not
+    // the two full allocating passes `replace("\r\n", ..).replace('\r', ..)` pays
+    // even when there is nothing to replace.
+    let Some(first) = crate::bytes::find_byte(s.as_bytes(), b'\r') else {
+        return s.to_string();
+    };
+    // Rewrite in a single pass from the first '\r': a CRLF pair and a lone CR each
+    // collapse to one '\n'. '\r'/'\n' are ASCII, so slicing on their byte offsets
+    // always lands on a char boundary; the runs between them copy verbatim.
+    let bytes = s.as_bytes();
+    let mut out = String::with_capacity(s.len());
+    out.push_str(&s[..first]);
+    let mut run = first;
+    let mut i = first;
+    while i < bytes.len() {
+        if bytes[i] == b'\r' {
+            out.push_str(&s[run..i]);
+            out.push('\n');
+            // A '\n' right after the '\r' is part of the same CRLF line break.
+            if bytes.get(i + 1) == Some(&b'\n') {
+                i += 1;
+            }
+            run = i + 1;
+        }
+        i += 1;
+    }
+    out.push_str(&s[run..]);
+    out
 }
 
 /// Write `bytes` to `path` atomically: stage them in a sibling temp file in the

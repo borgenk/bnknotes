@@ -390,7 +390,7 @@ impl Iterator for Lines<'_> {
             return None;
         }
         loop {
-            if let Some(nl) = self.cur.iter().position(|&b| b == b'\n') {
+            if let Some(nl) = crate::bytes::find_byte(self.cur, b'\n') {
                 let line = (self.line_start, self.abs + nl, true);
                 let consumed = nl + 1;
                 self.cur = &self.cur[consumed..];
@@ -706,7 +706,7 @@ fn newlines_before(node: &Inner, byte: usize) -> usize {
     match &node.kind {
         Kind::Leaf(s) => {
             debug_assert!(byte <= s.len(), "newlines_before within the leaf");
-            s.as_bytes()[..byte].iter().filter(|&&b| b == b'\n').count()
+            crate::bytes::count_byte(&s.as_bytes()[..byte], b'\n')
         }
         Kind::Branch(l, r) => {
             if byte <= l.bytes {
@@ -719,7 +719,7 @@ fn newlines_before(node: &Inner, byte: usize) -> usize {
 }
 
 fn bytecount_nl(s: &str) -> usize {
-    s.bytes().filter(|&b| b == b'\n').count()
+    crate::bytes::count_byte(s.as_bytes(), b'\n')
 }
 
 #[cfg(test)]

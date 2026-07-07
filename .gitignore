@@ -7,3 +7,7 @@ dist/
 
 # Perf harness: the committed baseline stays tracked; each run's latest does not.
 perf/latest.txt
+
+# Perf lab: the local time series and any fetched stress corpora are machine-local.
+perf/history.jsonl
+perf/corpus/

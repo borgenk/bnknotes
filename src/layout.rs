@@ -1129,24 +1129,6 @@ fn lay_line(
 /// base geometry the [`LineIndex`] measures, reveal-independent by construction.
 const NO_REVEAL: (usize, usize) = (usize::MAX, usize::MAX);
 
-/// The content of logical line `i` (excluding its trailing newline).
-fn line_str(rope: &Rope, i: usize) -> String {
-    let n = rope.len_lines();
-    let ls = rope.line_to_byte(i);
-    let le = if i + 1 < n {
-        rope.line_to_byte(i + 1) - 1
-    } else {
-        rope.line_to_byte(i + 1)
-    };
-    rope.byte_slice(ls..le)
-}
-
-/// Whether logical line `ia` of `a` equals logical line `ib` of `b` by content,
-/// for diffing a document against its previous version during incremental layout.
-fn line_eq(a: &Rope, ia: usize, b: &Rope, ib: usize) -> bool {
-    line_str(a, ia) == line_str(b, ib)
-}
-
 /// One logical line's contribution to the document's vertical geometry.
 #[derive(Clone, Copy, PartialEq, Debug)]
 struct LineRec {
@@ -1363,16 +1345,19 @@ impl LineIndex {
             *self = Self::build(fonts, new, wrap_width, body_size, images);
             return;
         }
-        // First line that differs, and count of identical trailing lines.
-        let mut front = 0;
-        while front < new_n && front < old_n && line_eq(new, front, prev, front) {
-            front += 1;
-        }
-        let max_back = (new_n - front).min(old_n - front);
-        let mut back = 0;
-        while back < max_back && line_eq(new, new_n - 1 - back, prev, old_n - 1 - back) {
-            back += 1;
-        }
+        // Find the changed byte span cheaply (shared leaves compared as raw bytes,
+        // never materialized), then map it to a conservative changed line range.
+        let prefix = new.common_prefix_len(prev);
+        let suffix = new.common_suffix_len(prev, new.len().min(prev.len()) - prefix);
+        let front = new.byte_to_line(prefix);
+        // Trailing lines strictly after the one holding the suffix boundary are
+        // unchanged; the boundary line itself is re-measured (conservative). Clamp
+        // so both the new and old resync indices stay valid.
+        let suffix_start = new.len() - suffix;
+        let back = (new_n - 1)
+            .saturating_sub(new.byte_to_line(suffix_start))
+            .min(new_n.saturating_sub(front))
+            .min(old_n.saturating_sub(front));
         let delta = new_n as isize - old_n as isize;
         // First line of the unchanged suffix; re-measurement may converge here.
         let resync = new_n - back;

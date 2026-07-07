@@ -138,6 +138,130 @@ impl Rope {
         let byte = byte.min(self.root.bytes);
         newlines_before(&self.root, byte)
     }
+
+    /// The number of leading bytes this rope shares with `other`. Walks both
+    /// leaf-byte streams from the front (no allocation, at byte-comparison speed),
+    /// so diffing an edited document against its previous version is cheap; the
+    /// shared-root fast path makes an untouched document O(1).
+    pub fn common_prefix_len(&self, other: &Rope) -> usize {
+        if Rc::ptr_eq(&self.root, &other.root) {
+            return self.root.bytes;
+        }
+        let mut ia = Leaves::forward(&self.root);
+        let mut ib = Leaves::forward(&other.root);
+        let (mut a, mut b): (&[u8], &[u8]) = (&[], &[]);
+        let mut matched = 0;
+        loop {
+            if a.is_empty() {
+                match ia.next() {
+                    Some(s) => a = s.as_bytes(),
+                    None => return matched,
+                }
+            }
+            if b.is_empty() {
+                match ib.next() {
+                    Some(s) => b = s.as_bytes(),
+                    None => return matched,
+                }
+            }
+            let n = a.len().min(b.len());
+            let mut i = 0;
+            while i < n && a[i] == b[i] {
+                i += 1;
+            }
+            matched += i;
+            if i < n {
+                return matched;
+            }
+            a = &a[n..];
+            b = &b[n..];
+        }
+    }
+
+    /// The number of trailing bytes this rope shares with `other`, up to `cap`
+    /// bytes (so a caller can keep the suffix from overlapping a known common
+    /// prefix). Walks both leaf-byte streams from the back.
+    pub fn common_suffix_len(&self, other: &Rope, cap: usize) -> usize {
+        let mut ia = Leaves::backward(&self.root);
+        let mut ib = Leaves::backward(&other.root);
+        let (mut a, mut b): (&[u8], &[u8]) = (&[], &[]);
+        let mut matched = 0;
+        while matched < cap {
+            if a.is_empty() {
+                match ia.next() {
+                    Some(s) => a = s.as_bytes(),
+                    None => return matched,
+                }
+            }
+            if b.is_empty() {
+                match ib.next() {
+                    Some(s) => b = s.as_bytes(),
+                    None => return matched,
+                }
+            }
+            let n = a.len().min(b.len()).min(cap - matched);
+            let mut i = 0;
+            while i < n && a[a.len() - 1 - i] == b[b.len() - 1 - i] {
+                i += 1;
+            }
+            matched += i;
+            if i < n {
+                return matched;
+            }
+            a = &a[..a.len() - n];
+            b = &b[..b.len() - n];
+        }
+        matched
+    }
+}
+
+/// A lazy left-to-right or right-to-left iterator over a subtree's leaf strings,
+/// for streaming byte comparison without materializing the text.
+struct Leaves<'a> {
+    stack: Vec<&'a Rc<Inner>>,
+    /// When true, yield leaves right-to-left (the stack pushes the left child last
+    /// so the right child pops first).
+    reverse: bool,
+}
+
+impl<'a> Leaves<'a> {
+    fn forward(root: &'a Rc<Inner>) -> Self {
+        Leaves {
+            stack: vec![root],
+            reverse: false,
+        }
+    }
+
+    fn backward(root: &'a Rc<Inner>) -> Self {
+        Leaves {
+            stack: vec![root],
+            reverse: true,
+        }
+    }
+}
+
+impl<'a> Iterator for Leaves<'a> {
+    type Item = &'a str;
+
+    fn next(&mut self) -> Option<&'a str> {
+        while let Some(node) = self.stack.pop() {
+            match &node.kind {
+                Kind::Leaf(s) => return Some(s),
+                Kind::Branch(l, r) => {
+                    // Push so the near child pops first: left-first for forward,
+                    // right-first for backward.
+                    if self.reverse {
+                        self.stack.push(l);
+                        self.stack.push(r);
+                    } else {
+                        self.stack.push(r);
+                        self.stack.push(l);
+                    }
+                }
+            }
+        }
+        None
+    }
 }
 
 impl Default for Rope {
@@ -385,6 +509,72 @@ mod tests {
         assert_eq!(r.to_string(), "a\nbc\n\nd");
         assert_eq!(r.len(), 7);
         assert_eq!(r.len_lines(), 4, "three newlines -> four lines");
+    }
+
+    #[test]
+    fn common_prefix_and_suffix_match_a_naive_scan() {
+        fn naive_prefix(a: &str, b: &str) -> usize {
+            a.bytes().zip(b.bytes()).take_while(|(x, y)| x == y).count()
+        }
+        fn naive_suffix(a: &str, b: &str, cap: usize) -> usize {
+            a.bytes()
+                .rev()
+                .zip(b.bytes().rev())
+                .take_while(|(x, y)| x == y)
+                .count()
+                .min(cap)
+        }
+        // A base long enough to span many leaves, edited several ways so the ropes
+        // share structure at shifted offsets.
+        let base = "The quick brown fox jumps over the lazy dog. ".repeat(2000);
+        let cases = [
+            base.clone(),
+            format!("X{base}"),
+            format!("{base}Y"),
+            {
+                let mut s = base.clone();
+                s.insert(s.len() / 2, 'Z');
+                s
+            },
+            {
+                let mut s = base.clone();
+                s.replace_range(100..200, "");
+                s
+            },
+            format!("{base}日本語"),
+            String::new(),
+        ];
+        for a in &cases {
+            for b in &cases {
+                let (ra, rb) = (Rope::from_str(a), Rope::from_str(b));
+                let p = ra.common_prefix_len(&rb);
+                assert_eq!(p, naive_prefix(a, b), "prefix");
+                let cap = a.len().min(b.len()) - p;
+                assert_eq!(
+                    ra.common_suffix_len(&rb, cap),
+                    naive_suffix(a, b, cap),
+                    "suffix"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn common_prefix_of_a_shared_clone_is_the_whole_length() {
+        let mut r = Rope::from_str(&"lorem ipsum dolor ".repeat(500));
+        // A clone shares the root, so the fast path returns the full length.
+        let before = r.clone();
+        assert_eq!(before.common_prefix_len(&before.clone()), before.len());
+        // After a one-byte insert, only that byte is outside the shared prefix and
+        // suffix; the scan finds them across the still-shared leaves.
+        r.insert(r.len() / 2, "!");
+        let p = r.common_prefix_len(&before);
+        let s = r.common_suffix_len(&before, r.len().min(before.len()) - p);
+        assert_eq!(
+            p + s,
+            before.len(),
+            "one inserted byte splits prefix and suffix"
+        );
     }
 
     #[test]

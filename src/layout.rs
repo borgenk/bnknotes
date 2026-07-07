@@ -1638,14 +1638,14 @@ fn wrap_segments(
         return vec![(0, line.len())];
     }
     // Measure each cluster once: its offset within the line, width in its run's
-    // face, and whether it is a space (a wrap opportunity).
-    let clusters: Vec<(usize, f32, bool)> = grapheme::graphemes(line)
-        .into_iter()
-        .map(|(off, cluster)| {
-            let face = run_face(fonts, size, kind_at(spans, off), heading);
-            (off, shape::text_advance(face, cluster), cluster == " ")
-        })
-        .collect();
+    // face, and whether it is a space (a wrap opportunity). Sized up front to the
+    // byte length (an upper bound on cluster count), so this fills in one
+    // allocation rather than growing from empty on every line.
+    let mut clusters: Vec<(usize, f32, bool)> = Vec::with_capacity(line.len());
+    clusters.extend(grapheme::graphemes(line).map(|(off, cluster)| {
+        let face = run_face(fonts, size, kind_at(spans, off), heading);
+        (off, shape::text_advance(face, cluster), cluster == " ")
+    }));
     if clusters.is_empty() {
         return vec![(0, line.len())];
     }

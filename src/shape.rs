@@ -39,7 +39,6 @@ pub fn text_advance(face: &Face, text: &str) -> f32 {
         return text.chars().map(|c| face.advance(c)).sum();
     }
     grapheme::graphemes(text)
-        .into_iter()
         .map(|(_, cluster)| face.cluster_advance(cluster))
         .sum()
 }
@@ -204,7 +203,6 @@ mod tests {
         let text = "Hello, world 123 <> []";
         let fast = text_advance(&face, text);
         let clustered: f32 = grapheme::graphemes(text)
-            .into_iter()
             .map(|(_, cluster)| face.cluster_advance(cluster))
             .sum();
         assert_eq!(

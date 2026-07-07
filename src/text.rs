@@ -898,7 +898,6 @@ fn line_clusters(rope: &Rope, line: usize) -> Vec<(usize, bool)> {
     let le = rope.line_to_byte(line + 1);
     let s = rope.byte_slice(ls..le);
     grapheme::graphemes(&s)
-        .into_iter()
         .map(|(off, c)| (ls + off, cluster_is_word(c)))
         .collect()
 }

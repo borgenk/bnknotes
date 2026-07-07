@@ -55,83 +55,117 @@ enum Incb {
 
 /// Byte offsets of every grapheme cluster boundary in `s`, always including 0
 /// and `s.len()`. Consecutive entries bound one cluster.
-fn boundaries(s: &str) -> Vec<usize> {
-    let mut out = vec![0];
-    let mut prev: Option<Gcb> = None;
-    // Consecutive Regional_Indicator scalars ending at `prev` (raw run length,
-    // never reset): a break falls between two RIs only when this is even.
-    let mut ri_run: u32 = 0;
-    // GB11 state: `ep_then_extend` means the run ending at `prev` is an
-    // Extended_Pictographic followed by zero or more Extend; `zwj_after_ep`
-    // means that run was then closed by a ZWJ (so ZWJ x Ext_Pict must not break).
-    let mut ep_then_extend = false;
-    let mut zwj_after_ep = false;
-    // GB9c state: `incb_run` means the run ending at `prev` is an InCB=Consonant
-    // followed by only InCB Extend/Linker scalars; `incb_linker` means that run
-    // has included at least one Linker. Together they let a following Consonant
-    // join the conjunct.
-    let mut incb_run = false;
-    let mut incb_linker = false;
+/// A lazy iterator over the grapheme clusters of a string, each yielded as its
+/// byte offset and substring. It runs the UAX #29 break state machine forward one
+/// scalar at a time, so no boundary list is ever materialized, the layout measure
+/// path segments millions of clusters and must not allocate a `Vec` per line.
+pub struct Graphemes<'a> {
+    s: &'a str,
+    iter: core::str::CharIndices<'a>,
+    /// Byte offset of the cluster being accumulated.
+    start: usize,
+    done: bool,
+    prev: Option<Gcb>,
+    /// Consecutive Regional_Indicator scalars ending at `prev` (raw run length): a
+    /// break falls between two RIs only when this is even.
+    ri_run: u32,
+    /// GB11: the run ending at `prev` is an Extended_Pictographic then zero or more
+    /// Extend (`ep_then_extend`), possibly closed by a ZWJ (`zwj_after_ep`).
+    ep_then_extend: bool,
+    zwj_after_ep: bool,
+    /// GB9c: the run ending at `prev` is an InCB=Consonant then only InCB
+    /// Extend/Linker (`incb_run`), including at least one Linker (`incb_linker`).
+    incb_run: bool,
+    incb_linker: bool,
+}
 
-    for (i, c) in s.char_indices() {
-        let g = gcb(c);
-        let ep = is_extended_pictographic(c);
-        let ci = incb(c);
-        let gb9c = incb_run && incb_linker && ci == Some(Incb::Consonant);
-
-        if let Some(p) = prev {
-            if should_break(p, g, ep, ri_run, zwj_after_ep, gb9c) {
-                out.push(i);
-            }
+impl<'a> Graphemes<'a> {
+    fn new(s: &'a str) -> Self {
+        Graphemes {
+            s,
+            iter: s.char_indices(),
+            start: 0,
+            done: false,
+            prev: None,
+            ri_run: 0,
+            ep_then_extend: false,
+            zwj_after_ep: false,
+            incb_run: false,
+            incb_linker: false,
         }
+    }
 
-        ri_run = if g == Gcb::RegionalIndicator {
-            if prev == Some(Gcb::RegionalIndicator) {
-                ri_run + 1
+    /// Fold one scalar's break properties into the carried state (the state-update
+    /// half of GB1..GB13), in the order the rules require: `ri_run` reads the
+    /// previous scalar, then `prev` advances.
+    fn advance(&mut self, g: Gcb, ep: bool, ci: Option<Incb>) {
+        self.ri_run = if g == Gcb::RegionalIndicator {
+            if self.prev == Some(Gcb::RegionalIndicator) {
+                self.ri_run + 1
             } else {
                 1
             }
         } else {
             0
         };
-
         if ep {
-            ep_then_extend = true;
-            zwj_after_ep = false;
+            self.ep_then_extend = true;
+            self.zwj_after_ep = false;
         } else if g == Gcb::Extend {
-            zwj_after_ep = false; // ep_then_extend carries through Extend*
+            self.zwj_after_ep = false; // ep_then_extend carries through Extend*
         } else if g == Gcb::Zwj {
-            zwj_after_ep = ep_then_extend;
-            ep_then_extend = false;
+            self.zwj_after_ep = self.ep_then_extend;
+            self.ep_then_extend = false;
         } else {
-            ep_then_extend = false;
-            zwj_after_ep = false;
+            self.ep_then_extend = false;
+            self.zwj_after_ep = false;
         }
-
         match ci {
-            // A consonant starts (or restarts) a conjunct run.
             Some(Incb::Consonant) => {
-                incb_run = true;
-                incb_linker = false;
+                self.incb_run = true;
+                self.incb_linker = false;
             }
-            // Linker and Extend continue a run only if one is open; a Linker also
-            // satisfies the "at least one Linker" requirement.
-            Some(Incb::Linker) => incb_linker |= incb_run,
+            Some(Incb::Linker) => self.incb_linker |= self.incb_run,
             Some(Incb::Extend) => {}
-            // Anything else ends the run.
             None => {
-                incb_run = false;
-                incb_linker = false;
+                self.incb_run = false;
+                self.incb_linker = false;
             }
         }
-
-        prev = Some(g);
+        self.prev = Some(g);
     }
+}
 
-    if out.last() != Some(&s.len()) {
-        out.push(s.len());
+impl<'a> Iterator for Graphemes<'a> {
+    type Item = (usize, &'a str);
+
+    fn next(&mut self) -> Option<(usize, &'a str)> {
+        if self.done {
+            return None;
+        }
+        loop {
+            let Some((i, c)) = self.iter.next() else {
+                // The final cluster runs to the end of the string.
+                self.done = true;
+                return (self.start < self.s.len()).then(|| (self.start, &self.s[self.start..]));
+            };
+            let g = gcb(c);
+            let ep = is_extended_pictographic(c);
+            let ci = incb(c);
+            let gb9c = self.incb_run && self.incb_linker && ci == Some(Incb::Consonant);
+            // A break before `c` closes the cluster at `[start, i)`; `c` then opens
+            // the next one. State advances for `c` either way.
+            let brk = self
+                .prev
+                .is_some_and(|p| should_break(p, g, ep, self.ri_run, self.zwj_after_ep, gb9c));
+            self.advance(g, ep, ci);
+            if brk {
+                let out = (self.start, &self.s[self.start..i]);
+                self.start = i;
+                return Some(out);
+            }
+        }
     }
-    out
 }
 
 /// Whether a cluster boundary falls between adjacent scalars `prev` and `cur`.
@@ -195,27 +229,29 @@ fn should_break(
 }
 
 /// The byte offset of the first cluster boundary strictly after `i`. `i` is
-/// assumed to be a boundary itself (the cursor always sits on one).
+/// assumed to be a boundary itself (the cursor always sits on one). Cluster starts
+/// plus the string end are the boundaries, so the first start past `i` is it, or
+/// the end when `i` sits in the last cluster.
 pub fn next_boundary(s: &str, i: usize) -> usize {
-    boundaries(s)
-        .into_iter()
-        .find(|&b| b > i)
+    graphemes(s)
+        .map(|(off, _)| off)
+        .find(|&off| off > i)
         .unwrap_or(s.len())
 }
 
 /// The byte offset of the last cluster boundary strictly before `i`.
 pub fn prev_boundary(s: &str, i: usize) -> usize {
-    boundaries(s)
-        .into_iter()
-        .rev()
-        .find(|&b| b < i)
+    graphemes(s)
+        .map(|(off, _)| off)
+        .take_while(|&off| off < i)
+        .last()
         .unwrap_or(0)
 }
 
-/// The grapheme clusters of `s`, each as its byte offset and substring.
-pub fn graphemes(s: &str) -> Vec<(usize, &str)> {
-    let bounds = boundaries(s);
-    bounds.windows(2).map(|w| (w[0], &s[w[0]..w[1]])).collect()
+/// The grapheme clusters of `s`, lazily: each yielded as its byte offset and
+/// substring, with nothing allocated.
+pub fn graphemes(s: &str) -> Graphemes<'_> {
+    Graphemes::new(s)
 }
 
 // ---------------------------------------------------------------------------
@@ -274,7 +310,10 @@ mod tests {
 
     /// Cluster boundaries as a list, for compact assertions.
     fn bounds(s: &str) -> Vec<usize> {
-        boundaries(s)
+        graphemes(s)
+            .map(|(o, _)| o)
+            .chain(std::iter::once(s.len()))
+            .collect()
     }
 
     #[test]
@@ -363,7 +402,7 @@ mod tests {
 
     #[test]
     fn graphemes_splits_into_substrings() {
-        let g = graphemes("a😀b");
+        let g: Vec<_> = graphemes("a😀b").collect();
         assert_eq!(g, vec![(0, "a"), (1, "😀"), (5, "b")]);
     }
 

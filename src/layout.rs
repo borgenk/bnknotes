@@ -868,6 +868,9 @@ impl Layout {
 /// for wrapping. Held by the build loop (or, in the parallel build, per worker).
 #[derive(Default)]
 struct LayoutScratch {
+    /// The line's inline spans (block marker plus code/emphasis/link runs),
+    /// produced by [`line_spans_into`]/[`code_block_spans_into`].
+    spans: Vec<markdown::Span>,
     /// One entry per grapheme cluster: its byte offset, pixel width, and whether it
     /// is a space (a wrap opportunity). Sized to the widest line seen.
     clusters: Vec<(usize, f32, bool)>,
@@ -974,20 +977,19 @@ fn lay_line(
     // pass and renders as one code run. The ``` fence lines hide their backticks off
     // the cursor's line, like a heading's `#`. A code line carries `Body` as an
     // inert style (its gutter is unused).
-    let (style, size, spans, block_marker, block_persists, revealed, code_block) =
+    let (style, size, block_marker, block_persists, revealed, code_block) =
         if let Some(open) = *fence {
             *list_depth = None;
             let delimiter = markdown::closes_code_fence(&line, open);
             if delimiter {
                 *fence = None;
             }
-            let spans = code_block_spans(&line, delimiter);
+            code_block_spans_into(&line, delimiter, &mut pool.spans);
             // Only a fence delimiter line has backticks to hide.
             let revealed = !delimiter || on_line;
             (
                 markdown::LineStyle::Body,
                 body_size,
-                spans,
                 0,
                 false,
                 revealed,
@@ -996,11 +998,10 @@ fn lay_line(
         } else if let Some(open) = markdown::opens_code_fence(&line) {
             *list_depth = None;
             *fence = Some(open);
-            let spans = code_block_spans(&line, true);
+            code_block_spans_into(&line, true, &mut pool.spans);
             (
                 markdown::LineStyle::Body,
                 body_size,
-                spans,
                 0,
                 false,
                 on_line,
@@ -1010,10 +1011,10 @@ fn lay_line(
             // Resolve list nesting across lines: an item deeper than one past the
             // previous item has no parent and renders as body.
             let (style, marker) = resolve_list(&line, list_depth);
+            line_spans_into(&line, marker, &mut pool.spans);
             (
                 style,
                 markdown::font_size(style, body_size),
-                line_spans(&line, marker),
                 marker,
                 markdown::block_marker_persists(style),
                 on_line,
@@ -1077,7 +1078,7 @@ fn lay_line(
         fonts,
         size,
         &line,
-        &spans,
+        &pool.spans,
         line_wrap,
         block_indent,
         heading.is_some(),
@@ -1115,7 +1116,7 @@ fn lay_line(
                 Vec::new()
             } else {
                 clip_runs(
-                    &spans,
+                    &pool.spans,
                     start,
                     end,
                     ls,
@@ -1744,47 +1745,52 @@ fn resolve_list(line: &str, list_depth: &mut Option<usize>) -> (markdown::LineSt
     }
 }
 
-/// The full inline span list of a logical `line`, line-relative: a leading
-/// block marker of `marker` bytes (a heading's `#`s, a list `- `, etc., if any)
-/// followed by the inline spans of the content past it, offset back over the
-/// marker. Tiles `[0, line.len())`. `marker` is passed in (not recomputed) so a
-/// caller can suppress it, e.g. an over-nested list item that renders as plain
-/// body text gets `marker == 0`.
-fn line_spans(line: &str, marker: usize) -> Vec<markdown::Span> {
-    let mut spans = Vec::new();
+/// Fill `out` with the full inline span list of a logical `line`, line-relative:
+/// a leading block marker of `marker` bytes (a heading's `#`s, a list `- `, etc.,
+/// if any) followed by the inline spans of the content past it, offset back over
+/// the marker. Tiles `[0, line.len())`. `marker` is passed in (not recomputed) so
+/// a caller can suppress it, e.g. an over-nested list item that renders as plain
+/// body text gets `marker == 0`. Reuses the pooled `out` buffer rather than
+/// allocating a fresh Vec per line.
+fn line_spans_into(line: &str, marker: usize, out: &mut Vec<markdown::Span>) {
+    out.clear();
     if marker > 0 {
-        spans.push(markdown::Span {
+        out.push(markdown::Span {
             start: 0,
             end: marker,
             kind: markdown::SpanKind::Marker,
         });
     }
-    for mut span in markdown::inline_spans(&line[marker..]) {
+    // Append the content's spans (content-relative), then shift them past the
+    // marker in place, so no intermediate Vec is allocated for them.
+    let base = out.len();
+    markdown::inline_spans_append(&line[marker..], out);
+    for span in &mut out[base..] {
         span.start += marker;
         span.end += marker;
-        spans.push(span);
     }
-    spans
 }
 
-/// The spans of a line inside a fenced code block: a whole-line code run, or, on
-/// a fence delimiter line (the opening or closing ```), a whole-line marker run
-/// so the fence and any info string read as dimmed syntax. No inline parsing
-/// happens inside a code block. An empty line has no runs (the panel still draws).
-fn code_block_spans(line: &str, delimiter: bool) -> Vec<markdown::Span> {
+/// Fill `out` with the spans of a line inside a fenced code block: a whole-line
+/// code run, or, on a fence delimiter line (the opening or closing ```), a
+/// whole-line marker run so the fence and any info string read as dimmed syntax.
+/// No inline parsing happens inside a code block. An empty line has no runs (the
+/// panel still draws). Reuses the pooled `out` buffer.
+fn code_block_spans_into(line: &str, delimiter: bool, out: &mut Vec<markdown::Span>) {
+    out.clear();
     if line.is_empty() {
-        return Vec::new();
+        return;
     }
     let kind = if delimiter {
         markdown::SpanKind::Marker
     } else {
         markdown::SpanKind::Text(markdown::Emphasis::Code)
     };
-    vec![markdown::Span {
+    out.push(markdown::Span {
         start: 0,
         end: line.len(),
         kind,
-    }]
+    });
 }
 
 /// Clip line-relative `spans` to the visual segment `[seg_start, seg_end)`,

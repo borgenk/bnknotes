@@ -387,28 +387,41 @@ pub struct Span {
 /// Split `content` into a contiguous list of inline spans covering `[0, len)`,
 /// recognizing code spans, inline links, and `*`/`_`/`~~` emphasis. Text between
 /// and around markup becomes `Text(..)` spans, so the result has no gaps. Empty
-/// input yields no spans.
+/// input yields no spans. The owning wrapper over [`inline_spans_append`]; the
+/// layout reads spans through the appending form to pool the buffer, so this is
+/// used only by tests.
+#[cfg(test)]
 pub fn inline_spans(content: &str) -> Vec<Span> {
+    let mut out = Vec::new();
+    inline_spans_append(content, &mut out);
+    out
+}
+
+/// Append `content`'s inline spans, content-relative and tiling `[0, len)`, to
+/// `out` without clearing it, so a caller can reuse a pooled buffer across lines.
+/// [`inline_spans`] is the owning wrapper.
+pub fn inline_spans_append(content: &str, out: &mut Vec<Span>) {
     let bytes = content.as_bytes();
     let n = bytes.len();
     if n == 0 {
-        return Vec::new();
+        return;
     }
 
     // Fast path: content with none of the inline-markup bytes has no code span,
     // emphasis, strikethrough, or link, so every byte resolves to `Regular` and the
-    // whole thing coalesces to a single plain run. Returning it directly skips the
+    // whole thing coalesces to a single plain run. Pushing it directly skips the
     // dozen per-line mask allocations below, and this is the shape of ordinary
     // prose, most lines of most documents.
     if !bytes
         .iter()
         .any(|&b| matches!(b, b'`' | b'*' | b'_' | b'~' | b'['))
     {
-        return vec![Span {
+        out.push(Span {
             start: 0,
             end: n,
             kind: SpanKind::Text(Emphasis::Regular),
-        }];
+        });
+        return;
     }
 
     // Code spans first, since they bind tighter than emphasis. `in_code` marks every
@@ -476,13 +489,12 @@ pub fn inline_spans(content: &str) -> Vec<Span> {
             })
         }
     };
-    let mut spans = Vec::new();
     let mut start = 0;
     let mut cur = kind_at(0);
     for b in 1..n {
         let kind = kind_at(b);
         if kind != cur {
-            spans.push(Span {
+            out.push(Span {
                 start,
                 end: b,
                 kind: cur,
@@ -491,12 +503,11 @@ pub fn inline_spans(content: &str) -> Vec<Span> {
             cur = kind;
         }
     }
-    spans.push(Span {
+    out.push(Span {
         start,
         end: n,
         kind: cur,
     });
-    spans
 }
 
 /// One maximal run of `*` or `_` lying outside any code span, with whether it can

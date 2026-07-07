@@ -367,6 +367,7 @@ impl Layout {
         // the only two pieces of state that carry across logical lines.
         let mut fence: Option<usize> = None;
         let mut list_depth: Option<usize> = None;
+        let mut pool = LayoutScratch::default();
         let n_lines = rope.len_lines();
         for i in 0..n_lines {
             let ls = rope.line_to_byte(i);
@@ -392,6 +393,8 @@ impl Layout {
                 box_top,
                 &mut fence,
                 &mut list_depth,
+                &mut pool,
+                false,
                 &mut lines,
             );
         }
@@ -432,6 +435,7 @@ impl Layout {
         let (mut fence, mut list_depth) = index.entry_state(start);
         let mut box_top = box_top_seed;
         let start_top = box_top;
+        let mut pool = LayoutScratch::default();
         let mut lines = Vec::new();
         for i in start..end {
             let ls = rope.line_to_byte(i);
@@ -455,6 +459,8 @@ impl Layout {
                 box_top,
                 &mut fence,
                 &mut list_depth,
+                &mut pool,
+                false,
                 &mut lines,
             );
         }
@@ -855,6 +861,20 @@ impl Layout {
     }
 }
 
+/// Per-line scratch buffers, pre-allocated once per build and reused across every
+/// line so laying out a line clears and refills them rather than allocating fresh
+/// Vecs. The buffers grow to the largest line the build sees and then stay put, so
+/// after the first few lines the per-line layout does no intermediate allocation
+/// for wrapping. Held by the build loop (or, in the parallel build, per worker).
+#[derive(Default)]
+struct LayoutScratch {
+    /// One entry per grapheme cluster: its byte offset, pixel width, and whether it
+    /// is a space (a wrap opportunity). Sized to the widest line seen.
+    clusters: Vec<(usize, f32, bool)>,
+    /// The wrapped visual segments' byte ranges, produced by [`wrap_segments`].
+    segments: Vec<(usize, usize)>,
+}
+
 /// Lay out one logical line `[ls, le)` starting at content-space top `box_top`,
 /// appending its visual line(s) to `out` and returning the height it added (the
 /// amount to advance `box_top` before the next line). `fence` and `list_depth` are
@@ -863,6 +883,10 @@ impl Layout {
 /// image widgets only, never wrap points or baselines. This is the single per-line
 /// unit shared by the full [`Layout::build_with_images`] loop and (later) the
 /// windowed build, so the two can never disagree on a line's shape.
+///
+/// `pool` supplies the per-line scratch buffers (`clusters`, `segments`), owned by
+/// the caller's build loop and reused across every line so laying out a line
+/// clears and refills them instead of allocating fresh Vecs.
 #[allow(clippy::too_many_arguments)]
 fn lay_line(
     fonts: &Fonts,
@@ -878,6 +902,11 @@ fn lay_line(
     box_top: i32,
     fence: &mut Option<usize>,
     list_depth: &mut Option<usize>,
+    pool: &mut LayoutScratch,
+    // When true the caller only wants each line's height and image flag (the
+    // `LineIndex` build), so the styled runs are skipped: `clip_runs` allocates a
+    // `Vec` per visual row that measurement would immediately discard.
+    measure_only: bool,
     out: &mut Vec<VisualLine>,
 ) -> i32 {
     // Running box top within this logical line; the return value is how far it
@@ -1044,7 +1073,7 @@ fn lay_line(
     // absolute buffer positions. It measures the source text, so clipping spans to
     // each segment never disagrees with the breaks, and reveal state (which only
     // hides markers) never reflows the document.
-    let segments = wrap_segments(
+    wrap_segments(
         fonts,
         size,
         &line,
@@ -1052,9 +1081,11 @@ fn lay_line(
         line_wrap,
         block_indent,
         heading.is_some(),
+        &mut pool.clusters,
+        &mut pool.segments,
     );
-    let last = segments.len() - 1;
-    for (k, (start, end)) in segments.into_iter().enumerate() {
+    let last = pool.segments.len() - 1;
+    for (k, &(start, end)) in pool.segments.iter().enumerate() {
         // Every segment carries the shared left inset (`seg_pad`); wrapped
         // continuations add the marker's width on top so their text hangs under the
         // first line's text.
@@ -1080,15 +1111,19 @@ fn lay_line(
             // hard break.
             hard: k == last && has_newline,
             size,
-            runs: clip_runs(
-                &spans,
-                start,
-                end,
-                ls,
-                revealed,
-                block_marker,
-                block_persists,
-            ),
+            runs: if measure_only {
+                Vec::new()
+            } else {
+                clip_runs(
+                    &spans,
+                    start,
+                    end,
+                    ls,
+                    revealed,
+                    block_marker,
+                    block_persists,
+                )
+            },
             indent,
             gutter,
             code_block,
@@ -1159,6 +1194,7 @@ fn measure_chunk(
     let mut fence: Option<usize> = None;
     let mut list_depth: Option<usize> = None;
     let mut scratch: Vec<VisualLine> = Vec::new();
+    let mut pool = LayoutScratch::default();
     let mut recs = Vec::with_capacity(hi - lo);
     for i in lo..hi {
         recs.push(LineIndex::measure_line(
@@ -1171,6 +1207,7 @@ fn measure_chunk(
             images,
             &mut fence,
             &mut list_depth,
+            &mut pool,
             &mut scratch,
         ));
     }
@@ -1261,6 +1298,7 @@ impl LineIndex {
         images: &ImageStore,
         fence: &mut Option<usize>,
         list_depth: &mut Option<usize>,
+        pool: &mut LayoutScratch,
         scratch: &mut Vec<VisualLine>,
     ) -> LineRec {
         let ls = rope.line_to_byte(i);
@@ -1287,6 +1325,8 @@ impl LineIndex {
             0,
             fence,
             list_depth,
+            pool,
+            true,
             scratch,
         );
         // Only a decoded standalone image changes height when revealed; measure
@@ -1311,6 +1351,8 @@ impl LineIndex {
                 0,
                 &mut f2,
                 &mut d2,
+                pool,
+                true,
                 scratch,
             );
             revealed - height
@@ -1352,6 +1394,7 @@ impl LineIndex {
         let mut fence: Option<usize> = None;
         let mut list_depth: Option<usize> = None;
         let mut scratch: Vec<VisualLine> = Vec::new();
+        let mut pool = LayoutScratch::default();
         for i in 0..n {
             recs.push(Self::measure_line(
                 fonts,
@@ -1363,6 +1406,7 @@ impl LineIndex {
                 images,
                 &mut fence,
                 &mut list_depth,
+                &mut pool,
                 &mut scratch,
             ));
         }
@@ -1458,6 +1502,7 @@ impl LineIndex {
         let mut fence: Option<usize> = None;
         let mut list_depth: Option<usize> = None;
         let mut scratch: Vec<VisualLine> = Vec::new();
+        let mut pool = LayoutScratch::default();
         for (out, &(lo, hi)) in outs.iter().zip(&ranges) {
             if fence.is_none() && list_depth.is_none() {
                 recs.extend_from_slice(&out.recs);
@@ -1475,6 +1520,7 @@ impl LineIndex {
                         images,
                         &mut fence,
                         &mut list_depth,
+                        &mut pool,
                         &mut scratch,
                     ));
                 }
@@ -1531,6 +1577,7 @@ impl LineIndex {
         let (mut fence, mut list_depth) = self.entry_state(front);
         let mut mid: Vec<LineRec> = Vec::new();
         let mut scratch: Vec<VisualLine> = Vec::new();
+        let mut pool = LayoutScratch::default();
         let mut i = front;
         let converge_old = loop {
             let old_i = i as isize - delta;
@@ -1556,6 +1603,7 @@ impl LineIndex {
                 images,
                 &mut fence,
                 &mut list_depth,
+                &mut pool,
                 &mut scratch,
             ));
             i += 1;
@@ -1791,6 +1839,7 @@ fn clip_runs(
 /// segment uses the full `wrap_width` (its marker sits in that width), and every
 /// continuation is wrapped `block_indent` pixels narrower, since it renders inset
 /// by that much. So the text column is the same width on every line of the item.
+#[allow(clippy::too_many_arguments)]
 fn wrap_segments(
     fonts: &Fonts,
     size: u32,
@@ -1799,24 +1848,28 @@ fn wrap_segments(
     wrap_width: i32,
     block_indent: i32,
     heading: bool,
-) -> Vec<(usize, usize)> {
+    clusters: &mut Vec<(usize, f32, bool)>,
+    segments: &mut Vec<(usize, usize)>,
+) {
+    segments.clear();
     if wrap_width <= 0 || line.is_empty() {
-        return vec![(0, line.len())];
+        segments.push((0, line.len()));
+        return;
     }
     // Measure each cluster once: its offset within the line, width in its run's
-    // face, and whether it is a space (a wrap opportunity). Sized up front to the
-    // byte length (an upper bound on cluster count), so this fills in one
-    // allocation rather than growing from empty on every line.
-    let mut clusters: Vec<(usize, f32, bool)> = Vec::with_capacity(line.len());
+    // face, and whether it is a space (a wrap opportunity). The pooled buffer is
+    // cleared and refilled, so it reuses its capacity across lines instead of
+    // allocating one sized to the line on every call.
+    clusters.clear();
     clusters.extend(grapheme::graphemes(line).map(|(off, cluster)| {
         let face = run_face(fonts, size, kind_at(spans, off), heading);
         (off, shape::text_advance(face, cluster), cluster == " ")
     }));
     if clusters.is_empty() {
-        return vec![(0, line.len())];
+        segments.push((0, line.len()));
+        return;
     }
 
-    let mut segments = Vec::new();
     let mut i = 0;
     while i < clusters.len() {
         // The first segment gets the full width; continuations are narrower by
@@ -1852,7 +1905,6 @@ fn wrap_segments(
         segments.push((seg_start, clusters[next].0));
         i = next;
     }
-    segments
 }
 
 #[cfg(test)]

@@ -103,13 +103,16 @@ impl Regex {
     /// at its starting position. Empty matches are skipped: highlighting a
     /// zero-width range is useless in a find UI and would otherwise match at
     /// every position.
-    pub fn find_all(&self, text: &str) -> Vec<(usize, usize)> {
+    pub fn find_all(&self, text: &str, limit: usize) -> Vec<(usize, usize)> {
         let mut out = Vec::new();
         let mut i = 0;
         while i <= text.len() {
             if let Some(end) = self.match_at(text, i) {
                 if end > i {
                     out.push((i, end));
+                    if out.len() >= limit {
+                        break;
+                    }
                     i = end;
                     continue;
                 }
@@ -424,13 +427,20 @@ mod tests {
     fn all(pattern: &str, text: &str) -> Vec<(usize, usize)> {
         Regex::compile(pattern)
             .expect("pattern compiles")
-            .find_all(text)
+            .find_all(text, usize::MAX)
     }
 
     #[test]
     fn literals_match_like_the_plain_search() {
         assert_eq!(all("one", "one two one"), vec![(0, 3), (8, 11)]);
         assert_eq!(all("fox", "Fox FOX"), vec![(0, 3), (4, 7)], "ASCII folded");
+    }
+
+    #[test]
+    fn find_all_stops_at_the_limit() {
+        let re = Regex::compile("a").expect("pattern compiles");
+        assert_eq!(re.find_all("aaaa", 2).len(), 2, "capped");
+        assert_eq!(re.find_all("aaaa", usize::MAX).len(), 4, "uncapped");
     }
 
     #[test]

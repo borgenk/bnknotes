@@ -25,6 +25,14 @@ pub enum Field {
     Replace,
 }
 
+/// Cap on collected matches. A query matching a large fraction of a big document
+/// would otherwise allocate an unbounded match list (the mem-report's worst case
+/// is gigabytes of `(start, end)` pairs). Collection stops at this many, which is
+/// far past any count a user navigates or a note contains, so it only bites a
+/// pathological search; a repeated replace-all still drains the rest as the anchor
+/// advances past the replaced text.
+const MAX_MATCHES: usize = 100_000;
+
 /// The find bar's state: fields, modes, and the matches of the query against
 /// the text it was last scanned over.
 pub struct FindState {
@@ -309,14 +317,14 @@ impl FindState {
             Vec::new()
         } else if self.regex {
             match Regex::compile(&self.query) {
-                Ok(re) => re.find_all(text),
+                Ok(re) => re.find_all(text, MAX_MATCHES),
                 Err(_) => {
                     self.error = true;
                     Vec::new()
                 }
             }
         } else {
-            scan(text, &self.query)
+            scan(text, &self.query, MAX_MATCHES)
         };
         if self.word {
             found.retain(|&(start, end)| on_word_boundaries(text, start, end));
@@ -334,7 +342,7 @@ impl FindState {
 /// Byte ranges of every non-overlapping occurrence of `query` in `text`, in
 /// order, comparing ASCII letters case-insensitively and everything else
 /// byte-exactly. An empty query matches nothing.
-fn scan(text: &str, query: &str) -> Vec<(usize, usize)> {
+fn scan(text: &str, query: &str, limit: usize) -> Vec<(usize, usize)> {
     let (t, q) = (text.as_bytes(), query.as_bytes());
     let mut out = Vec::new();
     if q.is_empty() {
@@ -344,6 +352,9 @@ fn scan(text: &str, query: &str) -> Vec<(usize, usize)> {
     while i + q.len() <= t.len() {
         if t[i..i + q.len()].eq_ignore_ascii_case(q) {
             out.push((i, i + q.len()));
+            if out.len() >= limit {
+                break;
+            }
             i += q.len();
         } else {
             i += 1;
@@ -367,6 +378,12 @@ fn on_word_boundaries(text: &str, start: usize, end: usize) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The module `scan` gained a match cap; these tests want every match, so
+    /// this shadow passes an unbounded limit.
+    fn scan(text: &str, query: &str) -> Vec<(usize, usize)> {
+        super::scan(text, query, usize::MAX)
+    }
 
     #[test]
     fn scan_finds_all_occurrences_in_order() {
@@ -398,6 +415,14 @@ mod tests {
             assert!(text.is_char_boundary(start) && text.is_char_boundary(end));
         }
         assert_eq!(scan(text, "é").len(), 2);
+    }
+
+    #[test]
+    fn scan_stops_at_the_match_limit() {
+        // The cap bounds the collected list, so a query matching a huge fraction
+        // of a document cannot allocate without bound.
+        assert_eq!(super::scan("a a a a a", "a", 2).len(), 2);
+        assert_eq!(super::scan("a a a a a", "a", usize::MAX).len(), 5);
     }
 
     #[test]

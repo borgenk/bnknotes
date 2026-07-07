@@ -6,9 +6,10 @@ use crate::file::{self, FileFormat};
 use crate::find::FindState;
 use crate::freetype::Fonts;
 use crate::image::ImageStore;
-use crate::layout::{ImageUi, Layout, Rect};
+use crate::layout::{ImageUi, Layout, LineIndex, Rect, RevealAdjust};
 use crate::markdown;
 use crate::protocol::wp_cursor_shape_device_v1;
+use crate::rope::Rope;
 use crate::scroll;
 use crate::store;
 use crate::text::TextBuffer;
@@ -67,6 +68,11 @@ type LayoutKey = (
     Option<usize>,
     Option<usize>,
 );
+
+/// The inputs the line-metrics index depends on: content version, column x and
+/// width, and body font size. Reveal and scroll leave these unchanged, so a cursor
+/// move or a scroll reuses the index and only the visible window rebuilds.
+type IndexKey = (u64, i32, i32, u32);
 
 /// Which region holds keyboard focus. Editing keys go to the focused editor;
 /// the file tree takes navigation keys when it is focused.
@@ -187,8 +193,16 @@ pub(crate) struct EditorPane {
     pub(crate) find: FindState,
     pub(crate) scroll_y: i32,
     pub(crate) content_height: i32,
+    pub(crate) line_index: Option<LineIndex>,
+    pub(crate) index_key: Option<IndexKey>,
+    /// The rope the current index was built from, so an edit can be re-measured
+    /// incrementally by diffing against it. An `Rc` clone, so keeping it is free.
+    pub(crate) prev_rope: Option<Rope>,
     pub(crate) layout_cache: Option<Layout>,
     pub(crate) layout_key: Option<LayoutKey>,
+    /// The logical-line range `[start, end)` the cached window covers, so a caller
+    /// can tell whether an offset (the cursor, a click) falls inside it.
+    pub(crate) layout_band: (usize, usize),
     pub(crate) goal_x: Option<f32>,
     pub(crate) selecting: bool,
     pub(crate) frozen_reveal: Option<(usize, usize)>,
@@ -212,8 +226,12 @@ impl EditorPane {
             find: FindState::new(),
             scroll_y: 0,
             content_height: 0,
+            line_index: None,
+            index_key: None,
+            prev_rope: None,
             layout_cache: None,
             layout_key: None,
+            layout_band: (0, 0),
             goal_x: None,
             selecting: false,
             frozen_reveal: None,
@@ -278,13 +296,83 @@ impl EditorPane {
         }
     }
 
-    /// Lay the text out into the column `rect`: wrap to its width less a margin
-    /// each side, origin at its top-left plus margin. Memoized on `(version,
-    /// column x, column width, font, active line span, image UI)`, so a scroll or
-    /// idle redraw reuses the cache; only an edit, a cross-line move, or a column
-    /// resize misses. Baking the column's `x` into the layout keeps content in
-    /// its column with no clip.
-    pub(crate) fn ensure_layout(&mut self, fonts: &Fonts, rect: Rect) {
+    /// The ≤2-line overlay of image sources revealed right now (the reveal range's
+    /// ends and the raw-pinned line), so the index reports heights and positions
+    /// under the current reveal. Empty (and free) for the common no-image case.
+    fn reveal_adjust(&self) -> RevealAdjust {
+        let mut adjust = RevealAdjust::default();
+        let Some(index) = self.line_index.as_ref() else {
+            return adjust;
+        };
+        let rope = self.text.rope();
+        let (lo, hi) = self.reveal_range();
+        let l0 = rope.byte_to_line(lo);
+        adjust.push(l0, index.reveal_extra(l0));
+        let l1 = rope.byte_to_line(hi);
+        if l1 != l0 {
+            adjust.push(l1, index.reveal_extra(l1));
+        }
+        if let Some(raw) = self.raw_image {
+            let lr = rope.byte_to_line(raw);
+            adjust.push(lr, index.reveal_extra(lr));
+        }
+        adjust
+    }
+
+    /// Rebuild the line-metrics index when the content, column, or font changes
+    /// (not on a scroll or cursor move), then refresh `content_height` from it plus
+    /// any revealed image sources. The index is where the O(document) measuring
+    /// lives now, paid once per edit or resize rather than per keystroke.
+    pub(crate) fn ensure_index(&mut self, fonts: &Fonts, rect: Rect) {
+        let key = (self.text.version(), rect.x, rect.w, FONT_SIZE);
+        if self.index_key != Some(key) {
+            let wrap_width = rect.w - 2 * MARGIN;
+            self.scan_images();
+            // When only the content changed (same column and font), re-measure just
+            // the edited region against the previous rope; otherwise (first build,
+            // or a resize) rebuild in full.
+            let geometry_same = matches!(
+                self.index_key,
+                Some((_, x, w, fsize)) if x == rect.x && w == rect.w && fsize == FONT_SIZE
+            );
+            let incremental =
+                geometry_same && self.line_index.is_some() && self.prev_rope.is_some();
+            if incremental {
+                let mut index = self.line_index.take().expect("checked");
+                let prev = self.prev_rope.take().expect("checked");
+                index.update(
+                    fonts,
+                    self.text.rope(),
+                    &prev,
+                    wrap_width,
+                    FONT_SIZE,
+                    &self.images,
+                );
+                self.line_index = Some(index);
+            } else {
+                self.line_index = Some(LineIndex::build(
+                    fonts,
+                    self.text.rope(),
+                    wrap_width,
+                    FONT_SIZE,
+                    &self.images,
+                ));
+            }
+            self.prev_rope = Some(self.text.rope().clone());
+            self.index_key = Some(key);
+        }
+        let adjust = self.reveal_adjust();
+        if let Some(index) = self.line_index.as_ref() {
+            self.content_height = index.content_height(&adjust) + 2 * MARGIN;
+        }
+    }
+
+    /// Rebuild the windowed layout when the viewport leaves the built band or the
+    /// reveal changes. The window covers the viewport plus a page of overscan each
+    /// side (so all incremental motion and the caret sit inside it) with absolute
+    /// positions seeded from the index, so lines above the window are never laid
+    /// out. A scroll or cursor move that stays within the band reuses the cache.
+    pub(crate) fn ensure_window(&mut self, fonts: &Fonts, rect: Rect) {
         let active = self.reveal_range();
         let active_lines = {
             let rope = self.text.rope();
@@ -300,30 +388,98 @@ impl EditorPane {
             self.selected_image,
             self.raw_image,
         );
-        if self.layout_key != Some(key) {
-            let wrap_width = rect.w - 2 * MARGIN;
-            self.scan_images();
-            let layout = Layout::build_with_images(
+        let adjust = self.reveal_adjust();
+        let (vis_top, vis_bot, over, n) = {
+            let Some(index) = self.line_index.as_ref() else {
+                return;
+            };
+            (
+                index.line_at_y(self.scroll_y, &adjust),
+                index.line_at_y(self.scroll_y + rect.h.max(0), &adjust),
+                self.page_lines(fonts, rect),
+                index.len(),
+            )
+        };
+        let covered = self.layout_key == Some(key)
+            && self.layout_cache.is_some()
+            && self.layout_band.0 <= vis_top
+            && self.layout_band.1 > vis_bot;
+        if covered {
+            return;
+        }
+        let start = vis_top.saturating_sub(over);
+        let end = (vis_bot + over + 1).min(n).max(start);
+        let wrap_width = rect.w - 2 * MARGIN;
+        let layout = {
+            let index = self.line_index.as_ref().expect("index built above");
+            let seed = rect.y + MARGIN + index.logical_top(start, &adjust);
+            Layout::build_window(
                 fonts,
                 self.text.rope(),
                 rect.x + MARGIN,
-                rect.y + MARGIN,
+                seed,
                 wrap_width,
                 FONT_SIZE,
                 active,
                 &self.images,
                 self.image_ui(),
-            );
-            self.content_height = layout.text_height() + 2 * MARGIN;
-            self.layout_cache = Some(layout);
-            self.layout_key = Some(key);
-        }
+                index,
+                start,
+                end,
+            )
+        };
+        self.layout_cache = Some(layout);
+        self.layout_band = (start, end);
+        self.layout_key = Some(key);
+    }
+
+    /// Ensure both the index and the visible window are current for `rect`. Callers
+    /// that paint or hit-test the viewport use this; cursor-only operations use
+    /// [`Self::ensure_index`] with [`Self::cursor_window`] instead.
+    pub(crate) fn ensure_layout(&mut self, fonts: &Fonts, rect: Rect) {
+        self.ensure_index(fonts, rect);
+        self.ensure_window(fonts, rect);
+    }
+
+    /// Lay out a window centered on the cursor (a page each side plus slack for
+    /// page-motion targets landing at the edges), with absolute document positions
+    /// from the index. Cursor operations run the ordinary [`Layout`] methods on
+    /// this, so their logic is shared with the full build; it is built on demand and
+    /// is O(viewport), never O(document). Requires the index (call `ensure_index`).
+    fn cursor_window(&self, fonts: &Fonts, rect: Rect) -> Option<Layout> {
+        let index = self.line_index.as_ref()?;
+        let rope = self.text.rope();
+        let adjust = self.reveal_adjust();
+        let active = self.reveal_range();
+        let cursor_line = rope.byte_to_line(self.text.cursor());
+        let span = self.page_lines(fonts, rect) + 4;
+        let n = index.len();
+        let start = cursor_line.saturating_sub(span);
+        let end = (cursor_line + span + 1).min(n).max(start);
+        let seed = rect.y + MARGIN + index.logical_top(start, &adjust);
+        let wrap_width = rect.w - 2 * MARGIN;
+        Some(Layout::build_window(
+            fonts,
+            rope,
+            rect.x + MARGIN,
+            seed,
+            wrap_width,
+            FONT_SIZE,
+            active,
+            &self.images,
+            self.image_ui(),
+            index,
+            start,
+            end,
+        ))
     }
 
     /// Scroll by `delta` px within the column `rect`, clamped to the content.
     /// Returns whether the offset changed (so the caller can mark a repaint).
     pub(crate) fn scroll_by(&mut self, fonts: &Fonts, rect: Rect, delta: i32) -> bool {
-        self.ensure_layout(fonts, rect);
+        // Only the content height (from the index) is needed to clamp; the visible
+        // window rebuilds on the next frame at the new offset.
+        self.ensure_index(fonts, rect);
         let sy = scroll::clamp(self.scroll_y + delta, self.content_height, rect.h);
         let moved = sy != self.scroll_y;
         self.scroll_y = sy;
@@ -331,17 +487,16 @@ impl EditorPane {
     }
 
     /// Scroll the minimum to keep the caret visible after a cursor move; returns
-    /// whether the offset changed.
+    /// whether the offset changed. The caret's band comes from a window built
+    /// around the cursor, so this works even when the cursor sits far outside the
+    /// currently painted window.
     pub(crate) fn scroll_caret_into_view(&mut self, fonts: &Fonts, rect: Rect) -> bool {
-        self.ensure_layout(fonts, rect);
+        self.ensure_index(fonts, rect);
         let cursor = self.text.cursor();
-        let Some((_, caret_top, caret_h)) = self
-            .layout_cache
-            .as_ref()
-            .map(|l| l.caret(fonts, self.text.rope(), cursor))
-        else {
+        let Some(win) = self.cursor_window(fonts, rect) else {
             return false;
         };
+        let (_, caret_top, caret_h) = win.caret(fonts, self.text.rope(), cursor);
         let sy = scroll::reveal(
             self.scroll_y,
             caret_top,
@@ -363,17 +518,15 @@ impl EditorPane {
         dir: i32,
         extend: bool,
     ) -> bool {
-        self.ensure_layout(fonts, rect);
+        self.ensure_index(fonts, rect);
         let cursor = self.text.cursor();
         let before_sel = self.text.selection();
-        // Read the cached layout by reference; `goal_x`/`text` are disjoint
-        // fields, so they can be touched while the layout borrow is live.
-        let Some(layout) = self.layout_cache.as_ref() else {
+        let Some(win) = self.cursor_window(fonts, rect) else {
             return false;
         };
-        let (caret_x, _, _) = layout.caret(fonts, self.text.rope(), cursor);
+        let (caret_x, _, _) = win.caret(fonts, self.text.rope(), cursor);
         let goal = self.goal_x.unwrap_or(caret_x as f32);
-        let target = layout.offset_vertical(fonts, self.text.rope(), cursor, dir, goal);
+        let target = win.offset_vertical(fonts, self.text.rope(), cursor, dir, goal);
         self.goal_x = Some(goal);
         self.text.set_cursor(target, extend);
         self.text.cursor() != cursor || self.text.selection() != before_sel
@@ -387,13 +540,13 @@ impl EditorPane {
         to_end: bool,
         extend: bool,
     ) -> bool {
-        self.ensure_layout(fonts, rect);
+        self.ensure_index(fonts, rect);
         let cursor = self.text.cursor();
         let before_sel = self.text.selection();
-        let Some(layout) = self.layout_cache.as_ref() else {
+        let Some(win) = self.cursor_window(fonts, rect) else {
             return false;
         };
-        let (start, end) = layout.line_bounds(cursor);
+        let (start, end) = win.line_bounds(cursor);
         let target = if to_end {
             end
         } else {
@@ -407,20 +560,22 @@ impl EditorPane {
 
     /// Move the cursor one column-height up/down, keeping the sticky goal column.
     pub(crate) fn move_page(&mut self, fonts: &Fonts, rect: Rect, dir: i32, extend: bool) -> bool {
-        self.ensure_layout(fonts, rect);
+        self.ensure_index(fonts, rect);
         let cursor = self.text.cursor();
         let before_sel = self.text.selection();
         let page_lines = self.page_lines(fonts, rect);
-        let Some(layout) = self.layout_cache.as_ref() else {
+        let Some(win) = self.cursor_window(fonts, rect) else {
             return false;
         };
-        let (caret_x, _, _) = layout.caret(fonts, self.text.rope(), cursor);
+        let (caret_x, _, _) = win.caret(fonts, self.text.rope(), cursor);
         let goal = self.goal_x.unwrap_or(caret_x as f32);
         // Step a line at a time so each hop honors the goal column and the
-        // varying per-line heights; stop early at the first or last line.
+        // varying per-line heights; stop early at the first or last line. The
+        // cursor window spans a page plus slack, so a full page of steps stays
+        // inside it.
         let mut target = cursor;
         for _ in 0..page_lines {
-            let next = layout.offset_vertical(fonts, self.text.rope(), target, dir, goal);
+            let next = win.offset_vertical(fonts, self.text.rope(), target, dir, goal);
             if next == target {
                 break;
             }
@@ -436,6 +591,33 @@ impl EditorPane {
     pub(crate) fn page_lines(&self, fonts: &Fonts, rect: Rect) -> usize {
         let line_height = fonts.metrics(FONT_SIZE).line_height.max(1);
         (rect.h / line_height - 1).max(1) as usize
+    }
+
+    /// Content-space top for each current find match, from the index, so the tick
+    /// strip places a match outside the painted window at its true position. Empty
+    /// when find is closed or the index is not built. Call after `ensure_index`.
+    pub(crate) fn find_tick_tops(&self) -> Vec<i32> {
+        let Some(index) = self.line_index.as_ref() else {
+            return Vec::new();
+        };
+        if !self.find.is_open() {
+            return Vec::new();
+        }
+        let rope = self.text.rope();
+        let adjust = self.reveal_adjust();
+        self.find
+            .matches()
+            .iter()
+            .map(|&(start, _)| MARGIN + index.logical_top(rope.byte_to_line(start), &adjust))
+            .collect()
+    }
+
+    /// Whether the cursor's logical line falls inside the painted window, so a caret
+    /// drawn from that window sits at the true position rather than a clamped
+    /// fallback. Off-window (scrolled far away) means the caret is simply not drawn.
+    pub(crate) fn cursor_in_window(&self) -> bool {
+        let line = self.text.rope().byte_to_line(self.text.cursor());
+        self.layout_band.0 <= line && line < self.layout_band.1
     }
 
     /// Content-space y for a window y inside this pane's column (the column top

@@ -54,6 +54,11 @@ pub(crate) struct FindPaint<'a> {
     /// Index into `matches` of the current match. It is not highlighted here
     /// because the app mirrors it into the buffer selection.
     pub current: usize,
+    /// Content-space top of each match's line, from the line index, so the tick
+    /// strip places a match that sits outside the painted window correctly.
+    pub tick_tops: &'a [i32],
+    /// Total document content height, for the tick strip's proportional mapping.
+    pub doc_height: i32,
 }
 
 /// A [`DrawCmd::Text`] for `text` from `x` along `baseline` in `face`/`color`,
@@ -89,7 +94,13 @@ fn text_cmd(
 }
 
 /// The painter's view of an open find bar, or `None` when it is closed.
-pub(crate) fn build_find_paint(find: &FindState) -> Option<FindPaint<'_>> {
+/// `tick_tops` and `doc_height` come from the caller's line index, so the tick
+/// strip does not depend on which lines the windowed layout currently holds.
+pub(crate) fn build_find_paint<'a>(
+    find: &'a FindState,
+    tick_tops: &'a [i32],
+    doc_height: i32,
+) -> Option<FindPaint<'a>> {
     if !find.is_open() {
         return None;
     }
@@ -103,6 +114,8 @@ pub(crate) fn build_find_paint(find: &FindState) -> Option<FindPaint<'_>> {
         error: find.error(),
         matches: find.matches(),
         current: find.current(),
+        tick_tops,
+        doc_height,
     })
 }
 
@@ -525,7 +538,7 @@ pub(crate) fn build_display_list(
     // The find bar and its match ticks float over everything else, so they go
     // last.
     if let Some(find) = &p.find {
-        push_find_ticks(&mut list, layout, find, width as i32, view_h);
+        push_find_ticks(&mut list, find, width as i32, view_h);
         push_find_bar(&mut list, fonts, find, width as i32);
     }
 
@@ -537,29 +550,17 @@ pub(crate) fn build_display_list(
 /// a glance and survives scrolling. Ticks are deduplicated per two-pixel row,
 /// which bounds the strip to O(viewport) commands however many matches exist;
 /// the current match's tick is wider and bright.
-fn push_find_ticks(
-    list: &mut DisplayList,
-    layout: &Layout,
-    find: &FindPaint,
-    width: i32,
-    view_h: i32,
-) {
+fn push_find_ticks(list: &mut DisplayList, find: &FindPaint, width: i32, view_h: i32) {
     if find.matches.is_empty() || view_h <= 0 {
         return;
     }
-    let lines = layout.lines();
-    let content_h = (layout.text_height() + 2 * MARGIN).max(view_h) as i64;
+    let content_h = find.doc_height.max(view_h) as i64;
     let mut occupied = vec![false; (view_h / 2 + 1) as usize];
-    for (i, &(start, _)) in find.matches.iter().enumerate() {
-        // The line containing the match's start; matches always sit inside
-        // some line, but fall back to the top defensively.
-        let idx = lines
-            .partition_point(|l| l.start <= start)
-            .saturating_sub(1);
-        let Some(line) = lines.get(idx) else {
-            continue;
-        };
-        let y = (line.baseline as i64 * (view_h - TICK_HEIGHT) as i64 / content_h) as i32;
+    for i in 0..find.matches.len() {
+        // Each match's content-space top comes from the line index, so an offscreen
+        // match still maps to its true position rather than the window's edge.
+        let top = find.tick_tops.get(i).copied().unwrap_or(0) as i64;
+        let y = (top * (view_h - TICK_HEIGHT) as i64 / content_h) as i32;
         let bucket = (y / 2).clamp(0, view_h / 2) as usize;
         let current = i == find.current;
         if occupied[bucket] && !current {
@@ -936,6 +937,23 @@ fn push_image_chrome(list: &mut DisplayList, fonts: &Fonts, pic: &Rect) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The tick strip's per-match tops and document height, matching the values
+    /// the app derives from its line index: each match's line baseline, and the
+    /// content height including margins.
+    fn tick_tops(layout: &Layout, matches: &[(usize, usize)]) -> (Vec<i32>, i32) {
+        let tops = matches
+            .iter()
+            .map(|&(start, _)| {
+                let idx = layout
+                    .lines()
+                    .partition_point(|l| l.start <= start)
+                    .saturating_sub(1);
+                layout.lines().get(idx).map_or(0, |l| l.baseline)
+            })
+            .collect();
+        (tops, layout.text_height() + 2 * MARGIN)
+    }
     use crate::rope::Rope;
 
     fn paint_params(width: usize, height: usize) -> PaintParams<'static> {
@@ -1042,6 +1060,7 @@ mod tests {
         let wrap = w as i32 - 2 * MARGIN;
         let layout = Layout::build(&fonts, &rope, MARGIN, MARGIN, wrap, FONT_SIZE, (0, 0));
         let matches = [(0usize, 3usize), (8, 11), (16, 19)];
+        let (tops, doc_h) = tick_tops(&layout, &matches);
         let params = PaintParams {
             width: w,
             height: h,
@@ -1060,6 +1079,8 @@ mod tests {
                 error: false,
                 matches: &matches,
                 current: 1,
+                tick_tops: &tops,
+                doc_height: doc_h,
             }),
         };
         let list = build_display_list(&fonts, &layout, &rope, &params);
@@ -1097,6 +1118,7 @@ mod tests {
         let wrap = w as i32 - 2 * MARGIN;
         let layout = Layout::build(&fonts, &rope, MARGIN, MARGIN, wrap, FONT_SIZE, (0, 0));
         let matches = [(0usize, 3usize), (8, 11), (19, 22)];
+        let (tops, doc_h) = tick_tops(&layout, &matches);
         let params = PaintParams {
             width: w,
             height: h,
@@ -1114,6 +1136,8 @@ mod tests {
                 error: false,
                 matches: &matches,
                 current: 0,
+                tick_tops: &tops,
+                doc_height: doc_h,
             }),
         };
         let list = build_display_list(&fonts, &layout, &rope, &params);

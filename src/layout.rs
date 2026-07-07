@@ -363,275 +363,105 @@ impl Layout {
         // ascent below it, and the next box follows one line height down.
         let mut box_top = top;
         // `fence` holds the open fence's backtick count while inside a code block,
-        // the one piece of state that carries across logical lines.
+        // and `list_depth` the nesting depth of the most recent valid list item:
+        // the only two pieces of state that carry across logical lines.
         let mut fence: Option<usize> = None;
-        // `list_depth` is the nesting depth of the most recent valid list item (or
-        // `None` outside a list), so an item is rendered as a list only when its
-        // parent, one level shallower, is present above it.
         let mut list_depth: Option<usize> = None;
         let n_lines = rope.len_lines();
         for i in 0..n_lines {
             let ls = rope.line_to_byte(i);
-            // Every logical line but the last ends in a '\n'; its content
-            // excludes that byte. The rope materializes just this line.
+            // Every logical line but the last ends in a '\n'; its content excludes
+            // that byte. The rope materializes just this line inside `lay_line`.
             let has_newline = i + 1 < n_lines;
             let le = if has_newline {
                 rope.line_to_byte(i + 1) - 1
             } else {
                 rope.line_to_byte(i + 1)
             };
-            let line = rope.byte_slice(ls..le);
-            // Whether the cursor/selection touches this logical line: the same
-            // reveal test headings use, applied to fence lines too.
-            let on_line = active.0 <= le && active.1 >= ls;
-            // A standalone `![alt](path)` line whose image has decoded renders as a
-            // picture box. The picture always shows; when its source is revealed
-            // (cursor on the line, or the corner button pinned it open) the editable
-            // `![alt](path)` is laid out as a text line *above* the picture, so you
-            // edit with a live preview below. Inside a code fence the syntax is
-            // literal, not an image; a missing or undecodable image falls through to
-            // plain source so a broken link stays visible and editable.
-            //
-            // `pending_image`, when set, is the widget to append after this line's
-            // source text (the reveal case). The no-reveal case pushes its widget
-            // and `continue`s, never reaching the text path.
-            let mut pending_image: Option<ImageBox> = None;
-            if fence.is_none() {
-                if let Some(link) = markdown::standalone_image(&line) {
-                    if let Some((iw, ih)) = images.dimensions(&line[link.path.0..link.path.1]) {
-                        list_depth = None;
-                        let column = if wrap_width > 0 {
-                            wrap_width
-                        } else {
-                            iw as i32
-                        };
-                        let (width, height) = fit_image(iw, ih, column);
-                        let image = ImageBox {
-                            path_start: ls + link.path.0,
-                            path_end: ls + link.path.1,
-                            width,
-                            height,
-                            selected: image_ui.selected == Some(ls),
-                        };
-                        if on_line || image_ui.raw == Some(ls) {
-                            // Source revealed: emit it (fall through), then the widget.
-                            pending_image = Some(image);
-                        } else {
-                            // Picture only: one widget line, no source text.
-                            lines.push(VisualLine {
-                                start: ls,
-                                end: le,
-                                baseline: box_top + fonts.metrics(body_size).ascent,
-                                hard: has_newline,
-                                size: body_size,
-                                runs: Vec::new(),
-                                indent: 0,
-                                gutter: Gutter::None,
-                                code_block: false,
-                                heading: None,
-                                task: None,
-                                rule: false,
-                                image: Some(image),
-                            });
-                            box_top += image.box_height();
-                            continue;
-                        }
-                    }
-                }
-            }
-            // A line inside a fenced code block is code, not markdown: it skips the
-            // inline pass and renders as one code run. The ``` fence lines render
-            // their backticks as a marker that hides off the cursor's line, like a
-            // heading's `#`, so an unfocused block reads without fences (the panel
-            // still draws, leaving a blank padded row). The code lines between
-            // carry no markers, so their reveal flag is inert; keep it true. A code
-            // line carries `Body` as an inert style (its gutter is unused).
-            let (style, size, spans, block_marker, block_persists, revealed, code_block) =
-                if let Some(open) = fence {
-                    list_depth = None;
-                    let delimiter = markdown::closes_code_fence(&line, open);
-                    if delimiter {
-                        fence = None;
-                    }
-                    let spans = code_block_spans(&line, delimiter);
-                    // Only a fence delimiter line has backticks to hide.
-                    let revealed = !delimiter || on_line;
-                    (
-                        markdown::LineStyle::Body,
-                        body_size,
-                        spans,
-                        0,
-                        false,
-                        revealed,
-                        true,
-                    )
-                } else if let Some(open) = markdown::opens_code_fence(&line) {
-                    list_depth = None;
-                    fence = Some(open);
-                    let spans = code_block_spans(&line, true);
-                    (
-                        markdown::LineStyle::Body,
-                        body_size,
-                        spans,
-                        0,
-                        false,
-                        on_line,
-                        true,
-                    )
-                } else {
-                    // Resolve list nesting across lines: an item deeper than one
-                    // past the previous item has no parent and renders as body.
-                    let (style, marker) = resolve_list(&line, &mut list_depth);
-                    (
-                        style,
-                        markdown::font_size(style, body_size),
-                        line_spans(&line, marker),
-                        marker,
-                        markdown::block_marker_persists(style),
-                        on_line,
-                        false,
-                    )
-                };
-            // A revealed image's source always shows verbatim (its markers, if any,
-            // are not hidden), so the text above the picture reads as written.
-            let revealed = revealed || pending_image.is_some();
-            let metrics = fonts.metrics(size);
-            // Heading lines color their text by level (fence/code lines carry the
-            // inert `Body` style, so they are never headings here).
-            let heading = match style {
-                markdown::LineStyle::Heading(level) => Some(level),
-                _ => None,
-            };
-            // Stamped on every segment of a task item, so a checked item's text
-            // dims and strikes through wrapped continuations too.
-            let task = match style {
-                markdown::LineStyle::Task { checked } => Some(checked),
-                _ => None,
-            };
-            // A thematic break draws as a horizontal rule once the cursor leaves
-            // it; on the line itself the raw `---` shows (and `revealed` is true),
-            // matching how a heading reveals its `#`.
-            let rule = matches!(style, markdown::LineStyle::Rule) && !revealed;
-            // A list or quote item hangs its wrapped continuations under the text:
-            // the inset is the marker's width, measured on the source marker in the
-            // regular face at this line's size, so it matches the width the marker
-            // run itself advances on the first line and the columns line up.
-            let block_indent = if block_persists && block_marker > 0 {
-                shape::text_advance(fonts.face(size, FontStyle::Regular), &line[..block_marker])
-                    .round() as i32
-            } else {
-                0
-            };
-            // A left inset shared by every segment of the line, and how much it
-            // narrows the wrap width: a code block pads both sides inside its
-            // panel; a list item shifts right by a small indent (one side only).
-            let is_list = matches!(
-                style,
-                markdown::LineStyle::Bullet
-                    | markdown::LineStyle::Ordered
-                    | markdown::LineStyle::Task { .. }
-            );
-            let (seg_pad, wrap_reduce) = if code_block {
-                (CODE_PAD_X, 2 * CODE_PAD_X)
-            } else if is_list {
-                (LIST_INDENT, LIST_INDENT)
-            } else {
-                (0, 0)
-            };
-            let line_wrap = if wrap_width > 0 {
-                (wrap_width - wrap_reduce).max(1)
-            } else {
-                wrap_width
-            };
-            // `wrap_segments` returns ranges relative to the line; offset them
-            // back to absolute buffer positions for the visual lines. It measures
-            // the source text (every run in its own face), so clipping spans to
-            // each segment never disagrees with the breaks, and reveal state,
-            // which only hides markers, never reflows the document.
-            let segments = wrap_segments(
+            box_top += lay_line(
                 fonts,
-                size,
-                &line,
-                &spans,
-                line_wrap,
-                block_indent,
-                heading.is_some(),
+                rope,
+                ls,
+                le,
+                has_newline,
+                wrap_width,
+                body_size,
+                active,
+                images,
+                image_ui,
+                box_top,
+                &mut fence,
+                &mut list_depth,
+                &mut lines,
             );
-            let last = segments.len() - 1;
-            for (k, (start, end)) in segments.into_iter().enumerate() {
-                // Every segment carries the shared left inset (`seg_pad`); wrapped
-                // continuations add the marker's width on top so their text hangs
-                // under the first line's text.
-                let indent = seg_pad + if k == 0 { 0 } else { block_indent };
-                // A bullet shows its dot decoration even on the cursor's own line,
-                // so a list stays a list while you edit it (the raw `- ` is the
-                // editable source beneath the dot). A quote still reveals its raw
-                // `> ` for editing, drawing the bar only once the cursor leaves.
-                let gutter = match style {
-                    markdown::LineStyle::Bullet if k == 0 => Gutter::Bullet,
-                    // A task item draws its checkbox only once the cursor leaves
-                    // (like a quote's bar): on the line itself the raw `- [ ]` is
-                    // the editable source, and a click there edits, not toggles.
-                    markdown::LineStyle::Task { checked } if k == 0 && !revealed => {
-                        Gutter::Checkbox { checked }
-                    }
-                    markdown::LineStyle::Quote if !revealed => Gutter::QuoteBar { marker: k == 0 },
-                    _ => Gutter::None,
-                };
-                lines.push(VisualLine {
-                    start: ls + start,
-                    end: ls + end,
-                    baseline: box_top + metrics.ascent,
-                    // Only the final segment of a logical line that has a
-                    // trailing '\n' is a hard break.
-                    hard: k == last && has_newline,
-                    size,
-                    runs: clip_runs(
-                        &spans,
-                        start,
-                        end,
-                        ls,
-                        revealed,
-                        block_marker,
-                        block_persists,
-                    ),
-                    indent,
-                    gutter,
-                    code_block,
-                    heading,
-                    task,
-                    rule,
-                    image: None,
-                });
-                box_top += metrics.line_height;
-            }
-            // The picture sits below its just-emitted source line(s) (the reveal
-            // case). It is a widget line: never a caret target, taller than text.
-            if let Some(image) = pending_image {
-                lines.push(VisualLine {
-                    start: ls,
-                    end: le,
-                    // The source line above owns the caret and the logical line's
-                    // newline; this widget carries neither.
-                    baseline: box_top + metrics.ascent,
-                    hard: false,
-                    size: body_size,
-                    runs: Vec::new(),
-                    indent: 0,
-                    gutter: Gutter::None,
-                    code_block: false,
-                    heading: None,
-                    task: None,
-                    rule: false,
-                    image: Some(image),
-                });
-                box_top += image.box_height();
-            }
         }
         Self {
             lines,
             left,
             text_height: box_top - top,
+        }
+    }
+
+    /// Lay out only the logical lines `[band_start, band_end)`, seeding the running
+    /// box top from `box_top_seed` (the caller reads it from the [`LineIndex`], which
+    /// knows where the band sits without laying out the lines above it) and the
+    /// cross-line carry state from `index.entry_state(band_start)`. The resulting
+    /// `lines` hold absolute document baselines, so the existing consumers
+    /// (`caret`, `offset_at`, `selection_rects`, …) work unchanged on the window;
+    /// callers guarantee the offsets they ask about fall inside the band. This is
+    /// the windowed counterpart of [`Self::build_with_images`]: same per-line
+    /// [`lay_line`], a bounded slice of the loop.
+    #[allow(clippy::too_many_arguments)]
+    pub fn build_window(
+        fonts: &Fonts,
+        rope: &Rope,
+        left: i32,
+        box_top_seed: i32,
+        wrap_width: i32,
+        body_size: u32,
+        active: (usize, usize),
+        images: &ImageStore,
+        image_ui: ImageUi,
+        index: &LineIndex,
+        band_start: usize,
+        band_end: usize,
+    ) -> Self {
+        let n = rope.len_lines();
+        let start = band_start.min(n);
+        let end = band_end.min(n).max(start);
+        let (mut fence, mut list_depth) = index.entry_state(start);
+        let mut box_top = box_top_seed;
+        let start_top = box_top;
+        let mut lines = Vec::new();
+        for i in start..end {
+            let ls = rope.line_to_byte(i);
+            let has_newline = i + 1 < n;
+            let le = if has_newline {
+                rope.line_to_byte(i + 1) - 1
+            } else {
+                rope.line_to_byte(i + 1)
+            };
+            box_top += lay_line(
+                fonts,
+                rope,
+                ls,
+                le,
+                has_newline,
+                wrap_width,
+                body_size,
+                active,
+                images,
+                image_ui,
+                box_top,
+                &mut fence,
+                &mut list_depth,
+                &mut lines,
+            );
+        }
+        Self {
+            lines,
+            left,
+            text_height: box_top - start_top,
         }
     }
 
@@ -1025,6 +855,627 @@ impl Layout {
     }
 }
 
+/// Lay out one logical line `[ls, le)` starting at content-space top `box_top`,
+/// appending its visual line(s) to `out` and returning the height it added (the
+/// amount to advance `box_top` before the next line). `fence` and `list_depth` are
+/// the only cross-line carry, threaded by `&mut`; everything else is a pure
+/// function of this line's text plus `active`/`image_ui`, which affect reveal and
+/// image widgets only, never wrap points or baselines. This is the single per-line
+/// unit shared by the full [`Layout::build_with_images`] loop and (later) the
+/// windowed build, so the two can never disagree on a line's shape.
+#[allow(clippy::too_many_arguments)]
+fn lay_line(
+    fonts: &Fonts,
+    rope: &Rope,
+    ls: usize,
+    le: usize,
+    has_newline: bool,
+    wrap_width: i32,
+    body_size: u32,
+    active: (usize, usize),
+    images: &ImageStore,
+    image_ui: ImageUi,
+    box_top: i32,
+    fence: &mut Option<usize>,
+    list_depth: &mut Option<usize>,
+    out: &mut Vec<VisualLine>,
+) -> i32 {
+    // Running box top within this logical line; the return value is how far it
+    // advanced past the incoming `box_top`.
+    let mut y = box_top;
+    let line = rope.byte_slice(ls..le);
+    // Whether the cursor/selection touches this logical line: the same reveal test
+    // headings use, applied to fence lines too.
+    let on_line = active.0 <= le && active.1 >= ls;
+    // A standalone `![alt](path)` line whose image has decoded renders as a picture
+    // box. The picture always shows; when its source is revealed (cursor on the
+    // line, or the corner button pinned it open) the editable `![alt](path)` is laid
+    // out as a text line *above* the picture. Inside a code fence the syntax is
+    // literal, not an image; a missing or undecodable image falls through to plain
+    // source so a broken link stays visible and editable.
+    //
+    // `pending_image`, when set, is the widget to append after this line's source
+    // text (the reveal case). The no-reveal case pushes its widget and returns,
+    // never reaching the text path.
+    let mut pending_image: Option<ImageBox> = None;
+    if fence.is_none() {
+        if let Some(link) = markdown::standalone_image(&line) {
+            if let Some((iw, ih)) = images.dimensions(&line[link.path.0..link.path.1]) {
+                *list_depth = None;
+                let column = if wrap_width > 0 {
+                    wrap_width
+                } else {
+                    iw as i32
+                };
+                let (width, height) = fit_image(iw, ih, column);
+                let image = ImageBox {
+                    path_start: ls + link.path.0,
+                    path_end: ls + link.path.1,
+                    width,
+                    height,
+                    selected: image_ui.selected == Some(ls),
+                };
+                if on_line || image_ui.raw == Some(ls) {
+                    // Source revealed: emit it (fall through), then the widget.
+                    pending_image = Some(image);
+                } else {
+                    // Picture only: one widget line, no source text.
+                    out.push(VisualLine {
+                        start: ls,
+                        end: le,
+                        baseline: y + fonts.metrics(body_size).ascent,
+                        hard: has_newline,
+                        size: body_size,
+                        runs: Vec::new(),
+                        indent: 0,
+                        gutter: Gutter::None,
+                        code_block: false,
+                        heading: None,
+                        task: None,
+                        rule: false,
+                        image: Some(image),
+                    });
+                    y += image.box_height();
+                    return y - box_top;
+                }
+            }
+        }
+    }
+    // A line inside a fenced code block is code, not markdown: it skips the inline
+    // pass and renders as one code run. The ``` fence lines hide their backticks off
+    // the cursor's line, like a heading's `#`. A code line carries `Body` as an
+    // inert style (its gutter is unused).
+    let (style, size, spans, block_marker, block_persists, revealed, code_block) =
+        if let Some(open) = *fence {
+            *list_depth = None;
+            let delimiter = markdown::closes_code_fence(&line, open);
+            if delimiter {
+                *fence = None;
+            }
+            let spans = code_block_spans(&line, delimiter);
+            // Only a fence delimiter line has backticks to hide.
+            let revealed = !delimiter || on_line;
+            (
+                markdown::LineStyle::Body,
+                body_size,
+                spans,
+                0,
+                false,
+                revealed,
+                true,
+            )
+        } else if let Some(open) = markdown::opens_code_fence(&line) {
+            *list_depth = None;
+            *fence = Some(open);
+            let spans = code_block_spans(&line, true);
+            (
+                markdown::LineStyle::Body,
+                body_size,
+                spans,
+                0,
+                false,
+                on_line,
+                true,
+            )
+        } else {
+            // Resolve list nesting across lines: an item deeper than one past the
+            // previous item has no parent and renders as body.
+            let (style, marker) = resolve_list(&line, list_depth);
+            (
+                style,
+                markdown::font_size(style, body_size),
+                line_spans(&line, marker),
+                marker,
+                markdown::block_marker_persists(style),
+                on_line,
+                false,
+            )
+        };
+    // A revealed image's source always shows verbatim (its markers, if any, are not
+    // hidden), so the text above the picture reads as written.
+    let revealed = revealed || pending_image.is_some();
+    let metrics = fonts.metrics(size);
+    // Heading lines color their text by level (fence/code lines carry the inert
+    // `Body` style, so they are never headings here).
+    let heading = match style {
+        markdown::LineStyle::Heading(level) => Some(level),
+        _ => None,
+    };
+    // Stamped on every segment of a task item, so a checked item's text dims and
+    // strikes through wrapped continuations too.
+    let task = match style {
+        markdown::LineStyle::Task { checked } => Some(checked),
+        _ => None,
+    };
+    // A thematic break draws as a horizontal rule once the cursor leaves it; on the
+    // line itself the raw `---` shows (and `revealed` is true).
+    let rule = matches!(style, markdown::LineStyle::Rule) && !revealed;
+    // A list or quote item hangs its wrapped continuations under the text: the inset
+    // is the marker's width, measured on the source marker in the regular face at
+    // this line's size, so it matches the width the marker run itself advances.
+    let block_indent = if block_persists && block_marker > 0 {
+        shape::text_advance(fonts.face(size, FontStyle::Regular), &line[..block_marker]).round()
+            as i32
+    } else {
+        0
+    };
+    // A left inset shared by every segment of the line, and how much it narrows the
+    // wrap width: a code block pads both sides inside its panel; a list item shifts
+    // right by a small indent (one side only).
+    let is_list = matches!(
+        style,
+        markdown::LineStyle::Bullet
+            | markdown::LineStyle::Ordered
+            | markdown::LineStyle::Task { .. }
+    );
+    let (seg_pad, wrap_reduce) = if code_block {
+        (CODE_PAD_X, 2 * CODE_PAD_X)
+    } else if is_list {
+        (LIST_INDENT, LIST_INDENT)
+    } else {
+        (0, 0)
+    };
+    let line_wrap = if wrap_width > 0 {
+        (wrap_width - wrap_reduce).max(1)
+    } else {
+        wrap_width
+    };
+    // `wrap_segments` returns ranges relative to the line; offset them back to
+    // absolute buffer positions. It measures the source text, so clipping spans to
+    // each segment never disagrees with the breaks, and reveal state (which only
+    // hides markers) never reflows the document.
+    let segments = wrap_segments(
+        fonts,
+        size,
+        &line,
+        &spans,
+        line_wrap,
+        block_indent,
+        heading.is_some(),
+    );
+    let last = segments.len() - 1;
+    for (k, (start, end)) in segments.into_iter().enumerate() {
+        // Every segment carries the shared left inset (`seg_pad`); wrapped
+        // continuations add the marker's width on top so their text hangs under the
+        // first line's text.
+        let indent = seg_pad + if k == 0 { 0 } else { block_indent };
+        // A bullet shows its dot even on the cursor's own line, so a list stays a
+        // list while you edit it. A quote reveals its raw `> ` for editing, drawing
+        // the bar only once the cursor leaves.
+        let gutter = match style {
+            markdown::LineStyle::Bullet if k == 0 => Gutter::Bullet,
+            // A task item draws its checkbox only once the cursor leaves: on the line
+            // itself the raw `- [ ]` is the editable source, and a click there edits.
+            markdown::LineStyle::Task { checked } if k == 0 && !revealed => {
+                Gutter::Checkbox { checked }
+            }
+            markdown::LineStyle::Quote if !revealed => Gutter::QuoteBar { marker: k == 0 },
+            _ => Gutter::None,
+        };
+        out.push(VisualLine {
+            start: ls + start,
+            end: ls + end,
+            baseline: y + metrics.ascent,
+            // Only the final segment of a logical line that has a trailing '\n' is a
+            // hard break.
+            hard: k == last && has_newline,
+            size,
+            runs: clip_runs(
+                &spans,
+                start,
+                end,
+                ls,
+                revealed,
+                block_marker,
+                block_persists,
+            ),
+            indent,
+            gutter,
+            code_block,
+            heading,
+            task,
+            rule,
+            image: None,
+        });
+        y += metrics.line_height;
+    }
+    // The picture sits below its just-emitted source line(s) (the reveal case). It is
+    // a widget line: never a caret target, taller than text.
+    if let Some(image) = pending_image {
+        out.push(VisualLine {
+            start: ls,
+            end: le,
+            // The source line above owns the caret and the logical line's newline;
+            // this widget carries neither.
+            baseline: y + metrics.ascent,
+            hard: false,
+            size: body_size,
+            runs: Vec::new(),
+            indent: 0,
+            gutter: Gutter::None,
+            code_block: false,
+            heading: None,
+            task: None,
+            rule: false,
+            image: Some(image),
+        });
+        y += image.box_height();
+    }
+    y - box_top
+}
+
+/// An `active` range that reveals nothing: `MAX <= le` is always false, so every
+/// line lays out with its markers collapsed and no image source shown. This is the
+/// base geometry the [`LineIndex`] measures, reveal-independent by construction.
+const NO_REVEAL: (usize, usize) = (usize::MAX, usize::MAX);
+
+/// The content of logical line `i` (excluding its trailing newline).
+fn line_str(rope: &Rope, i: usize) -> String {
+    let n = rope.len_lines();
+    let ls = rope.line_to_byte(i);
+    let le = if i + 1 < n {
+        rope.line_to_byte(i + 1) - 1
+    } else {
+        rope.line_to_byte(i + 1)
+    };
+    rope.byte_slice(ls..le)
+}
+
+/// Whether logical line `ia` of `a` equals logical line `ib` of `b` by content,
+/// for diffing a document against its previous version during incremental layout.
+fn line_eq(a: &Rope, ia: usize, b: &Rope, ib: usize) -> bool {
+    line_str(a, ia) == line_str(b, ib)
+}
+
+/// One logical line's contribution to the document's vertical geometry.
+#[derive(Clone, Copy, PartialEq, Debug)]
+struct LineRec {
+    /// Base (unrevealed) pixel height: the sum of the line's visual rows.
+    height: i32,
+    /// Extra height the source text adds above a standalone picture when its line
+    /// is revealed; 0 for every non-image line. Applied as a per-query overlay so
+    /// the base height stays a pure function of `(version, width)`.
+    reveal_extra: i32,
+    /// Open code-fence backtick count entering this line (0 = not in a fence).
+    fence_in: u16,
+    /// List nesting depth entering this line (-1 = not in a list).
+    depth_in: i16,
+}
+
+/// A ≤2-line overlay of the extra height revealed image sources add on top of the
+/// base [`LineIndex`] geometry (the cursor's image line, and a raw-pinned one).
+/// Empty is the base geometry.
+#[derive(Clone, Copy, Default)]
+pub struct RevealAdjust {
+    entries: [(usize, i32); 2],
+    len: usize,
+}
+
+impl RevealAdjust {
+    /// Record that logical line `line` reveals `extra` pixels of image source.
+    /// Ignores zero deltas and duplicates, and never grows past two entries.
+    pub fn push(&mut self, line: usize, extra: i32) {
+        if extra == 0 || self.entries[..self.len].iter().any(|&(l, _)| l == line) {
+            return;
+        }
+        if self.len < self.entries.len() {
+            self.entries[self.len] = (line, extra);
+            self.len += 1;
+        }
+    }
+
+    fn total(&self) -> i32 {
+        self.entries[..self.len].iter().map(|&(_, e)| e).sum()
+    }
+
+    fn before(&self, line: usize) -> i32 {
+        self.entries[..self.len]
+            .iter()
+            .filter(|&&(l, _)| l < line)
+            .map(|&(_, e)| e)
+            .sum()
+    }
+}
+
+/// The document's vertical geometry as a per-logical-line index: each line's base
+/// pixel height and the cross-line carry state entering it. Built by measuring
+/// every line once via [`lay_line`], it computes total content height, maps a
+/// logical line to a content-space position, and seeds a windowed layout that
+/// starts mid-document, all without keeping the whole document's runs. A cursor
+/// move or scroll reuses the index unchanged (heights do not depend on reveal);
+/// only an edit or resize rebuilds it.
+#[derive(Clone)]
+pub struct LineIndex {
+    recs: Vec<LineRec>,
+    /// Cumulative base height: `tops[i]` is the content-space top of logical line
+    /// `i` (0-relative); `tops[len]` is the total base height.
+    tops: Vec<i32>,
+}
+
+impl LineIndex {
+    /// Measure one logical line `i`'s record, advancing the carry state
+    /// (`fence`/`list_depth`) through it. Shared by [`Self::build`] and
+    /// [`Self::update`] so the incremental path can never disagree with a rebuild.
+    #[allow(clippy::too_many_arguments)]
+    fn measure_line(
+        fonts: &Fonts,
+        rope: &Rope,
+        i: usize,
+        n: usize,
+        wrap_width: i32,
+        body_size: u32,
+        images: &ImageStore,
+        fence: &mut Option<usize>,
+        list_depth: &mut Option<usize>,
+        scratch: &mut Vec<VisualLine>,
+    ) -> LineRec {
+        let ls = rope.line_to_byte(i);
+        let has_newline = i + 1 < n;
+        let le = if has_newline {
+            rope.line_to_byte(i + 1) - 1
+        } else {
+            rope.line_to_byte(i + 1)
+        };
+        let fence_in = *fence;
+        let depth_in = *list_depth;
+        scratch.clear();
+        let height = lay_line(
+            fonts,
+            rope,
+            ls,
+            le,
+            has_newline,
+            wrap_width,
+            body_size,
+            NO_REVEAL,
+            images,
+            ImageUi::default(),
+            0,
+            fence,
+            list_depth,
+            scratch,
+        );
+        // Only a decoded standalone image changes height when revealed; measure
+        // that once here. Re-running from the pre-line carry reproduces the same
+        // state mutation (an image forces list_depth=None, fence must be None), so
+        // the throwaway `f2`/`d2` are discarded.
+        let reveal_extra = if scratch.iter().any(|v| v.image.is_some()) {
+            let mut f2 = fence_in;
+            let mut d2 = depth_in;
+            scratch.clear();
+            let revealed = lay_line(
+                fonts,
+                rope,
+                ls,
+                le,
+                has_newline,
+                wrap_width,
+                body_size,
+                (ls, le),
+                images,
+                ImageUi::default(),
+                0,
+                &mut f2,
+                &mut d2,
+                scratch,
+            );
+            revealed - height
+        } else {
+            0
+        };
+        LineRec {
+            height,
+            reveal_extra,
+            fence_in: fence_in.map_or(0, |c| c as u16),
+            depth_in: depth_in.map_or(-1, |d| d as i16),
+        }
+    }
+
+    /// Build the cumulative-height prefix (`tops`) from a record list.
+    fn from_recs(recs: Vec<LineRec>) -> Self {
+        let mut tops = Vec::with_capacity(recs.len() + 1);
+        let mut acc = 0;
+        for rec in &recs {
+            tops.push(acc);
+            acc += rec.height;
+        }
+        tops.push(acc);
+        LineIndex { recs, tops }
+    }
+
+    /// Measure every logical line's base geometry and carry state. `images` is the
+    /// pane's decoded-image store, so a standalone `![](...)` line is recognized as
+    /// a picture (and its `reveal_extra` recorded) exactly as the full build sees it.
+    pub fn build(
+        fonts: &Fonts,
+        rope: &Rope,
+        wrap_width: i32,
+        body_size: u32,
+        images: &ImageStore,
+    ) -> Self {
+        let n = rope.len_lines();
+        let mut recs = Vec::with_capacity(n);
+        let mut fence: Option<usize> = None;
+        let mut list_depth: Option<usize> = None;
+        let mut scratch: Vec<VisualLine> = Vec::new();
+        for i in 0..n {
+            recs.push(Self::measure_line(
+                fonts,
+                rope,
+                i,
+                n,
+                wrap_width,
+                body_size,
+                images,
+                &mut fence,
+                &mut list_depth,
+                &mut scratch,
+            ));
+        }
+        Self::from_recs(recs)
+    }
+
+    /// Incrementally bring the index up to date after an edit turned `prev` into
+    /// `new`, re-measuring only the changed region instead of the whole document.
+    ///
+    /// The changed byte span is found by a byte-cheap line diff (matching prefix
+    /// from the front, matching suffix from the back). Re-measurement runs forward
+    /// from the first changed line until the carry state entering a line re-syncs
+    /// with the old index past the changed text: from there on, identical text fed
+    /// identical state yields identical records, so the untouched tail is reused
+    /// (only its position shifts, recomputed by `from_recs`). A change that never
+    /// re-syncs (an unterminated fence flipping every following line) re-measures to
+    /// EOF, exactly as a full rebuild would. If `prev` does not match this index,
+    /// it falls back to a full rebuild.
+    #[allow(clippy::too_many_arguments)]
+    pub fn update(
+        &mut self,
+        fonts: &Fonts,
+        new: &Rope,
+        prev: &Rope,
+        wrap_width: i32,
+        body_size: u32,
+        images: &ImageStore,
+    ) {
+        let new_n = new.len_lines();
+        let old_n = self.recs.len();
+        if old_n != prev.len_lines() {
+            *self = Self::build(fonts, new, wrap_width, body_size, images);
+            return;
+        }
+        // First line that differs, and count of identical trailing lines.
+        let mut front = 0;
+        while front < new_n && front < old_n && line_eq(new, front, prev, front) {
+            front += 1;
+        }
+        let max_back = (new_n - front).min(old_n - front);
+        let mut back = 0;
+        while back < max_back && line_eq(new, new_n - 1 - back, prev, old_n - 1 - back) {
+            back += 1;
+        }
+        let delta = new_n as isize - old_n as isize;
+        // First line of the unchanged suffix; re-measurement may converge here.
+        let resync = new_n - back;
+
+        let (mut fence, mut list_depth) = self.entry_state(front);
+        let mut mid: Vec<LineRec> = Vec::new();
+        let mut scratch: Vec<VisualLine> = Vec::new();
+        let mut i = front;
+        let converge_old = loop {
+            let old_i = i as isize - delta;
+            // Converge only once past the changed text (i in the suffix) and the
+            // incoming carry state matches the old index there; then the rest is
+            // provably identical and reused.
+            if i >= resync && old_i >= front as isize && (old_i as usize) < old_n {
+                let old_state = self.entry_state(old_i as usize);
+                if (fence, list_depth) == old_state {
+                    break old_i as usize;
+                }
+            }
+            if i >= new_n {
+                break old_n;
+            }
+            mid.push(Self::measure_line(
+                fonts,
+                new,
+                i,
+                new_n,
+                wrap_width,
+                body_size,
+                images,
+                &mut fence,
+                &mut list_depth,
+                &mut scratch,
+            ));
+            i += 1;
+        };
+
+        let mut recs = Vec::with_capacity(front + mid.len() + old_n.saturating_sub(converge_old));
+        recs.extend_from_slice(&self.recs[..front]);
+        recs.append(&mut mid);
+        recs.extend_from_slice(&self.recs[converge_old..]);
+        *self = Self::from_recs(recs);
+    }
+
+    // A document always has at least one logical line, so there is no meaningful
+    // empty index; `len` stands alone.
+    #[allow(clippy::len_without_is_empty)]
+    pub fn len(&self) -> usize {
+        self.recs.len()
+    }
+
+    /// Total content height, including any image sources the overlay reveals.
+    pub fn content_height(&self, adjust: &RevealAdjust) -> i32 {
+        self.tops[self.recs.len()] + adjust.total()
+    }
+
+    /// Content-space top of logical line `line` (0-relative), pushed down by any
+    /// earlier revealed image.
+    pub fn logical_top(&self, line: usize, adjust: &RevealAdjust) -> i32 {
+        let line = line.min(self.recs.len());
+        self.tops[line] + adjust.before(line)
+    }
+
+    /// The logical line whose row band contains content-space `y`: the last line
+    /// whose top is `<= y`, clamped into range. Turns a scroll offset into a window
+    /// band edge. `logical_top` is monotonic in `line`, so a binary search finds it.
+    pub fn line_at_y(&self, y: i32, adjust: &RevealAdjust) -> usize {
+        let n = self.recs.len();
+        if n == 0 {
+            return 0;
+        }
+        let (mut lo, mut hi) = (0usize, n);
+        while lo < hi {
+            let mid = (lo + hi) / 2;
+            if self.logical_top(mid, adjust) <= y {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        lo.saturating_sub(1)
+    }
+
+    /// The extra height logical line `line` gains when its image source is revealed
+    /// (0 for a non-image line). The pane uses this to build a [`RevealAdjust`].
+    pub fn reveal_extra(&self, line: usize) -> i32 {
+        self.recs.get(line).map_or(0, |r| r.reveal_extra)
+    }
+
+    /// The cross-line carry state entering logical line `line`: the open fence's
+    /// backtick count and the list nesting depth. Used to seed a mid-document
+    /// window and to detect re-sync during an incremental update.
+    pub fn entry_state(&self, line: usize) -> (Option<usize>, Option<usize>) {
+        match self.recs.get(line) {
+            Some(rec) => (
+                (rec.fence_in != 0).then_some(rec.fence_in as usize),
+                (rec.depth_in >= 0).then_some(rec.depth_in as usize),
+            ),
+            None => (None, None),
+        }
+    }
+}
+
 /// Display size for an image of intrinsic size `iw` x `ih` shown in a `column`
 /// of pixels: the intrinsic size when it already fits, otherwise scaled down to
 /// the column width with its aspect ratio preserved. Never upscaled (a small
@@ -1287,6 +1738,282 @@ mod tests {
     fn tight_wrap(f: &Fonts) -> i32 {
         let face = f.face(BODY, FontStyle::Regular);
         (shape::text_advance(face, "aaa ") + shape::text_advance(face, "b") / 2.0) as i32
+    }
+
+    /// A pixel-complete fingerprint of one visual line: every field that reaches
+    /// the screen. Two layouts with equal fingerprints render identically, so this
+    /// is the oracle every later stage (the windowed build, the incremental index)
+    /// and any future allocation refactor is diffed against.
+    #[derive(Clone, PartialEq, Debug)]
+    struct LineFp {
+        start: usize,
+        end: usize,
+        baseline: i32,
+        hard: bool,
+        size: u32,
+        indent: i32,
+        gutter: Gutter,
+        code_block: bool,
+        heading: Option<u8>,
+        task: Option<bool>,
+        rule: bool,
+        image: Option<(usize, usize, i32, i32, bool)>,
+        runs: Vec<(usize, usize, markdown::SpanKind, bool)>,
+    }
+
+    fn fingerprint(l: &Layout) -> Vec<LineFp> {
+        l.lines()
+            .iter()
+            .map(|v| LineFp {
+                start: v.start,
+                end: v.end,
+                baseline: v.baseline,
+                hard: v.hard,
+                size: v.size,
+                indent: v.indent,
+                gutter: v.gutter,
+                code_block: v.code_block,
+                heading: v.heading,
+                task: v.task,
+                rule: v.rule,
+                image: v
+                    .image
+                    .map(|im| (im.path_start, im.path_end, im.width, im.height, im.selected)),
+                runs: v
+                    .runs
+                    .iter()
+                    .map(|r| (r.start, r.end, r.kind, r.visible))
+                    .collect(),
+            })
+            .collect()
+    }
+
+    /// Curated fixtures that exercise the constructs the index and windowing must
+    /// get right (nested lists, fences closed and unterminated, quotes, tasks,
+    /// rules, CRLF, trailing-newline, inline spans), paired with the seeded corpus
+    /// generators for scale.
+    const FIXTURES: &[&str] = &[
+        "",
+        "plain paragraph with no markup at all here",
+        "# Heading one\n\nbody text\n\n## Two\n\nmore\n",
+        "- a\n- b\n  - nested\n  - deeper still and long enough to wrap somewhere\n- c\n",
+        "1. one\n2. two\n3. three\n",
+        "- [ ] todo item\n- [x] done item\n",
+        "> a quote long enough to wrap across a narrow column of pixels here now\n",
+        "```\ncode line\nmore code\n```\nafter the fence\n",
+        "```rust\nunterminated fence runs to EOF\nstill code\nand more\n",
+        "---\n***\n___\n",
+        "a\nb\nc\nd\ne\nf\ng\nh\n",
+        "trailing line with no newline",
+        "windows\r\nline\r\nendings\r\n",
+        "mix **bold** and *italic* and `code` and [link](x) inline here\n",
+    ];
+
+    /// Every fixture plus each seeded corpus (kept small for fast tests) as a doc
+    /// to diff layout variants against.
+    fn oracle_docs() -> Vec<Rope> {
+        let mut docs: Vec<Rope> = FIXTURES.iter().map(|s| Rope::from_str(s)).collect();
+        for name in crate::corpus::NAMES {
+            if let Some(text) = crate::corpus::generate(name, 12 * 1024) {
+                docs.push(Rope::from_str(&text));
+            }
+        }
+        docs
+    }
+
+    /// Representative wrap widths: 0 disables wrapping, the rest span tight to wide.
+    const ORACLE_WIDTHS: &[i32] = &[0, 140, 300, 560, 1_000_000];
+
+    #[test]
+    fn fingerprint_is_deterministic_across_builds() {
+        // Idempotence: the same inputs must fingerprint identically, so a later
+        // stage's "unchanged output" assertion is meaningful and nondeterminism
+        // (e.g. a hash-order leak) is caught here first.
+        let f = fonts();
+        for r in oracle_docs() {
+            for &w in ORACLE_WIDTHS {
+                let a = fingerprint(&Layout::build(&f, &r, LEFT, TOP, w, BODY, (0, 0)));
+                let b = fingerprint(&Layout::build(&f, &r, LEFT, TOP, w, BODY, (0, 0)));
+                assert_eq!(a, b, "layout build must be deterministic (width {w})");
+            }
+        }
+    }
+
+    #[test]
+    fn line_index_matches_the_full_build() {
+        // Index oracle: the index's base heights reproduce the full build's
+        // total height and every logical line's top, across corpora and widths.
+        let f = fonts();
+        let no_images = ImageStore::new(None);
+        for r in oracle_docs() {
+            for &w in ORACLE_WIDTHS {
+                let full = Layout::build(&f, &r, LEFT, TOP, w, BODY, NO_REVEAL);
+                let idx = LineIndex::build(&f, &r, w, BODY, &no_images);
+                assert_eq!(idx.len(), r.len_lines(), "one record per logical line");
+                assert_eq!(
+                    idx.content_height(&RevealAdjust::default()),
+                    full.text_height(),
+                    "content height (width {w})"
+                );
+                // The first visual row of each logical line sits at the index's top.
+                let mut last = None;
+                for v in full.lines() {
+                    let li = r.byte_to_line(v.start);
+                    if Some(li) != last {
+                        let top = v.baseline - f.metrics(v.size).ascent - TOP;
+                        assert_eq!(
+                            idx.logical_top(li, &RevealAdjust::default()),
+                            top,
+                            "top of logical line {li} (width {w})"
+                        );
+                        last = Some(li);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn line_index_records_image_reveal_extra() {
+        // A decoded standalone image is the one line whose height depends on reveal;
+        // the index carries that delta as a per-line overlay.
+        let f = fonts();
+        let s = ImageStore::from_decoded(vec![(
+            "cat.png".to_string(),
+            crate::image::Image {
+                pixels: vec![0u32; 80 * 40],
+                width: 80,
+                height: 40,
+            },
+        )]);
+        let r = rope("intro line\n![cat](cat.png)\ntrailing line\n");
+        let w = 560;
+        let img_line = 1;
+        let idx = LineIndex::build(&f, &r, w, BODY, &s);
+        assert!(
+            idx.reveal_extra(img_line) > 0,
+            "revealing the source adds height"
+        );
+        assert_eq!(idx.reveal_extra(0), 0, "a text line has no reveal extra");
+        assert_eq!(idx.reveal_extra(2), 0);
+
+        // Base height (nothing revealed) matches a full no-reveal build.
+        let base = Layout::build_with_images(
+            &f,
+            &r,
+            LEFT,
+            TOP,
+            w,
+            BODY,
+            NO_REVEAL,
+            &s,
+            ImageUi::default(),
+        );
+        assert_eq!(
+            idx.content_height(&RevealAdjust::default()),
+            base.text_height()
+        );
+
+        // With the image's source revealed, the overlay height matches a full build
+        // that reveals the same line.
+        let ls = r.line_to_byte(img_line);
+        let le = r.line_to_byte(img_line + 1) - 1;
+        let revealed =
+            Layout::build_with_images(&f, &r, LEFT, TOP, w, BODY, (ls, le), &s, ImageUi::default());
+        let mut adj = RevealAdjust::default();
+        adj.push(img_line, idx.reveal_extra(img_line));
+        assert_eq!(idx.content_height(&adj), revealed.text_height());
+    }
+
+    #[test]
+    fn window_matches_the_full_build_slice() {
+        // Window oracle: a windowed build is byte-identical to the slice of the
+        // full build covering the same logical lines, at absolute document
+        // positions, across corpora, widths, and several bands.
+        let f = fonts();
+        let no_images = ImageStore::new(None);
+        for r in oracle_docs() {
+            let n = r.len_lines();
+            for &w in ORACLE_WIDTHS {
+                let full = Layout::build(&f, &r, LEFT, TOP, w, BODY, NO_REVEAL);
+                let idx = LineIndex::build(&f, &r, w, BODY, &no_images);
+                let full_fp = fingerprint(&full);
+                let bands: [(usize, usize); 5] = [
+                    (0, n),
+                    (0, (n / 2).max(1).min(n)),
+                    (n / 3, (2 * n / 3).max(n / 3)),
+                    (n.saturating_sub(4), n),
+                    (n / 2, n / 2), // empty band
+                ];
+                for (bs, be) in bands {
+                    let seed = TOP + idx.logical_top(bs, &RevealAdjust::default());
+                    let win = Layout::build_window(
+                        &f,
+                        &r,
+                        LEFT,
+                        seed,
+                        w,
+                        BODY,
+                        NO_REVEAL,
+                        &no_images,
+                        ImageUi::default(),
+                        &idx,
+                        bs,
+                        be,
+                    );
+                    let expected: Vec<_> = full_fp
+                        .iter()
+                        .filter(|fp| {
+                            let li = r.byte_to_line(fp.start);
+                            li >= bs && li < be
+                        })
+                        .cloned()
+                        .collect();
+                    assert_eq!(fingerprint(&win), expected, "window [{bs},{be}) width {w}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn incremental_index_matches_a_full_rebuild() {
+        // Incremental oracle: after each edit, the incrementally updated index must be
+        // byte-identical to a fresh full build. The edit stream covers in-line
+        // edits, a newline split, a whole-line delete, a fence change, a line join,
+        // and an unterminated fence that flips state to EOF (the non-convergence
+        // path). A convergence bug (stale heights/state below the edit) shows here.
+        let f = fonts();
+        let no_images = ImageStore::new(None);
+        let w = 300;
+        let mut text = String::from(
+            "# Title\n\nintro paragraph here\n\n- alpha\n- beta\n  - nested\n\n```\nlet x = 1;\n```\n\ntail line\nlast\n",
+        );
+        let mut rope = Rope::from_str(&text);
+        let mut index = LineIndex::build(&f, &rope, w, BODY, &no_images);
+
+        let edits: &[(&str, &str)] = &[
+            ("intro", "INTRO"),                                  // in-line replace
+            ("INTRO paragraph", "INTRO paragraph\nsecond line"), // insert a newline
+            ("- beta\n", ""),                                    // delete a whole line
+            ("```\nlet", "````\nlet"),                           // change the fence marker
+            ("tail line\nlast", "taillast"),                     // join two lines
+            ("# Title", "```\n# Title"),                         // open a fence: state to EOF
+        ];
+        for (needle, repl) in edits {
+            let pos = text
+                .find(needle)
+                .unwrap_or_else(|| panic!("needle {needle:?} not found"));
+            let prev = rope.clone();
+            text.replace_range(pos..pos + needle.len(), repl);
+            rope = Rope::from_str(&text);
+            index.update(&f, &rope, &prev, w, BODY, &no_images);
+            let rebuilt = LineIndex::build(&f, &rope, w, BODY, &no_images);
+            assert_eq!(
+                index.recs, rebuilt.recs,
+                "records after {needle:?} -> {repl:?}"
+            );
+            assert_eq!(index.tops, rebuilt.tops, "prefix sums after {needle:?}");
+        }
     }
 
     #[test]

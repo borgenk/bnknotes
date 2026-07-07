@@ -639,21 +639,26 @@ impl State {
             let ch = self.editors[i].content_height;
             self.editors[i].scroll_y = scroll::clamp(self.editors[i].scroll_y, ch, rect.h);
             let focused = self.focus == Focus::Editor(i);
+            let ed = &self.editors[i];
+            // Owned so it outlives the `FindPaint` that borrows it for this frame.
+            let tick_tops = ed.find_tick_tops();
             let params = PaintParams {
                 width: rect.w as usize,
                 height: rect.h as usize,
-                scroll_y: self.editors[i].scroll_y,
-                selection: self.editors[i].text.selection(),
-                cursor: self.editors[i].text.cursor(),
-                // Only the focused pane blinks a caret; others show none.
-                caret_visible: focused && self.caret_visible,
-                find: build_find_paint(&self.editors[i].find),
+                scroll_y: ed.scroll_y,
+                selection: ed.text.selection(),
+                cursor: ed.text.cursor(),
+                // The caret draws only on the focused pane's visible blink half, and
+                // only when the cursor's line is in the painted window; scrolled far
+                // from the cursor it is off screen and simply not drawn.
+                caret_visible: focused && self.caret_visible && ed.cursor_in_window(),
+                find: build_find_paint(&ed.find, &tick_tops, ed.content_height),
             };
-            if let Some(layout) = self.editors[i].layout_cache.as_ref() {
+            if let Some(layout) = ed.layout_cache.as_ref() {
                 list.append(&mut build_display_list(
                     &self.fonts,
                     layout,
-                    self.editors[i].text.rope(),
+                    ed.text.rope(),
                     &params,
                 ));
             }

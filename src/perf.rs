@@ -34,7 +34,7 @@ use crate::error::{Error, Result};
 use crate::find::FindState;
 use crate::freetype::Fonts;
 use crate::image::{Image, ImageStore};
-use crate::layout::{ImageUi, Layout};
+use crate::layout::{ImageUi, Layout, LineIndex};
 use crate::markdown;
 use crate::paint::{build_display_list, PaintParams};
 use crate::rope::Rope;
@@ -148,6 +148,47 @@ fn measure() -> Result<Vec<Sample>> {
         Layout::build(&fonts, &rope, MARGIN, MARGIN, wrap, FONT_SIZE, (0, 0))
             .lines()
             .len()
+    }));
+
+    // Windowed re-layout: build only a viewport-sized band, the cost now paid on a
+    // cursor move or a reveal change instead of a full `layout_build`. Bounded by
+    // the window, not the document, so it should sit far below `layout_build` and
+    // stay flat as documents grow. The index is warmed first (its build is the
+    // per-edit cost, guarded separately below).
+    let index = LineIndex::build(&fonts, &rope, wrap, FONT_SIZE, &images);
+    let band = 30.min(index.len());
+    out.push(sample("layout_window", 500, || {
+        Layout::build_window(
+            &fonts,
+            &rope,
+            MARGIN,
+            MARGIN,
+            wrap,
+            FONT_SIZE,
+            (0, 0),
+            &images,
+            ImageUi::default(),
+            &index,
+            0,
+            band,
+        )
+        .lines()
+        .len()
+    }));
+
+    // Incremental index update after a one-character edit: the per-keystroke cost
+    // that replaces a full `layout_build`. It re-measures only the edited line and
+    // reuses the rest, so it stays flat as documents grow. (The clone per iteration
+    // is measurement scaffolding, since `update` mutates in place.)
+    let edited = {
+        let mut t = text.clone();
+        t.insert(t.len() / 2, 'x');
+        Rope::from_str(&t)
+    };
+    out.push(sample("index_update", 500, || {
+        let mut idx = index.clone();
+        idx.update(&fonts, &edited, &rope, wrap, FONT_SIZE, &images);
+        idx.len()
     }));
 
     // Hit-test the pointer against the layout: the per-motion cost of a drag.
@@ -490,6 +531,21 @@ pub fn run_lab(args: &[String]) -> Result<()> {
         let mut glyphs = crate::gpu::GlyphCache::new();
         let _ = crate::gpu::build_frame(&fonts, &[&images], &frame, &mut glyphs, &|_| true);
 
+        // Windowed layout + incremental index: the per-cursor-move and per-keystroke
+        // costs that replace a full `layout` rebuild. A warm index, a viewport band,
+        // and a one-character edit (at a char boundary near the middle) set them up.
+        let index = LineIndex::build(&fonts, &rope, wrap, FONT_SIZE, &images);
+        let band = 30.min(index.len());
+        let edited = {
+            let mut t = text.clone();
+            let mut at = t.len() / 2;
+            while at < t.len() && !t.is_char_boundary(at) {
+                at += 1;
+            }
+            t.insert(at, 'x');
+            Rope::from_str(&t)
+        };
+
         let cpu_before = sys::cpu_time();
 
         let results = [
@@ -507,6 +563,29 @@ pub fn run_lab(args: &[String]) -> Result<()> {
                 f.open_at(0, &text);
                 f.push_str("the", &text);
                 f.matches().len()
+            }),
+            lab("window", LAB_REPS, false, || {
+                Layout::build_window(
+                    &fonts,
+                    &rope,
+                    MARGIN,
+                    MARGIN,
+                    wrap,
+                    FONT_SIZE,
+                    (0, 0),
+                    &images,
+                    ImageUi::default(),
+                    &index,
+                    0,
+                    band,
+                )
+                .lines()
+                .len()
+            }),
+            lab("index_upd", LAB_REPS, false, || {
+                let mut idx = index.clone();
+                idx.update(&fonts, &edited, &rope, wrap, FONT_SIZE, &images);
+                idx.len()
             }),
         ];
 

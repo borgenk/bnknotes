@@ -2,14 +2,34 @@ use core::ffi::c_void;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 
 use crate::error::{Error, Result};
-use crate::gpu::{FrameData, ImageKey};
+use crate::gpu::{AtlasInfo, AtlasUpload, FrameData, ImageKey};
 use crate::vulkan::abi::*;
-use crate::vulkan::renderer::{color_range, destroy_texture, write_image_set, HostBuffer, Texture};
+use crate::vulkan::renderer::{
+    allocate_set, color_range, destroy_texture, write_image_set, HostBuffer, Texture,
+};
 use crate::vulkan::Gpu;
 
 // ---------------------------------------------------------------------------
 // Render targets.
 // ---------------------------------------------------------------------------
+
+/// Which of the two font atlases a sync/upload targets. The glyph atlas is a
+/// single-channel coverage mask; the emoji atlas is full-color, so they differ
+/// only in their texture format (and which `Renderer` slot holds them).
+#[derive(Clone, Copy)]
+enum AtlasSlot {
+    Glyph,
+    Emoji,
+}
+
+impl AtlasSlot {
+    fn format(self) -> u32 {
+        match self {
+            AtlasSlot::Glyph => VK_FORMAT_R8_UNORM,
+            AtlasSlot::Emoji => VK_FORMAT_B8G8R8A8_UNORM,
+        }
+    }
+}
 
 /// One presentable render target: a device-local image whose memory is
 /// exported as the dmabuf behind a `wl_buffer`, plus the per-image submission
@@ -122,6 +142,60 @@ impl Drop for PendingImage<'_> {
             }
             if self.image != 0 {
                 (f.destroy_image)(d, self.image, core::ptr::null());
+            }
+        }
+    }
+}
+
+/// Partially constructed sampled texture, so an error mid-`create_texture`
+/// destroys exactly what exists so far (handle 0 = never created). Disarmed with
+/// [`core::mem::forget`] once the finished [`Texture`] takes the handles.
+struct PendingTexture<'a> {
+    gpu: &'a Gpu,
+    image: VkImage,
+    memory: VkDeviceMemory,
+    view: VkImageView,
+}
+
+impl Drop for PendingTexture<'_> {
+    fn drop(&mut self) {
+        let d = self.gpu.device.raw;
+        let f = &self.gpu.fns;
+        // SAFETY: every non-zero handle was created on this device and is
+        // destroyed exactly once; nothing was ever submitted with them.
+        unsafe {
+            if self.view != 0 {
+                (f.destroy_image_view)(d, self.view, core::ptr::null());
+            }
+            if self.memory != 0 {
+                (f.free_memory)(d, self.memory, core::ptr::null());
+            }
+            if self.image != 0 {
+                (f.destroy_image)(d, self.image, core::ptr::null());
+            }
+        }
+    }
+}
+
+/// Partially constructed host buffer, mirroring [`PendingTexture`] for
+/// `create_host_buffer` (handle 0 = never created).
+struct PendingBuffer<'a> {
+    gpu: &'a Gpu,
+    buf: VkBuffer,
+    memory: VkDeviceMemory,
+}
+
+impl Drop for PendingBuffer<'_> {
+    fn drop(&mut self) {
+        let d = self.gpu.device.raw;
+        let f = &self.gpu.fns;
+        // SAFETY: as for PendingTexture; freeing the memory unmaps it.
+        unsafe {
+            if self.memory != 0 {
+                (f.free_memory)(d, self.memory, core::ptr::null());
+            }
+            if self.buf != 0 {
+                (f.destroy_buffer)(d, self.buf, core::ptr::null());
             }
         }
     }
@@ -392,27 +466,39 @@ impl Gpu {
 
     /// Tear an image down. The caller ensures no submission is in flight
     /// (waits for release + fence, or [`Gpu::wait_idle`]).
+    ///
+    /// The finished image holds exactly the handles a [`PendingImage`] guards, so
+    /// rebuild one from them and let its `Drop` run the single teardown sequence
+    /// (destroying each handle once). The dmabuf `fd` closes when it drops at the
+    /// end of this scope.
     pub fn destroy_image(&self, img: GpuImage) {
-        let d = self.device.raw;
-        let f = &self.fns;
-        // SAFETY: all handles were created on this device by create_image and
-        // are destroyed exactly once; the caller guarantees the GPU is done
-        // with them. The dmabuf fd closes when img.fd drops.
-        unsafe {
-            (f.destroy_framebuffer)(d, img.framebuffer, core::ptr::null());
-            (f.destroy_image_view)(d, img.view, core::ptr::null());
-            (f.free_command_buffers)(d, self.pool, 1, &img.cmd);
-            (f.destroy_semaphore)(d, img.release, core::ptr::null());
-            (f.destroy_semaphore)(d, img.acquire, core::ptr::null());
-            (f.destroy_fence)(d, img.fence, core::ptr::null());
-        }
-        self.destroy_host_buffer(img.vertices);
-        self.destroy_host_buffer(img.staging);
-        // SAFETY: as above.
-        unsafe {
-            (f.free_memory)(d, img.memory, core::ptr::null());
-            (f.destroy_image)(d, img.image, core::ptr::null());
-        }
+        let GpuImage {
+            image,
+            memory,
+            fd: _fd,
+            cmd,
+            fence,
+            acquire,
+            release,
+            view,
+            framebuffer,
+            vertices,
+            staging,
+            ..
+        } = img;
+        drop(PendingImage {
+            gpu: self,
+            image,
+            memory,
+            fence,
+            acquire,
+            release,
+            cmd,
+            view,
+            framebuffer,
+            vertices,
+            staging,
+        });
     }
 
     /// Upload the frame's textures and vertices and record its command buffer,
@@ -991,79 +1077,22 @@ impl Gpu {
             self.renderer.dummy = dummy;
         }
 
-        // Atlas textures follow the CPU mirrors' generations. A replacement
-        // may still be sampled by the other slot's in-flight frame, so drain
-        // the queue first (growth is rare).
-        let glyph_gen = frame.glyph_atlas.generation;
-        if self
-            .renderer
-            .glyph_tex
-            .as_ref()
-            .is_none_or(|(_, g)| *g != glyph_gen)
-        {
-            if let Some((old, _)) = self.renderer.glyph_tex.take() {
-                self.wait_idle();
-                destroy_texture(&self.fns, self.device.raw, old);
-            }
-            let tex = self.create_texture(
-                VK_FORMAT_R8_UNORM,
-                frame.glyph_atlas.width,
-                frame.glyph_atlas.height,
-            )?;
-            self.renderer.glyph_tex = Some((tex, glyph_gen));
-            self.update_atlas_set()?;
-        }
-        let emoji_gen = frame.emoji_atlas.generation;
-        if self
-            .renderer
-            .emoji_tex
-            .as_ref()
-            .is_none_or(|(_, g)| *g != emoji_gen)
-        {
-            if let Some((old, _)) = self.renderer.emoji_tex.take() {
-                self.wait_idle();
-                destroy_texture(&self.fns, self.device.raw, old);
-            }
-            let tex = self.create_texture(
-                VK_FORMAT_B8G8R8A8_UNORM,
-                frame.emoji_atlas.width,
-                frame.emoji_atlas.height,
-            )?;
-            self.renderer.emoji_tex = Some((tex, emoji_gen));
-            self.update_atlas_set()?;
-        }
-
-        // Dirty-region atlas uploads.
-        if let Some(up) = &frame.glyph_upload {
-            if let Some((tex, _)) = &mut self.renderer.glyph_tex {
-                uploads.push(PendingUpload {
-                    image: tex.image,
-                    was_initialized: tex.initialized,
-                    staging_offset: staging.len(),
-                    x: up.x,
-                    y: up.y,
-                    w: up.w,
-                    h: up.h,
-                });
-                staging.extend_from_slice(&up.bytes);
-                tex.initialized = true;
-            }
-        }
-        if let Some(up) = &frame.emoji_upload {
-            if let Some((tex, _)) = &mut self.renderer.emoji_tex {
-                uploads.push(PendingUpload {
-                    image: tex.image,
-                    was_initialized: tex.initialized,
-                    staging_offset: staging.len(),
-                    x: up.x,
-                    y: up.y,
-                    w: up.w,
-                    h: up.h,
-                });
-                staging.extend_from_slice(&up.bytes);
-                tex.initialized = true;
-            }
-        }
+        // Atlas textures follow the CPU mirrors' generations, then take any
+        // dirty-region upload for the frame.
+        self.sync_atlas(AtlasSlot::Glyph, &frame.glyph_atlas)?;
+        self.sync_atlas(AtlasSlot::Emoji, &frame.emoji_atlas)?;
+        self.stage_atlas_upload(
+            AtlasSlot::Glyph,
+            &frame.glyph_upload,
+            &mut staging,
+            &mut uploads,
+        );
+        self.stage_atlas_upload(
+            AtlasSlot::Emoji,
+            &frame.emoji_upload,
+            &mut staging,
+            &mut uploads,
+        );
 
         // New image textures, one per (path, display size).
         for (key, argb) in &frame.image_uploads {
@@ -1091,47 +1120,111 @@ impl Gpu {
             self.renderer.images.insert(key.clone(), (stored, set));
         }
 
-        // Bound the image-texture cache: resizes mint new (path, size) keys,
-        // and the descriptor pool is finite. On overflow, evict everything
-        // this frame does not draw (their sets return to the pool). The drain
-        // makes eviction safe against the other slot's in-flight frame.
-        const IMAGE_TEXTURE_CAP: usize = 64;
-        if self.renderer.images.len() > IMAGE_TEXTURE_CAP {
-            let used: std::collections::HashSet<&ImageKey> = frame
-                .batches
-                .iter()
-                .filter_map(|b| b.image.as_ref())
-                .collect();
-            let evict: Vec<ImageKey> = self
-                .renderer
-                .images
-                .keys()
-                .filter(|k| !used.contains(k))
-                .cloned()
-                .collect();
-            if !evict.is_empty() {
-                self.wait_idle();
-                for key in evict {
-                    if let Some((tex, set)) = self.renderer.images.remove(&key) {
-                        // SAFETY: the pool was created with the free flag and
-                        // the set is no longer referenced (queue drained).
-                        unsafe {
-                            (self.fns.free_descriptor_sets)(
-                                self.device.raw,
-                                self.renderer.descriptor_pool,
-                                1,
-                                &set,
-                            )
-                        };
-                        destroy_texture(&self.fns, self.device.raw, tex);
-                    }
-                }
-            }
-        }
+        self.evict_unused_images(frame);
 
         // Uploads whose staging_offset was pushed before later bytes landed
         // stay valid: offsets only ever append.
         Ok((staging, uploads))
+    }
+
+    /// Rebuild an atlas texture when its CPU mirror's generation moved (or it
+    /// does not exist yet). A replacement may still be sampled by the other
+    /// slot's in-flight frame, so the queue is drained before the old texture is
+    /// destroyed, and the shared atlas descriptor set is repointed after the new
+    /// one exists. Shared by the glyph and emoji slots so that ordering lives in
+    /// one place.
+    fn sync_atlas(&mut self, slot: AtlasSlot, info: &AtlasInfo) -> Result<()> {
+        let tex = match slot {
+            AtlasSlot::Glyph => &mut self.renderer.glyph_tex,
+            AtlasSlot::Emoji => &mut self.renderer.emoji_tex,
+        };
+        if tex.as_ref().is_some_and(|(_, g)| *g == info.generation) {
+            return Ok(());
+        }
+        if let Some((old, _)) = tex.take() {
+            self.wait_idle();
+            destroy_texture(&self.fns, self.device.raw, old);
+        }
+        let tex = self.create_texture(slot.format(), info.width, info.height)?;
+        match slot {
+            AtlasSlot::Glyph => self.renderer.glyph_tex = Some((tex, info.generation)),
+            AtlasSlot::Emoji => self.renderer.emoji_tex = Some((tex, info.generation)),
+        }
+        self.update_atlas_set()
+    }
+
+    /// Queue an atlas's dirty region for upload into its live texture, appending
+    /// the bytes to `staging`. A no-op when the frame carried no change for that
+    /// slot or the texture does not exist yet.
+    fn stage_atlas_upload(
+        &mut self,
+        slot: AtlasSlot,
+        upload: &Option<AtlasUpload>,
+        staging: &mut Vec<u8>,
+        uploads: &mut Vec<PendingUpload>,
+    ) {
+        let Some(up) = upload else {
+            return;
+        };
+        let tex = match slot {
+            AtlasSlot::Glyph => self.renderer.glyph_tex.as_mut(),
+            AtlasSlot::Emoji => self.renderer.emoji_tex.as_mut(),
+        };
+        if let Some((tex, _)) = tex {
+            uploads.push(PendingUpload {
+                image: tex.image,
+                was_initialized: tex.initialized,
+                staging_offset: staging.len(),
+                x: up.x,
+                y: up.y,
+                w: up.w,
+                h: up.h,
+            });
+            staging.extend_from_slice(&up.bytes);
+            tex.initialized = true;
+        }
+    }
+
+    /// Bound the image-texture cache: resizes mint new (path, size) keys, and the
+    /// descriptor pool is finite. On overflow, evict everything this frame does
+    /// not draw (their sets return to the pool). The queue drain makes eviction
+    /// safe against the other slot's in-flight frame.
+    fn evict_unused_images(&mut self, frame: &FrameData) {
+        const IMAGE_TEXTURE_CAP: usize = 64;
+        if self.renderer.images.len() <= IMAGE_TEXTURE_CAP {
+            return;
+        }
+        let used: std::collections::HashSet<&ImageKey> = frame
+            .batches
+            .iter()
+            .filter_map(|b| b.image.as_ref())
+            .collect();
+        let evict: Vec<ImageKey> = self
+            .renderer
+            .images
+            .keys()
+            .filter(|k| !used.contains(k))
+            .cloned()
+            .collect();
+        if evict.is_empty() {
+            return;
+        }
+        self.wait_idle();
+        for key in evict {
+            if let Some((tex, set)) = self.renderer.images.remove(&key) {
+                // SAFETY: the pool was created with the free flag and the set is
+                // no longer referenced (queue drained).
+                unsafe {
+                    (self.fns.free_descriptor_sets)(
+                        self.device.raw,
+                        self.renderer.descriptor_pool,
+                        1,
+                        &set,
+                    )
+                };
+                destroy_texture(&self.fns, self.device.raw, tex);
+            }
+        }
     }
 
     /// Point the shared atlas descriptor set at the current atlas textures
@@ -1173,17 +1266,11 @@ impl Gpu {
 
     /// Allocate and fill a descriptor set for one image texture.
     fn allocate_image_set(&self, view: VkImageView) -> Result<VkDescriptorSet> {
-        let info = VkDescriptorSetAllocateInfo {
-            s_type: VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
-            p_next: core::ptr::null(),
-            descriptor_pool: self.renderer.descriptor_pool,
-            descriptor_set_count: 1,
-            p_set_layouts: &self.renderer.set_layout_image,
-        };
-        let mut set: VkDescriptorSet = 0;
-        // SAFETY: the pool and layout are live; one handle is written.
-        check(
-            unsafe { (self.fns.allocate_descriptor_sets)(self.device.raw, &info, &mut set) },
+        let set = allocate_set(
+            &self.fns,
+            self.device.raw,
+            self.renderer.descriptor_pool,
+            self.renderer.set_layout_image,
             "vkAllocateDescriptorSets",
         )?;
         write_image_set(
@@ -1222,10 +1309,16 @@ impl Gpu {
             p_queue_family_indices: core::ptr::null(),
             initial_layout: VK_IMAGE_LAYOUT_UNDEFINED,
         };
-        let mut image: VkImage = 0;
+        // The guard destroys whatever exists so far if any step below fails.
+        let mut pending = PendingTexture {
+            gpu: self,
+            image: 0,
+            memory: 0,
+            view: 0,
+        };
         // SAFETY: info outlives the call.
         check(
-            unsafe { (f.create_image)(d, &info, core::ptr::null(), &mut image) },
+            unsafe { (f.create_image)(d, &info, core::ptr::null(), &mut pending.image) },
             "vkCreateImage (texture)",
         )?;
         let mut reqs = VkMemoryRequirements {
@@ -1234,56 +1327,36 @@ impl Gpu {
             memory_type_bits: 0,
         };
         // SAFETY: image is live.
-        unsafe { (f.get_image_memory_requirements)(d, image, &mut reqs) };
-        let Some(memory_type) = self.pick_memory_type(reqs.memory_type_bits, 0) else {
-            // SAFETY: image is live and unbound.
-            unsafe { (f.destroy_image)(d, image, core::ptr::null()) };
-            return Err(Error::msg("no memory type fits a texture"));
-        };
+        unsafe { (f.get_image_memory_requirements)(d, pending.image, &mut reqs) };
+        let memory_type = self
+            .pick_memory_type(reqs.memory_type_bits, 0)
+            .ok_or_else(|| Error::msg("no memory type fits a texture"))?;
         let alloc = VkMemoryAllocateInfo {
             s_type: VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
             p_next: core::ptr::null(),
             allocation_size: reqs.size,
             memory_type_index: memory_type,
         };
-        let mut memory: VkDeviceMemory = 0;
         // SAFETY: alloc outlives the call.
-        let r = unsafe { (f.allocate_memory)(d, &alloc, core::ptr::null(), &mut memory) };
-        if r != VK_SUCCESS {
-            // SAFETY: image is live and unbound.
-            unsafe { (f.destroy_image)(d, image, core::ptr::null()) };
-            return Err(Error::msg(format!(
-                "vkAllocateMemory (texture) failed: VkResult {r}"
-            )));
-        }
+        check(
+            unsafe { (f.allocate_memory)(d, &alloc, core::ptr::null(), &mut pending.memory) },
+            "vkAllocateMemory (texture)",
+        )?;
         // SAFETY: image and memory are live and compatible.
-        let r = unsafe { (f.bind_image_memory)(d, image, memory, 0) };
-        if r != VK_SUCCESS {
-            // SAFETY: both are live; the failed bind leaves them separable.
-            unsafe {
-                (f.free_memory)(d, memory, core::ptr::null());
-                (f.destroy_image)(d, image, core::ptr::null());
-            }
-            return Err(Error::msg(format!(
-                "vkBindImageMemory (texture) failed: VkResult {r}"
-            )));
-        }
-        match self.create_view(image, format) {
-            Ok(view) => Ok(Texture {
-                image,
-                memory,
-                view,
-                initialized: false,
-            }),
-            Err(e) => {
-                // SAFETY: both are live; nothing else references them.
-                unsafe {
-                    (f.free_memory)(d, memory, core::ptr::null());
-                    (f.destroy_image)(d, image, core::ptr::null());
-                }
-                Err(e)
-            }
-        }
+        check(
+            unsafe { (f.bind_image_memory)(d, pending.image, pending.memory, 0) },
+            "vkBindImageMemory (texture)",
+        )?;
+        pending.view = self.create_view(pending.image, format)?;
+        // Success: hand the handles to the Texture and disarm the guard.
+        let texture = Texture {
+            image: pending.image,
+            memory: pending.memory,
+            view: pending.view,
+            initialized: false,
+        };
+        core::mem::forget(pending);
+        Ok(texture)
     }
 
     /// A plain 2D color view of `image`.
@@ -1328,10 +1401,15 @@ impl Gpu {
             queue_family_index_count: 0,
             p_queue_family_indices: core::ptr::null(),
         };
-        let mut buf: VkBuffer = 0;
+        // The guard destroys whatever exists so far if any step below fails.
+        let mut pending = PendingBuffer {
+            gpu: self,
+            buf: 0,
+            memory: 0,
+        };
         // SAFETY: info outlives the call.
         check(
-            unsafe { (f.create_buffer)(d, &info, core::ptr::null(), &mut buf) },
+            unsafe { (f.create_buffer)(d, &info, core::ptr::null(), &mut pending.buf) },
             "vkCreateBuffer",
         )?;
         let mut reqs = VkMemoryRequirements {
@@ -1340,52 +1418,43 @@ impl Gpu {
             memory_type_bits: 0,
         };
         // SAFETY: buf is live.
-        unsafe { (f.get_buffer_memory_requirements)(d, buf, &mut reqs) };
+        unsafe { (f.get_buffer_memory_requirements)(d, pending.buf, &mut reqs) };
         let required = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
-        let Some(memory_type) = self.pick_memory_type(reqs.memory_type_bits, required) else {
-            // SAFETY: buf is live and unbound.
-            unsafe { (f.destroy_buffer)(d, buf, core::ptr::null()) };
-            return Err(Error::msg("no host-visible memory type for a buffer"));
-        };
+        let memory_type = self
+            .pick_memory_type(reqs.memory_type_bits, required)
+            .ok_or_else(|| Error::msg("no host-visible memory type for a buffer"))?;
         let alloc = VkMemoryAllocateInfo {
             s_type: VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
             p_next: core::ptr::null(),
             allocation_size: reqs.size,
             memory_type_index: memory_type,
         };
-        let mut memory: VkDeviceMemory = 0;
         // SAFETY: alloc outlives the call.
-        let r = unsafe { (f.allocate_memory)(d, &alloc, core::ptr::null(), &mut memory) };
-        if r != VK_SUCCESS {
-            // SAFETY: buf is live and unbound.
-            unsafe { (f.destroy_buffer)(d, buf, core::ptr::null()) };
-            return Err(Error::msg(format!(
-                "vkAllocateMemory (buffer) failed: VkResult {r}"
-            )));
-        }
+        check(
+            unsafe { (f.allocate_memory)(d, &alloc, core::ptr::null(), &mut pending.memory) },
+            "vkAllocateMemory (buffer)",
+        )?;
         // SAFETY: buf and memory are live and compatible.
-        let r = unsafe { (f.bind_buffer_memory)(d, buf, memory, 0) };
+        let r = unsafe { (f.bind_buffer_memory)(d, pending.buf, pending.memory, 0) };
         let mut ptr: *mut c_void = core::ptr::null_mut();
         // SAFETY: memory is live, host-visible, and bound (checked below).
         let r2 = if r == VK_SUCCESS {
-            unsafe { (f.map_memory)(d, memory, 0, u64::MAX, 0, &mut ptr) }
+            unsafe { (f.map_memory)(d, pending.memory, 0, u64::MAX, 0, &mut ptr) }
         } else {
             r
         };
         if r2 != VK_SUCCESS || ptr.is_null() {
-            // SAFETY: both are live; nothing else references them.
-            unsafe {
-                (f.free_memory)(d, memory, core::ptr::null());
-                (f.destroy_buffer)(d, buf, core::ptr::null());
-            }
             return Err(Error::msg(format!("buffer bind/map failed: VkResult {r2}")));
         }
-        Ok(HostBuffer {
-            buf,
-            memory,
+        // Success: hand the handles to the HostBuffer and disarm the guard.
+        let buffer = HostBuffer {
+            buf: pending.buf,
+            memory: pending.memory,
             ptr: ptr.cast(),
             capacity: size,
-        })
+        };
+        core::mem::forget(pending);
+        Ok(buffer)
     }
 
     /// Free a host buffer (a zeroed default is a no-op).

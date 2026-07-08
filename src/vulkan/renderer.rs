@@ -163,6 +163,89 @@ fn shader_words(bytes: &[u8]) -> Result<Vec<u32>> {
         .collect())
 }
 
+/// Compile one SPIR-V stage into a shader module. `what` names the stage for the
+/// error message.
+fn create_shader_module(
+    fns: &DeviceFns,
+    device: VkDevice,
+    words: &[u32],
+    what: &str,
+) -> Result<VkShaderModule> {
+    let info = VkShaderModuleCreateInfo {
+        s_type: VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
+        p_next: core::ptr::null(),
+        flags: 0,
+        code_size: words.len() * 4,
+        p_code: words.as_ptr(),
+    };
+    let mut module: VkShaderModule = 0;
+    // SAFETY: the words outlive the call.
+    check(
+        unsafe { (fns.create_shader_module)(device, &info, core::ptr::null(), &mut module) },
+        what,
+    )?;
+    Ok(module)
+}
+
+/// A descriptor-set layout of `binding_count` combined image samplers at bindings
+/// `0..binding_count`, all visible to the fragment stage (the atlas set uses two,
+/// the per-image set one).
+fn sampler_set_layout(
+    fns: &DeviceFns,
+    device: VkDevice,
+    binding_count: u32,
+    what: &str,
+    out: &mut VkDescriptorSetLayout,
+) -> Result<()> {
+    let bindings: Vec<VkDescriptorSetLayoutBinding> = (0..binding_count)
+        .map(|binding| VkDescriptorSetLayoutBinding {
+            binding,
+            descriptor_type: VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+            descriptor_count: 1,
+            stage_flags: VK_SHADER_STAGE_FRAGMENT_BIT,
+            p_immutable_samplers: core::ptr::null(),
+        })
+        .collect();
+    let info = VkDescriptorSetLayoutCreateInfo {
+        s_type: VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+        p_next: core::ptr::null(),
+        flags: 0,
+        binding_count,
+        p_bindings: bindings.as_ptr(),
+    };
+    // SAFETY: info and bindings outlive the call.
+    check(
+        unsafe { (fns.create_descriptor_set_layout)(device, &info, core::ptr::null(), out) },
+        what,
+    )
+}
+
+/// Allocate one descriptor set of `layout` from `pool`. Argument order matters:
+/// `pool` and `layout` are both `u64` handle aliases, so a transposition would
+/// compile — pool first, then layout.
+pub(super) fn allocate_set(
+    fns: &DeviceFns,
+    device: VkDevice,
+    pool: VkDescriptorPool,
+    layout: VkDescriptorSetLayout,
+    what: &str,
+) -> Result<VkDescriptorSet> {
+    let info = VkDescriptorSetAllocateInfo {
+        s_type: VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+        p_next: core::ptr::null(),
+        descriptor_pool: pool,
+        descriptor_set_count: 1,
+        p_set_layouts: &layout,
+    };
+    let mut set: VkDescriptorSet = 0;
+    // SAFETY: the pool and layout are live; one handle is written.
+    check(
+        unsafe { (fns.allocate_descriptor_sets)(device, &info, &mut set) },
+        what,
+    )?;
+    Ok(set)
+}
+
 /// Build the frame renderer: the render pass, descriptor layouts, pipeline
 /// (from the committed SPIR-V), sampler, and descriptor pool with the two
 /// standing sets. On error, everything built so far is destroyed.
@@ -227,66 +310,19 @@ fn fill_renderer(r: &mut Renderer, fns: &DeviceFns, device: VkDevice) -> Result<
     )?;
 
     // Descriptor layouts: set 0 the two atlases, set 1 one image.
-    let atlas_bindings = [
-        VkDescriptorSetLayoutBinding {
-            binding: 0,
-            descriptor_type: VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
-            descriptor_count: 1,
-            stage_flags: VK_SHADER_STAGE_FRAGMENT_BIT,
-            p_immutable_samplers: core::ptr::null(),
-        },
-        VkDescriptorSetLayoutBinding {
-            binding: 1,
-            descriptor_type: VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
-            descriptor_count: 1,
-            stage_flags: VK_SHADER_STAGE_FRAGMENT_BIT,
-            p_immutable_samplers: core::ptr::null(),
-        },
-    ];
-    let atlas_info = VkDescriptorSetLayoutCreateInfo {
-        s_type: VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
-        p_next: core::ptr::null(),
-        flags: 0,
-        binding_count: atlas_bindings.len() as u32,
-        p_bindings: atlas_bindings.as_ptr(),
-    };
-    // SAFETY: atlas_info and bindings outlive the call.
-    check(
-        unsafe {
-            (fns.create_descriptor_set_layout)(
-                device,
-                &atlas_info,
-                core::ptr::null(),
-                &mut r.set_layout_atlas,
-            )
-        },
+    sampler_set_layout(
+        fns,
+        device,
+        2,
         "vkCreateDescriptorSetLayout (atlas)",
+        &mut r.set_layout_atlas,
     )?;
-    let image_binding = VkDescriptorSetLayoutBinding {
-        binding: 0,
-        descriptor_type: VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
-        descriptor_count: 1,
-        stage_flags: VK_SHADER_STAGE_FRAGMENT_BIT,
-        p_immutable_samplers: core::ptr::null(),
-    };
-    let image_info = VkDescriptorSetLayoutCreateInfo {
-        s_type: VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
-        p_next: core::ptr::null(),
-        flags: 0,
-        binding_count: 1,
-        p_bindings: &image_binding,
-    };
-    // SAFETY: image_info and its binding outlive the call.
-    check(
-        unsafe {
-            (fns.create_descriptor_set_layout)(
-                device,
-                &image_info,
-                core::ptr::null(),
-                &mut r.set_layout_image,
-            )
-        },
+    sampler_set_layout(
+        fns,
+        device,
+        1,
         "vkCreateDescriptorSetLayout (image)",
+        &mut r.set_layout_image,
     )?;
 
     // Pipeline layout: both sets plus the viewport push constant.
@@ -321,40 +357,19 @@ fn fill_renderer(r: &mut Renderer, fns: &DeviceFns, device: VkDevice) -> Result<
     // The pipeline, from the committed SPIR-V blobs.
     let vert_words = shader_words(include_bytes!("../../shaders/quad.vert.spv"))?;
     let frag_words = shader_words(include_bytes!("../../shaders/quad.frag.spv"))?;
-    let mut vert_module: VkShaderModule = 0;
-    let mut frag_module: VkShaderModule = 0;
-    let vert_info = VkShaderModuleCreateInfo {
-        s_type: VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
-        p_next: core::ptr::null(),
-        flags: 0,
-        code_size: vert_words.len() * 4,
-        p_code: vert_words.as_ptr(),
-    };
-    // SAFETY: the words outlive the call.
-    check(
-        unsafe {
-            (fns.create_shader_module)(device, &vert_info, core::ptr::null(), &mut vert_module)
-        },
-        "vkCreateShaderModule (vert)",
-    )?;
-    let frag_info = VkShaderModuleCreateInfo {
-        s_type: VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
-        p_next: core::ptr::null(),
-        flags: 0,
-        code_size: frag_words.len() * 4,
-        p_code: frag_words.as_ptr(),
-    };
-    // SAFETY: the words outlive the call.
-    let fr = unsafe {
-        (fns.create_shader_module)(device, &frag_info, core::ptr::null(), &mut frag_module)
-    };
-    if fr != VK_SUCCESS {
-        // SAFETY: vert_module is live and unused.
-        unsafe { (fns.destroy_shader_module)(device, vert_module, core::ptr::null()) };
-        return Err(Error::msg(format!(
-            "vkCreateShaderModule (frag) failed: VkResult {fr}"
-        )));
-    }
+    let vert_module =
+        create_shader_module(fns, device, &vert_words, "vkCreateShaderModule (vert)")?;
+    // The vert module is already live, so a frag failure must destroy it before
+    // returning (the one non-guard unwind left in this function).
+    let frag_module =
+        match create_shader_module(fns, device, &frag_words, "vkCreateShaderModule (frag)") {
+            Ok(module) => module,
+            Err(e) => {
+                // SAFETY: vert_module is live and unused.
+                unsafe { (fns.destroy_shader_module)(device, vert_module, core::ptr::null()) };
+                return Err(e);
+            }
+        };
 
     let pipeline_result = create_pipeline(fns, device, r, vert_module, frag_module);
     // The modules are compiled into the pipeline; they are not needed after.
@@ -419,28 +434,18 @@ fn fill_renderer(r: &mut Renderer, fns: &DeviceFns, device: VkDevice) -> Result<
         },
         "vkCreateDescriptorPool",
     )?;
-    let alloc = VkDescriptorSetAllocateInfo {
-        s_type: VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
-        p_next: core::ptr::null(),
-        descriptor_pool: r.descriptor_pool,
-        descriptor_set_count: 1,
-        p_set_layouts: &r.set_layout_atlas,
-    };
-    // SAFETY: the pool and layout are live.
-    check(
-        unsafe { (fns.allocate_descriptor_sets)(device, &alloc, &mut r.set_atlas) },
+    r.set_atlas = allocate_set(
+        fns,
+        device,
+        r.descriptor_pool,
+        r.set_layout_atlas,
         "vkAllocateDescriptorSets (atlas)",
     )?;
-    let alloc_dummy = VkDescriptorSetAllocateInfo {
-        s_type: VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
-        p_next: core::ptr::null(),
-        descriptor_pool: r.descriptor_pool,
-        descriptor_set_count: 1,
-        p_set_layouts: &r.set_layout_image,
-    };
-    // SAFETY: as above.
-    check(
-        unsafe { (fns.allocate_descriptor_sets)(device, &alloc_dummy, &mut r.set_dummy) },
+    r.set_dummy = allocate_set(
+        fns,
+        device,
+        r.descriptor_pool,
+        r.set_layout_image,
         "vkAllocateDescriptorSets (dummy)",
     )?;
     Ok(())

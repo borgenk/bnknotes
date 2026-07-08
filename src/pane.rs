@@ -636,13 +636,25 @@ impl EditorPane {
         py - rect.y as f32 + self.scroll_y as f32
     }
 
-    /// The byte offset under a window position within this pane's column.
-    pub(crate) fn pointer_offset(&mut self, fonts: &Fonts, rect: Rect, px: f32, py: f32) -> usize {
+    /// Ensure the windowed layout covers `rect`, then return it (with the buffer
+    /// rope, since the hit-tests need both) and the content-space y for the window
+    /// position `py`. `None` when no layout could be built. The shared preamble of
+    /// the pointer-query methods below; it hands back the rope so a caller need
+    /// not re-borrow `self` (which the returned layout reference locks) to reach
+    /// it.
+    fn layout_at(&mut self, fonts: &Fonts, rect: Rect, py: f32) -> Option<(&Layout, &Rope, f32)> {
         self.ensure_layout(fonts, rect);
         let y = self.content_y(rect, py);
-        self.layout_cache
-            .as_ref()
-            .map_or(0, |l| l.offset_at(fonts, self.text.rope(), px, y))
+        let layout = self.layout_cache.as_ref()?;
+        Some((layout, self.text.rope(), y))
+    }
+
+    /// The byte offset under a window position within this pane's column.
+    pub(crate) fn pointer_offset(&mut self, fonts: &Fonts, rect: Rect, px: f32, py: f32) -> usize {
+        match self.layout_at(fonts, rect, py) {
+            Some((layout, rope, y)) => layout.offset_at(fonts, rope, px, y),
+            None => 0,
+        }
     }
 
     /// Place the cursor (or, with `extend`, the selection's free end) at a window
@@ -655,12 +667,10 @@ impl EditorPane {
         py: f32,
         extend: bool,
     ) -> bool {
-        self.ensure_layout(fonts, rect);
-        let y = self.content_y(rect, py);
-        let Some(layout) = self.layout_cache.as_ref() else {
+        let Some((layout, rope, y)) = self.layout_at(fonts, rect, py) else {
             return false;
         };
-        let offset = layout.offset_at(fonts, self.text.rope(), px, y);
+        let offset = layout.offset_at(fonts, rope, px, y);
         self.text.set_cursor_changed(offset, extend)
     }
 
@@ -699,19 +709,14 @@ impl EditorPane {
         px: f32,
         py: f32,
     ) -> Option<usize> {
-        self.ensure_layout(fonts, rect);
-        let y = self.content_y(rect, py);
-        self.layout_cache
-            .as_ref()?
-            .checkbox_at(fonts, self.text.rope(), px, y)
+        let (layout, rope, y) = self.layout_at(fonts, rect, py)?;
+        layout.checkbox_at(fonts, rope, px, y)
     }
 
     /// Handle a press on an image button (toggles its raw source) or picture
     /// (selects it). Returns whether it was consumed.
     pub(crate) fn image_press(&mut self, fonts: &Fonts, rect: Rect, px: f32, py: f32) -> bool {
-        self.ensure_layout(fonts, rect);
-        let y = self.content_y(rect, py);
-        let Some(layout) = self.layout_cache.as_ref() else {
+        let Some((layout, _, y)) = self.layout_at(fonts, rect, py) else {
             return false;
         };
         let button = layout.image_button_at(fonts, px, y);
@@ -742,14 +747,27 @@ impl EditorPane {
         use wp_cursor_shape_device_v1::{SHAPE_DEFAULT, SHAPE_POINTER, SHAPE_TEXT};
         let over_link = self.link_under_pointer(fonts, rect, px, py).is_some();
         let over_checkbox = self.checkbox_under_pointer(fonts, rect, px, py).is_some();
-        self.ensure_layout(fonts, rect);
-        let y = self.content_y(rect, py);
-        match self.layout_cache.as_ref() {
-            _ if over_link || over_checkbox => SHAPE_POINTER,
-            Some(layout) if layout.image_button_at(fonts, px, y).is_some() => SHAPE_POINTER,
-            Some(layout) if layout.image_at(fonts, px, y).is_some() => SHAPE_DEFAULT,
+        if over_link || over_checkbox {
+            return SHAPE_POINTER;
+        }
+        match self.layout_at(fonts, rect, py) {
+            Some((layout, _, y)) if layout.image_button_at(fonts, px, y).is_some() => SHAPE_POINTER,
+            Some((layout, _, y)) if layout.image_at(fonts, px, y).is_some() => SHAPE_DEFAULT,
             _ => SHAPE_TEXT,
         }
+    }
+
+    /// The byte range of the rendered horizontal rule under a window position, if
+    /// its line is a collapsed thematic break, so a click can select the whole
+    /// rule line without the caller reaching into the layout cache.
+    pub(crate) fn rule_under_pointer(
+        &mut self,
+        fonts: &Fonts,
+        rect: Rect,
+        py: f32,
+    ) -> Option<(usize, usize)> {
+        let (layout, _, y) = self.layout_at(fonts, rect, py)?;
+        layout.rule_at(fonts, y)
     }
 
     /// Arm or disarm drag auto-scroll from the pointer's distance to this

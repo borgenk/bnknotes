@@ -6,6 +6,7 @@ use super::State;
 use crate::error::{Error, Result};
 use crate::ffi;
 use crate::find;
+use crate::freetype::Fonts;
 use crate::layout::Rect;
 use crate::pane::{EditorPane, Focus, Hit, SPLITTER};
 use crate::protocol::{
@@ -65,6 +66,104 @@ impl KeyRepeat {
             at: None,
         }
     }
+}
+
+/// Apply one pure-editor key action to the focused pane, returning whether it
+/// changed the buffer (so the caller can run its after-edit bookkeeping). These
+/// are the actions that need nothing but the pane, the fonts, and the viewport
+/// `rect`; the window/pane, find-bar, and clipboard/save actions are routed
+/// elsewhere by [`State::apply_action`]. `extend` is whether Shift is held.
+fn apply_editor_action(
+    ed: &mut EditorPane,
+    fonts: &Fonts,
+    rect: Rect,
+    extend: bool,
+    action: KeyAction,
+) -> bool {
+    let changed = match action {
+        KeyAction::Char(c) => {
+            let mut encoded = [0u8; 4];
+            ed.text.insert_str(c.encode_utf8(&mut encoded));
+            true
+        }
+        KeyAction::Enter => ed.text.enter(),
+        // On a list item, Tab nests it one level deeper and Shift+Tab one
+        // shallower. Anywhere else, Tab inserts a soft tab and Shift+Tab is a
+        // no-op (there is nothing to dedent).
+        KeyAction::Tab => {
+            if ed.text.cursor_on_list_item() {
+                ed.text.nest_list_item(extend)
+            } else if extend {
+                false
+            } else {
+                ed.text.insert_str(SOFT_TAB);
+                true
+            }
+        }
+        KeyAction::Backspace => ed.text.backspace(),
+        KeyAction::Delete => ed.text.delete_forward(),
+        KeyAction::DeleteWordBack => ed.text.delete_word_back(),
+        KeyAction::DeleteWordForward => ed.text.delete_word_forward(),
+        KeyAction::DeleteLine => ed.text.delete_line(),
+        KeyAction::Left => ed.text.move_left(extend),
+        KeyAction::Right => ed.text.move_right(extend),
+        KeyAction::WordLeft => ed.text.move_word_left(extend),
+        KeyAction::WordRight => ed.text.move_word_right(extend),
+        KeyAction::Up => ed.move_vertical(fonts, rect, -1, extend),
+        KeyAction::Down => ed.move_vertical(fonts, rect, 1, extend),
+        KeyAction::PageUp => ed.move_page(fonts, rect, -1, extend),
+        KeyAction::PageDown => ed.move_page(fonts, rect, 1, extend),
+        KeyAction::Home => ed.move_line_edge(fonts, rect, false, extend),
+        KeyAction::End => ed.move_line_edge(fonts, rect, true, extend),
+        KeyAction::DocStart => ed.text.move_doc_start(extend),
+        KeyAction::DocEnd => ed.text.move_doc_end(extend),
+        KeyAction::SelectAll => {
+            ed.text.select_all();
+            true
+        }
+        KeyAction::Undo => ed.text.undo(),
+        KeyAction::Redo => ed.text.redo(),
+        // With no find bar, Escape collapses a selection to a bare cursor; with
+        // nothing selected there is nothing to leave.
+        KeyAction::Escape => {
+            if ed.text.selection().is_some() {
+                let c = ed.text.cursor();
+                ed.text.set_cursor(c, false);
+                true
+            } else {
+                false
+            }
+        }
+        // Routed elsewhere by `apply_action` (window/pane, find bar, clipboard,
+        // and save); listed for exhaustiveness.
+        KeyAction::Copy
+        | KeyAction::Cut
+        | KeyAction::Paste
+        | KeyAction::Save
+        | KeyAction::Find
+        | KeyAction::Replace
+        | KeyAction::ToggleTree
+        | KeyAction::ToggleSecondPane
+        | KeyAction::FocusTree
+        | KeyAction::FocusPaneA
+        | KeyAction::FocusPaneB
+        | KeyAction::None => false,
+    };
+    // The vertical motions read `goal_x` (the remembered column). SelectAll and
+    // Escape leave it untouched (they do not move by column). Every other action
+    // invalidates it, so the next vertical motion recomputes from the new column.
+    if !matches!(
+        action,
+        KeyAction::Up
+            | KeyAction::Down
+            | KeyAction::PageUp
+            | KeyAction::PageDown
+            | KeyAction::SelectAll
+            | KeyAction::Escape
+    ) {
+        ed.goal_x = None;
+    }
+    changed
 }
 
 impl State {
@@ -222,106 +321,13 @@ impl State {
             self.land_on_match(target);
             return Ok(());
         }
-        let ed = &mut self.editors[i];
+        // The clipboard and save actions stay on `State`: they need the Wayland
+        // connection and swallow-and-report their own I/O errors (a peer closing
+        // the pipe early, or a disk failure, must not bring the editor down and
+        // lose unsaved work). Everything else is a pure edit on the focused pane.
         let changed = match action {
-            KeyAction::Char(c) => {
-                let mut encoded = [0u8; 4];
-                ed.text.insert_str(c.encode_utf8(&mut encoded));
-                ed.goal_x = None;
-                true
-            }
-            KeyAction::Enter => {
-                ed.goal_x = None;
-                ed.text.enter()
-            }
-            // On a list item, Tab nests it one level deeper and Shift+Tab one
-            // shallower. Anywhere else, Tab inserts a soft tab and Shift+Tab is a
-            // no-op (there is nothing to dedent).
-            KeyAction::Tab => {
-                ed.goal_x = None;
-                if ed.text.cursor_on_list_item() {
-                    ed.text.nest_list_item(extend)
-                } else if extend {
-                    false
-                } else {
-                    ed.text.insert_str(SOFT_TAB);
-                    true
-                }
-            }
-            KeyAction::Backspace => {
-                ed.goal_x = None;
-                ed.text.backspace()
-            }
-            KeyAction::Delete => {
-                ed.goal_x = None;
-                ed.text.delete_forward()
-            }
-            KeyAction::DeleteWordBack => {
-                ed.goal_x = None;
-                ed.text.delete_word_back()
-            }
-            KeyAction::DeleteWordForward => {
-                ed.goal_x = None;
-                ed.text.delete_word_forward()
-            }
-            KeyAction::DeleteLine => {
-                ed.goal_x = None;
-                ed.text.delete_line()
-            }
-            KeyAction::Left => {
-                ed.goal_x = None;
-                ed.text.move_left(extend)
-            }
-            KeyAction::Right => {
-                ed.goal_x = None;
-                ed.text.move_right(extend)
-            }
-            KeyAction::WordLeft => {
-                ed.goal_x = None;
-                ed.text.move_word_left(extend)
-            }
-            KeyAction::WordRight => {
-                ed.goal_x = None;
-                ed.text.move_word_right(extend)
-            }
-            KeyAction::Up => ed.move_vertical(&self.fonts, rect, -1, extend),
-            KeyAction::Down => ed.move_vertical(&self.fonts, rect, 1, extend),
-            KeyAction::PageUp => ed.move_page(&self.fonts, rect, -1, extend),
-            KeyAction::PageDown => ed.move_page(&self.fonts, rect, 1, extend),
-            KeyAction::Home => {
-                ed.goal_x = None;
-                ed.move_line_edge(&self.fonts, rect, false, extend)
-            }
-            KeyAction::End => {
-                ed.goal_x = None;
-                ed.move_line_edge(&self.fonts, rect, true, extend)
-            }
-            KeyAction::DocStart => {
-                ed.goal_x = None;
-                ed.text.move_doc_start(extend)
-            }
-            KeyAction::DocEnd => {
-                ed.goal_x = None;
-                ed.text.move_doc_end(extend)
-            }
-            KeyAction::SelectAll => {
-                ed.text.select_all();
-                true
-            }
-            KeyAction::Undo => {
-                ed.goal_x = None;
-                ed.text.undo()
-            }
-            KeyAction::Redo => {
-                ed.goal_x = None;
-                ed.text.redo()
-            }
-            // The clipboard actions manage their own redraw and may do I/O over a
-            // pipe to another app. As with Save, an I/O failure (e.g. a peer that
-            // closes the pipe early, EPIPE) must not bring the editor down and lose
-            // the user's unsaved work, so it is reported and swallowed rather than
-            // propagated out of the loop. With an image selected, Copy puts the
-            // picture on the clipboard instead of text.
+            // With an image selected, Copy puts the picture on the clipboard
+            // instead of text.
             KeyAction::Copy => {
                 let result = if self.editors[i].selected_image.is_some() {
                     self.copy_selected_image()
@@ -345,36 +351,13 @@ impl State {
                 }
                 false
             }
-            // Saving touches the disk but not the buffer; a failure must not
-            // bring the editor down and lose the user's unsaved work, so it is
-            // reported and swallowed rather than propagated out of the loop.
             KeyAction::Save => {
                 if let Err(e) = self.save() {
                     eprintln!("bnknotes: save failed: {e}");
                 }
                 false
             }
-            // Handled before this match: Find/Replace open the bar, and while
-            // it is open the bar consumes them (and Escape, to close itself).
-            KeyAction::Find | KeyAction::Replace => false,
-            // With no find bar, Escape collapses a selection to a bare cursor;
-            // with nothing selected there is nothing to leave.
-            KeyAction::Escape => {
-                if self.editors[i].text.selection().is_some() {
-                    let c = self.editors[i].text.cursor();
-                    self.editors[i].text.set_cursor(c, false);
-                    true
-                } else {
-                    false
-                }
-            }
-            // Handled before this match (returned early); listed for exhaustiveness.
-            KeyAction::ToggleTree
-            | KeyAction::ToggleSecondPane
-            | KeyAction::FocusTree
-            | KeyAction::FocusPaneA
-            | KeyAction::FocusPaneB
-            | KeyAction::None => false,
+            _ => apply_editor_action(&mut self.editors[i], &self.fonts, rect, extend, action),
         };
         if changed {
             self.after_edit();
@@ -880,13 +863,7 @@ impl State {
         self.editors[i].last_click_pos = (px, py);
         // A plain click on a rendered horizontal rule selects the whole rule line.
         if !shift {
-            self.editors[i].ensure_layout(&self.fonts, rect);
-            let cy = self.editors[i].content_y(rect, py);
-            let rule = self.editors[i]
-                .layout_cache
-                .as_ref()
-                .and_then(|l| l.rule_at(&self.fonts, cy));
-            if let Some((start, end)) = rule {
+            if let Some((start, end)) = self.editors[i].rule_under_pointer(&self.fonts, rect, py) {
                 self.editors[i].text.select_range(start, end);
                 self.editors[i].selecting = false;
                 self.dirty = true;

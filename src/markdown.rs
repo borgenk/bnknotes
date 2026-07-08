@@ -44,20 +44,22 @@ pub enum LineStyle {
     Rule,
 }
 
-/// The ATX heading level of `line`, or `None` if it is not a heading. A heading
-/// is one to six leading `'#'` followed immediately by a space or the line's
-/// end, per CommonMark: `#tag` is not a heading, but `#`, `# `, and `# Title`
-/// are. `line` must be a single logical line (no embedded `'\n'`).
-pub fn heading_level(line: &str) -> Option<u8> {
+/// An ATX heading's level and marker length (its `'#'` run plus the single
+/// separating space, if present), or `None` if `line` is not a heading. A heading
+/// is one to six leading `'#'` followed immediately by a space or the line's end,
+/// per CommonMark: `#tag` is not a heading, but `#`, `# `, and `# Title` are.
+/// `line` must be a single logical line (no embedded `'\n'`). Both pieces fall out
+/// of one scan, so a caller needing both (see [`classify`]) does not scan twice.
+fn heading(line: &str) -> Option<(u8, usize)> {
     let hashes = line.bytes().take_while(|&b| b == b'#').count();
     if hashes == 0 || hashes > 6 {
         return None;
     }
     match line.as_bytes().get(hashes) {
-        // Hashes run to the end of the line: an empty heading.
-        None => Some(hashes as u8),
+        // Hashes run to the end of the line: an empty heading, no space.
+        None => Some((hashes as u8, hashes)),
         // A space separates the marker from the heading text.
-        Some(&b' ') => Some(hashes as u8),
+        Some(&b' ') => Some((hashes as u8, hashes + 1)),
         // Anything else (e.g. `#tag`) is not a heading.
         Some(_) => None,
     }
@@ -69,8 +71,8 @@ pub fn heading_level(line: &str) -> Option<u8> {
 /// length falls straight out of the predicate that matched (each returns it), so
 /// a caller needing both does not run the predicates twice.
 pub fn classify(line: &str) -> (LineStyle, usize) {
-    if let Some(level) = heading_level(line) {
-        (LineStyle::Heading(level), heading_marker_len(line))
+    if let Some((level, marker)) = heading(line) {
+        (LineStyle::Heading(level), marker)
     } else if is_thematic_break(line) {
         // Checked before bullets so a spaced `- - -` or `* * *` reads as a rule,
         // not a list item. The whole rule is its marker (collapses off-cursor).
@@ -84,7 +86,7 @@ pub fn classify(line: &str) -> (LineStyle, usize) {
             Some(checked) => (LineStyle::Task { checked }, len + 4),
             None => (LineStyle::Bullet, len),
         }
-    } else if let Some(len) = ordered_marker(line) {
+    } else if let Some((_, len)) = ordered_parts(line) {
         (LineStyle::Ordered, len)
     } else {
         (LineStyle::Body, 0)
@@ -181,15 +183,6 @@ pub fn closes_code_fence(line: &str, open: usize) -> bool {
     ticks >= open && line[ticks..].trim().is_empty()
 }
 
-/// Byte length of a heading's `#` run plus the single separating space if present.
-fn heading_marker_len(line: &str) -> usize {
-    let hashes = line.bytes().take_while(|&b| b == b'#').count();
-    match line.as_bytes().get(hashes) {
-        Some(&b' ') => hashes + 1,
-        _ => hashes,
-    }
-}
-
 /// Spaces of leading indentation per list nesting level. A list item with this
 /// many leading spaces is one level deep, twice as many is two levels, and so on
 /// (see [`crate::layout`], which resolves a depth against its parent). Tab on a
@@ -232,10 +225,12 @@ fn task_box(line: &str, after: usize) -> Option<bool> {
     }
 }
 
-/// Marker length if `line` is an ordered item: optional leading indentation, one
-/// to nine digits, then `.` or `)`, then a required space (so `1.foo` and a bare
-/// `1.` stay body text). The length spans the indentation and the marker.
-fn ordered_marker(line: &str) -> Option<usize> {
+/// If `line` is an ordered item, the byte range of its digits and the full marker
+/// length (both spanning any leading indentation). An ordered item is optional
+/// indentation, one to nine digits, then `.` or `)`, then a required space (so
+/// `1.foo` and a bare `1.` stay body text). One scan feeds both the classifier
+/// (which wants the length) and renumbering (which wants the digits).
+fn ordered_parts(line: &str) -> Option<((usize, usize), usize)> {
     let indent = leading_indent(line);
     let bytes = &line.as_bytes()[indent..];
     let digits = bytes.iter().take_while(|&&b| b.is_ascii_digit()).count();
@@ -243,7 +238,9 @@ fn ordered_marker(line: &str) -> Option<usize> {
         return None;
     }
     match bytes.get(digits) {
-        Some(b'.' | b')') if bytes.get(digits + 1) == Some(&b' ') => Some(indent + digits + 2),
+        Some(b'.' | b')') if bytes.get(digits + 1) == Some(&b' ') => {
+            Some(((indent, indent + digits), indent + digits + 2))
+        }
         _ => None,
     }
 }
@@ -253,14 +250,9 @@ fn ordered_marker(line: &str) -> Option<usize> {
 /// ordered item: `"  12. x"` yields `(12, (2, 4))`. Drives the renumbering of
 /// the items that follow when Enter inserts a new numbered item.
 pub fn ordered_number(line: &str) -> Option<(u64, (usize, usize))> {
-    ordered_marker(line)?;
-    let indent = leading_indent(line);
-    let digits = line[indent..]
-        .bytes()
-        .take_while(u8::is_ascii_digit)
-        .count();
-    let value = line[indent..indent + digits].parse().ok()?;
-    Some((value, (indent, indent + digits)))
+    let ((ds, de), _) = ordered_parts(line)?;
+    let value = line[ds..de].parse().ok()?;
+    Some((value, (ds, de)))
 }
 
 /// Marker length if `line` is a blockquote: a leading `>`, plus a single space if
@@ -910,33 +902,36 @@ mod tests {
     fn recognizes_each_heading_level() {
         for level in 1..=6u8 {
             let line = format!("{} heading", "#".repeat(level as usize));
-            assert_eq!(heading_level(&line), Some(level));
+            // Level plus marker length (the `#` run and its trailing space).
+            assert_eq!(heading(&line), Some((level, level as usize + 1)));
             assert_eq!(style_of(&line), LineStyle::Heading(level));
         }
     }
 
     #[test]
     fn seven_hashes_is_not_a_heading() {
-        assert_eq!(heading_level("####### too deep"), None);
+        assert_eq!(heading("####### too deep"), None);
         assert_eq!(style_of("####### too deep"), LineStyle::Body);
     }
 
     #[test]
     fn hash_without_a_space_is_not_a_heading() {
-        assert_eq!(heading_level("#tag"), None);
-        assert_eq!(heading_level("##bold"), None);
+        assert_eq!(heading("#tag"), None);
+        assert_eq!(heading("##bold"), None);
     }
 
     #[test]
     fn bare_and_space_only_markers_are_empty_headings() {
-        assert_eq!(heading_level("#"), Some(1));
-        assert_eq!(heading_level("###"), Some(3));
-        assert_eq!(heading_level("# "), Some(1));
+        // No space after the hashes, so the marker is just the hashes.
+        assert_eq!(heading("#"), Some((1, 1)));
+        assert_eq!(heading("###"), Some((3, 3)));
+        // A trailing space is part of the marker.
+        assert_eq!(heading("# "), Some((1, 2)));
     }
 
     #[test]
     fn leading_space_disqualifies_a_heading() {
-        assert_eq!(heading_level(" # indented"), None);
+        assert_eq!(heading(" # indented"), None);
     }
 
     #[test]

@@ -731,28 +731,25 @@ fn push_find_bar(list: &mut DisplayList, fonts: &Fonts, find: &FindPaint, width:
         caret_after(list, pen + query_w, baseline);
     }
 
-    // The flags and counter, right-aligned on the query row.
+    // The flags and counter, right-aligned on the query row. Each flag glyph is
+    // lit when its mode is on, dim otherwise.
     let mut tx = x + w - pad - tail_w;
-    list.push(text_cmd(
-        key,
-        tx,
-        baseline,
-        tx + flag_word_w,
-        if find.word { FOREGROUND } else { MARKER_COLOR },
-        "W".to_string(),
-        m,
-    ));
-    tx += flag_word_w + gap;
-    list.push(text_cmd(
-        key,
-        tx,
-        baseline,
-        tx + flag_regex_w,
-        if find.regex { FOREGROUND } else { MARKER_COLOR },
-        ".*".to_string(),
-        m,
-    ));
-    tx += flag_regex_w + gap;
+    for (glyph, on, glyph_w) in [
+        ("W", find.word, flag_word_w),
+        (".*", find.regex, flag_regex_w),
+    ] {
+        let color = if on { FOREGROUND } else { MARKER_COLOR };
+        list.push(text_cmd(
+            key,
+            tx,
+            baseline,
+            tx + glyph_w,
+            color,
+            glyph.to_string(),
+            m,
+        ));
+        tx += glyph_w + gap;
+    }
     if !counter.is_empty() {
         let color = if find.error {
             FIND_ERROR_COLOR

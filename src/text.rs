@@ -468,20 +468,32 @@ impl TextBuffer {
         }
     }
 
+    /// Delete the span between the cursor and `target` as one undo step under
+    /// `group`, leaving the cursor at the lower end. No-op (returns `false`) when
+    /// the target is the cursor. The shared body of the per-key deletes, reached
+    /// only after [`take_selection`](Self::take_selection) finds no selection.
+    fn delete_to(&mut self, target: usize, group: Coalesce) -> bool {
+        let (lo, hi) = (self.cursor.min(target), self.cursor.max(target));
+        if lo == hi {
+            return false;
+        }
+        self.checkpoint(group);
+        self.text.remove(lo..hi);
+        self.cursor = lo;
+        self.touch();
+        true
+    }
+
     /// Delete the selection if there is one, else the grapheme cluster before
     /// the cursor. Returns whether anything changed.
     pub fn backspace(&mut self) -> bool {
         if self.take_selection() {
             return true;
         }
-        let Some(prev) = self.prev_grapheme() else {
-            return false;
-        };
-        self.checkpoint(Coalesce::Delete);
-        self.text.remove(prev..self.cursor);
-        self.cursor = prev;
-        self.touch();
-        true
+        match self.prev_grapheme() {
+            Some(prev) => self.delete_to(prev, Coalesce::Delete),
+            None => false,
+        }
     }
 
     /// Delete the selection if there is one, else the grapheme cluster after the
@@ -490,13 +502,10 @@ impl TextBuffer {
         if self.take_selection() {
             return true;
         }
-        let Some(next) = self.next_grapheme() else {
-            return false;
-        };
-        self.checkpoint(Coalesce::Delete);
-        self.text.remove(self.cursor..next);
-        self.touch();
-        true
+        match self.next_grapheme() {
+            Some(next) => self.delete_to(next, Coalesce::Delete),
+            None => false,
+        }
     }
 
     /// Delete the selection if there is one, else from the cursor back to the
@@ -507,14 +516,7 @@ impl TextBuffer {
             return true;
         }
         let target = prev_word_rope(&self.text, self.cursor);
-        if target == self.cursor {
-            return false;
-        }
-        self.checkpoint(Coalesce::None);
-        self.text.remove(target..self.cursor);
-        self.cursor = target;
-        self.touch();
-        true
+        self.delete_to(target, Coalesce::None)
     }
 
     /// Delete the selection if there is one, else from the cursor forward to the
@@ -524,13 +526,7 @@ impl TextBuffer {
             return true;
         }
         let target = next_word_rope(&self.text, self.cursor);
-        if target == self.cursor {
-            return false;
-        }
-        self.checkpoint(Coalesce::None);
-        self.text.remove(self.cursor..target);
-        self.touch();
-        true
+        self.delete_to(target, Coalesce::None)
     }
 
     /// Select the whole buffer (anchor at the start, cursor at the end).
@@ -556,11 +552,7 @@ impl TextBuffer {
     /// normalized on load), so one byte is stripped.
     pub fn select_line_at(&mut self, offset: usize) {
         let line = self.text.byte_to_line(offset.min(self.text.len()));
-        let start = self.text.line_to_byte(line);
-        let mut end = self.text.line_to_byte(line + 1);
-        if end > start && self.text.byte(end - 1) == Some(b'\n') {
-            end -= 1;
-        }
+        let (start, end) = self.text.line_content_range(line);
         self.set_selection(start, end);
     }
 

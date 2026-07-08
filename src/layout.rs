@@ -761,11 +761,7 @@ impl Layout {
     /// on the source text line (which a revealed image always has above its
     /// picture). Falls back to the last text line for an offset at the document end.
     fn line_for(&self, offset: usize) -> &VisualLine {
-        self.lines
-            .iter()
-            .filter(|l| l.image.is_none())
-            .find(|l| offset < l.end || (offset == l.end && l.hard))
-            .unwrap_or_else(|| self.last_text_line())
+        &self.lines[self.line_index_for(offset)]
     }
 
     fn line_index_for(&self, offset: usize) -> usize {
@@ -852,17 +848,6 @@ impl Layout {
         // build always pushes at least one line, so this never panics.
         debug_assert!(!self.lines.is_empty());
         &self.lines[self.lines.len() - 1]
-    }
-
-    /// The last caret-bearing (non-picture) line, the end-of-document fallback for
-    /// caret placement. Falls back to the very last line only in the degenerate
-    /// case of a document whose visual lines are all pictures.
-    fn last_text_line(&self) -> &VisualLine {
-        self.lines
-            .iter()
-            .rev()
-            .find(|l| l.image.is_none())
-            .unwrap_or_else(|| self.last_line())
     }
 
     /// Whether the visual line at `idx` is the picture half of a revealed image,

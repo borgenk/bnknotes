@@ -2865,14 +2865,6 @@ impl Gpu {
                 self.renderer.sampler,
                 dummy.view,
             );
-            write_image_set(
-                &self.fns,
-                self.device.raw,
-                self.renderer.set_dummy,
-                0,
-                self.renderer.sampler,
-                dummy.view,
-            );
             uploads.push(PendingUpload {
                 image: dummy.image,
                 was_initialized: false,

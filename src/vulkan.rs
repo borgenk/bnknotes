@@ -2443,20 +2443,26 @@ impl Gpu {
         Ok(())
     }
 
+    /// CPU-wait for `img`'s render fence to signal, the fallback both submit
+    /// paths take when the driver cannot hand the fence to the compositor. `what`
+    /// names the calling path for the error. A slow correct frame beats a torn one.
+    fn wait_fence(&self, img: &GpuImage, what: &str) -> Result<()> {
+        // SAFETY: fence is live; the timeout bounds a broken driver.
+        check(
+            unsafe {
+                (self.fns.wait_for_fences)(self.device.raw, 1, &img.fence, 1, FENCE_TIMEOUT_NS)
+            },
+            what,
+        )
+    }
+
     /// Submit under the implicit-sync bridge: after the submit, the render-done
     /// fence rides the dmabuf so the compositor waits for it. If the bridge is
-    /// unavailable, wait on the CPU instead; a slow correct frame beats a torn
-    /// one.
+    /// unavailable, wait on the CPU instead.
     fn submit_frame(&self, img: &mut GpuImage, wait_acquire: bool) -> Result<()> {
         self.submit_only(img, wait_acquire)?;
         if !self.export_render_fence(img)? {
-            // SAFETY: fence is live; the timeout bounds a broken driver.
-            check(
-                unsafe {
-                    (self.fns.wait_for_fences)(self.device.raw, 1, &img.fence, 1, FENCE_TIMEOUT_NS)
-                },
-                "vkWaitForFences (bridge fallback)",
-            )?;
+            self.wait_fence(img, "vkWaitForFences (bridge fallback)")?;
         }
         Ok(())
     }
@@ -2474,19 +2480,7 @@ impl Gpu {
         match self.render_done_fence(img)? {
             Some(fd) => Ok(Some(fd)),
             None => {
-                // SAFETY: fence is live; the timeout bounds a broken driver.
-                check(
-                    unsafe {
-                        (self.fns.wait_for_fences)(
-                            self.device.raw,
-                            1,
-                            &img.fence,
-                            1,
-                            FENCE_TIMEOUT_NS,
-                        )
-                    },
-                    "vkWaitForFences (explicit fallback)",
-                )?;
+                self.wait_fence(img, "vkWaitForFences (explicit fallback)")?;
                 Ok(None)
             }
         }
@@ -3743,25 +3737,18 @@ fn create_pipeline(
     vert: VkShaderModule,
     frag: VkShaderModule,
 ) -> Result<()> {
+    let stage = |stage: u32, module: VkShaderModule| VkPipelineShaderStageCreateInfo {
+        s_type: VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+        p_next: core::ptr::null(),
+        flags: 0,
+        stage,
+        module,
+        p_name: c"main".as_ptr(),
+        p_specialization_info: core::ptr::null(),
+    };
     let stages = [
-        VkPipelineShaderStageCreateInfo {
-            s_type: VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
-            p_next: core::ptr::null(),
-            flags: 0,
-            stage: VK_SHADER_STAGE_VERTEX_BIT,
-            module: vert,
-            p_name: c"main".as_ptr(),
-            p_specialization_info: core::ptr::null(),
-        },
-        VkPipelineShaderStageCreateInfo {
-            s_type: VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
-            p_next: core::ptr::null(),
-            flags: 0,
-            stage: VK_SHADER_STAGE_FRAGMENT_BIT,
-            module: frag,
-            p_name: c"main".as_ptr(),
-            p_specialization_info: core::ptr::null(),
-        },
+        stage(VK_SHADER_STAGE_VERTEX_BIT, vert),
+        stage(VK_SHADER_STAGE_FRAGMENT_BIT, frag),
     ];
     let binding = VkVertexInputBindingDescription {
         binding: 0,

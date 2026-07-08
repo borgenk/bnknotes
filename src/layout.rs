@@ -154,6 +154,37 @@ pub struct VisualLine {
     pub image: Option<ImageBox>,
 }
 
+impl VisualLine {
+    /// A picture-box widget line for a standalone `![alt](path)`: no runs, gutter,
+    /// or markup, just the image at the given `baseline`. Used both for the
+    /// picture-only case and the picture below a revealed source line, which
+    /// differ only in `baseline` and whether they own a hard break.
+    fn image_widget(
+        start: usize,
+        end: usize,
+        baseline: i32,
+        hard: bool,
+        size: u32,
+        image: ImageBox,
+    ) -> Self {
+        Self {
+            start,
+            end,
+            baseline,
+            hard,
+            size,
+            runs: 0..0,
+            indent: 0,
+            gutter: Gutter::None,
+            code_block: false,
+            heading: None,
+            task: None,
+            rule: false,
+            image: Some(image),
+        }
+    }
+}
+
 /// A block image laid out as a picture box for a logical line's `![alt](path)`.
 /// The path is kept as a byte range into the buffer (sliced at paint time to look
 /// the decoded image up in the [`ImageStore`]) rather than an owned string,
@@ -929,6 +960,142 @@ struct LayoutScratch {
     runs: Vec<Run>,
 }
 
+/// The per-line classification `lay_line` makes once, then threads through
+/// wrapping and run-clipping: the resolved block `style` and its font `size`, the
+/// leading block marker's byte length (`block_marker`) and whether it persists as
+/// a hanging indent (`block_persists`), whether the line's markers are `revealed`
+/// (shown verbatim rather than collapsed), and whether it is fenced `code_block`.
+/// The named accessors derive everything else (`heading`, `task`, `rule`, the list
+/// insets) so those rules live in one place instead of inline at each use.
+#[derive(Clone, Copy)]
+struct LineClass {
+    style: markdown::LineStyle,
+    size: u32,
+    block_marker: usize,
+    block_persists: bool,
+    revealed: bool,
+    code_block: bool,
+}
+
+impl LineClass {
+    /// The ATX heading level (1..=6) if this is a heading line, else `None`.
+    fn heading(&self) -> Option<u8> {
+        match self.style {
+            markdown::LineStyle::Heading(level) => Some(level),
+            _ => None,
+        }
+    }
+
+    /// `Some(checked)` when this line belongs to a task item, else `None`.
+    fn task(&self) -> Option<bool> {
+        match self.style {
+            markdown::LineStyle::Task { checked } => Some(checked),
+            _ => None,
+        }
+    }
+
+    /// True to draw a horizontal rule: a thematic break whose cursor has left, so
+    /// its raw `---` is collapsed (on the line itself the editable source shows).
+    fn rule(&self) -> bool {
+        matches!(self.style, markdown::LineStyle::Rule) && !self.revealed
+    }
+
+    /// A list or task item hangs its wrapped continuations under the text.
+    fn is_list(&self) -> bool {
+        matches!(
+            self.style,
+            markdown::LineStyle::Bullet
+                | markdown::LineStyle::Ordered
+                | markdown::LineStyle::Task { .. }
+        )
+    }
+
+    /// The left inset shared by every segment, and how much it narrows the wrap
+    /// width: a code block pads both sides inside its panel; a list item shifts
+    /// right by a small indent (one side only).
+    fn seg_pad_and_wrap_reduce(&self) -> (i32, i32) {
+        if self.code_block {
+            (CODE_PAD_X, 2 * CODE_PAD_X)
+        } else if self.is_list() {
+            (LIST_INDENT, LIST_INDENT)
+        } else {
+            (0, 0)
+        }
+    }
+
+    /// The hanging indent for wrapped continuations: the block marker's rendered
+    /// width, measured on the source marker in the regular face at this line's
+    /// size, so it matches the width the marker run itself advances.
+    fn block_indent(&self, fonts: &Fonts, line: &str) -> i32 {
+        if self.block_persists && self.block_marker > 0 {
+            shape::text_advance(
+                fonts.face(self.size, FontStyle::Regular),
+                &line[..self.block_marker],
+            )
+            .round() as i32
+        } else {
+            0
+        }
+    }
+}
+
+/// Classify one logical `line` for [`lay_line`]: resolve its block style (fenced
+/// code continuation, a fence opener, or ordinary markdown with list nesting),
+/// fill `pool.spans` with its inline markup, and thread the cross-line carry
+/// (`fence`, `list_depth`). `on_line` is whether the cursor/selection touches the
+/// line, which controls whether a delimiter's markers are revealed.
+fn classify_line(
+    ctx: &LayoutCtx,
+    line: &str,
+    on_line: bool,
+    carry: &mut LineCarry,
+    pool: &mut LayoutScratch,
+) -> LineClass {
+    if let Some(open) = carry.fence {
+        // Inside a fence: literal code, not markdown. Only a delimiter line has
+        // backticks to hide, and it reveals them on the cursor's own line.
+        carry.list_depth = None;
+        let delimiter = markdown::closes_code_fence(line, open);
+        if delimiter {
+            carry.fence = None;
+        }
+        code_block_spans_into(line, delimiter, &mut pool.spans);
+        LineClass {
+            style: markdown::LineStyle::Body,
+            size: ctx.body_size,
+            block_marker: 0,
+            block_persists: false,
+            revealed: !delimiter || on_line,
+            code_block: true,
+        }
+    } else if let Some(open) = markdown::opens_code_fence(line) {
+        carry.list_depth = None;
+        carry.fence = Some(open);
+        code_block_spans_into(line, true, &mut pool.spans);
+        LineClass {
+            style: markdown::LineStyle::Body,
+            size: ctx.body_size,
+            block_marker: 0,
+            block_persists: false,
+            revealed: on_line,
+            code_block: true,
+        }
+    } else {
+        // Ordinary markdown. Resolve list nesting across lines: an item deeper than
+        // one past the previous item has no parent and renders as body.
+        let (style, marker) = resolve_list(line, &mut carry.list_depth);
+        line_spans_into(line, marker, &mut pool.inline, &mut pool.spans);
+        LineClass {
+            style,
+            size: markdown::font_size(style, ctx.body_size),
+            block_marker: marker,
+            block_persists: markdown::block_marker_persists(style),
+            revealed: on_line,
+            code_block: false,
+        }
+    }
+}
+
 /// Lay out one logical line `[ls, le)` starting at content-space top `box_top`,
 /// appending its visual line(s) to `out` and returning the height it added (the
 /// amount to advance `box_top` before the next line). `fence` and `list_depth` are
@@ -994,21 +1161,14 @@ fn lay_line(
                     pending_image = Some(image);
                 } else {
                     // Picture only: one widget line, no source text.
-                    out.push(VisualLine {
-                        start: ls,
-                        end: le,
-                        baseline: y + ctx.fonts.metrics(ctx.body_size).ascent,
-                        hard: has_newline,
-                        size: ctx.body_size,
-                        runs: 0..0,
-                        indent: 0,
-                        gutter: Gutter::None,
-                        code_block: false,
-                        heading: None,
-                        task: None,
-                        rule: false,
-                        image: Some(image),
-                    });
+                    out.push(VisualLine::image_widget(
+                        ls,
+                        le,
+                        y + ctx.fonts.metrics(ctx.body_size).ascent,
+                        has_newline,
+                        ctx.body_size,
+                        image,
+                    ));
                     y += image.box_height();
                     return y - box_top;
                 }
@@ -1019,97 +1179,25 @@ fn lay_line(
     // pass and renders as one code run. The ``` fence lines hide their backticks off
     // the cursor's line, like a heading's `#`. A code line carries `Body` as an
     // inert style (its gutter is unused).
-    let (style, size, block_marker, block_persists, revealed, code_block) =
-        if let Some(open) = carry.fence {
-            carry.list_depth = None;
-            let delimiter = markdown::closes_code_fence(&line, open);
-            if delimiter {
-                carry.fence = None;
-            }
-            code_block_spans_into(&line, delimiter, &mut pool.spans);
-            // Only a fence delimiter line has backticks to hide.
-            let revealed = !delimiter || on_line;
-            (
-                markdown::LineStyle::Body,
-                ctx.body_size,
-                0,
-                false,
-                revealed,
-                true,
-            )
-        } else if let Some(open) = markdown::opens_code_fence(&line) {
-            carry.list_depth = None;
-            carry.fence = Some(open);
-            code_block_spans_into(&line, true, &mut pool.spans);
-            (
-                markdown::LineStyle::Body,
-                ctx.body_size,
-                0,
-                false,
-                on_line,
-                true,
-            )
-        } else {
-            // Resolve list nesting across lines: an item deeper than one past the
-            // previous item has no parent and renders as body.
-            let (style, marker) = resolve_list(&line, &mut carry.list_depth);
-            line_spans_into(&line, marker, &mut pool.inline, &mut pool.spans);
-            (
-                style,
-                markdown::font_size(style, ctx.body_size),
-                marker,
-                markdown::block_marker_persists(style),
-                on_line,
-                false,
-            )
-        };
+    let mut class = classify_line(ctx, &line, on_line, carry, pool);
     // A revealed image's source always shows verbatim (its markers, if any, are not
     // hidden), so the text above the picture reads as written.
-    let revealed = revealed || pending_image.is_some();
-    let metrics = ctx.fonts.metrics(size);
-    // Heading lines color their text by level (fence/code lines carry the inert
-    // `Body` style, so they are never headings here).
-    let heading = match style {
-        markdown::LineStyle::Heading(level) => Some(level),
-        _ => None,
-    };
-    // Stamped on every segment of a task item, so a checked item's text dims and
-    // strikes through wrapped continuations too.
-    let task = match style {
-        markdown::LineStyle::Task { checked } => Some(checked),
-        _ => None,
-    };
-    // A thematic break draws as a horizontal rule once the cursor leaves it; on the
-    // line itself the raw `---` shows (and `revealed` is true).
-    let rule = matches!(style, markdown::LineStyle::Rule) && !revealed;
-    // A list or quote item hangs its wrapped continuations under the text: the inset
-    // is the marker's width, measured on the source marker in the regular face at
-    // this line's size, so it matches the width the marker run itself advances.
-    let block_indent = if block_persists && block_marker > 0 {
-        shape::text_advance(
-            ctx.fonts.face(size, FontStyle::Regular),
-            &line[..block_marker],
-        )
-        .round() as i32
-    } else {
-        0
-    };
-    // A left inset shared by every segment of the line, and how much it narrows the
-    // wrap width: a code block pads both sides inside its panel; a list item shifts
-    // right by a small indent (one side only).
-    let is_list = matches!(
+    class.revealed |= pending_image.is_some();
+    // The plain fields the wrap loop and visual lines read by name; `class` keeps
+    // the classification for the derived accessors and `clip_runs_into`.
+    let LineClass {
         style,
-        markdown::LineStyle::Bullet
-            | markdown::LineStyle::Ordered
-            | markdown::LineStyle::Task { .. }
-    );
-    let (seg_pad, wrap_reduce) = if code_block {
-        (CODE_PAD_X, 2 * CODE_PAD_X)
-    } else if is_list {
-        (LIST_INDENT, LIST_INDENT)
-    } else {
-        (0, 0)
-    };
+        size,
+        revealed,
+        code_block,
+        ..
+    } = class;
+    let metrics = ctx.fonts.metrics(size);
+    let heading = class.heading();
+    let task = class.task();
+    let rule = class.rule();
+    let block_indent = class.block_indent(ctx.fonts, &line);
+    let (seg_pad, wrap_reduce) = class.seg_pad_and_wrap_reduce();
     let line_wrap = if ctx.wrap_width > 0 {
         (ctx.wrap_width - wrap_reduce).max(1)
     } else {
@@ -1154,16 +1242,7 @@ fn lay_line(
         // measure-only path (the index build) wants no runs, leaving an empty range.
         let runs_start = pool.runs.len() as u32;
         if !measure_only {
-            clip_runs_into(
-                &pool.spans,
-                start,
-                end,
-                ls,
-                revealed,
-                block_marker,
-                block_persists,
-                &mut pool.runs,
-            );
+            clip_runs_into(&pool.spans, start, end, ls, &class, &mut pool.runs);
         }
         out.push(VisualLine {
             start: ls + start,
@@ -1187,23 +1266,16 @@ fn lay_line(
     // The picture sits below its just-emitted source line(s) (the reveal case). It is
     // a widget line: never a caret target, taller than text.
     if let Some(image) = pending_image {
-        out.push(VisualLine {
-            start: ls,
-            end: le,
-            // The source line above owns the caret and the logical line's newline;
-            // this widget carries neither.
-            baseline: y + metrics.ascent,
-            hard: false,
-            size: ctx.body_size,
-            runs: 0..0,
-            indent: 0,
-            gutter: Gutter::None,
-            code_block: false,
-            heading: None,
-            task: None,
-            rule: false,
-            image: Some(image),
-        });
+        // The source line above owns the caret and the logical line's newline; this
+        // widget carries neither.
+        out.push(VisualLine::image_widget(
+            ls,
+            le,
+            y + metrics.ascent,
+            false,
+            ctx.body_size,
+            image,
+        ));
         y += image.box_height();
     }
     y - box_top
@@ -1782,9 +1854,7 @@ fn clip_runs_into(
     seg_start: usize,
     seg_end: usize,
     ls: usize,
-    revealed: bool,
-    block_marker: usize,
-    block_persists: bool,
+    class: &LineClass,
     out: &mut Vec<Run>,
 ) {
     for span in spans {
@@ -1796,11 +1866,11 @@ fn clip_runs_into(
         let is_marker = matches!(span.kind, markdown::SpanKind::Marker);
         // The block marker occupies the line's leading `[0, block_marker)` bytes;
         // inline markers (code, emphasis) start past it.
-        let is_block_marker = is_marker && span.start < block_marker;
+        let is_block_marker = is_marker && span.start < class.block_marker;
         let visible = if is_block_marker {
-            revealed || block_persists
+            class.revealed || class.block_persists
         } else {
-            !is_marker || revealed
+            !is_marker || class.revealed
         };
         out.push(Run {
             start: ls + s,

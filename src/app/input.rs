@@ -107,6 +107,15 @@ impl State {
         Ok(())
     }
 
+    /// Move keyboard focus to editor pane `i`, remembering it as the last active
+    /// editor, refreshing the title for its note, and marking a repaint.
+    fn focus_pane(&mut self, i: usize) {
+        self.focus = Focus::Editor(i);
+        self.last_editor = i;
+        self.refresh_title();
+        self.dirty = true;
+    }
+
     pub(super) fn apply_action(&mut self, action: KeyAction) -> Result<()> {
         // Window-level pane management, handled before any editor routing: toggle
         // the sidebar/second pane, or move focus between regions.
@@ -139,18 +148,12 @@ impl State {
                 return Ok(());
             }
             KeyAction::FocusPaneA => {
-                self.focus = Focus::Editor(0);
-                self.last_editor = 0;
-                self.refresh_title();
-                self.dirty = true;
+                self.focus_pane(0);
                 return Ok(());
             }
             KeyAction::FocusPaneB => {
                 if self.panes.second_open {
-                    self.focus = Focus::Editor(1);
-                    self.last_editor = 1;
-                    self.refresh_title();
-                    self.dirty = true;
+                    self.focus_pane(1);
                 }
                 return Ok(());
             }

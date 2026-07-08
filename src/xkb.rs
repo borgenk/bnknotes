@@ -302,54 +302,22 @@ impl Xkb {
         let ctrl = self.ctrl_active();
         match keycode {
             keycode::BACKSPACE => {
-                return if ctrl {
-                    KeyAction::DeleteWordBack
-                } else {
-                    KeyAction::Backspace
-                };
+                return ctrl_or(ctrl, KeyAction::DeleteWordBack, KeyAction::Backspace);
             }
             keycode::DELETE => {
-                return if ctrl {
-                    KeyAction::DeleteWordForward
-                } else {
-                    KeyAction::Delete
-                };
+                return ctrl_or(ctrl, KeyAction::DeleteWordForward, KeyAction::Delete);
             }
             keycode::ESC => return KeyAction::Escape,
             keycode::ENTER | keycode::KP_ENTER => return KeyAction::Enter,
             // Ctrl+Tab falls through to the (empty) Ctrl handler so it does not
             // insert; plain Tab inserts indentation.
             keycode::TAB if !ctrl => return KeyAction::Tab,
-            keycode::LEFT => {
-                return if ctrl {
-                    KeyAction::WordLeft
-                } else {
-                    KeyAction::Left
-                }
-            }
-            keycode::RIGHT => {
-                return if ctrl {
-                    KeyAction::WordRight
-                } else {
-                    KeyAction::Right
-                };
-            }
+            keycode::LEFT => return ctrl_or(ctrl, KeyAction::WordLeft, KeyAction::Left),
+            keycode::RIGHT => return ctrl_or(ctrl, KeyAction::WordRight, KeyAction::Right),
             keycode::UP => return KeyAction::Up,
             keycode::DOWN => return KeyAction::Down,
-            keycode::HOME => {
-                return if ctrl {
-                    KeyAction::DocStart
-                } else {
-                    KeyAction::Home
-                }
-            }
-            keycode::END => {
-                return if ctrl {
-                    KeyAction::DocEnd
-                } else {
-                    KeyAction::End
-                }
-            }
+            keycode::HOME => return ctrl_or(ctrl, KeyAction::DocStart, KeyAction::Home),
+            keycode::END => return ctrl_or(ctrl, KeyAction::DocEnd, KeyAction::End),
             keycode::PAGEUP => return KeyAction::PageUp,
             keycode::PAGEDOWN => return KeyAction::PageDown,
             _ => {}
@@ -482,6 +450,17 @@ impl Xkb {
             // SAFETY: old came from xkb_keymap_new_* and is freed once.
             unsafe { xkb_keymap_unref(old.as_ptr()) };
         }
+    }
+}
+
+/// The Ctrl-held action when `ctrl`, else the plain one. The navigation and
+/// delete keys that jump further with Ctrl (word/document motion, word delete)
+/// share this shape.
+fn ctrl_or(ctrl: bool, with_ctrl: KeyAction, plain: KeyAction) -> KeyAction {
+    if ctrl {
+        with_ctrl
+    } else {
+        plain
     }
 }
 

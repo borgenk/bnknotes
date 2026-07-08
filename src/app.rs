@@ -178,6 +178,55 @@ struct State {
     stats: bool,
 }
 
+/// Resolve the file-tree root and any file to open, from the CLI argument and the
+/// saved session root. Precedence: a directory argument roots there and opens no
+/// file; a file argument roots at its parent (or `cwd` if it has none) and opens
+/// the file; no argument uses the last session's root when it is still a
+/// directory, else `cwd`. Pure precedence, split out of `State::new` so it is
+/// testable without a live connection.
+fn resolve_root(
+    arg: Option<&Path>,
+    session_root: Option<&Path>,
+    cwd: &Path,
+) -> (PathBuf, Option<PathBuf>) {
+    match arg {
+        Some(p) if p.is_dir() => (p.to_path_buf(), None),
+        Some(p) => (
+            p.parent()
+                .map(Path::to_path_buf)
+                .unwrap_or_else(|| cwd.to_path_buf()),
+            Some(p.to_path_buf()),
+        ),
+        None => (
+            session_root
+                .filter(|r| r.is_dir())
+                .map(Path::to_path_buf)
+                .unwrap_or_else(|| cwd.to_path_buf()),
+            None,
+        ),
+    }
+}
+
+/// The region that holds focus at startup: a file argument focuses its editor
+/// pane; otherwise the saved focus, guarded so it never points at a hidden region
+/// (a saved tree or pane-B focus falls back to editor A when that region is not
+/// shown). Pure precedence, split out for testing.
+fn initial_focus(
+    has_cli_file: bool,
+    saved: store::Focus,
+    tree_visible: bool,
+    second_open: bool,
+) -> Focus {
+    if has_cli_file {
+        return Focus::Editor(0);
+    }
+    match saved {
+        store::Focus::Tree if tree_visible => Focus::Tree,
+        store::Focus::PaneB if second_open => Focus::Editor(1),
+        store::Focus::Tree | store::Focus::PaneA | store::Focus::PaneB => Focus::Editor(0),
+    }
+}
+
 impl State {
     fn new(path: Option<PathBuf>) -> Result<Self> {
         let conn = Connection::connect()?;
@@ -189,27 +238,8 @@ impl State {
         // falls back to the first-run default without failing.
         let session = store::load();
 
-        // Resolve the tree root: a directory argument roots there, a file roots
-        // at its parent, and no argument uses the last session's root or the
-        // working directory. A file argument also opens into editor A.
         let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-        let (root, cli_file) = match &path {
-            Some(p) if p.is_dir() => (p.clone(), None),
-            Some(p) => (
-                p.parent()
-                    .map(Path::to_path_buf)
-                    .unwrap_or_else(|| cwd.clone()),
-                Some(p.clone()),
-            ),
-            None => (
-                session
-                    .tree_root
-                    .clone()
-                    .filter(|r| r.is_dir())
-                    .unwrap_or(cwd),
-                None,
-            ),
-        };
+        let (root, cli_file) = resolve_root(path.as_deref(), session.tree_root.as_deref(), &cwd);
 
         // Editor A: the file argument wins; otherwise restore the session's
         // pane A. Editor B always restores from the session (empty if none).
@@ -233,17 +263,12 @@ impl State {
             tree_visible: session.tree_visible,
             second_open: session.second_open,
         };
-        // A file argument focuses its pane; otherwise the saved focus, guarded so
-        // it never points at a hidden region.
-        let focus = if cli_file.is_some() {
-            Focus::Editor(0)
-        } else {
-            match session.focus {
-                store::Focus::Tree if panes.tree_visible => Focus::Tree,
-                store::Focus::PaneB if panes.second_open => Focus::Editor(1),
-                store::Focus::Tree | store::Focus::PaneA | store::Focus::PaneB => Focus::Editor(0),
-            }
-        };
+        let focus = initial_focus(
+            cli_file.is_some(),
+            session.focus,
+            panes.tree_visible,
+            panes.second_open,
+        );
 
         Ok(Self {
             conn,
@@ -864,5 +889,74 @@ impl State {
             ],
         );
         id
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // `Focus` is not `Debug`, so compare with `==` inside `assert!`.
+
+    #[test]
+    fn resolve_root_prefers_a_directory_argument() {
+        let dir = std::env::temp_dir();
+        let (root, file) = resolve_root(Some(&dir), None, Path::new("/cwd"));
+        assert_eq!(root, dir);
+        assert_eq!(file, None);
+    }
+
+    #[test]
+    fn resolve_root_roots_a_file_argument_at_its_parent() {
+        let dir = std::env::temp_dir();
+        let arg = dir.join("note.md");
+        let (root, opened) = resolve_root(Some(&arg), None, Path::new("/cwd"));
+        assert_eq!(root, dir);
+        assert_eq!(opened.as_deref(), Some(arg.as_path()));
+    }
+
+    #[test]
+    fn resolve_root_uses_the_session_root_when_it_is_a_directory() {
+        let dir = std::env::temp_dir();
+        let (root, file) = resolve_root(None, Some(&dir), Path::new("/cwd"));
+        assert_eq!(root, dir);
+        assert_eq!(file, None);
+    }
+
+    #[test]
+    fn resolve_root_ignores_a_nonexistent_session_root() {
+        let bogus = Path::new("/does/not/exist/anywhere");
+        let (root, file) = resolve_root(None, Some(bogus), Path::new("/cwd"));
+        assert_eq!(root, Path::new("/cwd"));
+        assert_eq!(file, None);
+    }
+
+    #[test]
+    fn resolve_root_with_no_argument_or_session_uses_cwd() {
+        let (root, file) = resolve_root(None, None, Path::new("/here"));
+        assert_eq!(root, Path::new("/here"));
+        assert_eq!(file, None);
+    }
+
+    #[test]
+    fn initial_focus_a_file_argument_always_focuses_editor_a() {
+        // A file argument overrides any saved focus, even tree or pane B.
+        assert!(initial_focus(true, store::Focus::Tree, true, true) == Focus::Editor(0));
+        assert!(initial_focus(true, store::Focus::PaneB, true, true) == Focus::Editor(0));
+    }
+
+    #[test]
+    fn initial_focus_restores_the_saved_region_when_shown() {
+        assert!(initial_focus(false, store::Focus::Tree, true, true) == Focus::Tree);
+        assert!(initial_focus(false, store::Focus::PaneB, true, true) == Focus::Editor(1));
+        assert!(initial_focus(false, store::Focus::PaneA, true, true) == Focus::Editor(0));
+    }
+
+    #[test]
+    fn initial_focus_falls_back_to_editor_a_for_a_hidden_region() {
+        // Saved tree focus but the tree is hidden -> editor A.
+        assert!(initial_focus(false, store::Focus::Tree, false, true) == Focus::Editor(0));
+        // Saved pane-B focus but the second pane is closed -> editor A.
+        assert!(initial_focus(false, store::Focus::PaneB, true, false) == Focus::Editor(0));
     }
 }

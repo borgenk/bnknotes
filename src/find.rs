@@ -367,7 +367,7 @@ fn scan(text: &str, query: &str, limit: usize) -> Vec<(usize, usize)> {
 /// the range (if any) are not word characters. Word = alphanumeric or `_`,
 /// matching the editor's word-motion heuristic.
 fn on_word_boundaries(text: &str, start: usize, end: usize) -> bool {
-    let is_word = |c: char| c.is_alphanumeric() || c == '_';
+    let is_word = crate::grapheme::is_word_char;
     text[..start]
         .chars()
         .next_back()

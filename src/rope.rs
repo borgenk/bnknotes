@@ -167,6 +167,19 @@ impl Rope {
         newlines_before(&self.root, byte)
     }
 
+    /// The byte range `[start, content_end)` of logical line `line`, excluding its
+    /// trailing `'\n'`. The final line (no trailing newline) ends at the rope's
+    /// end. The single-line query form of what [`lines`](Self::lines) yields.
+    pub fn line_content_range(&self, line: usize) -> (usize, usize) {
+        let start = self.line_to_byte(line);
+        let end = if line + 1 < self.len_lines() {
+            self.line_to_byte(line + 1) - 1
+        } else {
+            self.line_to_byte(line + 1)
+        };
+        (start, end)
+    }
+
     /// The heap bytes this rope holds: every leaf's `String` capacity plus each
     /// node's `Arc` allocation (two atomic counters and the `Inner`). Walks the
     /// tree, so it is for the memory report, not a hot path.

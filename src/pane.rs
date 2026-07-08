@@ -681,12 +681,7 @@ impl EditorPane {
         let (a0, a1) = self.reveal_range();
         let rope = self.text.rope();
         let line = rope.byte_to_line(off);
-        let ls = rope.line_to_byte(line);
-        let le = if line + 1 < rope.len_lines() {
-            rope.line_to_byte(line + 1).saturating_sub(1)
-        } else {
-            rope.len()
-        };
+        let (ls, le) = rope.line_content_range(line);
         if a0 <= le && a1 >= ls {
             return None;
         }

@@ -284,12 +284,7 @@ impl TextBuffer {
         let mut edits: Vec<(usize, usize, u64)> = Vec::new();
         let n = self.text.len_lines();
         for i in self.text.byte_to_line(self.cursor) + 1..n {
-            let ls = self.text.line_to_byte(i);
-            let le = if i + 1 < n {
-                self.text.line_to_byte(i + 1) - 1
-            } else {
-                self.text.line_to_byte(i + 1)
-            };
+            let (ls, le) = self.text.line_content_range(i);
             let line = self.text.byte_slice(ls..le);
             if line.trim().is_empty() {
                 continue;
@@ -347,14 +342,7 @@ impl TextBuffer {
     /// The content byte range `[ls, le)` of the logical line containing `byte`,
     /// excluding any trailing `'\n'`.
     fn line_content_bounds(&self, byte: usize) -> (usize, usize) {
-        let i = self.text.byte_to_line(byte);
-        let ls = self.text.line_to_byte(i);
-        let le = if i + 1 < self.text.len_lines() {
-            self.text.line_to_byte(i + 1) - 1
-        } else {
-            self.text.line_to_byte(i + 1)
-        };
-        (ls, le)
+        self.text.line_content_range(self.text.byte_to_line(byte))
     }
 
     /// Whether the cursor's line is a list item (bullet or ordered, perhaps
@@ -420,8 +408,7 @@ impl TextBuffer {
         let mut i = line_idx;
         while i > 0 {
             i -= 1;
-            let ls = self.text.line_to_byte(i);
-            let le = self.text.line_to_byte(i + 1) - 1;
+            let (ls, le) = self.text.line_content_range(i);
             let line = self.text.byte_slice(ls..le);
             if line.trim().is_empty() {
                 continue;
@@ -441,12 +428,7 @@ impl TextBuffer {
         let mut starts = vec![self.text.line_to_byte(line_idx)];
         let mut i = line_idx + 1;
         while i < n {
-            let ls = self.text.line_to_byte(i);
-            let le = if i + 1 < n {
-                self.text.line_to_byte(i + 1) - 1
-            } else {
-                self.text.line_to_byte(i + 1)
-            };
+            let (ls, le) = self.text.line_content_range(i);
             if markdown::leading_indent(&self.text.byte_slice(ls..le)) <= cur_indent {
                 break;
             }
@@ -472,13 +454,24 @@ impl TextBuffer {
         true
     }
 
-    /// Delete the selection if there is one, else the grapheme cluster before
-    /// the cursor. Returns whether anything changed.
-    pub fn backspace(&mut self) -> bool {
+    /// Delete the selection as its own undo step if there is one, reporting
+    /// whether one was consumed. The shared preamble of the delete keys: each
+    /// falls through to its per-key delete only when there is no selection.
+    fn take_selection(&mut self) -> bool {
         if self.selection().is_some() {
             self.checkpoint(Coalesce::None);
             self.delete_selection();
             self.touch();
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Delete the selection if there is one, else the grapheme cluster before
+    /// the cursor. Returns whether anything changed.
+    pub fn backspace(&mut self) -> bool {
+        if self.take_selection() {
             return true;
         }
         let Some(prev) = self.prev_grapheme() else {
@@ -494,10 +487,7 @@ impl TextBuffer {
     /// Delete the selection if there is one, else the grapheme cluster after the
     /// cursor (forward delete). Returns whether anything changed.
     pub fn delete_forward(&mut self) -> bool {
-        if self.selection().is_some() {
-            self.checkpoint(Coalesce::None);
-            self.delete_selection();
-            self.touch();
+        if self.take_selection() {
             return true;
         }
         let Some(next) = self.next_grapheme() else {
@@ -513,10 +503,7 @@ impl TextBuffer {
     /// previous word boundary (Ctrl+Backspace). Each word delete is its own undo
     /// step. Returns whether anything changed.
     pub fn delete_word_back(&mut self) -> bool {
-        if self.selection().is_some() {
-            self.checkpoint(Coalesce::None);
-            self.delete_selection();
-            self.touch();
+        if self.take_selection() {
             return true;
         }
         let target = prev_word_rope(&self.text, self.cursor);
@@ -533,10 +520,7 @@ impl TextBuffer {
     /// Delete the selection if there is one, else from the cursor forward to the
     /// next word boundary (Ctrl+Delete). Returns whether anything changed.
     pub fn delete_word_forward(&mut self) -> bool {
-        if self.selection().is_some() {
-            self.checkpoint(Coalesce::None);
-            self.delete_selection();
-            self.touch();
+        if self.take_selection() {
             return true;
         }
         let target = next_word_rope(&self.text, self.cursor);
@@ -882,10 +866,7 @@ fn coalescable_insert(s: &str) -> bool {
 /// editors use for Ctrl+Arrow and Ctrl+Backspace, not full UAX #29 word
 /// segmentation.
 fn cluster_is_word(cluster: &str) -> bool {
-    cluster
-        .chars()
-        .next()
-        .is_some_and(|c| c.is_alphanumeric() || c == '_')
+    cluster.chars().next().is_some_and(grapheme::is_word_char)
 }
 
 /// The grapheme clusters of the logical line `line` as `(absolute byte start,

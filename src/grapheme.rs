@@ -248,6 +248,13 @@ pub fn prev_boundary(s: &str, i: usize) -> usize {
         .unwrap_or(0)
 }
 
+/// Whether `c` counts as a word character for word motion (Ctrl+arrow, word
+/// delete) and whole-word find: an alphanumeric or `_`. The single definition the
+/// two share, so they can never drift apart.
+pub fn is_word_char(c: char) -> bool {
+    c.is_alphanumeric() || c == '_'
+}
+
 /// The grapheme clusters of `s`, lazily: each yielded as its byte offset and
 /// substring, with nothing allocated.
 pub fn graphemes(s: &str) -> Graphemes<'_> {

@@ -115,13 +115,7 @@ impl State {
     /// editor `i`, or `None` if that line is no longer a standalone image.
     pub(super) fn image_path_at(&self, i: usize, ls: usize) -> Option<String> {
         let rope = self.editors[i].text.rope();
-        let line_idx = rope.byte_to_line(ls);
-        let n = rope.len_lines();
-        let le = if line_idx + 1 < n {
-            rope.line_to_byte(line_idx + 1) - 1
-        } else {
-            rope.line_to_byte(line_idx + 1)
-        };
+        let (_, le) = rope.line_content_range(rope.byte_to_line(ls));
         let line = rope.slice(ls..le).as_cow();
         let link = markdown::standalone_image(&line)?;
         Some(line[link.path.0..link.path.1].to_string())

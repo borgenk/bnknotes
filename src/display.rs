@@ -168,9 +168,10 @@ fn coalesce(rects: &mut Vec<Rect>) {
     }
 }
 
-/// Whether two rectangles share any interior pixel (touching edges do not count).
+/// Whether two rectangles share any interior pixel (touching edges do not count):
+/// exactly when their [`intersection`] is non-empty.
 fn intersects(a: Rect, b: Rect) -> bool {
-    a.x < b.x + b.w && b.x < a.x + a.w && a.y < b.y + b.h && b.y < a.y + a.h
+    intersection(a, b).is_some()
 }
 
 /// The smallest rectangle covering both `a` and `b`.

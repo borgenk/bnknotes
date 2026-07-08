@@ -3,6 +3,7 @@ use std::rc::Rc;
 use std::time::Instant;
 
 use super::State;
+use crate::conn::Connection;
 use crate::display::{self, DisplayList};
 use crate::dmabuf;
 use crate::error::{Error, Result};
@@ -35,6 +36,66 @@ pub(super) struct ExplicitSync {
     surface: u32,
     point: u64,
     buffer_release: [Option<u64>; 2],
+}
+
+impl ExplicitSync {
+    /// The sync file to wait on before rendering into buffer `idx`: the
+    /// compositor's release of that buffer's previous frame, or `None` the first
+    /// time the slot is used (nothing has read it yet).
+    fn release_fence(&self, idx: usize) -> Result<Option<OwnedFd>> {
+        match self.buffer_release[idx] {
+            Some(p) => Ok(Some(ffi::drm_syncobj_point_to_sync_file(
+                self.drm.as_raw_fd(),
+                self.release_syncobj,
+                p,
+                self.scratch,
+            )?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Publish this frame's render-done `fence` as buffer `idx`'s acquire point
+    /// and claim the matching release point on a fresh timeline value, so the
+    /// compositor waits for the GPU before reading and signals the point when it
+    /// is done (the buffer's next reuse waits on that via [`Self::release_fence`]).
+    fn publish(&mut self, conn: &mut Connection, fence: &OwnedFd, idx: usize) -> Result<()> {
+        self.point += 1;
+        let p = self.point;
+        ffi::drm_syncobj_sync_file_to_point(
+            self.drm.as_raw_fd(),
+            fence.as_raw_fd(),
+            self.acquire_syncobj,
+            p,
+            self.scratch,
+        )?;
+        self.buffer_release[idx] = Some(p);
+        let (hi, lo) = ((p >> 32) as u32, p as u32);
+        conn.request(
+            self.surface,
+            wp_linux_drm_syncobj_surface_v1::SET_ACQUIRE_POINT,
+            &[
+                Arg::Object(self.acquire_timeline),
+                Arg::Uint(hi),
+                Arg::Uint(lo),
+            ],
+        );
+        conn.request(
+            self.surface,
+            wp_linux_drm_syncobj_surface_v1::SET_RELEASE_POINT,
+            &[
+                Arg::Object(self.release_timeline),
+                Arg::Uint(hi),
+                Arg::Uint(lo),
+            ],
+        );
+        Ok(())
+    }
+
+    /// Forget every buffer's published release point (the buffers they named are
+    /// gone, e.g. after a resize), so the next use of each slot waits on nothing.
+    fn forget_buffers(&mut self) {
+        self.buffer_release = [None, None];
+    }
 }
 
 /// GPU/dmabuf presentation resources owned by the app: protocol globals and
@@ -259,7 +320,7 @@ impl State {
         // Fresh images never carried a release point, so a resize must forget
         // the old buffers' points; their next use starts with no wait.
         if let Some(es) = self.presentation.explicit_sync.as_mut() {
-            es.buffer_release = [None, None];
+            es.forget_buffers();
         }
         // Fresh images hold no known frame, so forget what was on screen: the
         // screen diff gates whether the next frame presents at all.
@@ -402,17 +463,7 @@ impl State {
             );
             match self.presentation.explicit_sync.as_ref() {
                 Some(es) => {
-                    // Wait on the compositor's release of this buffer's previous
-                    // frame; nothing to wait on the first time the slot is used.
-                    let release_wait = match es.buffer_release[idx] {
-                        Some(p) => Some(ffi::drm_syncobj_point_to_sync_file(
-                            es.drm.as_raw_fd(),
-                            es.release_syncobj,
-                            p,
-                            es.scratch,
-                        )?),
-                        None => None,
-                    };
+                    let release_wait = es.release_fence(idx)?;
                     gpu.render_list_explicit(img, &frame, color_f32(BACKGROUND), release_wait)?
                 }
                 None => {
@@ -435,29 +486,7 @@ impl State {
         // With no exportable fence the frame was CPU-waited: set no points.
         match (render_done, self.presentation.explicit_sync.as_mut()) {
             (Some(fence), Some(es)) => {
-                es.point += 1;
-                let p = es.point;
-                ffi::drm_syncobj_sync_file_to_point(
-                    es.drm.as_raw_fd(),
-                    fence.as_raw_fd(),
-                    es.acquire_syncobj,
-                    p,
-                    es.scratch,
-                )?;
-                es.buffer_release[idx] = Some(p);
-                let (hi, lo) = ((p >> 32) as u32, p as u32);
-                let (sync_surface, acquire_tl, release_tl) =
-                    (es.surface, es.acquire_timeline, es.release_timeline);
-                self.conn.request(
-                    sync_surface,
-                    wp_linux_drm_syncobj_surface_v1::SET_ACQUIRE_POINT,
-                    &[Arg::Object(acquire_tl), Arg::Uint(hi), Arg::Uint(lo)],
-                );
-                self.conn.request(
-                    sync_surface,
-                    wp_linux_drm_syncobj_surface_v1::SET_RELEASE_POINT,
-                    &[Arg::Object(release_tl), Arg::Uint(hi), Arg::Uint(lo)],
-                );
+                es.publish(&mut self.conn, &fence, idx)?;
                 self.presentation.explicit_fence_frames += 1;
             }
             (None, Some(es)) => {
@@ -484,36 +513,42 @@ impl State {
         self.presentation.busy[idx] = true;
 
         if let Some(started) = started {
-            let cache = self.fonts.cache_stats();
-            let gap = self
-                .presentation
-                .last_present
-                .map(|t| started.duration_since(t).as_secs_f64() * 1000.0)
-                .unwrap_or(0.0);
-            let sync = if self.presentation.explicit_sync.is_some() {
-                format!(
-                    "explicit-sync {} fence/{} cpu-wait",
-                    self.presentation.explicit_fence_frames,
-                    self.presentation.explicit_cpu_wait_frames
-                )
-            } else {
-                "implicit-sync bridge".to_string()
-            };
-            eprintln!(
-                "[stats] gpu frame {} {:.2}ms build+submit, {:.1}ms since last | glyphs hit {} miss {} ({:.1}% of {}) | {}",
-                self.presentation.frame_count,
-                started.elapsed().as_secs_f64() * 1000.0,
-                gap,
-                cache.hits,
-                cache.misses,
-                cache.hit_rate() * 100.0,
-                cache.lookups(),
-                sync,
-            );
+            self.log_frame_stats(started);
             self.presentation.last_present = Some(started);
         }
         self.presentation.frame_count += 1;
         Ok(true)
+    }
+
+    /// Print the per-frame stats line under `BNKNOTES_STATS`: the build+submit
+    /// time, the gap since the last present, the glyph-cache hit rate, and which
+    /// sync strategy (explicit points or the implicit bridge) carried the frame.
+    fn log_frame_stats(&self, started: Instant) {
+        let cache = self.fonts.cache_stats();
+        let gap = self
+            .presentation
+            .last_present
+            .map(|t| started.duration_since(t).as_secs_f64() * 1000.0)
+            .unwrap_or(0.0);
+        let sync = if self.presentation.explicit_sync.is_some() {
+            format!(
+                "explicit-sync {} fence/{} cpu-wait",
+                self.presentation.explicit_fence_frames, self.presentation.explicit_cpu_wait_frames
+            )
+        } else {
+            "implicit-sync bridge".to_string()
+        };
+        eprintln!(
+            "[stats] gpu frame {} {:.2}ms build+submit, {:.1}ms since last | glyphs hit {} miss {} ({:.1}% of {}) | {}",
+            self.presentation.frame_count,
+            started.elapsed().as_secs_f64() * 1000.0,
+            gap,
+            cache.hits,
+            cache.misses,
+            cache.hit_rate() * 100.0,
+            cache.lookups(),
+            sync,
+        );
     }
 
     /// Ask the dmabuf global for its default feedback. The events accumulate in

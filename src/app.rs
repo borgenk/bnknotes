@@ -818,64 +818,46 @@ impl State {
         let version = r.u32()?;
         match interface {
             protocol::IFACE_COMPOSITOR => {
-                let id = self.alloc_id();
-                self.bind(
-                    name,
-                    interface,
-                    version.min(protocol::VERSION_COMPOSITOR),
-                    id,
-                );
+                let id = self.bind_capped(name, interface, version, protocol::VERSION_COMPOSITOR);
                 self.compositor = Some(id);
             }
             protocol::IFACE_WM_BASE => {
-                let id = self.alloc_id();
-                self.bind(name, interface, version.min(protocol::VERSION_WM_BASE), id);
+                let id = self.bind_capped(name, interface, version, protocol::VERSION_WM_BASE);
                 self.wm_base = Some(id);
             }
             protocol::IFACE_SEAT => {
-                let id = self.alloc_id();
-                self.bind(name, interface, version.min(protocol::VERSION_SEAT), id);
+                let id = self.bind_capped(name, interface, version, protocol::VERSION_SEAT);
                 self.seat = Some(id);
             }
             protocol::IFACE_DATA_DEVICE_MANAGER => {
-                let id = self.alloc_id();
-                self.bind(
+                let id = self.bind_capped(
                     name,
                     interface,
-                    version.min(protocol::VERSION_DATA_DEVICE_MANAGER),
-                    id,
+                    version,
+                    protocol::VERSION_DATA_DEVICE_MANAGER,
                 );
                 self.data_device_manager = Some(id);
             }
             protocol::IFACE_CURSOR_SHAPE_MANAGER => {
-                let id = self.alloc_id();
-                self.bind(
+                let id = self.bind_capped(
                     name,
                     interface,
-                    version.min(protocol::VERSION_CURSOR_SHAPE_MANAGER),
-                    id,
+                    version,
+                    protocol::VERSION_CURSOR_SHAPE_MANAGER,
                 );
                 self.cursor_shape_manager = Some(id);
             }
             // Only useful at v4+ (the feedback object); an older advertisement
             // is left unbound and the GPU path simply stays unavailable.
             protocol::IFACE_DMABUF if version >= protocol::VERSION_DMABUF => {
-                let id = self.alloc_id();
-                let bound = version.min(protocol::VERSION_DMABUF);
-                self.bind(name, interface, bound, id);
+                let id = self.bind_capped(name, interface, version, protocol::VERSION_DMABUF);
                 self.dmabuf = Some(id);
-                self.dmabuf_version = bound;
+                self.dmabuf_version = version.min(protocol::VERSION_DMABUF);
             }
             // Explicit sync: bound only to be wired up
             // once a GPU backend exists; absent it, the bridge path is used.
             protocol::IFACE_DRM_SYNCOBJ => {
-                let id = self.alloc_id();
-                self.bind(
-                    name,
-                    interface,
-                    version.min(protocol::VERSION_DRM_SYNCOBJ),
-                    id,
-                );
+                let id = self.bind_capped(name, interface, version, protocol::VERSION_DRM_SYNCOBJ);
                 self.drm_syncobj_manager = Some(id);
             }
             _ => {}
@@ -970,7 +952,13 @@ impl State {
             .min()
     }
 
-    fn bind(&mut self, name: u32, interface: &str, version: u32, id: u32) {
+    /// Bind the just-advertised global at the version we negotiate: the
+    /// compositor's advertised `version` capped at `max`, the highest interface
+    /// version we support. Allocates the object id, sends the registry bind, and
+    /// returns the id for the caller to store. The shared body of every
+    /// [`on_global`](Self::on_global) arm.
+    fn bind_capped(&mut self, name: u32, interface: &str, version: u32, max: u32) -> u32 {
+        let id = self.alloc_id();
         self.conn.request(
             self.registry,
             wl_registry::BIND,
@@ -978,10 +966,11 @@ impl State {
                 Arg::Uint(name),
                 Arg::Bind {
                     interface,
-                    version,
+                    version: version.min(max),
                     new_id: id,
                 },
             ],
         );
+        id
     }
 }

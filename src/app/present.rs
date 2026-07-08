@@ -485,12 +485,7 @@ impl State {
                     self.dmabuf_fb.set_table(&[]);
                     return Ok(());
                 }
-                let ptr = ffi::mmap_ro(fd.as_raw_fd(), size)?;
-                // SAFETY: ptr maps `size` readable bytes from the table fd; the
-                // bytes are copied out before the mapping is released.
-                let bytes = unsafe { core::slice::from_raw_parts(ptr, size) }.to_vec();
-                // SAFETY: ptr/size came from mmap_ro and are not used again.
-                unsafe { ffi::unmap(ptr, size) };
+                let bytes = ffi::read_mapped(fd.as_raw_fd(), size)?;
                 self.dmabuf_fb.set_table(&bytes);
             }
             zwp_linux_dmabuf_feedback_v1::EV_MAIN_DEVICE => {

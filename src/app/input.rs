@@ -53,12 +53,7 @@ impl State {
                     .conn
                     .take_fd()
                     .ok_or_else(|| Error::msg("wl_keyboard.keymap arrived without its fd"))?;
-                let ptr = ffi::mmap_ro(fd.as_raw_fd(), size)?;
-                // SAFETY: ptr maps `size` readable bytes from the keymap fd; the
-                // bytes are copied out before the mapping is released.
-                let bytes = unsafe { core::slice::from_raw_parts(ptr, size) }.to_vec();
-                // SAFETY: ptr/size came from mmap_ro and are not used again.
-                unsafe { ffi::unmap(ptr, size) };
+                let bytes = ffi::read_mapped(fd.as_raw_fd(), size)?;
                 self.xkb.load_keymap(&bytes, format)?;
             }
             wl_keyboard::EV_KEY => {

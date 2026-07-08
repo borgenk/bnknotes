@@ -140,9 +140,24 @@ fn errno() -> c_int {
 // Memory mapping (the keyboard keymap fd).
 // ---------------------------------------------------------------------------
 
-/// Map `len` bytes of `fd` private and read-only. Used for the keyboard keymap
-/// the compositor sends over wl_keyboard.keymap.
-pub fn mmap_ro(fd: RawFd, len: usize) -> Result<*mut u8> {
+/// Read `len` bytes a compositor sent over an fd (the keyboard keymap, the dmabuf
+/// format table) into an owned `Vec`: map the fd read-only, copy the bytes out,
+/// and release the mapping. The one region of `unsafe` needed to read a raw
+/// mapping lives here, so callers deal only in `Vec<u8>`; `len` must be non-zero
+/// (`mmap` rejects a zero length). Errors if the mapping fails.
+pub fn read_mapped(fd: RawFd, len: usize) -> Result<Vec<u8>> {
+    let ptr = mmap_ro(fd, len)?;
+    // SAFETY: mmap_ro returned a live mapping of `len` readable bytes; the slice
+    // is copied into an owned Vec and the mapping is released before returning, so
+    // the raw pointer never escapes this function.
+    let bytes = unsafe { core::slice::from_raw_parts(ptr, len) }.to_vec();
+    // SAFETY: ptr/len came from mmap_ro just above and are not used again.
+    unsafe { unmap(ptr, len) };
+    Ok(bytes)
+}
+
+/// Map `len` bytes of `fd` private and read-only.
+fn mmap_ro(fd: RawFd, len: usize) -> Result<*mut u8> {
     // SAFETY: a fresh anonymous read-only private mapping of a received fd is
     // sound; failure is checked below.
     let p = unsafe { mmap(core::ptr::null_mut(), len, PROT_READ, MAP_PRIVATE, fd, 0) };
@@ -156,7 +171,7 @@ pub fn mmap_ro(fd: RawFd, len: usize) -> Result<*mut u8> {
 ///
 /// # Safety
 /// `ptr`/`len` must come from a live mapping that is not used again afterwards.
-pub unsafe fn unmap(ptr: *mut u8, len: usize) {
+unsafe fn unmap(ptr: *mut u8, len: usize) {
     // SAFETY: forwarded contract from the caller.
     unsafe {
         munmap(ptr as *mut c_void, len);

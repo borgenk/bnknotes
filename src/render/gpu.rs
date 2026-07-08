@@ -16,12 +16,12 @@
 
 use std::collections::HashMap;
 
-use crate::display::DrawCmd;
-use crate::display::RoundedCorners;
-use crate::image::ImageStore;
-use crate::layout::Rect;
 use crate::platform::freetype::{Face, FaceKey, Fonts};
+use crate::platform::geom::Rect;
 use crate::platform::grapheme;
+use crate::render::display::DrawCmd;
+use crate::render::display::RoundedCorners;
+use crate::render::image::ImageStore;
 
 /// Vertex modes, matching shaders/quad.frag.
 pub const MODE_SOLID: u32 = 0;
@@ -845,7 +845,7 @@ mod tests {
     #[test]
     fn image_splits_its_own_batch_and_uploads_once() {
         let fonts = Fonts::new(&[16]).expect("default font");
-        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/testdata");
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/render/testdata");
         let mut images = ImageStore::new(Some(dir));
         images.ensure("tiny.png");
         let mut cache = GlyphCache::new();

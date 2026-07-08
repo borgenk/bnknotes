@@ -3,13 +3,14 @@ use std::time::{Duration, Instant};
 
 use crate::file::{self, FileFormat};
 use crate::find::FindState;
-use crate::image::ImageStore;
-use crate::layout::{ImageUi, Layout, LayoutCtx, LineIndex, Rect, RevealAdjust};
+use crate::layout::{ImageUi, Layout, LayoutCtx, LineIndex, RevealAdjust};
 use crate::markdown;
 use crate::platform::error::{Error, Result};
 use crate::platform::freetype::Fonts;
+use crate::platform::geom::Rect;
 use crate::platform::protocol::wp_cursor_shape_device_v1;
 use crate::platform::scroll;
+use crate::render::image::ImageStore;
 use crate::rope::Rope;
 use crate::store;
 use crate::text::TextBuffer;

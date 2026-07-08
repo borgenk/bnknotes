@@ -7,7 +7,7 @@
 //!   presents a caret-sized damaged region instead of the whole surface, and a
 //!   keystroke reports the edited line rather than the screen.
 //! - **A backend-agnostic frame**: the list is turned into pixels by
-//!   the GPU batcher ([`crate::gpu::build_frame`]), which consumes exactly these
+//!   the GPU batcher ([`crate::render::gpu::build_frame`]), which consumes exactly these
 //!   commands. Nothing here is Vulkan-specific.
 //!
 //! Commands are in *screen* space (already shifted by the scroll), so scrolling,
@@ -21,8 +21,8 @@
 
 use std::collections::HashMap;
 
-use crate::layout::Rect;
 use crate::platform::freetype::FaceKey;
+use crate::platform::geom::Rect;
 
 /// A frame, as the ordered primitives that draw it. Stacking is the list order:
 /// background first, then panels, selection, glyphs, and the caret last.

@@ -58,11 +58,12 @@
 
 use std::ops::Range;
 
-use crate::image::ImageStore;
 use crate::markdown;
 use crate::platform::freetype::{Face, FaceKey, FontStyle, Fonts};
+use crate::platform::geom::Rect;
 use crate::platform::grapheme;
 use crate::platform::shape;
+use crate::render::image::ImageStore;
 use crate::rope::Rope;
 
 /// Extra highlight width drawn past a line's text when the selection includes
@@ -318,15 +319,6 @@ fn kind_at(spans: &[markdown::Span], off: usize) -> markdown::SpanKind {
         .map_or(markdown::SpanKind::Text(markdown::Emphasis::Regular), |s| {
             s.kind
         })
-}
-
-/// An axis-aligned rectangle in window pixels.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
-pub struct Rect {
-    pub x: i32,
-    pub y: i32,
-    pub w: i32,
-    pub h: i32,
 }
 
 #[derive(Clone)]
@@ -2137,7 +2129,7 @@ mod tests {
         let f = fonts();
         let s = ImageStore::from_decoded(vec![(
             "cat.png".to_string(),
-            crate::image::Image {
+            crate::render::image::Image {
                 pixels: vec![0u32; 80 * 40],
                 width: 80,
                 height: 40,
@@ -3526,8 +3518,8 @@ mod tests {
     }
 
     /// A decoded image of the given size, pixels zeroed (layout only reads dims).
-    fn decoded(w: u32, h: u32) -> crate::image::Image {
-        crate::image::Image {
+    fn decoded(w: u32, h: u32) -> crate::render::image::Image {
+        crate::render::image::Image {
             pixels: vec![0; (w * h) as usize],
             width: w,
             height: h,

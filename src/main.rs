@@ -3,23 +3,20 @@
 
 mod app;
 mod dev;
-mod display;
 mod file;
 mod find;
-mod gpu;
-mod image;
 mod layout;
 mod markdown;
 mod paint;
 mod pane;
 mod platform;
 mod regex;
+mod render;
 mod rope;
 mod store;
 mod text;
 mod theme;
 mod tree;
-mod vulkan;
 
 fn main() {
     // `--perf` runs the offline regression gate, `--perf-lab` the corpus-driven

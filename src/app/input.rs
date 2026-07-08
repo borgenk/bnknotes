@@ -4,11 +4,11 @@ use std::time::{Duration, Instant};
 
 use super::State;
 use crate::find;
-use crate::layout::Rect;
 use crate::pane::{EditorPane, Focus, Hit, SPLITTER};
 use crate::platform::error::{Error, Result};
 use crate::platform::ffi;
 use crate::platform::freetype::Fonts;
+use crate::platform::geom::Rect;
 use crate::platform::protocol::{
     wl_keyboard, wl_pointer, wp_cursor_shape_device_v1, wp_cursor_shape_manager_v1,
 };

@@ -184,7 +184,7 @@ const fn argb(a: u8, r: u8, g: u8, b: u8) -> u32 {
 /// against the document's directory. A path that fails to read or decode is kept
 /// as a negative entry so a broken link is not retried on every frame.
 ///
-/// The store owns the decoded pixels; [`crate::layout`] borrows it to size image
+/// The store owns the decoded pixels; the layout layer borrows it to size image
 /// lines, and the painter borrows it to blit them.
 pub struct ImageStore {
     /// The document's directory, that relative image paths resolve against.
@@ -273,7 +273,7 @@ mod tests {
     use super::*;
 
     // Real, tiny fixtures generated offline (no external sources): a 2x2 RGBA PNG
-    // and a 16x16 solid-red JPEG. See src/testdata.
+    // and a 16x16 solid-red JPEG. See src/render/testdata.
     const TINY_PNG: &[u8] = include_bytes!("testdata/tiny.png");
     const TINY_JPEG: &[u8] = include_bytes!("testdata/tiny.jpg");
 

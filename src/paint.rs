@@ -1,12 +1,13 @@
-use crate::display::{self, DisplayList, DrawCmd};
 use crate::find::{self, FindState};
-use crate::layout::{face_key, image_button_rect, Gutter, Layout, Rect};
+use crate::layout::{face_key, image_button_rect, Gutter, Layout};
 use crate::markdown;
 use crate::pane::TreePane;
 use crate::platform::freetype::{FaceKey, FontStyle, Fonts, Metrics};
+use crate::platform::geom::Rect;
 use crate::platform::grapheme;
 use crate::platform::scroll;
 use crate::platform::shape;
+use crate::render::display::{self, DisplayList, DrawCmd};
 use crate::theme::{
     BACKGROUND, BULLET, CARET_COLOR, CARET_WIDTH, CODE_BG, CODE_COLOR, CODE_RADIUS, FIND_BG,
     FIND_ERROR_COLOR, FIND_MATCH_COLOR, FIND_TICK_COLOR, FONT_SIZE, FOREGROUND, HEADING_COLORS,

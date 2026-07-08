@@ -32,12 +32,12 @@ use crate::dev::alloc;
 use crate::dev::corpus;
 use crate::dev::sys;
 use crate::find::FindState;
-use crate::image::{Image, ImageStore};
 use crate::layout::{ImageUi, Layout, LayoutCtx, LineIndex};
 use crate::markdown;
 use crate::paint::{build_display_list, PaintParams};
 use crate::platform::error::{Error, Result};
 use crate::platform::freetype::Fonts;
+use crate::render::image::{Image, ImageStore};
 use crate::rope::Rope;
 use crate::text::TextBuffer;
 use crate::theme::{FONT_SIZE, MARGIN};
@@ -239,13 +239,18 @@ fn measure() -> Result<Vec<Sample>> {
     // (glyph lookups against warm atlases, quad emission, batch splitting).
     // This runs even without a GPU, so the harness can hold it; the GPU-side
     // frame time is only observable via BNKNOTES_STATS on a live run.
-    let mut glyph_cache = crate::gpu::GlyphCache::new();
+    let mut glyph_cache = crate::render::gpu::GlyphCache::new();
     // Warm the atlases so the steady state (no uploads) is what is measured.
-    let _ = crate::gpu::build_frame(&fonts, &[&images], &frame_list, &mut glyph_cache, &|_| true);
+    let _ =
+        crate::render::gpu::build_frame(&fonts, &[&images], &frame_list, &mut glyph_cache, &|_| {
+            true
+        });
     out.push(sample("gpu_batch_frame", 500, || {
-        crate::gpu::build_frame(&fonts, &[&images], &frame_list, &mut glyph_cache, &|_| true)
-            .vertices
-            .len()
+        crate::render::gpu::build_frame(&fonts, &[&images], &frame_list, &mut glyph_cache, &|_| {
+            true
+        })
+        .vertices
+        .len()
     }));
 
     // Image resampling: the area/bilinear pass that scales a source bitmap to a
@@ -277,7 +282,7 @@ fn measure() -> Result<Vec<Sample>> {
     // key is the native size rather than the changing display size.
     let image_list = build_display_list(&fonts, &image_layout, &image_rope, &params(0, None));
     out.push(sample("image_upload_gpu", 200, || {
-        crate::gpu::build_frame(
+        crate::render::gpu::build_frame(
             &fonts,
             &[&image_store],
             &image_list,
@@ -564,8 +569,8 @@ pub fn run_lab(args: &[String]) -> Result<()> {
         // Warm the caches the real editor warms before it reaches steady state.
         let warm = Layout::build(&fonts, &rope, MARGIN, MARGIN, wrap, FONT_SIZE, (0, 0));
         let frame = build_display_list(&fonts, &warm, &rope, &params(0, None));
-        let mut glyphs = crate::gpu::GlyphCache::new();
-        let _ = crate::gpu::build_frame(&fonts, &[&images], &frame, &mut glyphs, &|_| true);
+        let mut glyphs = crate::render::gpu::GlyphCache::new();
+        let _ = crate::render::gpu::build_frame(&fonts, &[&images], &frame, &mut glyphs, &|_| true);
 
         // Windowed layout + incremental index: the per-cursor-move and per-keystroke
         // costs that replace a full `layout` rebuild. A warm index, a viewport band,

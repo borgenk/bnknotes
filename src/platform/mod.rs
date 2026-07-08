@@ -24,6 +24,7 @@ pub(crate) mod emoji;
 pub(crate) mod error;
 pub(crate) mod ffi;
 pub(crate) mod freetype;
+pub(crate) mod geom;
 pub(crate) mod grapheme;
 pub(crate) mod pixel;
 pub(crate) mod protocol;
@@ -37,7 +38,7 @@ mod tests {
     /// The platform layer must stay a clean leaf so it can become a standalone
     /// crate without untangling dependencies: a module here may name only
     /// `crate::platform::*` (its own siblings) and `std`, never `crate::app`,
-    /// `crate::layout`, `crate::gpu`, or anything else above it. Rust checks no
+    /// `crate::layout`, `crate::render::gpu`, or anything else above it. Rust checks no
     /// such direction inside one crate, so this walks the sources and does.
     #[test]
     fn platform_only_depends_on_itself() {

@@ -3,8 +3,6 @@ use std::rc::Rc;
 use std::time::Instant;
 
 use super::State;
-use crate::display::{self, DisplayList};
-use crate::gpu;
 use crate::platform::conn::Connection;
 use crate::platform::dmabuf;
 use crate::platform::error::{Error, Result};
@@ -15,8 +13,10 @@ use crate::platform::protocol::{
     zwp_linux_dmabuf_feedback_v1, zwp_linux_dmabuf_v1,
 };
 use crate::platform::wire::{Arg, Reader};
+use crate::render::display::{self, DisplayList};
+use crate::render::gpu;
+use crate::render::vulkan;
 use crate::theme::BACKGROUND;
-use crate::vulkan;
 
 /// Client-owned explicit-sync state (`linux-drm-syncobj-v1`), negotiated over a
 /// live GPU backend when the compositor advertises the manager. Two DRM syncobj

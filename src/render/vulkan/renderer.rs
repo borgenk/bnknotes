@@ -1,6 +1,6 @@
-use crate::gpu::{ImageKey, Vertex};
 use crate::platform::error::{Error, Result};
-use crate::vulkan::abi::*;
+use crate::render::gpu::{ImageKey, Vertex};
+use crate::render::vulkan::abi::*;
 
 /// One sampled texture (an atlas, an image, or the 1x1 dummy) and whether its
 /// contents have ever been defined (governs the upload barrier's old layout).
@@ -355,8 +355,8 @@ fn fill_renderer(r: &mut Renderer, fns: &DeviceFns, device: VkDevice) -> Result<
     )?;
 
     // The pipeline, from the committed SPIR-V blobs.
-    let vert_words = shader_words(include_bytes!("../../shaders/quad.vert.spv"))?;
-    let frag_words = shader_words(include_bytes!("../../shaders/quad.frag.spv"))?;
+    let vert_words = shader_words(include_bytes!("../../../shaders/quad.vert.spv"))?;
+    let frag_words = shader_words(include_bytes!("../../../shaders/quad.frag.spv"))?;
     let vert_module =
         create_shader_module(fns, device, &vert_words, "vkCreateShaderModule (vert)")?;
     // The vert module is already live, so a frag failure must destroy it before

@@ -21,13 +21,13 @@ mod target;
 
 use core::ffi::{c_char, CStr};
 
-use crate::gpu::ImageKey;
 use crate::platform::error::{Error, Result};
 use crate::platform::ffi::DynLib;
-use crate::vulkan::abi::*;
-use crate::vulkan::renderer::{create_renderer, Renderer};
+use crate::render::gpu::ImageKey;
+use crate::render::vulkan::abi::*;
+use crate::render::vulkan::renderer::{create_renderer, Renderer};
 
-pub(crate) use crate::vulkan::target::GpuImage;
+pub(crate) use crate::render::vulkan::target::GpuImage;
 
 // ---------------------------------------------------------------------------
 // Owned handles.

@@ -1,13 +1,13 @@
 use core::ffi::c_void;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 
-use crate::gpu::{AtlasInfo, AtlasUpload, FrameData, ImageKey};
 use crate::platform::error::{Error, Result};
-use crate::vulkan::abi::*;
-use crate::vulkan::renderer::{
+use crate::render::gpu::{AtlasInfo, AtlasUpload, FrameData, ImageKey};
+use crate::render::vulkan::abi::*;
+use crate::render::vulkan::renderer::{
     allocate_set, color_range, destroy_texture, write_image_set, HostBuffer, Texture,
 };
-use crate::vulkan::Gpu;
+use crate::render::vulkan::Gpu;
 
 // ---------------------------------------------------------------------------
 // Render targets.

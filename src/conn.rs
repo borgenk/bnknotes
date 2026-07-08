@@ -18,6 +18,33 @@ pub enum Fill {
     TimedOut,
 }
 
+/// The fixed 8-byte header at the front of every Wayland message.
+struct FrameHeader {
+    object: u32,
+    opcode: u16,
+    /// Total message length in bytes, this header included.
+    size: usize,
+}
+
+/// Parse the [`FrameHeader`] from the front of `buf`. The caller checks `buf`
+/// holds the 8-byte header before trusting `size`; a shorter buffer reads as
+/// zeroes rather than panicking.
+fn frame_header(buf: &[u8]) -> FrameHeader {
+    let word_at = |i: usize| {
+        u32::from_ne_bytes(
+            buf.get(i..i + 4)
+                .and_then(|b| b.try_into().ok())
+                .unwrap_or([0; 4]),
+        )
+    };
+    let word = word_at(4);
+    FrameHeader {
+        object: word_at(0),
+        opcode: (word & 0xffff) as u16,
+        size: (word >> 16) as usize,
+    }
+}
+
 pub struct Connection {
     stream: UnixStream,
     out: Vec<u8>,
@@ -112,11 +139,11 @@ impl Connection {
         // ids are protocol-fixed, so no interface knowledge is needed here.
         let mut off = self.in_pos;
         while off + 8 <= self.in_buf.len() {
-            let object = u32::from_ne_bytes(self.in_buf[off..off + 4].try_into().unwrap_or([0; 4]));
-            let word =
-                u32::from_ne_bytes(self.in_buf[off + 4..off + 8].try_into().unwrap_or([0; 4]));
-            let size = (word >> 16) as usize;
-            let opcode = (word & 0xffff) as u16;
+            let FrameHeader {
+                object,
+                opcode,
+                size,
+            } = frame_header(&self.in_buf[off..]);
             if size < 8 || off + size > self.in_buf.len() {
                 break;
             }
@@ -170,10 +197,11 @@ impl Connection {
         if buf.len() < 8 {
             return Ok(None);
         }
-        let object = u32::from_ne_bytes([buf[0], buf[1], buf[2], buf[3]]);
-        let word = u32::from_ne_bytes([buf[4], buf[5], buf[6], buf[7]]);
-        let size = (word >> 16) as usize;
-        let opcode = (word & 0xffff) as u16;
+        let FrameHeader {
+            object,
+            opcode,
+            size,
+        } = frame_header(buf);
         if size < 8 {
             return Err(Error::msg("malformed wayland message: size < 8"));
         }

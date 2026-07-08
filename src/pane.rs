@@ -1,5 +1,5 @@
 use std::path::{Path, PathBuf};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crate::error::{Error, Result};
 use crate::file::{self, FileFormat};
@@ -26,6 +26,53 @@ const MAX_FILE_BYTES: u64 = 64 * 1024 * 1024;
 const AUTOSCROLL_MARGIN: i32 = 24;
 /// Pixels scrolled per auto-scroll tick while the pointer is held in the edge zone.
 const AUTOSCROLL_STEP: i32 = 24;
+/// How often an auto-scroll tick fires while the pointer is held in the edge zone.
+const AUTOSCROLL_INTERVAL: Duration = Duration::from_millis(16);
+
+/// Two clicks within this window, and within [`MULTI_CLICK_RADIUS`] pixels,
+/// count as a double-click (then triple, ...).
+const MULTI_CLICK_INTERVAL: Duration = Duration::from_millis(400);
+/// How far apart successive clicks may land yet still chain into a multi-click.
+const MULTI_CLICK_RADIUS: f32 = 5.0;
+
+/// Multi-click chaining. Successive clicks landing close in time (within
+/// [`MULTI_CLICK_INTERVAL`]) and space (within [`MULTI_CLICK_RADIUS`]) escalate a
+/// single click to a double, then a triple, and so on; a click outside either
+/// window starts a fresh chain at one.
+pub(crate) struct ClickChain {
+    /// When the last click landed, or `None` before the first click.
+    last: Option<Instant>,
+    /// Where the last click landed, for the radius test.
+    last_pos: (f32, f32),
+    /// The current run length: 1 = single, 2 = double, 3 = triple, ...
+    count: u32,
+}
+
+impl ClickChain {
+    fn new() -> Self {
+        Self {
+            last: None,
+            last_pos: (0.0, 0.0),
+            count: 0,
+        }
+    }
+
+    /// Record a click at window position `(px, py)` occurring at `now`. Returns
+    /// the resulting click count (1 = single, 2 = double, ...) and whether it
+    /// chained onto the previous click.
+    pub(crate) fn register(&mut self, px: f32, py: f32, now: Instant) -> (u32, bool) {
+        let (lx, ly) = self.last_pos;
+        let near = (px - lx).abs() <= MULTI_CLICK_RADIUS && (py - ly).abs() <= MULTI_CLICK_RADIUS;
+        let chained = near
+            && self
+                .last
+                .is_some_and(|t| now.saturating_duration_since(t) <= MULTI_CLICK_INTERVAL);
+        self.count = if chained { self.count + 1 } else { 1 };
+        self.last = Some(now);
+        self.last_pos = (px, py);
+        (self.count, chained)
+    }
+}
 
 /// Read `path` into buffer text and its on-disk [`FileFormat`]. A path that does
 /// not exist yet is not an error: it opens an empty buffer that a later save
@@ -213,11 +260,16 @@ pub(crate) struct EditorPane {
     pub(crate) goal_x: Option<f32>,
     pub(crate) selecting: bool,
     pub(crate) frozen_reveal: Option<(usize, usize)>,
-    pub(crate) last_click: Option<Instant>,
-    pub(crate) last_click_pos: (f32, f32),
-    pub(crate) click_count: u32,
+    pub(crate) clicks: ClickChain,
+    /// Drag auto-scroll step: pixels per tick (negative up, positive down), 0 when
+    /// disarmed. Armed while a selection drag holds the pointer in a column's edge
+    /// zone; see [`Self::update_autoscroll`] and [`Self::autoscroll_due`].
     pub(crate) autoscroll: i32,
+    /// When the next auto-scroll tick is due; `None` while disarmed.
     pub(crate) autoscroll_at: Option<Instant>,
+    /// Pooled inline-markup scratch for [`Self::link_under_pointer`], so hit-testing
+    /// a hovered line's links reuses its buffers instead of reallocating per event.
+    link_scratch: markdown::InlineScratch,
 }
 
 impl EditorPane {
@@ -242,11 +294,10 @@ impl EditorPane {
             goal_x: None,
             selecting: false,
             frozen_reveal: None,
-            last_click: None,
-            last_click_pos: (0.0, 0.0),
-            click_count: 0,
+            clicks: ClickChain::new(),
             autoscroll: 0,
             autoscroll_at: None,
+            link_scratch: markdown::InlineScratch::default(),
         }
     }
 
@@ -693,7 +744,7 @@ impl EditorPane {
         }
         let content = rope.slice(ls..le).as_cow();
         let rel = off - ls;
-        let link = markdown::links(&content)
+        let link = markdown::links(&content, &mut self.link_scratch)
             .into_iter()
             .find(|l| l.text.0 <= rel && rel <= l.text.1)?;
         let dest = content[link.dest.0..link.dest.1].to_string();
@@ -771,7 +822,8 @@ impl EditorPane {
     }
 
     /// Arm or disarm drag auto-scroll from the pointer's distance to this
-    /// column's top/bottom edge.
+    /// column's top/bottom edge. The first arm seeds the tick deadline at now, so
+    /// the first tick fires on the next [`Self::autoscroll_due`] check.
     pub(crate) fn update_autoscroll(&mut self, rect: Rect, py: f32) {
         let y = py as i32 - rect.y;
         let step = if y < AUTOSCROLL_MARGIN {
@@ -782,12 +834,32 @@ impl EditorPane {
             0
         };
         if step == 0 {
-            self.autoscroll = 0;
-            self.autoscroll_at = None;
+            self.disarm_autoscroll();
         } else {
             self.autoscroll = step;
             self.autoscroll_at.get_or_insert_with(Instant::now);
         }
+    }
+
+    /// Stop drag auto-scroll: no step, no pending tick.
+    pub(crate) fn disarm_autoscroll(&mut self) {
+        self.autoscroll = 0;
+        self.autoscroll_at = None;
+    }
+
+    /// The scroll step if an auto-scroll tick is due at `now`, advancing the
+    /// deadline by one [`AUTOSCROLL_INTERVAL`]; `None` while disarmed or before
+    /// the next tick is due.
+    pub(crate) fn autoscroll_due(&mut self, now: Instant) -> Option<i32> {
+        if self.autoscroll == 0 {
+            return None;
+        }
+        let at = self.autoscroll_at?;
+        if at > now {
+            return None;
+        }
+        self.autoscroll_at = Some(now + AUTOSCROLL_INTERVAL);
+        Some(self.autoscroll)
     }
 }
 
@@ -893,5 +965,80 @@ mod tests {
         // Blank and all-whitespace lines: only the start to go to.
         assert_eq!(smart_home_target("", 5, 5, 5), 5);
         assert_eq!(smart_home_target("   ", 0, 3, 3), 0);
+    }
+
+    #[test]
+    fn clicks_chain_within_the_time_and_radius_window() {
+        let mut chain = ClickChain::new();
+        let t0 = Instant::now();
+        // The first click is a bare single that chains onto nothing.
+        assert_eq!(chain.register(10.0, 10.0, t0), (1, false));
+        // A second click just inside the interval and radius chains to a double.
+        let near = t0 + MULTI_CLICK_INTERVAL - Duration::from_millis(1);
+        assert_eq!(chain.register(12.0, 12.0, near), (2, true));
+        // A third, still in-window, escalates to a triple.
+        assert_eq!(
+            chain.register(12.0, 12.0, near + Duration::from_millis(1)),
+            (3, true)
+        );
+    }
+
+    #[test]
+    fn clicks_reset_outside_the_window() {
+        let mut chain = ClickChain::new();
+        let t0 = Instant::now();
+        assert_eq!(chain.register(10.0, 10.0, t0), (1, false));
+        // Too slow: past the interval starts a fresh single.
+        let slow = t0 + MULTI_CLICK_INTERVAL + Duration::from_millis(1);
+        assert_eq!(chain.register(10.0, 10.0, slow), (1, false));
+        // In time but too far: past the radius also starts a fresh single.
+        let far = MULTI_CLICK_RADIUS + 1.0;
+        assert_eq!(
+            chain.register(10.0 + far, 10.0, slow + Duration::from_millis(1)),
+            (1, false)
+        );
+    }
+
+    #[test]
+    fn autoscroll_arms_in_the_edge_zone_and_disarms_outside() {
+        let mut pane = EditorPane::empty();
+        let rect = Rect {
+            x: 0,
+            y: 0,
+            w: 200,
+            h: 400,
+        };
+        // Near the top edge: scroll up.
+        pane.update_autoscroll(rect, (AUTOSCROLL_MARGIN - 1) as f32);
+        assert_eq!(pane.autoscroll, -AUTOSCROLL_STEP);
+        assert!(pane.autoscroll_at.is_some());
+        // The interior: disarmed.
+        pane.update_autoscroll(rect, (rect.h / 2) as f32);
+        assert_eq!(pane.autoscroll, 0);
+        assert!(pane.autoscroll_at.is_none());
+        // Near the bottom edge: scroll down.
+        pane.update_autoscroll(rect, (rect.h - AUTOSCROLL_MARGIN + 1) as f32);
+        assert_eq!(pane.autoscroll, AUTOSCROLL_STEP);
+    }
+
+    #[test]
+    fn autoscroll_fires_once_per_interval_and_re_arms() {
+        let mut pane = EditorPane::empty();
+        // Disarmed: never due.
+        assert_eq!(pane.autoscroll_due(Instant::now()), None);
+        // Arm with a known step and a deadline one interval out.
+        pane.autoscroll = AUTOSCROLL_STEP;
+        let now = Instant::now();
+        pane.autoscroll_at = Some(now + AUTOSCROLL_INTERVAL);
+        // Before the deadline: not yet due.
+        assert_eq!(pane.autoscroll_due(now), None);
+        // At the deadline: due, and the deadline advances by one interval.
+        let due_at = now + AUTOSCROLL_INTERVAL;
+        assert_eq!(pane.autoscroll_due(due_at), Some(AUTOSCROLL_STEP));
+        assert_eq!(pane.autoscroll_at, Some(due_at + AUTOSCROLL_INTERVAL));
+        // Disarming stops it.
+        pane.disarm_autoscroll();
+        assert_eq!(pane.autoscroll, 0);
+        assert_eq!(pane.autoscroll_due(due_at + AUTOSCROLL_INTERVAL), None);
     }
 }

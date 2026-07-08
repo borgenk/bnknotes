@@ -797,14 +797,21 @@ pub struct Link {
 /// [`inline_spans`]; this is the structured view the editor uses to follow the link
 /// the pointer clicks. A `[x](y)` inside a code span is skipped, matching the
 /// renderer.
-pub fn links(content: &str) -> Vec<Link> {
+///
+/// Threads the caller's pooled [`InlineScratch`] so the "code makes links inert"
+/// masking runs through the same code-mask + link-span layers the renderer uses
+/// (layers 1-2 of [`inline_spans_append`]) instead of a parallel per-call
+/// allocation. Only `flags` and `links` are touched; the returned `Vec` is fresh.
+pub fn links(content: &str, scratch: &mut InlineScratch) -> Vec<Link> {
     let bytes = content.as_bytes();
-    let mut flags = vec![0u16; bytes.len()];
-    code_masks_into(content, &mut flags);
-    let mut spans = Vec::new();
-    link_spans_into(bytes, &flags, &mut spans);
-    spans
-        .into_iter()
+    let InlineScratch { flags, links, .. } = scratch;
+    flags.clear();
+    flags.resize(bytes.len(), 0);
+    code_masks_into(content, flags);
+    links.clear();
+    link_spans_into(bytes, flags, links);
+    links
+        .iter()
         .map(|l| Link {
             text: (l.open + 1, l.rb),
             dest: path_of_dest(content, l.rb + 2, l.rp),
@@ -1549,7 +1556,8 @@ mod tests {
 
     /// `(text, cleaned dest)` pairs for every link found, sliced back out of `s`.
     fn link_list(s: &str) -> Vec<(&str, &str)> {
-        links(s)
+        let mut scratch = InlineScratch::default();
+        links(s, &mut scratch)
             .into_iter()
             .map(|l| (&s[l.text.0..l.text.1], &s[l.dest.0..l.dest.1]))
             .collect()

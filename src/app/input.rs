@@ -29,15 +29,6 @@ const CARET_BLINK: Duration = Duration::from_millis(500);
 /// detent is ~15 axis units, so this lands a notch at roughly three body lines.
 const SCROLL_FACTOR: f32 = 4.0;
 
-/// Two clicks within this window, and within [`MULTI_CLICK_RADIUS`] pixels,
-/// count as a double-click (then triple, ...).
-const MULTI_CLICK_INTERVAL: Duration = Duration::from_millis(400);
-/// How far apart successive clicks may land yet still chain into a multi-click.
-const MULTI_CLICK_RADIUS: f32 = 5.0;
-
-/// How often an auto-scroll tick fires while the pointer is held in the edge zone.
-const AUTOSCROLL_INTERVAL: Duration = Duration::from_millis(16);
-
 /// Fallback auto-repeat timing if the compositor never sends repeat_info.
 const DEFAULT_REPEAT_DELAY_MS: u64 = 400;
 const DEFAULT_REPEAT_RATE: u32 = 25;
@@ -539,8 +530,7 @@ impl State {
                         }
                         let i = self.active_editor();
                         self.editors[i].selecting = false;
-                        self.editors[i].autoscroll = 0;
-                        self.editors[i].autoscroll_at = None;
+                        self.editors[i].disarm_autoscroll();
                         // Drag over: let the reveal catch up to the final selection.
                         if self.editors[i].frozen_reveal.take().is_some() {
                             self.dirty = true;
@@ -847,20 +837,7 @@ impl State {
             }
         }
         // Click chaining for double/triple-click.
-        let now = Instant::now();
-        let (lx, ly) = self.editors[i].last_click_pos;
-        let near = (px - lx).abs() <= MULTI_CLICK_RADIUS && (py - ly).abs() <= MULTI_CLICK_RADIUS;
-        let chained = near
-            && self.editors[i]
-                .last_click
-                .is_some_and(|t| now.saturating_duration_since(t) <= MULTI_CLICK_INTERVAL);
-        self.editors[i].click_count = if chained {
-            self.editors[i].click_count + 1
-        } else {
-            1
-        };
-        self.editors[i].last_click = Some(now);
-        self.editors[i].last_click_pos = (px, py);
+        let (click_count, chained) = self.editors[i].clicks.register(px, py, Instant::now());
         // A plain click on a rendered horizontal rule selects the whole rule line.
         if !shift {
             if let Some((start, end)) = self.editors[i].rule_under_pointer(&self.fonts, rect, py) {
@@ -880,7 +857,7 @@ impl State {
                 }
             }
         }
-        match self.editors[i].click_count {
+        match click_count {
             1 => {
                 self.editors[i].place_cursor_at(&self.fonts, rect, px, py, shift);
                 self.editors[i].selecting = true;
@@ -910,20 +887,16 @@ impl State {
     /// pointer, on the auto-scroll interval. A no-op when not auto-scrolling.
     pub(super) fn fire_autoscroll(&mut self) {
         let i = self.active_editor();
-        if self.editors[i].autoscroll == 0 || !self.editors[i].selecting {
-            self.editors[i].autoscroll = 0;
-            self.editors[i].autoscroll_at = None;
+        // A drag that ended (the selection was released) disarms; otherwise fire a
+        // tick only once its deadline has passed.
+        if !self.editors[i].selecting {
+            self.editors[i].disarm_autoscroll();
             return;
         }
-        let Some(at) = self.editors[i].autoscroll_at else {
+        let Some(step) = self.editors[i].autoscroll_due(Instant::now()) else {
             return;
         };
-        let now = Instant::now();
-        if at > now {
-            return;
-        }
         let rect = self.editor_rect(i);
-        let step = self.editors[i].autoscroll;
         let (px, py) = (self.pointer_x, self.pointer_y);
         if self.editors[i].scroll_by(&self.fonts, rect, step) {
             self.dirty = true;
@@ -931,7 +904,6 @@ impl State {
         if self.editors[i].place_cursor_at(&self.fonts, rect, px, py, true) {
             self.dirty = true;
         }
-        self.editors[i].autoscroll_at = Some(now + AUTOSCROLL_INTERVAL);
     }
 
     // --- Caret blink ------------------------------------------------------

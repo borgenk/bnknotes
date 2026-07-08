@@ -345,6 +345,45 @@ fn bench<T>(iters: u64, mut f: impl FnMut() -> T) -> (u64, u64) {
     best_of(5, iters, f)
 }
 
+/// How a measured number compares to its baseline: the one classification behind
+/// both the time and allocation columns and the regression gate, so all three
+/// agree by construction.
+#[derive(Clone, Copy)]
+enum Delta {
+    /// At least [`REGRESSION_RATIO`] worse than the baseline.
+    Regressed,
+    /// At least [`REGRESSION_RATIO`] better than the baseline.
+    Improved,
+    /// Within the noise band either way.
+    Flat,
+}
+
+impl Delta {
+    /// Classify `current` against `base` by the same ratio the gate uses.
+    fn classify(current: u64, base: u64) -> Delta {
+        if is_regression(current, base) {
+            Delta::Regressed
+        } else if base as f64 / current.max(1) as f64 >= REGRESSION_RATIO {
+            Delta::Improved
+        } else {
+            Delta::Flat
+        }
+    }
+
+    /// The word printed beside the percentage, empty when flat.
+    fn label(self) -> &'static str {
+        match self {
+            Delta::Regressed => "REGRESSION",
+            Delta::Improved => "improved",
+            Delta::Flat => "",
+        }
+    }
+
+    fn regressed(self) -> bool {
+        matches!(self, Delta::Regressed)
+    }
+}
+
 /// Print a current-vs-baseline table and return the names that regressed. Time is
 /// always compared; allocations are compared only when both the run and the
 /// baseline measured them (the `perf-alloc` feature was on for each), so an
@@ -359,56 +398,50 @@ fn print_table(samples: &[Sample], baseline: &HashMap<String, Base>) -> Vec<&'st
     let mut regressed = Vec::new();
     for s in sorted {
         let base = baseline.get(s.name);
-        let (base_ns_col, ns_flag) = match base {
-            Some(b) => {
-                let ratio = s.ns as f64 / b.ns.max(1) as f64;
-                let flag = if is_regression(s.ns, b.ns) {
-                    regressed.push(s.name);
-                    "REGRESSION"
-                } else if (b.ns as f64 / s.ns.max(1) as f64) >= REGRESSION_RATIO {
-                    "improved"
-                } else {
-                    ""
-                };
-                (
-                    format!("{}", b.ns),
-                    format!("{:+.1}% {}", (ratio - 1.0) * 100.0, flag),
-                )
-            }
-            None => ("(new)".to_string(), String::new()),
+
+        // Time column: always compared when a baseline row exists.
+        let ns_delta = base.map(|b| Delta::classify(s.ns, b.ns));
+        let (base_ns_col, ns_flag) = match (base, ns_delta) {
+            (Some(b), Some(delta)) => (
+                b.ns.to_string(),
+                format!("{:+.1}% {}", ratio_pct(s.ns, b.ns), delta.label()),
+            ),
+            _ => ("(new)".to_string(), String::new()),
         };
 
         // Allocation columns: shown when this run measured them; compared only when
         // the baseline did too.
-        let (alloc_cur, alloc_base, alloc_delta) = if alloc::ENABLED {
-            let base_allocs = base.and_then(|b| b.allocs);
-            let delta = match base_allocs {
-                Some(b) => {
-                    if is_regression(s.allocs, b) {
-                        if !regressed.contains(&s.name) {
-                            regressed.push(s.name);
-                        }
-                        format!("{:+.1}% REGRESSION", ratio_pct(s.allocs, b))
-                    } else if b as f64 / s.allocs.max(1) as f64 >= REGRESSION_RATIO {
-                        format!("{:+.1}% improved", ratio_pct(s.allocs, b))
-                    } else {
-                        format!("{:+.1}%", ratio_pct(s.allocs, b))
-                    }
+        let base_allocs = base.and_then(|b| b.allocs);
+        let alloc_delta = base_allocs.map(|b| Delta::classify(s.allocs, b));
+        let (alloc_cur, alloc_base, alloc_col) = if alloc::ENABLED {
+            let col = match (base_allocs, alloc_delta) {
+                (Some(b), Some(Delta::Flat)) => format!("{:+.1}%", ratio_pct(s.allocs, b)),
+                (Some(b), Some(delta)) => {
+                    format!("{:+.1}% {}", ratio_pct(s.allocs, b), delta.label())
                 }
-                None => String::new(),
+                _ => String::new(),
             };
             (
-                format!("{}", s.allocs),
+                s.allocs.to_string(),
                 base_allocs.map(|b| b.to_string()).unwrap_or_default(),
-                delta,
+                col,
             )
         } else {
             ("-".to_string(), "-".to_string(), String::new())
         };
 
+        // One scenario regresses if either its time or (when measured) its
+        // allocations did; both classifications are known here, so it is pushed
+        // once with no membership check.
+        let time_regressed = ns_delta.is_some_and(Delta::regressed);
+        let alloc_regressed = alloc::ENABLED && alloc_delta.is_some_and(Delta::regressed);
+        if time_regressed || alloc_regressed {
+            regressed.push(s.name);
+        }
+
         println!(
             "{:<20} {:>11} {:>11} {:>8}   {:>10} {:>10} {:>8}",
-            s.name, s.ns, base_ns_col, ns_flag, alloc_cur, alloc_base, alloc_delta
+            s.name, s.ns, base_ns_col, ns_flag, alloc_cur, alloc_base, alloc_col
         );
     }
     regressed
@@ -817,6 +850,21 @@ fn unix_seconds() -> u64 {
 // Shared helpers.
 // ---------------------------------------------------------------------------
 
+/// The command-line argument immediately following `flag`, if `flag` is present
+/// and has a following token. Folds the harness's flag-then-value scans.
+fn arg_after<'a>(args: &'a [String], flag: &str) -> Option<&'a str> {
+    let i = args.iter().position(|a| a == flag)?;
+    args.get(i + 1).map(String::as_str)
+}
+
+/// Run `f`, returning its result paired with the wall-clock nanoseconds it took.
+/// Folds the load bench's repeated `Instant::now()` / `elapsed` stage timing.
+fn timed<T>(f: impl FnOnce() -> T) -> (T, u64) {
+    let start = Instant::now();
+    let out = f();
+    (out, start.elapsed().as_nanos() as u64)
+}
+
 /// Create `path`'s parent directory if it has one.
 fn ensure_parent(path: &str) -> Result<()> {
     if let Some(dir) = Path::new(path)
@@ -918,67 +966,56 @@ fn rendered_as_code() {
 /// so a large-file stall can be pinned to a stage. Invoked as
 /// `--load-bench <path>`.
 pub fn run_load_bench(args: &[String]) -> Result<()> {
-    let path = args
-        .iter()
-        .position(|a| a == "--load-bench")
-        .and_then(|i| args.get(i + 1))
-        .ok_or_else(|| Error::msg("usage: --load-bench <path>"))?;
+    let path =
+        arg_after(args, "--load-bench").ok_or_else(|| Error::msg("usage: --load-bench <path>"))?;
 
     let (fonts, wrap, images) = boot()?;
 
     eprintln!("bnknotes load-bench: {path}\n");
     println!("  {:<14}{:>10}{:>17}", "stage", "time", "throughput");
 
-    let t = Instant::now();
-    let bytes = std::fs::read(path).map_err(|e| Error::msg(format!("read {path}: {e}")))?;
+    let (bytes, read_ns) = timed(|| std::fs::read(path));
+    let bytes = bytes.map_err(|e| Error::msg(format!("read {path}: {e}")))?;
     let n = bytes.len();
-    let read_ns = t.elapsed().as_nanos() as u64;
     report_stage("read (disk)", read_ns, n);
 
-    let t = Instant::now();
-    let (text, _format) = crate::file::decode(&bytes)?;
-    let decode_ns = t.elapsed().as_nanos() as u64;
+    let (decoded, decode_ns) = timed(|| crate::file::decode(&bytes));
+    let (text, _format) = decoded?;
     report_stage("decode", decode_ns, n);
 
-    let t = Instant::now();
-    let rope = Rope::from_str(&text);
-    let rope_ns = t.elapsed().as_nanos() as u64;
+    let (rope, rope_ns) = timed(|| Rope::from_str(&text));
     report_stage("rope build", rope_ns, n);
 
     // The image pre-scan the editor runs before building the index: one walk over
     // every line looking for a standalone `![](...)`. Cheap per line (no glyph
     // work), but O(document), so it counts toward a large-file open.
     let lines = rope.len_lines();
-    let t = Instant::now();
-    let mut image_lines = 0usize;
-    for (ls, le, _) in rope.lines() {
-        if markdown::standalone_image(&rope.slice(ls..le).as_cow()).is_some() {
-            image_lines += 1;
+    let (image_lines, scan_ns) = timed(|| {
+        let mut image_lines = 0usize;
+        for (ls, le, _) in rope.lines() {
+            if markdown::standalone_image(&rope.slice(ls..le).as_cow()).is_some() {
+                image_lines += 1;
+            }
         }
-    }
-    let scan_ns = t.elapsed().as_nanos() as u64;
+        image_lines
+    });
     report_stage("scan images", scan_ns, n);
 
-    let t = Instant::now();
-    let _index_seq = LineIndex::build(&fonts, &rope, wrap, FONT_SIZE, &images);
-    let index_seq_ns = t.elapsed().as_nanos() as u64;
+    let (_index_seq, index_seq_ns) =
+        timed(|| LineIndex::build(&fonts, &rope, wrap, FONT_SIZE, &images));
     report_stage("index (1 core)", index_seq_ns, n);
 
     // An optional positional arg after the path overrides the worker count, so the
     // memory/speed knee can be swept.
-    let threads = args
-        .iter()
-        .position(|a| a == "--load-bench")
-        .and_then(|i| args.get(i + 2))
+    let threads = arg_after(args, path)
         .and_then(|s| s.parse::<usize>().ok())
         .unwrap_or_else(|| {
             std::thread::available_parallelism()
                 .map(|p| p.get())
                 .unwrap_or(1)
         });
-    let t = Instant::now();
-    let index = LineIndex::build_parallel(&fonts, &rope, wrap, FONT_SIZE, &images, threads);
-    let index_ns = t.elapsed().as_nanos() as u64;
+    let (index, index_ns) =
+        timed(|| LineIndex::build_parallel(&fonts, &rope, wrap, FONT_SIZE, &images, threads));
     report_stage(&format!("index ({threads} cores)"), index_ns, n);
 
     let band = 60.min(index.len());
@@ -991,9 +1028,8 @@ pub fn run_load_bench(args: &[String]) -> Result<()> {
         &images,
         ImageUi::default(),
     );
-    let t = Instant::now();
-    let window = Layout::build_window(&window_ctx, MARGIN, MARGIN, &index, 0, band);
-    let window_ns = t.elapsed().as_nanos() as u64;
+    let (window, window_ns) =
+        timed(|| Layout::build_window(&window_ctx, MARGIN, MARGIN, &index, 0, band));
     report_stage("first window", window_ns, n);
 
     let total = read_ns + decode_ns + rope_ns + scan_ns + index_ns + window_ns;
@@ -1027,11 +1063,8 @@ fn report_stage(label: &str, ns: u64, bytes: usize) {
 /// index heap are computed exactly; RSS shows what the process actually holds,
 /// including the transient decode peak. Invoked as `--mem-report <path>`.
 pub fn run_mem_report(args: &[String]) -> Result<()> {
-    let path = args
-        .iter()
-        .position(|a| a == "--mem-report")
-        .and_then(|i| args.get(i + 1))
-        .ok_or_else(|| Error::msg("usage: --mem-report <path>"))?;
+    let path =
+        arg_after(args, "--mem-report").ok_or_else(|| Error::msg("usage: --mem-report <path>"))?;
 
     let (fonts, wrap, images) = boot()?;
 
@@ -1123,6 +1156,32 @@ mod tests {
         assert!(!is_regression(1099, 1000));
         assert!(is_regression(1100, 1000));
         assert!(!is_regression(900, 1000), "faster is never a regression");
+    }
+
+    #[test]
+    fn delta_classifies_around_the_ratio() {
+        // At/over the ratio worse is a regression; at/over it better is an
+        // improvement; the band between is flat. Same threshold as the gate.
+        assert!(Delta::classify(1100, 1000).regressed());
+        assert_eq!(Delta::classify(1100, 1000).label(), "REGRESSION");
+        assert!(!Delta::classify(1050, 1000).regressed());
+        assert_eq!(Delta::classify(1050, 1000).label(), "");
+        assert_eq!(Delta::classify(900, 1000).label(), "improved");
+        assert!(!Delta::classify(900, 1000).regressed());
+    }
+
+    #[test]
+    fn arg_after_reads_the_following_token() {
+        let args: Vec<String> = ["--load-bench", "notes.md", "4"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert_eq!(arg_after(&args, "--load-bench"), Some("notes.md"));
+        // The token after the path is the next positional (the worker count).
+        assert_eq!(arg_after(&args, "notes.md"), Some("4"));
+        // Absent flag, or a flag with nothing after it, is None.
+        assert_eq!(arg_after(&args, "--missing"), None);
+        assert_eq!(arg_after(&args, "4"), None);
     }
 
     #[test]

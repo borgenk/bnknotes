@@ -81,28 +81,24 @@ fn encode_str(buf: &mut Vec<u8>, s: &str) {
     }
 }
 
-/// Sequential reader over an event's argument bytes.
+/// Sequential reader over an event's argument bytes. Wraps the shared
+/// bounds-checked [`crate::bytes::Cursor`], decoding each argument in native byte
+/// order (the wire format is host-endian).
 pub struct Reader<'a> {
-    data: &'a [u8],
-    pos: usize,
+    cursor: crate::bytes::Cursor<'a>,
 }
 
 impl<'a> Reader<'a> {
     pub fn new(data: &'a [u8]) -> Self {
-        Self { data, pos: 0 }
+        Self {
+            cursor: crate::bytes::Cursor::new(data),
+        }
     }
 
     fn take(&mut self, n: usize) -> Result<&'a [u8]> {
-        let end = self
-            .pos
-            .checked_add(n)
-            .ok_or_else(|| Error::msg("wire reader length overflow"))?;
-        if end > self.data.len() {
-            return Err(Error::msg("truncated wayland message"));
-        }
-        let slice = &self.data[self.pos..end];
-        self.pos = end;
-        Ok(slice)
+        self.cursor
+            .take(n)
+            .ok_or_else(|| Error::msg("truncated wayland message"))
     }
 
     pub fn u32(&mut self) -> Result<u32> {

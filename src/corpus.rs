@@ -5,32 +5,44 @@
 //! `rand` crate, no clock), so a lab run is reproducible and a regression is real
 //! rather than a different random document.
 
-/// The corpora the lab knows how to generate, in the order it runs them.
-pub const NAMES: &[&str] = &[
-    "ascii_prose",
-    "giant_line",
-    "many_tiny_lines",
-    "unicode",
-    "emoji",
-    "combining",
-    "markdown",
+/// A corpus generator: builds a document of roughly the requested byte size.
+type Generator = fn(usize) -> String;
+
+/// The corpora the lab knows how to generate, in the order it runs them: each
+/// name paired with its generator. The single registry both [`NAMES`] and
+/// [`generate`] derive from, so a name and its dispatch can never drift apart.
+const CORPORA: &[(&str, Generator)] = &[
+    ("ascii_prose", ascii_prose),
+    ("giant_line", giant_line),
+    ("many_tiny_lines", many_tiny_lines),
+    ("unicode", unicode),
+    ("emoji", emoji),
+    ("combining", combining),
+    ("markdown", markdown),
 ];
+
+/// The corpus names, in run order. Derived from [`CORPORA`].
+pub const NAMES: &[&str] = &corpus_names();
+
+/// Peel the names off [`CORPORA`] into a fixed array at compile time.
+const fn corpus_names() -> [&'static str; CORPORA.len()] {
+    let mut names = [""; CORPORA.len()];
+    let mut i = 0;
+    while i < CORPORA.len() {
+        names[i] = CORPORA[i].0;
+        i += 1;
+    }
+    names
+}
 
 /// Generate the named corpus at approximately `target_bytes`, or `None` for an
 /// unknown name. The result may overshoot the target by one unit (a word, a
 /// line, a block); it never undershoots.
 pub fn generate(name: &str, target_bytes: usize) -> Option<String> {
-    let out = match name {
-        "ascii_prose" => ascii_prose(target_bytes),
-        "giant_line" => giant_line(target_bytes),
-        "many_tiny_lines" => many_tiny_lines(target_bytes),
-        "unicode" => unicode(target_bytes),
-        "emoji" => emoji(target_bytes),
-        "combining" => combining(target_bytes),
-        "markdown" => markdown(target_bytes),
-        _ => return None,
-    };
-    Some(out)
+    CORPORA
+        .iter()
+        .find(|(n, _)| *n == name)
+        .map(|(_, gen)| gen(target_bytes))
 }
 
 /// A minimal SplitMix64: enough spread to shape realistic text, fully

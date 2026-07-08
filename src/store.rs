@@ -276,30 +276,27 @@ fn write_string(out: &mut Vec<u8>, s: &str) -> Result<()> {
     Ok(())
 }
 
+/// Sequential reader over the state blob. Wraps the shared bounds-checked
+/// [`crate::bytes::Cursor`], decoding every field little-endian (the on-disk
+/// format is fixed little-endian, independent of the host).
 struct Reader<'a> {
-    data: &'a [u8],
-    pos: usize,
+    cursor: crate::bytes::Cursor<'a>,
 }
 
 impl<'a> Reader<'a> {
     fn new(data: &'a [u8]) -> Self {
-        Self { data, pos: 0 }
+        Self {
+            cursor: crate::bytes::Cursor::new(data),
+        }
     }
 
     fn take(&mut self, n: usize) -> Result<&'a [u8]> {
-        let end = self
-            .pos
-            .checked_add(n)
-            .ok_or_else(|| Error::msg("state offset overflow"))?;
-        if end > self.data.len() {
-            return Err(Error::msg(format!(
+        self.cursor.take(n).ok_or_else(|| {
+            Error::msg(format!(
                 "unexpected end of state at offset {} (need {n} more)",
-                self.pos
-            )));
-        }
-        let slice = &self.data[self.pos..end];
-        self.pos = end;
-        Ok(slice)
+                self.cursor.pos()
+            ))
+        })
     }
 
     fn u8(&mut self) -> Result<u8> {
@@ -353,11 +350,9 @@ impl<'a> Reader<'a> {
     }
 
     fn expect_end(&self) -> Result<()> {
-        if self.pos != self.data.len() {
-            return Err(Error::msg(format!(
-                "trailing {} bytes after state",
-                self.data.len() - self.pos
-            )));
+        let left = self.cursor.remaining();
+        if left != 0 {
+            return Err(Error::msg(format!("trailing {left} bytes after state")));
         }
         Ok(())
     }

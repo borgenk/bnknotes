@@ -136,6 +136,17 @@ fn errno() -> c_int {
     unsafe { *__errno_location() }
 }
 
+/// `Ok(())` when the syscall return `rc` is zero, else an error naming `what`
+/// with the current errno. The shared success-or-errno tail of the ioctl
+/// wrappers below (the FFI analog of vulkan's `check`).
+fn ok_or_errno(rc: c_int, what: &str) -> Result<()> {
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(Error::msg(format!("{what} failed: errno {}", errno())))
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Memory mapping (the keyboard keymap fd).
 // ---------------------------------------------------------------------------
@@ -546,13 +557,10 @@ pub fn drm_syncobj_create(drm: RawFd, signaled: bool) -> Result<u32> {
     };
     // SAFETY: arg is a live, correctly laid out drm_syncobj_create; the kernel
     // writes handle on success.
-    let rc = unsafe { ioctl(drm, DRM_IOCTL_SYNCOBJ_CREATE, &mut arg) };
-    if rc != 0 {
-        return Err(Error::msg(format!(
-            "DRM_IOCTL_SYNCOBJ_CREATE failed: errno {}",
-            errno()
-        )));
-    }
+    ok_or_errno(
+        unsafe { ioctl(drm, DRM_IOCTL_SYNCOBJ_CREATE, &mut arg) },
+        "DRM_IOCTL_SYNCOBJ_CREATE",
+    )?;
     Ok(arg.handle)
 }
 
@@ -566,14 +574,10 @@ fn drm_syncobj_import_sync_file(drm: RawFd, handle: u32, sync_file: RawFd) -> Re
         point: 0,
     };
     // SAFETY: arg is a live drm_syncobj_handle; the kernel reads handle and fd.
-    let rc = unsafe { ioctl(drm, DRM_IOCTL_SYNCOBJ_FD_TO_HANDLE, &mut arg) };
-    if rc != 0 {
-        return Err(Error::msg(format!(
-            "DRM_IOCTL_SYNCOBJ_FD_TO_HANDLE (import sync file) failed: errno {}",
-            errno()
-        )));
-    }
-    Ok(())
+    ok_or_errno(
+        unsafe { ioctl(drm, DRM_IOCTL_SYNCOBJ_FD_TO_HANDLE, &mut arg) },
+        "DRM_IOCTL_SYNCOBJ_FD_TO_HANDLE (import sync file)",
+    )
 }
 
 /// Export the fence at `handle`'s point 0 (a binary syncobj) as a sync file.
@@ -586,13 +590,10 @@ fn drm_syncobj_export_sync_file(drm: RawFd, handle: u32) -> Result<OwnedFd> {
         point: 0,
     };
     // SAFETY: arg is a live drm_syncobj_handle; the kernel writes fd on success.
-    let rc = unsafe { ioctl(drm, DRM_IOCTL_SYNCOBJ_HANDLE_TO_FD, &mut arg) };
-    if rc != 0 {
-        return Err(Error::msg(format!(
-            "DRM_IOCTL_SYNCOBJ_HANDLE_TO_FD (export sync file) failed: errno {}",
-            errno()
-        )));
-    }
+    ok_or_errno(
+        unsafe { ioctl(drm, DRM_IOCTL_SYNCOBJ_HANDLE_TO_FD, &mut arg) },
+        "DRM_IOCTL_SYNCOBJ_HANDLE_TO_FD (export sync file)",
+    )?;
     // SAFETY: the kernel handed us ownership of this sync-file fd.
     Ok(unsafe { OwnedFd::from_raw_fd(arg.fd) })
 }
@@ -614,14 +615,10 @@ fn drm_syncobj_transfer(
         pad: 0,
     };
     // SAFETY: arg is a live drm_syncobj_transfer; the kernel only reads it.
-    let rc = unsafe { ioctl(drm, DRM_IOCTL_SYNCOBJ_TRANSFER, &arg) };
-    if rc != 0 {
-        return Err(Error::msg(format!(
-            "DRM_IOCTL_SYNCOBJ_TRANSFER failed: errno {}",
-            errno()
-        )));
-    }
-    Ok(())
+    ok_or_errno(
+        unsafe { ioctl(drm, DRM_IOCTL_SYNCOBJ_TRANSFER, &arg) },
+        "DRM_IOCTL_SYNCOBJ_TRANSFER",
+    )
 }
 
 /// Export sync object `handle` as a shareable DRM syncobj fd (the object itself,
@@ -637,13 +634,10 @@ pub fn drm_syncobj_export_fd(drm: RawFd, handle: u32) -> Result<OwnedFd> {
     };
     // SAFETY: arg is a live, correctly laid out drm_syncobj_handle; the kernel
     // writes fd on success.
-    let rc = unsafe { ioctl(drm, DRM_IOCTL_SYNCOBJ_HANDLE_TO_FD, &mut arg) };
-    if rc != 0 {
-        return Err(Error::msg(format!(
-            "DRM_IOCTL_SYNCOBJ_HANDLE_TO_FD failed: errno {}",
-            errno()
-        )));
-    }
+    ok_or_errno(
+        unsafe { ioctl(drm, DRM_IOCTL_SYNCOBJ_HANDLE_TO_FD, &mut arg) },
+        "DRM_IOCTL_SYNCOBJ_HANDLE_TO_FD",
+    )?;
     // SAFETY: the kernel handed us ownership of this syncobj fd.
     Ok(unsafe { OwnedFd::from_raw_fd(arg.fd) })
 }
@@ -765,6 +759,13 @@ mod tests {
         assert_eq!(cmsg_align(mem::size_of::<CmsgHdr>()), 16);
         assert_eq!(cmsg_len(4), 20);
         assert_eq!(cmsg_space(4), 24);
+    }
+
+    #[test]
+    fn ok_or_errno_maps_zero_to_ok_and_nonzero_to_a_named_error() {
+        assert!(ok_or_errno(0, "DRM_IOCTL_X").is_ok());
+        let err = ok_or_errno(-1, "DRM_IOCTL_X").unwrap_err();
+        assert!(err.to_string().contains("DRM_IOCTL_X failed: errno"));
     }
 
     // The DRM syncobj ioctls talk straight to the kernel, so their request

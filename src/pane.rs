@@ -485,6 +485,15 @@ impl EditorPane {
         ))
     }
 
+    /// The cursor byte offset paired with a window laid out around it, after
+    /// refreshing the index. `None` only when the index is unavailable. The shared
+    /// preamble of the keyboard cursor-motions.
+    fn motion_window(&mut self, fonts: &Fonts, rect: Rect) -> Option<(Layout, usize)> {
+        self.ensure_index(fonts, rect);
+        let cursor = self.text.cursor();
+        self.cursor_window(fonts, rect).map(|win| (win, cursor))
+    }
+
     /// Scroll by `delta` px within the column `rect`, clamped to the content.
     /// Returns whether the offset changed (so the caller can mark a repaint).
     pub(crate) fn scroll_by(&mut self, fonts: &Fonts, rect: Rect, delta: i32) -> bool {
@@ -529,18 +538,14 @@ impl EditorPane {
         dir: i32,
         extend: bool,
     ) -> bool {
-        self.ensure_index(fonts, rect);
-        let cursor = self.text.cursor();
-        let before_sel = self.text.selection();
-        let Some(win) = self.cursor_window(fonts, rect) else {
+        let Some((win, cursor)) = self.motion_window(fonts, rect) else {
             return false;
         };
         let (caret_x, _, _) = win.caret(fonts, self.text.rope(), cursor);
         let goal = self.goal_x.unwrap_or(caret_x as f32);
         let target = win.offset_vertical(fonts, self.text.rope(), cursor, dir, goal);
         self.goal_x = Some(goal);
-        self.text.set_cursor(target, extend);
-        self.text.cursor() != cursor || self.text.selection() != before_sel
+        self.text.set_cursor_changed(target, extend)
     }
 
     /// Move the cursor to the start (`to_end = false`) or end of its visual line.
@@ -551,10 +556,7 @@ impl EditorPane {
         to_end: bool,
         extend: bool,
     ) -> bool {
-        self.ensure_index(fonts, rect);
-        let cursor = self.text.cursor();
-        let before_sel = self.text.selection();
-        let Some(win) = self.cursor_window(fonts, rect) else {
+        let Some((win, cursor)) = self.motion_window(fonts, rect) else {
             return false;
         };
         let (start, end) = win.line_bounds(cursor);
@@ -565,17 +567,13 @@ impl EditorPane {
             let line = self.text.rope().slice(start..end).as_cow();
             smart_home_target(&line, start, end, cursor)
         };
-        self.text.set_cursor(target, extend);
-        self.text.cursor() != cursor || self.text.selection() != before_sel
+        self.text.set_cursor_changed(target, extend)
     }
 
     /// Move the cursor one column-height up/down, keeping the sticky goal column.
     pub(crate) fn move_page(&mut self, fonts: &Fonts, rect: Rect, dir: i32, extend: bool) -> bool {
-        self.ensure_index(fonts, rect);
-        let cursor = self.text.cursor();
-        let before_sel = self.text.selection();
         let page_lines = self.page_lines(fonts, rect);
-        let Some(win) = self.cursor_window(fonts, rect) else {
+        let Some((win, cursor)) = self.motion_window(fonts, rect) else {
             return false;
         };
         let (caret_x, _, _) = win.caret(fonts, self.text.rope(), cursor);
@@ -593,8 +591,7 @@ impl EditorPane {
             target = next;
         }
         self.goal_x = Some(goal);
-        self.text.set_cursor(target, extend);
-        self.text.cursor() != cursor || self.text.selection() != before_sel
+        self.text.set_cursor_changed(target, extend)
     }
 
     /// How many visual lines make up a Page Up/Down jump in this column: its
@@ -662,10 +659,7 @@ impl EditorPane {
             return false;
         };
         let offset = layout.offset_at(fonts, self.text.rope(), px, y);
-        let before = self.text.cursor();
-        let before_sel = self.text.selection();
-        self.text.set_cursor(offset, extend);
-        self.text.cursor() != before || self.text.selection() != before_sel
+        self.text.set_cursor_changed(offset, extend)
     }
 
     /// The destination of the openable link under a window position, if its line

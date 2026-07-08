@@ -683,32 +683,33 @@ impl TextBuffer {
     /// word. With `extend`, grow the selection. Returns whether anything changed.
     pub fn move_word_left(&mut self, extend: bool) -> bool {
         let target = prev_word_rope(&self.text, self.cursor);
-        self.move_to(target, extend)
+        self.set_cursor_changed(target, extend)
     }
 
     /// Move the cursor one word right (Ctrl+Right), to the end of the next word.
     /// With `extend`, grow the selection. Returns whether anything changed.
     pub fn move_word_right(&mut self, extend: bool) -> bool {
         let target = next_word_rope(&self.text, self.cursor);
-        self.move_to(target, extend)
+        self.set_cursor_changed(target, extend)
     }
 
     /// Move the cursor to the very start of the buffer (Ctrl+Home). With
     /// `extend`, grow the selection. Returns whether anything changed.
     pub fn move_doc_start(&mut self, extend: bool) -> bool {
-        self.move_to(0, extend)
+        self.set_cursor_changed(0, extend)
     }
 
     /// Move the cursor to the very end of the buffer (Ctrl+End). With `extend`,
     /// grow the selection. Returns whether anything changed.
     pub fn move_doc_end(&mut self, extend: bool) -> bool {
-        self.move_to(self.text.len(), extend)
+        self.set_cursor_changed(self.text.len(), extend)
     }
 
     /// Move the cursor to `target` via [`set_cursor`](Self::set_cursor),
-    /// reporting whether the cursor or selection actually changed. The shared
-    /// body of the word- and document-motion keys.
-    fn move_to(&mut self, target: usize, extend: bool) -> bool {
+    /// reporting whether the cursor or selection actually changed. The
+    /// change-reporting form of `set_cursor`, shared by the word- and
+    /// document-motion keys and the pane's window-relative motions.
+    pub fn set_cursor_changed(&mut self, target: usize, extend: bool) -> bool {
         let before_cursor = self.cursor;
         let before_sel = self.selection();
         self.set_cursor(target, extend);

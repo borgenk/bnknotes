@@ -126,19 +126,26 @@ pub fn run(args: &[String]) -> Result<()> {
     )))
 }
 
+/// The environment every perf mode boots from: the bundled faces at all
+/// body/heading sizes, the content wrap width (the window less its margins), and
+/// an empty image store (the perf corpora carry no images, but build/paint need
+/// one to borrow).
+fn boot() -> Result<(Fonts, i32, ImageStore)> {
+    let fonts = Fonts::new(&markdown::all_sizes(FONT_SIZE))?;
+    let wrap = WIDTH as i32 - 2 * MARGIN;
+    Ok((fonts, wrap, ImageStore::new(None)))
+}
+
 /// Measure every scenario against the embedded fixture and a warm font set.
 fn measure() -> Result<Vec<Sample>> {
-    let fonts = Fonts::new(&markdown::all_sizes(FONT_SIZE))?;
+    let (fonts, wrap, images) = boot()?;
     let text = fixture();
     let rope = Rope::from_str(&text);
-    let wrap = WIDTH as i32 - 2 * MARGIN;
 
     // Build once up front: this warms the per-character advance cache, so the
     // timed `layout_build` below measures the steady re-layout cost (the per-frame
     // cost while editing), not the one-time cold measure of every glyph.
     let layout = Layout::build(&fonts, &rope, MARGIN, MARGIN, wrap, FONT_SIZE, (0, 0));
-    // An empty store satisfies build_frame's signature; the fixture has no images.
-    let images = ImageStore::new(None);
 
     let mut out = Vec::new();
 
@@ -312,32 +319,38 @@ fn sample<T>(name: &'static str, iters: u64, f: impl FnMut() -> T) -> Sample {
     Sample { name, ns, allocs }
 }
 
-/// Time `f` and return the best (minimum) ns per call plus the allocations one
-/// call makes. The minimum is the least noisy time estimator for a
-/// micro-benchmark: it is the run least disturbed by the scheduler. The allocation
-/// count is taken from a single warmed run, untimed, so counting never skews the
-/// time. `black_box` stops the optimizer eliding the work as dead.
-fn bench<T>(iters: u64, mut f: impl FnMut() -> T) -> (u64, u64) {
-    const ROUNDS: u32 = 5;
-    // One warmup before counting, so a first-call lazy init is not charged as
-    // steady-state allocation.
+/// The best (minimum) ns per call over `rounds`, each timing `inner` calls, plus
+/// the allocations one call makes. The minimum is the least noisy time estimator
+/// for a micro-benchmark: the round least disturbed by the scheduler. The
+/// allocation count is taken from a single warmed run, untimed (after a reset so a
+/// first-call lazy init is not charged as steady state), so counting never skews
+/// the time. `black_box` stops the optimizer eliding the work as dead. Shared by
+/// the Tier 1 [`bench`] (many `inner` calls per round) and the Tier 2 [`lab`]
+/// (one whole-document call per round).
+fn best_of<T>(rounds: u32, inner: u64, mut f: impl FnMut() -> T) -> (u64, u64) {
     black_box(f());
     alloc::reset();
     black_box(f());
     let allocs = alloc::snapshot().allocs;
 
+    let mut best = u64::MAX;
+    for _ in 0..rounds.max(1) {
+        let start = Instant::now();
+        for _ in 0..inner.max(1) {
+            black_box(f());
+        }
+        best = best.min((start.elapsed().as_nanos() as u64) / inner.max(1));
+    }
+    (best, allocs)
+}
+
+/// Time a Tier 1 scenario: warm the cache, then the best per-call ns over five
+/// rounds of `iters` calls each.
+fn bench<T>(iters: u64, mut f: impl FnMut() -> T) -> (u64, u64) {
     for _ in 0..iters.min(16) {
         black_box(f());
     }
-    let mut best = u64::MAX;
-    for _ in 0..ROUNDS {
-        let start = Instant::now();
-        for _ in 0..iters {
-            black_box(f());
-        }
-        best = best.min((start.elapsed().as_nanos() as u64) / iters.max(1));
-    }
-    (best, allocs)
+    best_of(5, iters, f)
 }
 
 /// Print a current-vs-baseline table and return the names that regressed. Time is
@@ -500,8 +513,7 @@ pub fn run_lab(args: &[String]) -> Result<()> {
     let target = size_mib * 1024 * 1024;
     let selected = select_corpora(args);
 
-    let fonts = Fonts::new(&markdown::all_sizes(FONT_SIZE))?;
-    let wrap = WIDTH as i32 - 2 * MARGIN;
+    let (fonts, wrap, images) = boot()?;
     eprintln!(
         "bnknotes perf-lab: {} MiB/corpus, {} corpus/corpora{}",
         size_mib,
@@ -526,7 +538,6 @@ pub fn run_lab(args: &[String]) -> Result<()> {
 
         // Warm the caches the real editor warms before it reaches steady state.
         let warm = Layout::build(&fonts, &rope, MARGIN, MARGIN, wrap, FONT_SIZE, (0, 0));
-        let images = ImageStore::new(None);
         let frame = build_display_list(&fonts, &warm, &rope, &params(0, None));
         let mut glyphs = crate::gpu::GlyphCache::new();
         let _ = crate::gpu::build_frame(&fonts, &[&images], &frame, &mut glyphs, &|_| true);
@@ -650,22 +661,13 @@ fn parse_size(args: &[String]) -> Option<usize> {
     None
 }
 
-/// Measure one lab scenario: allocations from a warmed, untimed run, then the
-/// best time over [`LAB_REPS`] rounds.
-fn lab<T>(name: &'static str, reps: u32, doc_wide: bool, mut f: impl FnMut() -> T) -> LabResult {
-    black_box(f());
-    alloc::reset();
-    black_box(f());
-    let allocs = alloc::snapshot().allocs;
-    let mut best = u64::MAX;
-    for _ in 0..reps.max(1) {
-        let start = Instant::now();
-        black_box(f());
-        best = best.min(start.elapsed().as_nanos() as u64);
-    }
+/// Measure one lab scenario: the best whole-document time over [`LAB_REPS`] rounds
+/// (one call each), with allocations from a warmed, untimed run.
+fn lab<T>(name: &'static str, reps: u32, doc_wide: bool, f: impl FnMut() -> T) -> LabResult {
+    let (ns, allocs) = best_of(reps, 1, f);
     LabResult {
         name,
-        ns: best,
+        ns,
         allocs,
         doc_wide,
     }
@@ -926,9 +928,7 @@ pub fn run_load_bench(args: &[String]) -> Result<()> {
         .and_then(|i| args.get(i + 1))
         .ok_or_else(|| Error::msg("usage: --load-bench <path>"))?;
 
-    let fonts = Fonts::new(&markdown::all_sizes(FONT_SIZE))?;
-    let wrap = WIDTH as i32 - 2 * MARGIN;
-    let images = ImageStore::new(None);
+    let (fonts, wrap, images) = boot()?;
 
     eprintln!("bnknotes load-bench: {path}\n");
     println!("  {:<14}{:>10}{:>17}", "stage", "time", "throughput");
@@ -1041,9 +1041,7 @@ pub fn run_mem_report(args: &[String]) -> Result<()> {
         .and_then(|i| args.get(i + 1))
         .ok_or_else(|| Error::msg("usage: --mem-report <path>"))?;
 
-    let fonts = Fonts::new(&markdown::all_sizes(FONT_SIZE))?;
-    let wrap = WIDTH as i32 - 2 * MARGIN;
-    let images = ImageStore::new(None);
+    let (fonts, wrap, images) = boot()?;
 
     // Build the document as an open does, then free the transient decode buffers
     // so the current RSS reflects the steady state.

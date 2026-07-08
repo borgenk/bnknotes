@@ -876,6 +876,27 @@ fn line_clusters(rope: &Rope, line: usize) -> Vec<(usize, bool)> {
         .collect()
 }
 
+/// The `(absolute byte start, is_word)` clusters at or after `pos`, in order,
+/// walking the rope a logical line at a time from the line containing `pos`. The
+/// shared traversal of the forward word-motion scanners; each layers its own
+/// state machine over these.
+fn forward_clusters(rope: &Rope, pos: usize) -> impl Iterator<Item = (usize, bool)> + '_ {
+    (rope.byte_to_line(pos.min(rope.len()))..rope.len_lines())
+        .flat_map(move |line| line_clusters(rope, line))
+        .filter(move |&(abs, _)| abs >= pos)
+}
+
+/// The `(absolute byte start, is_word)` clusters strictly before `pos`, in
+/// reverse order, walking the rope backward a logical line at a time from the
+/// line containing `pos - 1`. The shared traversal of the backward word-motion
+/// scanners; each layers its own state machine over these.
+fn backward_clusters(rope: &Rope, pos: usize) -> impl Iterator<Item = (usize, bool)> + '_ {
+    (0..=rope.byte_to_line(pos.saturating_sub(1)))
+        .rev()
+        .flat_map(move |line| line_clusters(rope, line).into_iter().rev())
+        .filter(move |&(abs, _)| abs < pos)
+}
+
 /// The byte offset one word forward from `pos`: skip any separators, then the
 /// run of word clusters, landing at the end of that word (or the buffer end).
 /// Scans the rope a logical line at a time from the cursor outward (words and
@@ -885,22 +906,14 @@ fn next_word_rope(rope: &Rope, pos: usize) -> usize {
     if pos >= len {
         return len;
     }
-    let n_lines = rope.len_lines();
-    let mut line = rope.byte_to_line(pos);
-    // Two phases carried across lines: skip leading separators, then consume the
-    // word run, stopping at the first separator after it.
+    // Two phases: skip leading separators, then consume the word run, stopping at
+    // the first separator after it.
     let mut in_word = false;
-    while line < n_lines {
-        for (abs, is_word) in line_clusters(rope, line) {
-            if abs < pos {
-                continue;
-            }
-            if in_word && !is_word {
-                return abs;
-            }
-            in_word |= is_word;
+    for (abs, is_word) in forward_clusters(rope, pos) {
+        if in_word && !is_word {
+            return abs;
         }
-        line += 1;
+        in_word |= is_word;
     }
     len
 }
@@ -912,26 +925,21 @@ fn prev_word_rope(rope: &Rope, pos: usize) -> usize {
     if pos == 0 {
         return 0;
     }
-    let mut line = rope.byte_to_line(pos - 1);
     let mut in_word = false;
     let mut start = 0;
-    loop {
-        for &(abs, is_word) in line_clusters(rope, line).iter().rev() {
-            if abs >= pos {
-                continue;
-            }
-            if in_word && !is_word {
-                return start;
-            }
-            if is_word {
-                in_word = true;
-                start = abs;
-            }
+    for (abs, is_word) in backward_clusters(rope, pos) {
+        if in_word && !is_word {
+            return start;
         }
-        if line == 0 {
-            return if in_word { start } else { 0 };
+        if is_word {
+            in_word = true;
+            start = abs;
         }
-        line -= 1;
+    }
+    if in_word {
+        start
+    } else {
+        0
     }
 }
 
@@ -1001,44 +1009,26 @@ fn class_run_start(rope: &Rope, from: usize, word: bool) -> usize {
     if from == 0 {
         return 0;
     }
-    let mut line = rope.byte_to_line(from - 1);
     let mut start = from;
-    loop {
-        for &(abs, is_word) in line_clusters(rope, line).iter().rev() {
-            if abs >= from {
-                continue;
-            }
-            if is_word != word {
-                return start;
-            }
-            start = abs;
-        }
-        if line == 0 {
+    for (abs, is_word) in backward_clusters(rope, from) {
+        if is_word != word {
             return start;
         }
-        line -= 1;
+        start = abs;
     }
+    start
 }
 
 /// The end byte offset (exclusive) of the maximal run of class `word` that
 /// contains the cluster beginning at `from`, scanning the rope forward line by
 /// line.
 fn class_run_end(rope: &Rope, from: usize, word: bool) -> usize {
-    let len = rope.len();
-    let n_lines = rope.len_lines();
-    let mut line = rope.byte_to_line(from.min(len.saturating_sub(1)));
-    while line < n_lines {
-        for (abs, is_word) in line_clusters(rope, line) {
-            if abs < from {
-                continue;
-            }
-            if is_word != word {
-                return abs;
-            }
+    for (abs, is_word) in forward_clusters(rope, from) {
+        if is_word != word {
+            return abs;
         }
-        line += 1;
     }
-    len
+    rope.len()
 }
 
 #[cfg(test)]

@@ -3,20 +3,20 @@ use std::rc::Rc;
 use std::time::Instant;
 
 use super::State;
-use crate::conn::Connection;
 use crate::display::{self, DisplayList};
-use crate::dmabuf;
-use crate::error::{Error, Result};
-use crate::ffi;
 use crate::gpu;
-use crate::protocol::{
+use crate::platform::conn::Connection;
+use crate::platform::dmabuf;
+use crate::platform::error::{Error, Result};
+use crate::platform::ffi;
+use crate::platform::protocol::{
     self, wl_buffer, wl_display, wl_surface, wp_linux_drm_syncobj_manager_v1,
     wp_linux_drm_syncobj_surface_v1, xdg_surface, zwp_linux_buffer_params_v1,
     zwp_linux_dmabuf_feedback_v1, zwp_linux_dmabuf_v1,
 };
+use crate::platform::wire::{Arg, Reader};
 use crate::theme::BACKGROUND;
 use crate::vulkan;
-use crate::wire::{Arg, Reader};
 
 /// Client-owned explicit-sync state (`linux-drm-syncobj-v1`), negotiated over a
 /// live GPU backend when the compositor advertises the manager. Two DRM syncobj

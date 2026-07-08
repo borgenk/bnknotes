@@ -21,8 +21,8 @@ use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::rc::Rc;
 
-use crate::emoji::{wants_emoji, ColorGlyph, EmojiFont};
-use crate::error::{Error, Result};
+use crate::platform::emoji::{wants_emoji, ColorGlyph, EmojiFont};
+use crate::platform::error::{Error, Result};
 
 /// A monospace family and the four style files the editor draws emphasis with.
 /// The first family whose `regular` file exists wins; a missing bold, italic, or

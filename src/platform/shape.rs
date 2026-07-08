@@ -23,8 +23,8 @@
 use core::ffi::{c_char, c_int, c_uint, c_void};
 use core::ptr::{self, NonNull};
 
-use crate::freetype::Face;
-use crate::grapheme;
+use crate::platform::freetype::Face;
+use crate::platform::grapheme;
 
 /// Total pen advance of `text` at the face's current pixel size, in pixels.
 /// Measures with metrics only (no rasterization), matching how the renderer

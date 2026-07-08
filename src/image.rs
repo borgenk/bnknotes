@@ -16,7 +16,7 @@ use std::path::{Path, PathBuf};
 
 use zune_core::options::DecoderOptions;
 
-use crate::error::{Error, Result};
+use crate::platform::error::{Error, Result};
 
 /// A decoded image: ARGB8888 pixels (`0xAARRGGBB`, the byte order of the editor's
 /// xRGB8888 shm buffer) plus dimensions. One heap allocation, sampled by the

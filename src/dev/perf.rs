@@ -31,13 +31,13 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use crate::dev::alloc;
 use crate::dev::corpus;
 use crate::dev::sys;
-use crate::error::{Error, Result};
 use crate::find::FindState;
-use crate::freetype::Fonts;
 use crate::image::{Image, ImageStore};
 use crate::layout::{ImageUi, Layout, LayoutCtx, LineIndex};
 use crate::markdown;
 use crate::paint::{build_display_list, PaintParams};
+use crate::platform::error::{Error, Result};
+use crate::platform::freetype::Fonts;
 use crate::rope::Rope;
 use crate::text::TextBuffer;
 use crate::theme::{FONT_SIZE, MARGIN};
@@ -223,7 +223,7 @@ fn measure() -> Result<Vec<Sample>> {
     // Raw glyph rasterization of printable ASCII (the uncached FreeType path), so a
     // regression in the rasterizer itself is visible independent of the cache. The
     // GPU path still rasterizes every glyph once, into its texture atlas.
-    let face = fonts.face(FONT_SIZE, crate::freetype::FontStyle::Regular);
+    let face = fonts.face(FONT_SIZE, crate::platform::freetype::FontStyle::Regular);
     out.push(sample("glyph_raster_ascii", 20, || {
         let mut sum = 0usize;
         for c in 0x20u8..0x7f {
@@ -253,7 +253,7 @@ fn measure() -> Result<Vec<Sample>> {
     // this guards the resampler itself (now used for color-emoji glyph strikes).
     let native: Vec<u32> = vec![0xff_30_60_90; 400 * 300];
     out.push(sample("image_resample", 200, || {
-        crate::pixel::resample_argb(&native, 400, 300, 200, 150).len()
+        crate::platform::pixel::resample_argb(&native, 400, 300, 200, 150).len()
     }));
 
     // Re-laying-out a document containing an image at a fresh width, as a splitter

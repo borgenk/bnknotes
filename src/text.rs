@@ -27,8 +27,8 @@
 
 use std::collections::VecDeque;
 
-use crate::grapheme;
 use crate::markdown;
+use crate::platform::grapheme;
 use crate::rope::Rope;
 
 /// Cap on undo history, so a long session cannot grow the stacks without bound.

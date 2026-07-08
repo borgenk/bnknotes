@@ -413,7 +413,7 @@ impl Iterator for Lines<'_> {
             return None;
         }
         loop {
-            if let Some(nl) = crate::bytes::find_byte(self.cur, b'\n') {
+            if let Some(nl) = crate::platform::bytes::find_byte(self.cur, b'\n') {
                 let line = (self.line_start, self.abs + nl, true);
                 let consumed = nl + 1;
                 self.cur = &self.cur[consumed..];
@@ -699,7 +699,7 @@ fn newlines_before(node: &Inner, byte: usize) -> usize {
     match &node.kind {
         Kind::Leaf(s) => {
             debug_assert!(byte <= s.len(), "newlines_before within the leaf");
-            crate::bytes::count_byte(&s.as_bytes()[..byte], b'\n')
+            crate::platform::bytes::count_byte(&s.as_bytes()[..byte], b'\n')
         }
         Kind::Branch(l, r) => {
             if byte <= l.bytes {
@@ -712,7 +712,7 @@ fn newlines_before(node: &Inner, byte: usize) -> usize {
 }
 
 fn bytecount_nl(s: &str) -> usize {
-    crate::bytes::count_byte(s.as_bytes(), b'\n')
+    crate::platform::bytes::count_byte(s.as_bytes(), b'\n')
 }
 
 /// Heap bytes of `node` and its subtree: each node is an `Arc` allocation (two

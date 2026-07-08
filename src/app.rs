@@ -30,25 +30,25 @@ use std::time::{Duration, Instant};
 use self::clipboard::{is_text_mime, ClipboardState, CLIPBOARD_MIMES};
 use self::input::KeyRepeat;
 use self::present::GpuPresentation;
-use crate::conn::{Connection, Fill};
 use crate::display::DisplayList;
-use crate::error::{Error, Result};
 use crate::file;
-use crate::freetype::Fonts;
 use crate::layout::Rect;
 use crate::markdown;
 use crate::paint::{build_display_list, build_find_paint, push_splitter, push_tree, PaintParams};
 use crate::pane::{restore_editor, Columns, EditorPane, Focus, PaneLayout, TreePane};
-use crate::protocol::{
+use crate::platform::conn::{Connection, Fill};
+use crate::platform::error::{Error, Result};
+use crate::platform::freetype::Fonts;
+use crate::platform::protocol::{
     self, wl_buffer, wl_callback, wl_compositor, wl_data_device_manager, wl_data_offer, wl_display,
     wl_registry, wl_seat, wl_surface, xdg_surface, xdg_toplevel, xdg_wm_base,
 };
-use crate::scroll;
+use crate::platform::scroll;
+use crate::platform::wire::{Arg, Message, Reader};
+use crate::platform::xkb::Xkb;
 use crate::store;
 use crate::theme::FONT_SIZE;
 use crate::tree;
-use crate::wire::{Arg, Message, Reader};
-use crate::xkb::Xkb;
 
 /// Upper bound on either surface dimension, applied to a compositor-supplied
 /// configure size. Far beyond any real display (8K is 7680 wide), it just keeps a

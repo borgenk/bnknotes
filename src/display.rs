@@ -21,8 +21,8 @@
 
 use std::collections::HashMap;
 
-use crate::freetype::FaceKey;
 use crate::layout::Rect;
+use crate::platform::freetype::FaceKey;
 
 /// A frame, as the ordered primitives that draw it. Stacking is the list order:
 /// background first, then panels, selection, glyphs, and the caret last.

@@ -18,10 +18,10 @@ use std::collections::HashMap;
 
 use crate::display::DrawCmd;
 use crate::display::RoundedCorners;
-use crate::freetype::{Face, FaceKey, Fonts};
-use crate::grapheme;
 use crate::image::ImageStore;
 use crate::layout::Rect;
+use crate::platform::freetype::{Face, FaceKey, Fonts};
+use crate::platform::grapheme;
 
 /// Vertex modes, matching shaders/quad.frag.
 pub const MODE_SOLID: u32 = 0;
@@ -737,7 +737,7 @@ mod tests {
             baseline: 16,
             face: FaceKey::Prose {
                 size: 16,
-                style: crate::freetype::FontStyle::Regular,
+                style: crate::platform::freetype::FontStyle::Regular,
             },
             color: 0x00ff_ffff,
             text: "abcabc".to_string(),
@@ -780,7 +780,7 @@ mod tests {
                 baseline: 16,
                 face: FaceKey::Prose {
                     size: 16,
-                    style: crate::freetype::FontStyle::Regular,
+                    style: crate::platform::freetype::FontStyle::Regular,
                 },
                 color: 0x00ff_ffff,
                 text: "hi".to_string(),
@@ -923,7 +923,7 @@ mod tests {
             baseline: 16,
             face: FaceKey::Prose {
                 size: 16,
-                style: crate::freetype::FontStyle::Regular,
+                style: crate::platform::freetype::FontStyle::Regular,
             },
             color: 0x00ff_ffff,
             text: "😀".to_string(),

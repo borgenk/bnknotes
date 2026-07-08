@@ -6,7 +6,7 @@
 //! every argument is padded to a 4-byte boundary. File descriptors are not in
 //! the byte stream; they travel as SCM_RIGHTS ancillary data (see `ffi`).
 
-use crate::error::{Error, Result};
+use crate::platform::error::{Error, Result};
 
 /// One request argument. The `Bind` variant is the "generic" new-id used only
 /// by `wl_registry.bind`, where the interface is not known statically and is
@@ -82,16 +82,16 @@ fn encode_str(buf: &mut Vec<u8>, s: &str) {
 }
 
 /// Sequential reader over an event's argument bytes. Wraps the shared
-/// bounds-checked [`crate::bytes::Cursor`], decoding each argument in native byte
+/// bounds-checked [`crate::platform::bytes::Cursor`], decoding each argument in native byte
 /// order (the wire format is host-endian).
 pub struct Reader<'a> {
-    cursor: crate::bytes::Cursor<'a>,
+    cursor: crate::platform::bytes::Cursor<'a>,
 }
 
 impl<'a> Reader<'a> {
     pub fn new(data: &'a [u8]) -> Self {
         Self {
-            cursor: crate::bytes::Cursor::new(data),
+            cursor: crate::platform::bytes::Cursor::new(data),
         }
     }
 

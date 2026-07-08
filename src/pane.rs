@@ -1,16 +1,16 @@
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use crate::error::{Error, Result};
 use crate::file::{self, FileFormat};
 use crate::find::FindState;
-use crate::freetype::Fonts;
 use crate::image::ImageStore;
 use crate::layout::{ImageUi, Layout, LayoutCtx, LineIndex, Rect, RevealAdjust};
 use crate::markdown;
-use crate::protocol::wp_cursor_shape_device_v1;
+use crate::platform::error::{Error, Result};
+use crate::platform::freetype::Fonts;
+use crate::platform::protocol::wp_cursor_shape_device_v1;
+use crate::platform::scroll;
 use crate::rope::Rope;
-use crate::scroll;
 use crate::store;
 use crate::text::TextBuffer;
 use crate::theme::{FONT_SIZE, MARGIN};
@@ -748,7 +748,7 @@ impl EditorPane {
             .into_iter()
             .find(|l| l.text.0 <= rel && rel <= l.text.1)?;
         let dest = content[link.dest.0..link.dest.1].to_string();
-        crate::browser::can_open(&dest).then_some(dest)
+        crate::platform::browser::can_open(&dest).then_some(dest)
     }
 
     /// The logical-line start of the rendered task checkbox under a window

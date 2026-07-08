@@ -58,12 +58,12 @@
 
 use std::ops::Range;
 
-use crate::freetype::{Face, FaceKey, FontStyle, Fonts};
-use crate::grapheme;
 use crate::image::ImageStore;
 use crate::markdown;
+use crate::platform::freetype::{Face, FaceKey, FontStyle, Fonts};
+use crate::platform::grapheme;
+use crate::platform::shape;
 use crate::rope::Rope;
-use crate::shape;
 
 /// Extra highlight width drawn past a line's text when the selection includes
 /// that line's trailing newline, hinting the break itself is selected.

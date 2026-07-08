@@ -21,7 +21,7 @@ use core::ffi::{c_char, c_int, c_uint, c_ulong, c_void, CStr};
 use std::mem;
 use std::os::fd::{FromRawFd, OwnedFd, RawFd};
 
-use crate::error::{Error, Result};
+use crate::platform::error::{Error, Result};
 
 // ---------------------------------------------------------------------------
 // Constants (Linux generic ABI).

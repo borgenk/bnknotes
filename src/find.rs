@@ -15,7 +15,7 @@
 //! (select + reveal, replace) and hands the state to the painter, so every
 //! transition here is unit-testable with plain strings.
 
-use crate::grapheme;
+use crate::platform::grapheme;
 use crate::regex::Regex;
 use crate::text::TextBuffer;
 
@@ -366,7 +366,7 @@ fn scan(text: &str, query: &str, limit: usize) -> Vec<(usize, usize)> {
 /// the range (if any) are not word characters. Word = alphanumeric or `_`,
 /// matching the editor's word-motion heuristic.
 fn on_word_boundaries(text: &str, start: usize, end: usize) -> bool {
-    let is_word = crate::grapheme::is_word_char;
+    let is_word = crate::platform::grapheme::is_word_char;
     text[..start]
         .chars()
         .next_back()

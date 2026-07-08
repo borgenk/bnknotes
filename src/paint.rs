@@ -1,12 +1,12 @@
 use crate::display::{self, DisplayList, DrawCmd};
 use crate::find::{self, FindState};
-use crate::freetype::{FaceKey, FontStyle, Fonts, Metrics};
-use crate::grapheme;
 use crate::layout::{face_key, image_button_rect, Gutter, Layout, Rect};
 use crate::markdown;
 use crate::pane::TreePane;
-use crate::scroll;
-use crate::shape;
+use crate::platform::freetype::{FaceKey, FontStyle, Fonts, Metrics};
+use crate::platform::grapheme;
+use crate::platform::scroll;
+use crate::platform::shape;
 use crate::theme::{
     BACKGROUND, BULLET, CARET_COLOR, CARET_WIDTH, CODE_BG, CODE_COLOR, CODE_RADIUS, FIND_BG,
     FIND_ERROR_COLOR, FIND_MATCH_COLOR, FIND_TICK_COLOR, FONT_SIZE, FOREGROUND, HEADING_COLORS,
@@ -727,7 +727,11 @@ fn push_find_bar(list: &mut DisplayList, fonts: &Fonts, find: &FindPaint, width:
     // Keep a field's display within a third of the window by dropping leading
     // clusters: the end is where editing happens. Queries are short, so the
     // remeasure loop is cheap.
-    fn tail_that_fits<'t>(face: &crate::freetype::Face, text: &'t str, max: f32) -> &'t str {
+    fn tail_that_fits<'t>(
+        face: &crate::platform::freetype::Face,
+        text: &'t str,
+        max: f32,
+    ) -> &'t str {
         let mut shown = text;
         while shape::text_advance(face, shown) > max && !shown.is_empty() {
             shown = &shown[grapheme::next_boundary(shown, 0)..];

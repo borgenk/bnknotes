@@ -2,38 +2,24 @@
 //! Wayland client (no winit, no smithay, almost no crates).
 
 mod app;
-mod browser;
-mod bytes;
-mod conn;
 mod dev;
 mod display;
-mod dmabuf;
-mod emoji;
-mod error;
-mod ffi;
 mod file;
 mod find;
-mod freetype;
 mod gpu;
-mod grapheme;
 mod image;
 mod layout;
 mod markdown;
 mod paint;
 mod pane;
-mod pixel;
-mod protocol;
+mod platform;
 mod regex;
 mod rope;
-mod scroll;
-mod shape;
 mod store;
 mod text;
 mod theme;
 mod tree;
 mod vulkan;
-mod wire;
-mod xkb;
 
 fn main() {
     // `--perf` runs the offline regression gate, `--perf-lab` the corpus-driven

@@ -21,9 +21,9 @@ mod target;
 
 use core::ffi::{c_char, CStr};
 
-use crate::error::{Error, Result};
-use crate::ffi::DynLib;
 use crate::gpu::ImageKey;
+use crate::platform::error::{Error, Result};
+use crate::platform::ffi::DynLib;
 use crate::vulkan::abi::*;
 use crate::vulkan::renderer::{create_renderer, Renderer};
 
@@ -407,8 +407,8 @@ fn pick_device(
     main_device: u64,
 ) -> Result<(VkPhysicalDevice, String, u32, Option<u32>)> {
     let (want_major, want_minor) = (
-        i64::from(crate::dmabuf::dev_major(main_device)),
-        i64::from(crate::dmabuf::dev_minor(main_device)),
+        i64::from(crate::platform::dmabuf::dev_major(main_device)),
+        i64::from(crate::platform::dmabuf::dev_minor(main_device)),
     );
     let mut seen = Vec::new();
 

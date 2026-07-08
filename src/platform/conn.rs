@@ -7,9 +7,9 @@ use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use crate::error::{Error, Result};
-use crate::ffi;
-use crate::wire::{self, Arg, Message, Reader};
+use crate::platform::error::{Error, Result};
+use crate::platform::ffi;
+use crate::platform::wire::{self, Arg, Message, Reader};
 
 /// The outcome of a [`Connection::fill`]: bytes arrived (0 means the peer
 /// closed), or the read timed out with the socket idle.

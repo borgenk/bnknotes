@@ -1,6 +1,6 @@
 use core::ffi::{c_char, c_void, CStr};
 
-use crate::error::{Error, Result};
+use crate::platform::error::{Error, Result};
 
 // ---------------------------------------------------------------------------
 // Handles, scalars, and constants.

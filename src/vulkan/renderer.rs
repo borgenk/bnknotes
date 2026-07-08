@@ -1,5 +1,5 @@
-use crate::error::{Error, Result};
 use crate::gpu::{ImageKey, Vertex};
+use crate::platform::error::{Error, Result};
 use crate::vulkan::abi::*;
 
 /// One sampled texture (an atlas, an image, or the 1x1 dummy) and whether its

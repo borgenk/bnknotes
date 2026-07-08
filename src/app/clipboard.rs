@@ -1,12 +1,14 @@
 use std::os::fd::AsRawFd;
 
 use super::State;
-use crate::error::{Error, Result};
-use crate::ffi;
 use crate::file;
 use crate::markdown;
-use crate::protocol::{wl_data_device, wl_data_device_manager, wl_data_offer, wl_data_source};
-use crate::wire::{Arg, Reader};
+use crate::platform::error::{Error, Result};
+use crate::platform::ffi;
+use crate::platform::protocol::{
+    wl_data_device, wl_data_device_manager, wl_data_offer, wl_data_source,
+};
+use crate::platform::wire::{Arg, Reader};
 
 /// MIME types we advertise when putting text on the clipboard, and accept when
 /// pasting. The charset variant is listed first as the preferred form.

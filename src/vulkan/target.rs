@@ -1,8 +1,8 @@
 use core::ffi::c_void;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 
-use crate::error::{Error, Result};
 use crate::gpu::{AtlasInfo, AtlasUpload, FrameData, ImageKey};
+use crate::platform::error::{Error, Result};
 use crate::vulkan::abi::*;
 use crate::vulkan::renderer::{
     allocate_set, color_range, destroy_texture, write_image_set, HostBuffer, Texture,
@@ -723,7 +723,10 @@ impl Gpu {
     /// The implicit-sync bridge's acquire: the dmabuf's current read/write
     /// fences become the acquire wait.
     fn import_read_fences(&self, img: &GpuImage) -> Result<bool> {
-        self.import_acquire(img, crate::ffi::dmabuf_export_sync_file(img.fd())?)
+        self.import_acquire(
+            img,
+            crate::platform::ffi::dmabuf_export_sync_file(img.fd())?,
+        )
     }
 
     /// Export the just-submitted release semaphore as a sync file. `None` when
@@ -753,7 +756,7 @@ impl Gpu {
         let Some(sync) = self.render_done_fence(img)? else {
             return Ok(false);
         };
-        crate::ffi::dmabuf_import_sync_file(img.fd(), sync.as_raw_fd())
+        crate::platform::ffi::dmabuf_import_sync_file(img.fd(), sync.as_raw_fd())
     }
 
     /// Record `img`'s command buffer for one frame: texture uploads, the

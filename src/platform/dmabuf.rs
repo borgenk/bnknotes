@@ -20,7 +20,7 @@
 //! This module is pure parsing and state: the fd mmap and the wire routing live
 //! with the caller (`app.rs`), so everything here is testable on plain bytes.
 
-use crate::error::{Error, Result};
+use crate::platform::error::{Error, Result};
 
 /// DRM fourcc for 32-bit xRGB, little-endian (`XR24`), the dmabuf twin of the
 /// `wl_shm` XRGB8888 the software path renders today.

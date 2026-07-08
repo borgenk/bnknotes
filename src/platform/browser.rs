@@ -7,7 +7,7 @@
 
 use std::process::{Command, Stdio};
 
-use crate::error::{Error, Result};
+use crate::platform::error::{Error, Result};
 
 /// Open `url` in the default browser via `xdg-open`, detached from the editor.
 ///

@@ -10,12 +10,12 @@ use core::ptr::NonNull;
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 
-use crate::freetype::{
+use crate::platform::freetype::{
     CacheStats, FT_Load_Glyph, Face, FtBitmap, FT_LOAD_COLOR, FT_LOAD_RENDER, FT_PIXEL_MODE_BGRA,
 };
-use crate::grapheme;
-use crate::pixel::{premultiplied_over, resample_argb, straight_from_premultiplied};
-use crate::shape::Shaper;
+use crate::platform::grapheme;
+use crate::platform::pixel::{premultiplied_over, resample_argb, straight_from_premultiplied};
+use crate::platform::shape::Shaper;
 
 /// Whether a grapheme cluster should render as color emoji. `mono_has` reports
 /// whether the text face can draw a character itself, so symbols the text font
@@ -185,7 +185,7 @@ impl EmojiFont {
     /// it: at least one glyph and no `.notdef`. The single success predicate
     /// behind both [`Self::advance`] and [`Self::with_glyph`], which is what
     /// keeps measuring and drawing in agreement.
-    fn shaped(&self, cluster: &str) -> Option<Vec<crate::shape::ShapedGlyph>> {
+    fn shaped(&self, cluster: &str) -> Option<Vec<crate::platform::shape::ShapedGlyph>> {
         let glyphs = self.shaper.shape(cluster);
         if glyphs.is_empty() || glyphs.iter().any(|g| g.id == 0) {
             return None;
@@ -250,7 +250,7 @@ impl EmojiFont {
     /// returning the placed strikes and the total pen advance (in strike units,
     /// before the display-size scale). A glyph the font cannot decode is skipped
     /// but still advances the pen, so an inkless cluster keeps its width.
-    fn place_strikes(&self, shaped: &[crate::shape::ShapedGlyph]) -> (Vec<Placed>, f32) {
+    fn place_strikes(&self, shaped: &[crate::platform::shape::ShapedGlyph]) -> (Vec<Placed>, f32) {
         let mut placed = Vec::new();
         let mut pen = 0.0f32;
         for g in shaped {

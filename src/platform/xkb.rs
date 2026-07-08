@@ -19,7 +19,7 @@
 use core::ffi::{c_char, c_int, c_void};
 use core::ptr::NonNull;
 
-use crate::error::{Error, Result};
+use crate::platform::error::{Error, Result};
 
 /// Wayland passes raw evdev keycodes; XKB expects them offset by +8.
 const EVDEV_OFFSET: u32 = 8;

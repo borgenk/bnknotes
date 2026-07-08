@@ -28,7 +28,7 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::error::{Error, Result};
+use crate::platform::error::{Error, Result};
 
 const FILENAME: &str = "state.bin";
 const MAGIC: &[u8; 4] = b"BNKN";
@@ -277,16 +277,16 @@ fn write_string(out: &mut Vec<u8>, s: &str) -> Result<()> {
 }
 
 /// Sequential reader over the state blob. Wraps the shared bounds-checked
-/// [`crate::bytes::Cursor`], decoding every field little-endian (the on-disk
+/// [`crate::platform::bytes::Cursor`], decoding every field little-endian (the on-disk
 /// format is fixed little-endian, independent of the host).
 struct Reader<'a> {
-    cursor: crate::bytes::Cursor<'a>,
+    cursor: crate::platform::bytes::Cursor<'a>,
 }
 
 impl<'a> Reader<'a> {
     fn new(data: &'a [u8]) -> Self {
         Self {
-            cursor: crate::bytes::Cursor::new(data),
+            cursor: crate::platform::bytes::Cursor::new(data),
         }
     }
 

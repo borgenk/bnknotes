@@ -21,7 +21,7 @@ use std::fs::File;
 use std::io::Write;
 use std::path::Path;
 
-use crate::error::{Error, Result};
+use crate::platform::error::{Error, Result};
 
 /// The UTF-8 byte-order mark. Some editors prepend it; we strip it on load and,
 /// if it was present, restore it on save.
@@ -119,7 +119,7 @@ pub fn normalize_newlines(s: &str) -> String {
     // No carriage return means the text is already LF-normalized: one copy, not
     // the two full allocating passes `replace("\r\n", ..).replace('\r', ..)` pays
     // even when there is nothing to replace.
-    let Some(first) = crate::bytes::find_byte(s.as_bytes(), b'\r') else {
+    let Some(first) = crate::platform::bytes::find_byte(s.as_bytes(), b'\r') else {
         return s.to_string();
     };
     // Rewrite in a single pass from the first '\r': a CRLF pair and a lone CR each

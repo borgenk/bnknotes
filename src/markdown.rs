@@ -339,7 +339,7 @@ pub fn all_sizes(base: u32) -> Vec<u32> {
 // inside code spans are not handled. Notes rarely need the omitted cases.
 
 /// Inline emphasis of a text run, selecting the face and color it renders with.
-/// A closed set; [`crate::freetype::FontStyle`] maps it to an actual face.
+/// A closed set; [`crate::platform::freetype::FontStyle`] maps it to an actual face.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Emphasis {
     /// Ordinary body text.

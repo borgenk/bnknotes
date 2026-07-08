@@ -3,19 +3,19 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 use super::State;
-use crate::error::{Error, Result};
-use crate::ffi;
 use crate::find;
-use crate::freetype::Fonts;
 use crate::layout::Rect;
 use crate::pane::{EditorPane, Focus, Hit, SPLITTER};
-use crate::protocol::{
+use crate::platform::error::{Error, Result};
+use crate::platform::ffi;
+use crate::platform::freetype::Fonts;
+use crate::platform::protocol::{
     wl_keyboard, wl_pointer, wp_cursor_shape_device_v1, wp_cursor_shape_manager_v1,
 };
-use crate::scroll;
+use crate::platform::scroll;
+use crate::platform::wire::{Arg, Reader};
+use crate::platform::xkb::KeyAction;
 use crate::theme::{FONT_SIZE, TREE_PAD};
-use crate::wire::{Arg, Reader};
-use crate::xkb::KeyAction;
 
 /// What the Tab key inserts: spaces (a "soft tab"), not a literal `'\t'`. This
 /// keeps the buffer free of tab characters and spares the renderer any tab-stop
@@ -851,7 +851,7 @@ impl State {
         // A plain, un-chained click on a rendered link follows it.
         if !chained && !shift {
             if let Some(dest) = self.editors[i].link_under_pointer(&self.fonts, rect, px, py) {
-                if crate::browser::open_url(&dest).is_ok() {
+                if crate::platform::browser::open_url(&dest).is_ok() {
                     self.editors[i].selecting = false;
                     return;
                 }

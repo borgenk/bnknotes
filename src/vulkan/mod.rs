@@ -92,12 +92,11 @@ pub struct Gpu {
 }
 
 impl Gpu {
-    /// Bring up Vulkan against the DRM device `main_device` (a dev_t from
-    /// dmabuf feedback), or against the first capable device when `None` (the
-    /// offline pixel-parity harness, which has no compositor to match): load
-    /// the loader, create an instance, pick the physical device, and create a
-    /// one-queue logical device with the dmabuf presentation extensions.
-    pub fn new(main_device: Option<u64>) -> Result<Self> {
+    /// Bring up Vulkan against the DRM device `main_device` (a dev_t from the
+    /// compositor's dmabuf feedback): load the loader, create an instance, pick
+    /// the physical device matching that DRM identity, and create a one-queue
+    /// logical device with the dmabuf presentation extensions.
+    pub fn new(main_device: u64) -> Result<Self> {
         let lib = DynLib::open(c"libvulkan.so.1")?;
         let gipa_ptr = lib
             .sym(c"vkGetInstanceProcAddr")
@@ -397,23 +396,20 @@ fn has_extension(exts: &[VkExtensionProperties], wanted: &CStr) -> bool {
         .any(|e| c_name(&e.extension_name).as_bytes() == wanted.to_bytes())
 }
 
-/// Pick the physical device whose DRM identity matches `main_device` (or the
-/// first capable device when `None`), and which offers a graphics queue and
-/// every required extension. Returns the device, its name, and the graphics
-/// queue family index.
+/// Pick the physical device whose DRM identity matches `main_device` and which
+/// offers a graphics queue and every required extension. Returns the device, its
+/// name, and the graphics queue family index.
 fn pick_device(
     get_props2: PfnGetPhysicalDeviceProperties2,
     enumerate_exts: PfnEnumerateDeviceExtensionProperties,
     get_queue_families: PfnGetPhysicalDeviceQueueFamilyProperties,
     physicals: &[VkPhysicalDevice],
-    main_device: Option<u64>,
+    main_device: u64,
 ) -> Result<(VkPhysicalDevice, String, u32, Option<u32>)> {
-    let want = main_device.map(|dev| {
-        (
-            i64::from(crate::dmabuf::dev_major(dev)),
-            i64::from(crate::dmabuf::dev_minor(dev)),
-        )
-    });
+    let (want_major, want_minor) = (
+        i64::from(crate::dmabuf::dev_major(main_device)),
+        i64::from(crate::dmabuf::dev_minor(main_device)),
+    );
     let mut seen = Vec::new();
 
     for &physical in physicals {
@@ -439,11 +435,6 @@ fn pick_device(
             // SAFETY: physical is live; props chains one correctly-typed struct.
             unsafe { get_props2(physical, &mut props) };
             name = c_name(&props.properties.device_name);
-        } else if want.is_none() {
-            // No compositor to match: the DRM identity is not needed.
-            // SAFETY: physical is live; props chains nothing.
-            unsafe { get_props2(physical, &mut props) };
-            name = c_name(&props.properties.device_name);
         } else {
             // Without the DRM identity the device cannot be matched to the
             // compositor's; note it for the error message and move on.
@@ -456,18 +447,16 @@ fn pick_device(
             continue;
         }
 
-        if let Some((want_major, want_minor)) = want {
-            let primary_matches = drm.has_primary != 0
-                && (drm.primary_major, drm.primary_minor) == (want_major, want_minor);
-            let render_matches = drm.has_render != 0
-                && (drm.render_major, drm.render_minor) == (want_major, want_minor);
-            if !primary_matches && !render_matches {
-                seen.push(format!(
-                    "{name} (drm {}:{} / {}:{})",
-                    drm.primary_major, drm.primary_minor, drm.render_major, drm.render_minor
-                ));
-                continue;
-            }
+        let primary_matches = drm.has_primary != 0
+            && (drm.primary_major, drm.primary_minor) == (want_major, want_minor);
+        let render_matches =
+            drm.has_render != 0 && (drm.render_major, drm.render_minor) == (want_major, want_minor);
+        if !primary_matches && !render_matches {
+            seen.push(format!(
+                "{name} (drm {}:{} / {}:{})",
+                drm.primary_major, drm.primary_minor, drm.render_major, drm.render_minor
+            ));
+            continue;
         }
 
         let missing: Vec<&str> = REQUIRED_DEVICE_EXTENSIONS
@@ -476,24 +465,16 @@ fn pick_device(
             .filter_map(|e| e.to_str().ok())
             .collect();
         if !missing.is_empty() {
-            // A device the compositor named that cannot serve is a hard,
-            // explainable failure; an unnamed candidate is just skipped.
-            if want.is_some() {
-                return Err(Error::msg(format!(
-                    "device {name} matches the compositor's DRM device but lacks {}",
-                    missing.join(", ")
-                )));
-            }
-            seen.push(format!("{name} (lacks {})", missing.join(", ")));
-            continue;
+            // The device the compositor named cannot serve: a hard, explainable
+            // failure rather than a silent fallback.
+            return Err(Error::msg(format!(
+                "device {name} matches the compositor's DRM device but lacks {}",
+                missing.join(", ")
+            )));
         }
 
         let Some(queue_family) = graphics_family(get_queue_families, physical) else {
-            if want.is_some() {
-                return Err(Error::msg(format!("device {name} has no graphics queue")));
-            }
-            seen.push(format!("{name} (no graphics queue)"));
-            continue;
+            return Err(Error::msg(format!("device {name} has no graphics queue")));
         };
         // The render node (no DRM master needed) is where explicit sync creates
         // its syncobjs; `None` when the device exposes no render node.
@@ -501,12 +482,8 @@ fn pick_device(
         return Ok((physical, name, queue_family, render_minor));
     }
 
-    let target = match want {
-        Some((major, minor)) => format!("matches DRM device {major}:{minor}"),
-        None => "is capable".to_string(),
-    };
     Err(Error::msg(format!(
-        "no vulkan device {target} (saw: {})",
+        "no vulkan device matches DRM device {want_major}:{want_minor} (saw: {})",
         seen.join("; ")
     )))
 }

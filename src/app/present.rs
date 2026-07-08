@@ -105,7 +105,7 @@ impl State {
         if compositor_mods.is_empty() {
             return Err(Error::msg("compositor does not accept XRGB8888 dmabufs"));
         }
-        let gpu = vulkan::Gpu::new(Some(main_device))?;
+        let gpu = vulkan::Gpu::new(main_device)?;
         let mods = gpu.image_modifiers(&compositor_mods);
         if mods.is_empty() {
             return Err(Error::msg(
@@ -648,7 +648,7 @@ impl State {
         // actually allocate and export a presentable image? A failure here is
         // the probe's answer, not an error.
         let main_device = fb.main_device;
-        let gpu = match vulkan::Gpu::new(Some(main_device)) {
+        let gpu = match vulkan::Gpu::new(main_device) {
             Ok(gpu) => gpu,
             Err(e) => {
                 println!("gpu-probe: vulkan unavailable: {e}");

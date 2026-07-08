@@ -32,33 +32,29 @@ pub(crate) struct PaintParams<'a> {
     pub find: Option<FindPaint<'a>>,
 }
 
-/// What the painter needs from an open find bar, borrowed from the app's
-/// [`FindState`] for the frame being built.
+/// What the painter needs from an open find bar: the [`FindState`] itself,
+/// borrowed for the frame being built, plus the two tick-strip inputs that come
+/// from the caller's line index rather than the find state.
 pub(crate) struct FindPaint<'a> {
-    /// The query as typed; the bar shows the tail that fits.
-    pub query: &'a str,
-    /// The replacement text when the replace row is shown.
-    pub replace: Option<&'a str>,
-    /// Whether the replace field (rather than the query) has the keyboard.
-    pub focus_replace: bool,
-    /// The focused field's whole content is selected (Ctrl+A or a reopened
-    /// query); drawn on a selection fill since the next edit replaces it.
-    pub selected: bool,
-    /// Mode flags, drawn bright when on.
-    pub word: bool,
-    pub regex: bool,
-    /// The query is an invalid regular expression.
-    pub error: bool,
-    /// Byte ranges of every match, in document order.
-    pub matches: &'a [(usize, usize)],
-    /// Index into `matches` of the current match. It is not highlighted here
-    /// because the app mirrors it into the buffer selection.
-    pub current: usize,
+    /// The open find bar's state (query, matches, current index, mode flags).
+    pub state: &'a FindState,
     /// Content-space top of each match's line, from the line index, so the tick
     /// strip places a match that sits outside the painted window correctly.
     pub tick_tops: &'a [i32],
     /// Total document content height, for the tick strip's proportional mapping.
     pub doc_height: i32,
+}
+
+impl FindPaint<'_> {
+    /// The replacement text to show, or `None` when the replace row is hidden.
+    fn replace(&self) -> Option<&str> {
+        self.state.show_replace().then(|| self.state.replacement())
+    }
+
+    /// Whether the replace field (rather than the query) holds the keyboard.
+    fn focus_replace(&self) -> bool {
+        self.state.focus() == find::Field::Replace
+    }
 }
 
 /// A [`DrawCmd::Text`] for `text` from `x` along `baseline` in `face`/`color`,
@@ -101,19 +97,8 @@ pub(crate) fn build_find_paint<'a>(
     tick_tops: &'a [i32],
     doc_height: i32,
 ) -> Option<FindPaint<'a>> {
-    if !find.is_open() {
-        return None;
-    }
-    Some(FindPaint {
-        query: find.query(),
-        replace: find.show_replace().then(|| find.replacement()),
-        focus_replace: find.focus() == find::Field::Replace,
-        selected: find.selected(),
-        word: find.word(),
-        regex: find.regex(),
-        error: find.error(),
-        matches: find.matches(),
-        current: find.current(),
+    find.is_open().then_some(FindPaint {
+        state: find,
         tick_tops,
         doc_height,
     })
@@ -398,12 +383,11 @@ impl<'a> Painter<'a> {
     /// short query with thousands of hits does not price every frame by them.
     fn find_matches(&mut self, find: &FindPaint) {
         let visible = visible_byte_range(self.fonts, self.layout, self.scroll_y, self.view_h);
-        let lo = find.matches.partition_point(|&(_, end)| end <= visible.0);
-        let hi = find
-            .matches
-            .partition_point(|&(start, _)| start < visible.1);
-        for (i, &(start, end)) in find.matches.iter().enumerate().take(hi).skip(lo) {
-            if i == find.current {
+        let matches = find.state.matches();
+        let lo = matches.partition_point(|&(_, end)| end <= visible.0);
+        let hi = matches.partition_point(|&(start, _)| start < visible.1);
+        for (i, &(start, end)) in matches.iter().enumerate().take(hi).skip(lo) {
+            if i == find.state.current() {
                 continue;
             }
             for rect in self
@@ -643,18 +627,18 @@ impl<'a> Painter<'a> {
 /// which bounds the strip to O(viewport) commands however many matches exist;
 /// the current match's tick is wider and bright.
 fn push_find_ticks(list: &mut DisplayList, find: &FindPaint, width: i32, view_h: i32) {
-    if find.matches.is_empty() || view_h <= 0 {
+    if find.state.matches().is_empty() || view_h <= 0 {
         return;
     }
     let content_h = find.doc_height.max(view_h) as i64;
     let mut occupied = vec![false; (view_h / 2 + 1) as usize];
-    for i in 0..find.matches.len() {
+    for i in 0..find.state.matches().len() {
         // Each match's content-space top comes from the line index, so an offscreen
         // match still maps to its true position rather than the window's edge.
         let top = find.tick_tops.get(i).copied().unwrap_or(0) as i64;
         let y = (top * (view_h - TICK_HEIGHT) as i64 / content_h) as i32;
         let bucket = (y / 2).clamp(0, view_h / 2) as usize;
-        let current = i == find.current;
+        let current = i == find.state.current();
         if occupied[bucket] && !current {
             continue;
         }
@@ -721,14 +705,18 @@ fn push_find_bar(list: &mut DisplayList, fonts: &Fonts, find: &FindPaint, width:
 
     // The right-hand cluster on the query row: the mode flags (bright when
     // on) and the match counter (the alert color for a broken regex).
-    let counter = if find.query.is_empty() {
+    let counter = if find.state.query().is_empty() {
         String::new()
-    } else if find.error {
+    } else if find.state.error() {
         "!".to_string()
-    } else if find.matches.is_empty() {
+    } else if find.state.matches().is_empty() {
         "0/0".to_string()
     } else {
-        format!("{}/{}", find.current + 1, find.matches.len())
+        format!(
+            "{}/{}",
+            find.state.current() + 1,
+            find.state.matches().len()
+        )
     };
     let counter_w = shape::text_advance(face, &counter).ceil() as i32;
     let flag_word_w = shape::text_advance(face, "W").ceil() as i32;
@@ -747,9 +735,9 @@ fn push_find_bar(list: &mut DisplayList, fonts: &Fonts, find: &FindPaint, width:
         shown
     }
     let field_max = (width / 3).max(3 * size as i32) as f32;
-    let query = tail_that_fits(face, find.query, field_max);
+    let query = tail_that_fits(face, find.state.query(), field_max);
     let query_w = shape::text_advance(face, query).ceil() as i32;
-    let replace = find.replace.map(|r| tail_that_fits(face, r, field_max));
+    let replace = find.replace().map(|r| tail_that_fits(face, r, field_max));
     let replace_w = replace
         .map(|r| shape::text_advance(face, r).ceil() as i32)
         .unwrap_or(0);
@@ -793,7 +781,7 @@ fn push_find_bar(list: &mut DisplayList, fonts: &Fonts, find: &FindPaint, width:
     let baseline = y + pad / 2 + m.ascent;
     let pen = x + pad;
     if !query.is_empty() {
-        if find.selected && !find.focus_replace {
+        if find.state.selected() && !find.focus_replace() {
             list.push(DrawCmd::Fill {
                 rect: Rect {
                     x: pen,
@@ -804,7 +792,7 @@ fn push_find_bar(list: &mut DisplayList, fonts: &Fonts, find: &FindPaint, width:
                 color: SELECTION_COLOR,
             });
         }
-        let color = if find.error {
+        let color = if find.state.error() {
             FIND_ERROR_COLOR
         } else {
             FOREGROUND
@@ -819,7 +807,7 @@ fn push_find_bar(list: &mut DisplayList, fonts: &Fonts, find: &FindPaint, width:
             m,
         ));
     }
-    if !find.focus_replace {
+    if !find.focus_replace() {
         caret_after(list, pen + query_w, baseline);
     }
 
@@ -827,8 +815,8 @@ fn push_find_bar(list: &mut DisplayList, fonts: &Fonts, find: &FindPaint, width:
     // lit when its mode is on, dim otherwise.
     let mut tx = x + w - pad - tail_w;
     for (glyph, on, glyph_w) in [
-        ("W", find.word, flag_word_w),
-        (".*", find.regex, flag_regex_w),
+        ("W", find.state.word(), flag_word_w),
+        (".*", find.state.regex(), flag_regex_w),
     ] {
         let color = if on { FOREGROUND } else { MARKER_COLOR };
         list.push(text_cmd(
@@ -843,7 +831,7 @@ fn push_find_bar(list: &mut DisplayList, fonts: &Fonts, find: &FindPaint, width:
         tx += glyph_w + gap;
     }
     if !counter.is_empty() {
-        let color = if find.error {
+        let color = if find.state.error() {
             FIND_ERROR_COLOR
         } else {
             MARKER_COLOR
@@ -873,7 +861,7 @@ fn push_find_bar(list: &mut DisplayList, fonts: &Fonts, find: &FindPaint, width:
             m,
         ));
         if !replacement.is_empty() {
-            if find.selected && find.focus_replace {
+            if find.state.selected() && find.focus_replace() {
                 list.push(DrawCmd::Fill {
                     rect: Rect {
                         x: pen + arrow_w,
@@ -894,7 +882,7 @@ fn push_find_bar(list: &mut DisplayList, fonts: &Fonts, find: &FindPaint, width:
                 m,
             ));
         }
-        if find.focus_replace {
+        if find.focus_replace() {
             caret_after(list, pen + arrow_w + replace_w, baseline);
         }
     }
@@ -1148,8 +1136,14 @@ mod tests {
         let (w, h) = (600usize, 200usize);
         let wrap = w as i32 - 2 * MARGIN;
         let layout = Layout::build(&fonts, &rope, MARGIN, MARGIN, wrap, FONT_SIZE, (0, 0));
-        let matches = [(0usize, 3usize), (8, 11), (16, 19)];
-        let (tops, doc_h) = tick_tops(&layout, &matches);
+        // Drive a real find state to the same shape: query "one", three matches,
+        // the current one at index 1 (byte 8) — the anchor aims `current` at the
+        // first match at or after it.
+        let buf = crate::text::TextBuffer::from_text("one two one two one\n".to_string());
+        let mut bar = FindState::new();
+        bar.open_at(8, &buf);
+        bar.push_str("one", &buf);
+        let (tops, doc_h) = tick_tops(&layout, bar.matches());
         let params = PaintParams {
             width: w,
             height: h,
@@ -1158,19 +1152,7 @@ mod tests {
             selection: Some((8, 11)),
             cursor: 11,
             caret_visible: false,
-            find: Some(FindPaint {
-                query: "one",
-                replace: None,
-                focus_replace: false,
-                selected: false,
-                word: false,
-                regex: false,
-                error: false,
-                matches: &matches,
-                current: 1,
-                tick_tops: &tops,
-                doc_height: doc_h,
-            }),
+            find: build_find_paint(&bar, &tops, doc_h),
         };
         let list = build_display_list(&fonts, &layout, &rope, &params);
         let match_fills = list
@@ -1206,8 +1188,16 @@ mod tests {
         let (w, h) = (600usize, 200usize);
         let wrap = w as i32 - 2 * MARGIN;
         let layout = Layout::build(&fonts, &rope, MARGIN, MARGIN, wrap, FONT_SIZE, (0, 0));
-        let matches = [(0usize, 3usize), (8, 11), (19, 22)];
-        let (tops, doc_h) = tick_tops(&layout, &matches);
+        // Drive a real find state: whole-word query "one" (three matches, current
+        // 0) with the replace row open, focused, and holding "two".
+        let buf = crate::text::TextBuffer::from_text("one two one\nfiller\none more\n".to_string());
+        let mut bar = FindState::new();
+        bar.open_at(0, &buf);
+        bar.push_str("one", &buf);
+        bar.toggle_word(&buf);
+        bar.open_replace_at(0, &buf);
+        bar.push_str("two", &buf);
+        let (tops, doc_h) = tick_tops(&layout, bar.matches());
         let params = PaintParams {
             width: w,
             height: h,
@@ -1215,19 +1205,7 @@ mod tests {
             selection: Some((0, 3)),
             cursor: 3,
             caret_visible: false,
-            find: Some(FindPaint {
-                query: "one",
-                replace: Some("two"),
-                focus_replace: true,
-                selected: false,
-                word: true,
-                regex: false,
-                error: false,
-                matches: &matches,
-                current: 0,
-                tick_tops: &tops,
-                doc_height: doc_h,
-            }),
+            find: build_find_paint(&bar, &tops, doc_h),
         };
         let list = build_display_list(&fonts, &layout, &rope, &params);
         let texts: Vec<&str> = list

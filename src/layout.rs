@@ -368,52 +368,11 @@ impl Layout {
         images: &ImageStore,
         image_ui: ImageUi,
     ) -> Self {
-        let mut lines = Vec::new();
-        // `box_top` is the top of the current line's box; the baseline sits one
-        // ascent below it, and the next box follows one line height down.
-        let mut box_top = top;
-        // `fence` holds the open fence's backtick count while inside a code block,
-        // and `list_depth` the nesting depth of the most recent valid list item:
-        // the only two pieces of state that carry across logical lines.
-        let mut fence: Option<usize> = None;
-        let mut list_depth: Option<usize> = None;
-        let mut pool = LayoutScratch::default();
-        let n_lines = rope.len_lines();
-        for i in 0..n_lines {
-            let ls = rope.line_to_byte(i);
-            // Every logical line but the last ends in a '\n'; its content excludes
-            // that byte. The rope materializes just this line inside `lay_line`.
-            let has_newline = i + 1 < n_lines;
-            let le = if has_newline {
-                rope.line_to_byte(i + 1) - 1
-            } else {
-                rope.line_to_byte(i + 1)
-            };
-            box_top += lay_line(
-                fonts,
-                rope,
-                ls,
-                le,
-                has_newline,
-                wrap_width,
-                body_size,
-                active,
-                images,
-                image_ui,
-                box_top,
-                &mut fence,
-                &mut list_depth,
-                &mut pool,
-                false,
-                &mut lines,
-            );
-        }
-        Self {
-            lines,
-            runs: pool.runs,
-            left,
-            text_height: box_top - top,
-        }
+        let n = rope.len_lines();
+        Self::build_range(
+            fonts, rope, left, top, wrap_width, body_size, active, images, image_ui, 0, n, None,
+            None,
+        )
     }
 
     /// Lay out only the logical lines `[band_start, band_end)`, seeding the running
@@ -443,13 +402,53 @@ impl Layout {
         let n = rope.len_lines();
         let start = band_start.min(n);
         let end = band_end.min(n).max(start);
-        let (mut fence, mut list_depth) = index.entry_state(start);
+        let (fence, list_depth) = index.entry_state(start);
+        Self::build_range(
+            fonts,
+            rope,
+            left,
+            box_top_seed,
+            wrap_width,
+            body_size,
+            active,
+            images,
+            image_ui,
+            start,
+            end,
+            fence,
+            list_depth,
+        )
+    }
+
+    /// Lay out logical lines `[start, end)` starting at content-space top
+    /// `box_top_seed`, seeded with the cross-line carry (`fence`, `list_depth`)
+    /// entering `start`. The one loop behind both the full build
+    /// ([`Self::build_with_images`], `0..n` from ground state) and the windowed
+    /// build ([`Self::build_window`], a band seeded from the index).
+    #[allow(clippy::too_many_arguments)]
+    fn build_range(
+        fonts: &Fonts,
+        rope: &Rope,
+        left: i32,
+        box_top_seed: i32,
+        wrap_width: i32,
+        body_size: u32,
+        active: (usize, usize),
+        images: &ImageStore,
+        image_ui: ImageUi,
+        start: usize,
+        end: usize,
+        mut fence: Option<usize>,
+        mut list_depth: Option<usize>,
+    ) -> Self {
+        let n = rope.len_lines();
         let mut box_top = box_top_seed;
-        let start_top = box_top;
         let mut pool = LayoutScratch::default();
         let mut lines = Vec::new();
         for i in start..end {
             let ls = rope.line_to_byte(i);
+            // Every logical line but the last ends in a '\n'; its content excludes
+            // that byte. The rope materializes just this line inside `lay_line`.
             let has_newline = i + 1 < n;
             let le = if has_newline {
                 rope.line_to_byte(i + 1) - 1
@@ -479,7 +478,7 @@ impl Layout {
             lines,
             runs: pool.runs,
             left,
-            text_height: box_top - start_top,
+            text_height: box_top - box_top_seed,
         }
     }
 
@@ -1207,9 +1206,11 @@ struct ChunkOut {
     end_depth: Option<usize>,
 }
 
-/// Measure logical lines `[lo, hi)` of `rope` into `LineRec`s, starting from
-/// ground entry state (no fence, no list), and report the entry state left at the
-/// end. Runs on a worker thread with that thread's own `fonts`.
+/// Measure logical lines `[lo, hi)` of `rope` into `LineRec`s, starting from the
+/// given entry state (`None`/`None` is ground, no fence or list), and report the
+/// entry state left at the end. The single measure loop behind the sequential
+/// [`LineIndex::build`], the parallel workers, and the stitch re-measure; a worker
+/// runs it on its own `fonts`.
 #[allow(clippy::too_many_arguments)]
 fn measure_chunk(
     fonts: &Fonts,
@@ -1220,9 +1221,9 @@ fn measure_chunk(
     wrap_width: i32,
     body_size: u32,
     images: &ImageStore,
+    mut fence: Option<usize>,
+    mut list_depth: Option<usize>,
 ) -> ChunkOut {
-    let mut fence: Option<usize> = None;
-    let mut list_depth: Option<usize> = None;
     let mut scratch: Vec<VisualLine> = Vec::new();
     let mut pool = LayoutScratch::default();
     let mut recs = Vec::with_capacity(hi - lo);
@@ -1420,27 +1421,10 @@ impl LineIndex {
         images: &ImageStore,
     ) -> Self {
         let n = rope.len_lines();
-        let mut recs = Vec::with_capacity(n);
-        let mut fence: Option<usize> = None;
-        let mut list_depth: Option<usize> = None;
-        let mut scratch: Vec<VisualLine> = Vec::new();
-        let mut pool = LayoutScratch::default();
-        for i in 0..n {
-            recs.push(Self::measure_line(
-                fonts,
-                rope,
-                i,
-                n,
-                wrap_width,
-                body_size,
-                images,
-                &mut fence,
-                &mut list_depth,
-                &mut pool,
-                &mut scratch,
-            ));
-        }
-        Self::from_recs(recs)
+        let out = measure_chunk(
+            fonts, rope, 0, n, n, wrap_width, body_size, images, None, None,
+        );
+        Self::from_recs(out.recs)
     }
 
     /// Build the index across up to `threads` worker threads, for a large
@@ -1503,14 +1487,14 @@ impl LineIndex {
                     s.spawn(move || {
                         let fonts = Fonts::new(&markdown::all_sizes(body_size)).ok()?;
                         Some(measure_chunk(
-                            &fonts, rope, lo, hi, n, wrap_width, body_size, images,
+                            &fonts, rope, lo, hi, n, wrap_width, body_size, images, None, None,
                         ))
                     })
                 })
                 .collect();
             let (lo0, hi0) = ranges[0];
             let mut outs = vec![Some(measure_chunk(
-                fonts, rope, lo0, hi0, n, wrap_width, body_size, images,
+                fonts, rope, lo0, hi0, n, wrap_width, body_size, images, None, None,
             ))];
             for h in handles {
                 outs.push(h.join().ok().flatten());
@@ -1531,29 +1515,18 @@ impl LineIndex {
         let mut recs: Vec<LineRec> = Vec::with_capacity(n);
         let mut fence: Option<usize> = None;
         let mut list_depth: Option<usize> = None;
-        let mut scratch: Vec<VisualLine> = Vec::new();
-        let mut pool = LayoutScratch::default();
         for (out, &(lo, hi)) in outs.iter().zip(&ranges) {
             if fence.is_none() && list_depth.is_none() {
                 recs.extend_from_slice(&out.recs);
                 fence = out.end_fence;
                 list_depth = out.end_depth;
             } else {
-                for i in lo..hi {
-                    recs.push(Self::measure_line(
-                        fonts,
-                        rope,
-                        i,
-                        n,
-                        wrap_width,
-                        body_size,
-                        images,
-                        &mut fence,
-                        &mut list_depth,
-                        &mut pool,
-                        &mut scratch,
-                    ));
-                }
+                let re = measure_chunk(
+                    fonts, rope, lo, hi, n, wrap_width, body_size, images, fence, list_depth,
+                );
+                recs.extend_from_slice(&re.recs);
+                fence = re.end_fence;
+                list_depth = re.end_depth;
             }
         }
         Self::from_recs(recs)

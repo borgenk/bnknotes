@@ -3,7 +3,7 @@ use std::rc::Rc;
 use std::time::Instant;
 
 use super::State;
-use crate::display;
+use crate::display::{self, DisplayList};
 use crate::dmabuf;
 use crate::error::{Error, Result};
 use crate::ffi;
@@ -37,17 +37,67 @@ pub(super) struct ExplicitSync {
     buffer_release: [Option<u64>; 2],
 }
 
+/// GPU/dmabuf presentation resources owned by the app: protocol globals and
+/// feedback, the Vulkan backend, the two exported swap buffers, explicit-sync
+/// state, and the small counters used by the stats line.
+pub(super) struct GpuPresentation {
+    pub(super) dmabuf: Option<u32>,
+    pub(super) dmabuf_version: u32,
+    pub(super) feedback_id: u32,
+    pub(super) feedback: dmabuf::FeedbackState,
+    pub(super) backend: Option<vulkan::Gpu>,
+    pub(super) images: Vec<vulkan::GpuImage>,
+    pub(super) modifiers: Vec<u64>,
+    pub(super) glyphs: gpu::GlyphCache,
+    pub(super) syncobj_manager: Option<u32>,
+    pub(super) explicit_sync: Option<ExplicitSync>,
+    pub(super) buffers: [u32; 2],
+    pub(super) busy: [bool; 2],
+    pub(super) buffer_size: (u32, u32),
+    pub(super) present_list: Rc<DisplayList>,
+    pub(super) frame_count: u64,
+    pub(super) last_present: Option<Instant>,
+    pub(super) explicit_fence_frames: u64,
+    pub(super) explicit_cpu_wait_frames: u64,
+}
+
+impl GpuPresentation {
+    pub(super) fn new() -> Self {
+        Self {
+            dmabuf: None,
+            dmabuf_version: 0,
+            feedback_id: 0,
+            feedback: dmabuf::FeedbackState::default(),
+            backend: None,
+            images: Vec::new(),
+            modifiers: Vec::new(),
+            glyphs: gpu::GlyphCache::new(),
+            syncobj_manager: None,
+            explicit_sync: None,
+            buffers: [0, 0],
+            busy: [false, false],
+            buffer_size: (0, 0),
+            present_list: Rc::default(),
+            frame_count: 0,
+            last_present: None,
+            explicit_fence_frames: 0,
+            explicit_cpu_wait_frames: 0,
+        }
+    }
+}
+
 impl State {
     /// Bring the Vulkan backend up from the committed dmabuf feedback: a
     /// device matching the compositor's, and a modifier list their common
     /// ground. Called before `create_buffers`, which allocates the exportable
     /// GPU images. A failure here is fatal (the editor requires a GPU).
     pub(super) fn init_gpu(&mut self) -> Result<()> {
-        if self.dmabuf.is_none() {
+        if self.presentation.dmabuf.is_none() {
             return Err(Error::msg("compositor lacks zwp_linux_dmabuf_v1 v4+"));
         }
         let fb = self
-            .dmabuf_fb
+            .presentation
+            .feedback
             .ready()
             .ok_or_else(|| Error::msg("dmabuf feedback never committed"))?;
         let main_device = fb.main_device;
@@ -62,8 +112,8 @@ impl State {
                 "no common DRM modifier between compositor and device",
             ));
         }
-        self.gpu_modifiers = mods;
-        self.gpu = Some(gpu);
+        self.presentation.modifiers = mods;
+        self.presentation.backend = Some(gpu);
         Ok(())
     }
 
@@ -72,14 +122,19 @@ impl State {
     /// failure the GPU path keeps the implicit-sync bridge, which is why this
     /// returns nothing and only logs under stats.
     pub(super) fn init_explicit_sync(&mut self) {
-        let Some(manager) = self.drm_syncobj_manager else {
+        let Some(manager) = self.presentation.syncobj_manager else {
             return;
         };
-        let Some(minor) = self.gpu.as_ref().and_then(vulkan::Gpu::render_node) else {
+        let Some(minor) = self
+            .presentation
+            .backend
+            .as_ref()
+            .and_then(vulkan::Gpu::render_node)
+        else {
             return; // No GPU backend, or the device exposes no render node.
         };
         match self.negotiate_explicit_sync(manager, minor) {
-            Ok(es) => self.explicit_sync = Some(es),
+            Ok(es) => self.presentation.explicit_sync = Some(es),
             Err(e) => {
                 if self.stats {
                     eprintln!("bnknotes: explicit sync unavailable, using the sync bridge: {e}");
@@ -149,16 +204,17 @@ impl State {
     /// path to fall back to.
     pub(super) fn create_buffers(&mut self) -> Result<()> {
         let dmabuf_global = self
+            .presentation
             .dmabuf
             .ok_or_else(|| Error::msg("gpu buffers without zwp_linux_dmabuf_v1"))?;
         let (w, h) = (self.width, self.height);
         let mut images = Vec::with_capacity(2);
         {
-            let Some(gpu) = self.gpu.as_ref() else {
+            let Some(gpu) = self.presentation.backend.as_ref() else {
                 return Err(Error::msg("gpu buffers without a gpu backend"));
             };
             for _ in 0..2 {
-                images.push(gpu.create_image(w, h, &self.gpu_modifiers)?);
+                images.push(gpu.create_image(w, h, &self.presentation.modifiers)?);
             }
         }
         for (i, img) in images.iter().enumerate() {
@@ -195,41 +251,41 @@ impl State {
             );
             self.conn
                 .request(params, zwp_linux_buffer_params_v1::DESTROY, &[]);
-            self.buffers[i] = buffer;
+            self.presentation.buffers[i] = buffer;
         }
-        self.gpu_images = images;
-        self.buffer_size = (self.width, self.height);
-        self.busy = [false, false];
+        self.presentation.images = images;
+        self.presentation.buffer_size = (self.width, self.height);
+        self.presentation.busy = [false, false];
         // Fresh images never carried a release point, so a resize must forget
         // the old buffers' points; their next use starts with no wait.
-        if let Some(es) = self.explicit_sync.as_mut() {
+        if let Some(es) = self.presentation.explicit_sync.as_mut() {
             es.buffer_release = [None, None];
         }
         // Fresh images hold no known frame, so forget what was on screen: the
         // screen diff gates whether the next frame presents at all.
-        self.present_list = Rc::default();
+        self.presentation.present_list = Rc::default();
         Ok(())
     }
 
     /// Destroy the current buffers and their backing GPU images. The server
     /// recycles the wl_buffer ids via `delete_id` into our free list.
     pub(super) fn destroy_buffers(&mut self) {
-        let buffers = self.buffers;
+        let buffers = self.presentation.buffers;
         for b in buffers {
             if b != 0 {
                 self.conn.request(b, wl_buffer::DESTROY, &[]);
             }
         }
-        if let Some(gpu) = &self.gpu {
+        if let Some(gpu) = &self.presentation.backend {
             // Nothing may be in flight while images are destroyed; resize is
             // rare enough that a full drain is the simple correct answer.
             gpu.wait_idle();
-            for img in self.gpu_images.drain(..) {
+            for img in self.presentation.images.drain(..) {
                 gpu.destroy_image(img);
             }
         }
-        self.buffers = [0, 0];
-        self.busy = [false, false];
+        self.presentation.buffers = [0, 0];
+        self.presentation.busy = [false, false];
     }
 
     /// Record a new surface size `(w, h)`. The buffers are NOT reallocated here:
@@ -289,11 +345,11 @@ impl State {
         // Deferring this from every configure to the first frame after them
         // collapses an interactive resize's dmabuf churn to one reallocation per
         // painted frame (frame-callback paced), instead of one per configure.
-        if self.buffer_size != (self.width, self.height) {
+        if self.presentation.buffer_size != (self.width, self.height) {
             self.destroy_buffers();
             self.create_buffers()?;
         }
-        let Some(idx) = (0..2).find(|&i| !self.busy[i]) else {
+        let Some(idx) = (0..2).find(|&i| !self.presentation.busy[i]) else {
             return Ok(false);
         };
         let started = self.stats.then(Instant::now);
@@ -303,7 +359,7 @@ impl State {
 
         // Nothing changed since the on-screen frame: nothing to present (the
         // common idle case).
-        let screen_dmg = display::damage(&self.present_list, &new_list, sw, sh);
+        let screen_dmg = display::damage(&self.presentation.present_list, &new_list, sw, sh);
         // Acknowledge the latest configure paired with this commit, so the buffer
         // the compositor sees is always the one sized to the configure it just
         // acked; that is what keeps an anchored (left/top) resize edge from
@@ -330,10 +386,10 @@ impl State {
         // whichever pane it belongs to.
         let images = [&self.editors[0].images, &self.editors[1].images];
         let render_done = {
-            let Some(gpu) = self.gpu.as_mut() else {
+            let Some(gpu) = self.presentation.backend.as_mut() else {
                 return Err(Error::msg("gpu frame without a gpu backend"));
             };
-            let Some(img) = self.gpu_images.get_mut(idx) else {
+            let Some(img) = self.presentation.images.get_mut(idx) else {
                 return Err(Error::msg("gpu frame without gpu buffers"));
             };
             let known = |key: &gpu::ImageKey| gpu.has_image(key);
@@ -341,10 +397,10 @@ impl State {
                 &self.fonts,
                 &images,
                 &new_list,
-                &mut self.gpu_glyphs,
+                &mut self.presentation.glyphs,
                 &known,
             );
-            match self.explicit_sync.as_ref() {
+            match self.presentation.explicit_sync.as_ref() {
                 Some(es) => {
                     // Wait on the compositor's release of this buffer's previous
                     // frame; nothing to wait on the first time the slot is used.
@@ -365,9 +421,9 @@ impl State {
                 }
             }
         };
-        self.present_list = new_list;
+        self.presentation.present_list = new_list;
 
-        let buffer = self.buffers[idx];
+        let buffer = self.presentation.buffers[idx];
         self.conn.request(
             self.surface,
             wl_surface::ATTACH,
@@ -377,7 +433,7 @@ impl State {
         // point and claim a release point, so the compositor waits before
         // reading and signals when done (the buffer's next reuse waits on it).
         // With no exportable fence the frame was CPU-waited: set no points.
-        match (render_done, self.explicit_sync.as_mut()) {
+        match (render_done, self.presentation.explicit_sync.as_mut()) {
             (Some(fence), Some(es)) => {
                 es.point += 1;
                 let p = es.point;
@@ -402,11 +458,11 @@ impl State {
                     wp_linux_drm_syncobj_surface_v1::SET_RELEASE_POINT,
                     &[Arg::Object(release_tl), Arg::Uint(hi), Arg::Uint(lo)],
                 );
-                self.explicit_fence_frames += 1;
+                self.presentation.explicit_fence_frames += 1;
             }
             (None, Some(es)) => {
                 es.buffer_release[idx] = None;
-                self.explicit_cpu_wait_frames += 1;
+                self.presentation.explicit_cpu_wait_frames += 1;
             }
             _ => {}
         }
@@ -425,25 +481,27 @@ impl State {
             .request(self.surface, wl_surface::FRAME, &[Arg::NewId(callback)]);
         self.frame_callback = callback;
         self.conn.request(self.surface, wl_surface::COMMIT, &[]);
-        self.busy[idx] = true;
+        self.presentation.busy[idx] = true;
 
         if let Some(started) = started {
             let cache = self.fonts.cache_stats();
             let gap = self
+                .presentation
                 .last_present
                 .map(|t| started.duration_since(t).as_secs_f64() * 1000.0)
                 .unwrap_or(0.0);
-            let sync = if self.explicit_sync.is_some() {
+            let sync = if self.presentation.explicit_sync.is_some() {
                 format!(
                     "explicit-sync {} fence/{} cpu-wait",
-                    self.explicit_fence_frames, self.explicit_cpu_wait_frames
+                    self.presentation.explicit_fence_frames,
+                    self.presentation.explicit_cpu_wait_frames
                 )
             } else {
                 "implicit-sync bridge".to_string()
             };
             eprintln!(
                 "[stats] gpu frame {} {:.2}ms build+submit, {:.1}ms since last | glyphs hit {} miss {} ({:.1}% of {}) | {}",
-                self.frame_count,
+                self.presentation.frame_count,
                 started.elapsed().as_secs_f64() * 1000.0,
                 gap,
                 cache.hits,
@@ -452,16 +510,16 @@ impl State {
                 cache.lookups(),
                 sync,
             );
-            self.last_present = Some(started);
+            self.presentation.last_present = Some(started);
         }
-        self.frame_count += 1;
+        self.presentation.frame_count += 1;
         Ok(true)
     }
 
     /// Ask the dmabuf global for its default feedback. The events accumulate in
     /// `dmabuf_fb` as they arrive; nothing waits on them.
     pub(super) fn request_dmabuf_feedback(&mut self) {
-        let Some(dmabuf) = self.dmabuf else {
+        let Some(dmabuf) = self.presentation.dmabuf else {
             return;
         };
         let id = self.alloc_id();
@@ -470,7 +528,7 @@ impl State {
             zwp_linux_dmabuf_v1::GET_DEFAULT_FEEDBACK,
             &[Arg::NewId(id)],
         );
-        self.dmabuf_feedback = id;
+        self.presentation.feedback_id = id;
     }
 
     /// One event of a feedback burst; `dmabuf_fb` accumulates and commits.
@@ -482,26 +540,28 @@ impl State {
                     Error::msg("dmabuf feedback format_table arrived without its fd")
                 })?;
                 if size == 0 {
-                    self.dmabuf_fb.set_table(&[]);
+                    self.presentation.feedback.set_table(&[]);
                     return Ok(());
                 }
                 let bytes = ffi::read_mapped(fd.as_raw_fd(), size)?;
-                self.dmabuf_fb.set_table(&bytes);
+                self.presentation.feedback.set_table(&bytes);
             }
             zwp_linux_dmabuf_feedback_v1::EV_MAIN_DEVICE => {
-                self.dmabuf_fb.main_device(r.array()?)?;
+                self.presentation.feedback.main_device(r.array()?)?;
             }
             zwp_linux_dmabuf_feedback_v1::EV_TRANCHE_TARGET_DEVICE => {
-                self.dmabuf_fb.tranche_device(r.array()?)?;
+                self.presentation.feedback.tranche_device(r.array()?)?;
             }
             zwp_linux_dmabuf_feedback_v1::EV_TRANCHE_FORMATS => {
-                self.dmabuf_fb.tranche_formats(r.array()?);
+                self.presentation.feedback.tranche_formats(r.array()?);
             }
             zwp_linux_dmabuf_feedback_v1::EV_TRANCHE_FLAGS => {
-                self.dmabuf_fb.tranche_flags(r.u32()?);
+                self.presentation.feedback.tranche_flags(r.u32()?);
             }
-            zwp_linux_dmabuf_feedback_v1::EV_TRANCHE_DONE => self.dmabuf_fb.tranche_done(),
-            zwp_linux_dmabuf_feedback_v1::EV_DONE => self.dmabuf_fb.done(),
+            zwp_linux_dmabuf_feedback_v1::EV_TRANCHE_DONE => {
+                self.presentation.feedback.tranche_done()
+            }
+            zwp_linux_dmabuf_feedback_v1::EV_DONE => self.presentation.feedback.done(),
             _ => {}
         }
         Ok(())
@@ -517,7 +577,7 @@ impl State {
             &[Arg::NewId(self.registry)],
         );
         self.roundtrip()?;
-        if self.dmabuf.is_none() {
+        if self.presentation.dmabuf.is_none() {
             println!(
                 "gpu-probe: compositor lacks zwp_linux_dmabuf_v1 v{}+; \
                  the editor cannot run here (it requires the GPU path)",
@@ -527,9 +587,9 @@ impl State {
         }
         println!(
             "gpu-probe: zwp_linux_dmabuf_v1 bound at v{}",
-            self.dmabuf_version
+            self.presentation.dmabuf_version
         );
-        match self.drm_syncobj_manager {
+        match self.presentation.syncobj_manager {
             Some(_) => println!(
                 "gpu-probe: {} present: explicit sync available",
                 protocol::IFACE_DRM_SYNCOBJ
@@ -543,14 +603,14 @@ impl State {
         // it, so one roundtrip delivers the whole feedback burst.
         self.request_dmabuf_feedback();
         self.roundtrip()?;
-        let Some(fb) = self.dmabuf_fb.ready() else {
+        let Some(fb) = self.presentation.feedback.ready() else {
             return Err(Error::msg(
                 "compositor never committed dmabuf feedback (no done event)",
             ));
         };
         println!(
             "gpu-probe: format table: {} format+modifier pairs",
-            self.dmabuf_fb.table_len()
+            self.presentation.feedback.table_len()
         );
         println!(
             "gpu-probe: main device: {}:{}",

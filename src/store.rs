@@ -108,6 +108,13 @@ impl Session {
     /// truncated file can never yield a zero-width sidebar or an off-screen
     /// split. Applied after every decode.
     fn sanitized(mut self) -> Self {
+        // A window smaller than this is unusable, and one past 16384 (the app's
+        // surface-dimension cap) risks overflowing the buffer-size arithmetic, so
+        // clamp a hand-edited or truncated size into a sane range.
+        self.window = (
+            self.window.0.clamp(400, 16384),
+            self.window.1.clamp(300, 16384),
+        );
         self.tree_width = self.tree_width.clamp(120, 800);
         self.split_ratio = if self.split_ratio.is_finite() {
             self.split_ratio.clamp(0.1, 0.9)
@@ -458,10 +465,22 @@ mod tests {
         let s = Session {
             tree_width: 5,
             split_ratio: 9.0,
+            window: (10, 999_999),
             ..Session::default()
         }
         .sanitized();
         assert_eq!(s.tree_width, 120);
         assert_eq!(s.split_ratio, 0.9);
+        assert_eq!(s.window, (400, 16384));
+    }
+
+    #[test]
+    fn sanitize_leaves_a_sane_window_alone() {
+        let s = Session {
+            window: (1280, 800),
+            ..Session::default()
+        }
+        .sanitized();
+        assert_eq!(s.window, (1280, 800));
     }
 }

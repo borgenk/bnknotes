@@ -29,14 +29,12 @@ use std::time::{Duration, Instant};
 
 use self::clipboard::{is_text_mime, CLIPBOARD_MIMES};
 use self::input::{DEFAULT_REPEAT_DELAY_MS, DEFAULT_REPEAT_RATE};
-use self::present::ExplicitSync;
+use self::present::GpuPresentation;
 use crate::conn::{Connection, Fill};
 use crate::display::DisplayList;
-use crate::dmabuf;
 use crate::error::{Error, Result};
 use crate::file;
 use crate::freetype::Fonts;
-use crate::gpu;
 use crate::layout::Rect;
 use crate::markdown;
 use crate::paint::{build_display_list, build_find_paint, push_splitter, push_tree, PaintParams};
@@ -49,13 +47,9 @@ use crate::scroll;
 use crate::store;
 use crate::theme::FONT_SIZE;
 use crate::tree;
-use crate::vulkan;
 use crate::wire::{Arg, Message, Reader};
 use crate::xkb::Xkb;
 
-/// Initial window size; the compositor may resize us to whatever it likes.
-const INIT_WIDTH: u32 = 800;
-const INIT_HEIGHT: u32 = 600;
 /// Upper bound on either surface dimension, applied to a compositor-supplied
 /// configure size. Far beyond any real display (8K is 7680 wide), it just keeps a
 /// bogus or hostile size from blowing up the buffer-size arithmetic.
@@ -99,10 +93,6 @@ struct State {
     drag_splitter: Option<usize>,
     /// The toplevel title last sent, so it is only re-set when it changes.
     title: String,
-    /// The modified flag the current `title` reflects, so `refresh_title` can skip
-    /// the format!+compare on the common case (a cursor move leaves it unchanged).
-    /// `None` until the first title is sent.
-    title_modified: Option<bool>,
 
     /// Current surface size in pixels.
     width: u32,
@@ -121,34 +111,9 @@ struct State {
     pointer: u32,
     data_device_manager: Option<u32>,
     data_device: u32,
-    /// The dmabuf global (None when absent or below v4, which the GPU path
-    /// requires), the version it was bound at, the feedback object created from
-    /// it, and the accumulating feedback the GPU backend consumes. They are the
-    /// negotiation half of the GPU path.
-    dmabuf: Option<u32>,
-    dmabuf_version: u32,
-    dmabuf_feedback: u32,
-    dmabuf_fb: dmabuf::FeedbackState,
-    /// The Vulkan backend: the device plus one exportable image per swap slot.
-    /// Always `Some` once `bring_up` succeeds (a missing device hard-exits at
-    /// startup, so the editor never runs without a GPU); it stays an `Option`
-    /// only because it is created mid-bring-up, after the dmabuf feedback the
-    /// device selection needs has been committed.
-    gpu: Option<vulkan::Gpu>,
-    gpu_images: Vec<vulkan::GpuImage>,
-    /// The compositor∩device modifier list images are allocated with,
-    /// computed once at GPU init and reused across resizes.
-    gpu_modifiers: Vec<u64>,
-    /// The GPU path's persistent glyph/emoji atlases (CPU mirrors plus slot
-    /// records); steady-state frames insert nothing and upload nothing.
-    gpu_glyphs: gpu::GlyphCache,
-    /// The explicit-sync manager global (`wp_linux_drm_syncobj_manager_v1`) when
-    /// the compositor offers it; `None` means the GPU path uses the implicit-sync
-    /// bridge.
-    drm_syncobj_manager: Option<u32>,
-    /// Active explicit-sync objects, negotiated once a GPU backend is up and the
-    /// manager is present. `None` keeps the bridge.
-    explicit_sync: Option<ExplicitSync>,
+    /// GPU/dmabuf presentation resources: feedback, backend, swap buffers,
+    /// explicit sync, and per-frame presentation counters.
+    presentation: GpuPresentation,
     /// The cursor-shape manager (if the compositor offers it) and the shape
     /// device we create for our pointer. The shape varies by what is under the
     /// pointer: a hand over an image's button, the plain arrow over a picture, the
@@ -198,21 +163,6 @@ struct State {
     selection_offer: u32,
     selection_text_mime: Option<String>,
 
-    // Double-buffered GPU images: two exportable dmabuf-backed buffers,
-    // ping-ponged so we only render into a buffer the compositor has released.
-    buffers: [u32; 2],
-    busy: [bool; 2],
-    /// The `(width, height)` the current buffers were allocated at. A configure
-    /// only records the new surface size; the buffers are reallocated lazily in
-    /// `render_frame` when this no longer matches, so a burst of configures
-    /// during an interactive resize costs one reallocation per painted frame
-    /// rather than one per configure.
-    buffer_size: (u32, u32),
-    /// The display list last committed to the compositor, i.e. what is on screen.
-    /// The new frame is diffed against this to decide whether to present at all
-    /// and which regions to report as damaged.
-    present_list: Rc<DisplayList>,
-
     // Id allocation: a bump counter plus a free list fed by `delete_id`.
     next_id: u32,
     free_ids: Vec<u32>,
@@ -240,18 +190,6 @@ struct State {
     /// prints its render time and the glyph-cache hit rate to stderr. Plain
     /// instrumentation so an optimization can be measured rather than guessed at.
     stats: bool,
-    /// Count of frames presented, for the stats line.
-    frame_count: u64,
-    /// When the previous frame was presented, for the inter-frame gap in stats.
-    last_present: Option<Instant>,
-    /// Explicit-sync accounting for the stats line: frames that published a real
-    /// render-done fence as the acquire point, versus frames where the driver
-    /// could not export one so the GPU path CPU-waited the frame to completion
-    /// instead. A climbing `cpu_wait` count means explicit sync negotiated but is
-    /// degrading to a synchronous wait (fence export is the usual suspect on some
-    /// drivers); both stay at zero on the implicit-sync bridge.
-    explicit_fence_frames: u64,
-    explicit_cpu_wait_frames: u64,
 }
 
 impl State {
@@ -335,9 +273,8 @@ impl State {
             },
             drag_splitter: None,
             title: String::new(),
-            title_modified: None,
-            width: INIT_WIDTH,
-            height: INIT_HEIGHT,
+            width: session.window.0,
+            height: session.window.1,
             registry: 0,
             compositor: None,
             wm_base: None,
@@ -349,16 +286,7 @@ impl State {
             pointer: 0,
             data_device_manager: None,
             data_device: 0,
-            dmabuf: None,
-            dmabuf_version: 0,
-            dmabuf_feedback: 0,
-            dmabuf_fb: dmabuf::FeedbackState::default(),
-            gpu: None,
-            gpu_images: Vec::new(),
-            gpu_modifiers: Vec::new(),
-            gpu_glyphs: gpu::GlyphCache::new(),
-            drm_syncobj_manager: None,
-            explicit_sync: None,
+            presentation: GpuPresentation::new(),
             cursor_shape_manager: None,
             cursor_shape_device: 0,
             pointer_serial: 0,
@@ -380,10 +308,6 @@ impl State {
             incoming_text_mime: None,
             selection_offer: 0,
             selection_text_mime: None,
-            buffers: [0, 0],
-            busy: [false, false],
-            buffer_size: (0, 0),
-            present_list: Rc::default(),
             next_id: 2, // 1 is wl_display
             free_ids: Vec::new(),
             pending_sync: None,
@@ -394,10 +318,6 @@ impl State {
             dirty: true,
             frame_callback: 0,
             stats: std::env::var_os("BNKNOTES_STATS").is_some(),
-            frame_count: 0,
-            last_present: None,
-            explicit_fence_frames: 0,
-            explicit_cpu_wait_frames: 0,
         })
     }
 
@@ -538,7 +458,7 @@ impl State {
         );
         // Name the GPU device, so "which GPU?" never needs a probe. The backend
         // is mandatory (bring_up exits above if it is missing), so it is present.
-        if let Some(gpu) = &self.gpu {
+        if let Some(gpu) = &self.presentation.backend {
             eprintln!("bnknotes: renderer: gpu ({})", gpu.name());
         }
         self.run_until(|s| s.closed)?;
@@ -798,15 +718,15 @@ impl State {
             return Ok(());
         }
 
-        if self.dmabuf_feedback != 0 && msg.object == self.dmabuf_feedback {
+        if self.presentation.feedback_id != 0 && msg.object == self.presentation.feedback_id {
             return self.on_dmabuf_feedback(msg.opcode, &mut r);
         }
 
         if msg.opcode == wl_buffer::EV_RELEASE {
-            if msg.object == self.buffers[0] {
-                self.busy[0] = false;
-            } else if msg.object == self.buffers[1] {
-                self.busy[1] = false;
+            if msg.object == self.presentation.buffers[0] {
+                self.presentation.busy[0] = false;
+            } else if msg.object == self.presentation.buffers[1] {
+                self.presentation.busy[1] = false;
             }
         }
         Ok(())
@@ -851,14 +771,14 @@ impl State {
             // is left unbound and the GPU path simply stays unavailable.
             protocol::IFACE_DMABUF if version >= protocol::VERSION_DMABUF => {
                 let id = self.bind_capped(name, interface, version, protocol::VERSION_DMABUF);
-                self.dmabuf = Some(id);
-                self.dmabuf_version = version.min(protocol::VERSION_DMABUF);
+                self.presentation.dmabuf = Some(id);
+                self.presentation.dmabuf_version = version.min(protocol::VERSION_DMABUF);
             }
             // Explicit sync: bound only to be wired up
             // once a GPU backend exists; absent it, the bridge path is used.
             protocol::IFACE_DRM_SYNCOBJ => {
                 let id = self.bind_capped(name, interface, version, protocol::VERSION_DRM_SYNCOBJ);
-                self.drm_syncobj_manager = Some(id);
+                self.presentation.syncobj_manager = Some(id);
             }
             _ => {}
         }
@@ -904,14 +824,10 @@ impl State {
 
     /// Send the toplevel title only if it changed, so the modified indicator and
     /// filename stay current without re-setting an identical string each frame.
+    /// The title tracks the active pane, its file, and its modified flag, so every
+    /// focus change routes through `focus_pane` to call this; the `desired`
+    /// compare then dedupes the protocol request on the unchanged common path.
     fn refresh_title(&mut self) {
-        // The title depends only on the modified flag and the (session-fixed)
-        // filename, so a cursor move that left the modified state untouched cannot
-        // change it: skip the format!+compare on that common path.
-        let modified = self.editors[self.active_editor()].text.is_modified();
-        if self.title_modified == Some(modified) {
-            return;
-        }
         let desired = self.window_title();
         if desired != self.title {
             self.conn.request(
@@ -921,7 +837,6 @@ impl State {
             );
             self.title = desired;
         }
-        self.title_modified = Some(modified);
     }
 
     /// How long to block for input: the soonest of the next key-repeat, the next

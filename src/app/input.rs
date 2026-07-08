@@ -123,7 +123,7 @@ impl State {
             KeyAction::ToggleTree => {
                 self.panes.tree_visible = !self.panes.tree_visible;
                 if !self.panes.tree_visible && self.focus == Focus::Tree {
-                    self.focus = Focus::Editor(self.last_editor);
+                    self.focus_pane(self.last_editor);
                 }
                 self.dirty = true;
                 self.save_session();
@@ -132,10 +132,8 @@ impl State {
             KeyAction::ToggleSecondPane => {
                 self.panes.second_open = !self.panes.second_open;
                 if !self.panes.second_open && self.focus == Focus::Editor(1) {
-                    self.focus = Focus::Editor(0);
-                    self.last_editor = 0;
+                    self.focus_pane(0);
                 }
-                self.refresh_title();
                 self.dirty = true;
                 self.save_session();
                 return Ok(());
@@ -656,9 +654,7 @@ impl State {
             Ok(pane) => {
                 let i = self.last_editor;
                 self.editors[i] = pane;
-                self.focus = Focus::Editor(i);
-                self.refresh_title();
-                self.dirty = true;
+                self.focus_pane(i);
                 self.save_session();
             }
             Err(e) => eprintln!("bnknotes: cannot open {}: {e}", path.display()),
@@ -785,8 +781,7 @@ impl State {
             Hit::Splitter(s) => self.drag_splitter = Some(s),
             Hit::Tree(rect) => self.tree_press(rect, py),
             Hit::Editor(i, rect) => {
-                self.focus = Focus::Editor(i);
-                self.last_editor = i;
+                self.focus_pane(i);
                 self.editor_press(i, rect, px, py);
             }
             Hit::None => {}
@@ -892,6 +887,8 @@ impl State {
                 let c = self.editors[i].text.cursor();
                 let reveal = self.editors[i].text.selection().unwrap_or((c, c));
                 self.editors[i].frozen_reveal = Some(reveal);
+                // Show the moved caret on the next frame, not the next blink wake.
+                self.dirty = true;
             }
             2 => {
                 let offset = self.editors[i].pointer_offset(&self.fonts, rect, px, py);

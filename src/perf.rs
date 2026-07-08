@@ -187,11 +187,7 @@ fn measure() -> Result<Vec<Sample>> {
     // that replaces a full `layout_build`. It re-measures only the edited line and
     // reuses the rest, so it stays flat as documents grow. (The clone per iteration
     // is measurement scaffolding, since `update` mutates in place.)
-    let edited = {
-        let mut t = text.clone();
-        t.insert(t.len() / 2, 'x');
-        Rope::from_str(&t)
-    };
+    let edited = edited_middle(&text);
     out.push(sample("index_update", 500, || {
         let mut idx = index.clone();
         idx.update(&fonts, &edited, &rope, wrap, FONT_SIZE, &images);
@@ -547,15 +543,7 @@ pub fn run_lab(args: &[String]) -> Result<()> {
         // and a one-character edit (at a char boundary near the middle) set them up.
         let index = LineIndex::build(&fonts, &rope, wrap, FONT_SIZE, &images);
         let band = 30.min(index.len());
-        let edited = {
-            let mut t = text.clone();
-            let mut at = t.len() / 2;
-            while at < t.len() && !t.is_char_boundary(at) {
-                at += 1;
-            }
-            t.insert(at, 'x');
-            Rope::from_str(&t)
-        };
+        let edited = edited_middle(&text);
 
         let cpu_before = sys::cpu_time();
 
@@ -874,6 +862,20 @@ fn human_time(ns: u64) -> String {
     } else {
         format!("{:.2} s", ns as f64 / 1_000_000_000.0)
     }
+}
+
+/// Clone `text` and insert one character near its middle, returning the edited
+/// rope. Models the single-keystroke edit the incremental-index benches measure;
+/// the insertion point is advanced to the next char boundary so a multibyte
+/// corpus cannot panic `String::insert`.
+fn edited_middle(text: &str) -> Rope {
+    let mut t = text.to_string();
+    let mut at = t.len() / 2;
+    while at < t.len() && !t.is_char_boundary(at) {
+        at += 1;
+    }
+    t.insert(at, 'x');
+    Rope::from_str(&t)
 }
 
 /// A few hundred lines of representative markdown: headings, wrapping prose with

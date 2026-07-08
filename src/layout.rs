@@ -311,6 +311,107 @@ pub struct Layout {
     text_height: i32,
 }
 
+/// Shared layout/index inputs for one width and reveal state.
+#[derive(Clone, Copy)]
+struct LayoutCtx<'a> {
+    fonts: &'a Fonts,
+    rope: &'a Rope,
+    wrap_width: i32,
+    body_size: u32,
+    active: (usize, usize),
+    images: &'a ImageStore,
+    image_ui: ImageUi,
+}
+
+impl<'a> LayoutCtx<'a> {
+    fn new(
+        fonts: &'a Fonts,
+        rope: &'a Rope,
+        wrap_width: i32,
+        body_size: u32,
+        active: (usize, usize),
+        images: &'a ImageStore,
+        image_ui: ImageUi,
+    ) -> Self {
+        Self {
+            fonts,
+            rope,
+            wrap_width,
+            body_size,
+            active,
+            images,
+            image_ui,
+        }
+    }
+
+    fn with_active(self, active: (usize, usize)) -> Self {
+        Self { active, ..self }
+    }
+
+    /// A ctx for base-geometry measurement (the [`LineIndex`] paths): reveal forced
+    /// off ([`NO_REVEAL`], no image UI), so the geometry it feeds stays a pure
+    /// function of `(version, width)` by construction rather than by each caller
+    /// remembering to pass the no-reveal inputs.
+    fn for_index(
+        fonts: &'a Fonts,
+        rope: &'a Rope,
+        wrap_width: i32,
+        body_size: u32,
+        images: &'a ImageStore,
+    ) -> Self {
+        Self::new(
+            fonts,
+            rope,
+            wrap_width,
+            body_size,
+            NO_REVEAL,
+            images,
+            ImageUi::default(),
+        )
+    }
+}
+
+#[derive(Clone, Copy)]
+struct LogicalLine {
+    start: usize,
+    end: usize,
+    has_newline: bool,
+}
+
+impl LogicalLine {
+    fn at(rope: &Rope, line: usize, line_count: usize) -> Self {
+        let start = rope.line_to_byte(line);
+        let has_newline = line + 1 < line_count;
+        let end = if has_newline {
+            rope.line_to_byte(line + 1) - 1
+        } else {
+            rope.line_to_byte(line + 1)
+        };
+        Self {
+            start,
+            end,
+            has_newline,
+        }
+    }
+}
+
+/// Cross-line parser state for constructs that carry over logical lines.
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+struct LineCarry {
+    fence: Option<usize>,
+    list_depth: Option<usize>,
+}
+
+impl LineCarry {
+    fn new(fence: Option<usize>, list_depth: Option<usize>) -> Self {
+        Self { fence, list_depth }
+    }
+
+    fn pair(self) -> (Option<usize>, Option<usize>) {
+        (self.fence, self.list_depth)
+    }
+}
+
 impl Layout {
     /// Lay `text` out within `wrap_width` pixels (<= 0 disables wrapping), with
     /// the text block starting at `top` and inset by `left`. Each logical line
@@ -369,10 +470,8 @@ impl Layout {
         image_ui: ImageUi,
     ) -> Self {
         let n = rope.len_lines();
-        Self::build_range(
-            fonts, rope, left, top, wrap_width, body_size, active, images, image_ui, 0, n, None,
-            None,
-        )
+        let ctx = LayoutCtx::new(fonts, rope, wrap_width, body_size, active, images, image_ui);
+        Self::build_range(&ctx, left, top, 0, n, LineCarry::default())
     }
 
     /// Lay out only the logical lines `[band_start, band_end)`, seeding the running
@@ -403,20 +502,14 @@ impl Layout {
         let start = band_start.min(n);
         let end = band_end.min(n).max(start);
         let (fence, list_depth) = index.entry_state(start);
+        let ctx = LayoutCtx::new(fonts, rope, wrap_width, body_size, active, images, image_ui);
         Self::build_range(
-            fonts,
-            rope,
+            &ctx,
             left,
             box_top_seed,
-            wrap_width,
-            body_size,
-            active,
-            images,
-            image_ui,
             start,
             end,
-            fence,
-            list_depth,
+            LineCarry::new(fence, list_depth),
         )
     }
 
@@ -425,54 +518,21 @@ impl Layout {
     /// entering `start`. The one loop behind both the full build
     /// ([`Self::build_with_images`], `0..n` from ground state) and the windowed
     /// build ([`Self::build_window`], a band seeded from the index).
-    #[allow(clippy::too_many_arguments)]
     fn build_range(
-        fonts: &Fonts,
-        rope: &Rope,
+        ctx: &LayoutCtx,
         left: i32,
         box_top_seed: i32,
-        wrap_width: i32,
-        body_size: u32,
-        active: (usize, usize),
-        images: &ImageStore,
-        image_ui: ImageUi,
         start: usize,
         end: usize,
-        mut fence: Option<usize>,
-        mut list_depth: Option<usize>,
+        mut carry: LineCarry,
     ) -> Self {
-        let n = rope.len_lines();
+        let n = ctx.rope.len_lines();
         let mut box_top = box_top_seed;
         let mut pool = LayoutScratch::default();
         let mut lines = Vec::new();
         for i in start..end {
-            let ls = rope.line_to_byte(i);
-            // Every logical line but the last ends in a '\n'; its content excludes
-            // that byte. The rope materializes just this line inside `lay_line`.
-            let has_newline = i + 1 < n;
-            let le = if has_newline {
-                rope.line_to_byte(i + 1) - 1
-            } else {
-                rope.line_to_byte(i + 1)
-            };
-            box_top += lay_line(
-                fonts,
-                rope,
-                ls,
-                le,
-                has_newline,
-                wrap_width,
-                body_size,
-                active,
-                images,
-                image_ui,
-                box_top,
-                &mut fence,
-                &mut list_depth,
-                &mut pool,
-                false,
-                &mut lines,
-            );
+            let line = LogicalLine::at(ctx.rope, i, n);
+            box_top += lay_line(ctx, line, box_top, &mut carry, &mut pool, false, &mut lines);
         }
         Self {
             lines,
@@ -899,21 +959,11 @@ struct LayoutScratch {
 /// `pool` supplies the per-line scratch buffers (`clusters`, `segments`), owned by
 /// the caller's build loop and reused across every line so laying out a line
 /// clears and refills them instead of allocating fresh Vecs.
-#[allow(clippy::too_many_arguments)]
 fn lay_line(
-    fonts: &Fonts,
-    rope: &Rope,
-    ls: usize,
-    le: usize,
-    has_newline: bool,
-    wrap_width: i32,
-    body_size: u32,
-    active: (usize, usize),
-    images: &ImageStore,
-    image_ui: ImageUi,
+    ctx: &LayoutCtx,
+    logical: LogicalLine,
     box_top: i32,
-    fence: &mut Option<usize>,
-    list_depth: &mut Option<usize>,
+    carry: &mut LineCarry,
     pool: &mut LayoutScratch,
     // When true the caller only wants each line's height and image flag (the
     // `LineIndex` build), so the styled runs are skipped: `clip_runs` allocates a
@@ -921,13 +971,14 @@ fn lay_line(
     measure_only: bool,
     out: &mut Vec<VisualLine>,
 ) -> i32 {
+    let (ls, le, has_newline) = (logical.start, logical.end, logical.has_newline);
     // Running box top within this logical line; the return value is how far it
     // advanced past the incoming `box_top`.
     let mut y = box_top;
-    let line = rope.slice(ls..le).as_cow();
+    let line = ctx.rope.slice(ls..le).as_cow();
     // Whether the cursor/selection touches this logical line: the same reveal test
     // headings use, applied to fence lines too.
-    let on_line = active.0 <= le && active.1 >= ls;
+    let on_line = ctx.active.0 <= le && ctx.active.1 >= ls;
     // A standalone `![alt](path)` line whose image has decoded renders as a picture
     // box. The picture always shows; when its source is revealed (cursor on the
     // line, or the corner button pinned it open) the editable `![alt](path)` is laid
@@ -939,12 +990,12 @@ fn lay_line(
     // text (the reveal case). The no-reveal case pushes its widget and returns,
     // never reaching the text path.
     let mut pending_image: Option<ImageBox> = None;
-    if fence.is_none() {
+    if carry.fence.is_none() {
         if let Some(link) = markdown::standalone_image(&line) {
-            if let Some((iw, ih)) = images.dimensions(&line[link.path.0..link.path.1]) {
-                *list_depth = None;
-                let column = if wrap_width > 0 {
-                    wrap_width
+            if let Some((iw, ih)) = ctx.images.dimensions(&line[link.path.0..link.path.1]) {
+                carry.list_depth = None;
+                let column = if ctx.wrap_width > 0 {
+                    ctx.wrap_width
                 } else {
                     iw as i32
                 };
@@ -954,9 +1005,9 @@ fn lay_line(
                     path_end: ls + link.path.1,
                     width,
                     height,
-                    selected: image_ui.selected == Some(ls),
+                    selected: ctx.image_ui.selected == Some(ls),
                 };
-                if on_line || image_ui.raw == Some(ls) {
+                if on_line || ctx.image_ui.raw == Some(ls) {
                     // Source revealed: emit it (fall through), then the widget.
                     pending_image = Some(image);
                 } else {
@@ -964,9 +1015,9 @@ fn lay_line(
                     out.push(VisualLine {
                         start: ls,
                         end: le,
-                        baseline: y + fonts.metrics(body_size).ascent,
+                        baseline: y + ctx.fonts.metrics(ctx.body_size).ascent,
                         hard: has_newline,
-                        size: body_size,
+                        size: ctx.body_size,
                         runs: 0..0,
                         indent: 0,
                         gutter: Gutter::None,
@@ -987,30 +1038,30 @@ fn lay_line(
     // the cursor's line, like a heading's `#`. A code line carries `Body` as an
     // inert style (its gutter is unused).
     let (style, size, block_marker, block_persists, revealed, code_block) =
-        if let Some(open) = *fence {
-            *list_depth = None;
+        if let Some(open) = carry.fence {
+            carry.list_depth = None;
             let delimiter = markdown::closes_code_fence(&line, open);
             if delimiter {
-                *fence = None;
+                carry.fence = None;
             }
             code_block_spans_into(&line, delimiter, &mut pool.spans);
             // Only a fence delimiter line has backticks to hide.
             let revealed = !delimiter || on_line;
             (
                 markdown::LineStyle::Body,
-                body_size,
+                ctx.body_size,
                 0,
                 false,
                 revealed,
                 true,
             )
         } else if let Some(open) = markdown::opens_code_fence(&line) {
-            *list_depth = None;
-            *fence = Some(open);
+            carry.list_depth = None;
+            carry.fence = Some(open);
             code_block_spans_into(&line, true, &mut pool.spans);
             (
                 markdown::LineStyle::Body,
-                body_size,
+                ctx.body_size,
                 0,
                 false,
                 on_line,
@@ -1019,11 +1070,11 @@ fn lay_line(
         } else {
             // Resolve list nesting across lines: an item deeper than one past the
             // previous item has no parent and renders as body.
-            let (style, marker) = resolve_list(&line, list_depth);
+            let (style, marker) = resolve_list(&line, &mut carry.list_depth);
             line_spans_into(&line, marker, &mut pool.inline, &mut pool.spans);
             (
                 style,
-                markdown::font_size(style, body_size),
+                markdown::font_size(style, ctx.body_size),
                 marker,
                 markdown::block_marker_persists(style),
                 on_line,
@@ -1033,7 +1084,7 @@ fn lay_line(
     // A revealed image's source always shows verbatim (its markers, if any, are not
     // hidden), so the text above the picture reads as written.
     let revealed = revealed || pending_image.is_some();
-    let metrics = fonts.metrics(size);
+    let metrics = ctx.fonts.metrics(size);
     // Heading lines color their text by level (fence/code lines carry the inert
     // `Body` style, so they are never headings here).
     let heading = match style {
@@ -1053,8 +1104,11 @@ fn lay_line(
     // is the marker's width, measured on the source marker in the regular face at
     // this line's size, so it matches the width the marker run itself advances.
     let block_indent = if block_persists && block_marker > 0 {
-        shape::text_advance(fonts.face(size, FontStyle::Regular), &line[..block_marker]).round()
-            as i32
+        shape::text_advance(
+            ctx.fonts.face(size, FontStyle::Regular),
+            &line[..block_marker],
+        )
+        .round() as i32
     } else {
         0
     };
@@ -1074,17 +1128,17 @@ fn lay_line(
     } else {
         (0, 0)
     };
-    let line_wrap = if wrap_width > 0 {
-        (wrap_width - wrap_reduce).max(1)
+    let line_wrap = if ctx.wrap_width > 0 {
+        (ctx.wrap_width - wrap_reduce).max(1)
     } else {
-        wrap_width
+        ctx.wrap_width
     };
     // `wrap_segments` returns ranges relative to the line; offset them back to
     // absolute buffer positions. It measures the source text, so clipping spans to
     // each segment never disagrees with the breaks, and reveal state (which only
     // hides markers) never reflows the document.
     wrap_segments(
-        fonts,
+        ctx.fonts,
         size,
         &line,
         &pool.spans,
@@ -1158,7 +1212,7 @@ fn lay_line(
             // this widget carries neither.
             baseline: y + metrics.ascent,
             hard: false,
-            size: body_size,
+            size: ctx.body_size,
             runs: 0..0,
             indent: 0,
             gutter: Gutter::None,
@@ -1187,8 +1241,7 @@ const PARALLEL_MIN_LINES: usize = 20_000;
 /// state it ended in, which the stitch pass checks against the true carry.
 struct ChunkOut {
     recs: Vec<LineRec>,
-    end_fence: Option<usize>,
-    end_depth: Option<usize>,
+    end: LineCarry,
 }
 
 /// Measure logical lines `[lo, hi)` of `rope` into `LineRec`s, starting from the
@@ -1196,42 +1249,27 @@ struct ChunkOut {
 /// entry state left at the end. The single measure loop behind the sequential
 /// [`LineIndex::build`], the parallel workers, and the stitch re-measure; a worker
 /// runs it on its own `fonts`.
-#[allow(clippy::too_many_arguments)]
 fn measure_chunk(
-    fonts: &Fonts,
-    rope: &Rope,
+    ctx: &LayoutCtx,
     lo: usize,
     hi: usize,
     n: usize,
-    wrap_width: i32,
-    body_size: u32,
-    images: &ImageStore,
-    mut fence: Option<usize>,
-    mut list_depth: Option<usize>,
+    mut carry: LineCarry,
 ) -> ChunkOut {
     let mut scratch: Vec<VisualLine> = Vec::new();
     let mut pool = LayoutScratch::default();
     let mut recs = Vec::with_capacity(hi - lo);
     for i in lo..hi {
         recs.push(LineIndex::measure_line(
-            fonts,
-            rope,
+            ctx,
             i,
             n,
-            wrap_width,
-            body_size,
-            images,
-            &mut fence,
-            &mut list_depth,
+            &mut carry,
             &mut pool,
             &mut scratch,
         ));
     }
-    ChunkOut {
-        recs,
-        end_fence: fence,
-        end_depth: list_depth,
-    }
+    ChunkOut { recs, end: carry }
 }
 
 /// One logical line's contribution to the document's vertical geometry.
@@ -1303,70 +1341,31 @@ impl LineIndex {
     /// Measure one logical line `i`'s record, advancing the carry state
     /// (`fence`/`list_depth`) through it. Shared by [`Self::build`] and
     /// [`Self::update`] so the incremental path can never disagree with a rebuild.
-    #[allow(clippy::too_many_arguments)]
     fn measure_line(
-        fonts: &Fonts,
-        rope: &Rope,
+        ctx: &LayoutCtx,
         i: usize,
         n: usize,
-        wrap_width: i32,
-        body_size: u32,
-        images: &ImageStore,
-        fence: &mut Option<usize>,
-        list_depth: &mut Option<usize>,
+        carry: &mut LineCarry,
         pool: &mut LayoutScratch,
         scratch: &mut Vec<VisualLine>,
     ) -> LineRec {
-        let ls = rope.line_to_byte(i);
-        let has_newline = i + 1 < n;
-        let le = if has_newline {
-            rope.line_to_byte(i + 1) - 1
-        } else {
-            rope.line_to_byte(i + 1)
-        };
-        let fence_in = *fence;
-        let depth_in = *list_depth;
+        let logical = LogicalLine::at(ctx.rope, i, n);
+        let carry_in = *carry;
         scratch.clear();
-        let height = lay_line(
-            fonts,
-            rope,
-            ls,
-            le,
-            has_newline,
-            wrap_width,
-            body_size,
-            NO_REVEAL,
-            images,
-            ImageUi::default(),
-            0,
-            fence,
-            list_depth,
-            pool,
-            true,
-            scratch,
-        );
+        let height = lay_line(ctx, logical, 0, carry, pool, true, scratch);
         // Only a decoded standalone image changes height when revealed; measure
         // that once here. Re-running from the pre-line carry reproduces the same
         // state mutation (an image forces list_depth=None, fence must be None), so
-        // the throwaway `f2`/`d2` are discarded.
+        // the throwaway `revealed_carry` is discarded.
         let reveal_extra = if scratch.iter().any(|v| v.image.is_some()) {
-            let mut f2 = fence_in;
-            let mut d2 = depth_in;
+            let mut revealed_carry = carry_in;
+            let revealed_ctx = ctx.with_active((logical.start, logical.end));
             scratch.clear();
             let revealed = lay_line(
-                fonts,
-                rope,
-                ls,
-                le,
-                has_newline,
-                wrap_width,
-                body_size,
-                (ls, le),
-                images,
-                ImageUi::default(),
+                &revealed_ctx,
+                logical,
                 0,
-                &mut f2,
-                &mut d2,
+                &mut revealed_carry,
                 pool,
                 true,
                 scratch,
@@ -1378,8 +1377,8 @@ impl LineIndex {
         LineRec {
             height,
             reveal_extra,
-            fence_in: fence_in.map_or(0, |c| c as u16),
-            depth_in: depth_in.map_or(-1, |d| d as i16),
+            fence_in: carry_in.fence.map_or(0, |c| c as u16),
+            depth_in: carry_in.list_depth.map_or(-1, |d| d as i16),
         }
     }
 
@@ -1406,9 +1405,8 @@ impl LineIndex {
         images: &ImageStore,
     ) -> Self {
         let n = rope.len_lines();
-        let out = measure_chunk(
-            fonts, rope, 0, n, n, wrap_width, body_size, images, None, None,
-        );
+        let ctx = LayoutCtx::for_index(fonts, rope, wrap_width, body_size, images);
+        let out = measure_chunk(&ctx, 0, n, n, LineCarry::default());
         Self::from_recs(out.recs)
     }
 
@@ -1440,26 +1438,30 @@ impl LineIndex {
         if threads == 1 || n < PARALLEL_MIN_LINES {
             return Self::build(fonts, rope, wrap_width, body_size, images);
         }
-        Self::build_chunked(fonts, rope, wrap_width, body_size, images, threads)
+        let ctx = LayoutCtx::for_index(fonts, rope, wrap_width, body_size, images);
+        Self::build_chunked(&ctx, threads)
     }
 
     /// The chunked build behind [`build_parallel`](Self::build_parallel), without
     /// the small-document threshold, so a test can force many small chunks to
     /// exercise the stitch and fence/list fix-up paths.
-    fn build_chunked(
-        fonts: &Fonts,
-        rope: &Rope,
-        wrap_width: i32,
-        body_size: u32,
-        images: &ImageStore,
-        threads: usize,
-    ) -> Self {
-        let n = rope.len_lines();
+    fn build_chunked(ctx: &LayoutCtx, threads: usize) -> Self {
+        let n = ctx.rope.len_lines();
         let chunk = n.div_ceil(threads);
         let ranges: Vec<(usize, usize)> = (0..threads)
             .map(|t| (t * chunk, ((t + 1) * chunk).min(n)))
             .filter(|&(lo, hi)| lo < hi)
             .collect();
+        // Copy out the ctx's `Send` fields so each worker rebuilds its ctx from
+        // these rather than capturing `ctx` itself: `Fonts` is `!Sync` (FreeType
+        // faces are not shareable), so `&LayoutCtx` is not `Send` and cannot cross
+        // the thread boundary. Each worker opens its own `fonts` instead.
+        let rope = ctx.rope;
+        let wrap_width = ctx.wrap_width;
+        let body_size = ctx.body_size;
+        let active = ctx.active;
+        let images = ctx.images;
+        let image_ui = ctx.image_ui;
 
         // Measure every chunk from ground state. The main thread takes the first
         // chunk with the caller's fonts; each other chunk gets a worker that opens
@@ -1471,16 +1473,15 @@ impl LineIndex {
                 .map(|&(lo, hi)| {
                     s.spawn(move || {
                         let fonts = Fonts::new(&markdown::all_sizes(body_size)).ok()?;
-                        Some(measure_chunk(
-                            &fonts, rope, lo, hi, n, wrap_width, body_size, images, None, None,
-                        ))
+                        let worker_ctx = LayoutCtx::new(
+                            &fonts, rope, wrap_width, body_size, active, images, image_ui,
+                        );
+                        Some(measure_chunk(&worker_ctx, lo, hi, n, LineCarry::default()))
                     })
                 })
                 .collect();
             let (lo0, hi0) = ranges[0];
-            let mut outs = vec![Some(measure_chunk(
-                fonts, rope, lo0, hi0, n, wrap_width, body_size, images, None, None,
-            ))];
+            let mut outs = vec![Some(measure_chunk(ctx, lo0, hi0, n, LineCarry::default()))];
             for h in handles {
                 outs.push(h.join().ok().flatten());
             }
@@ -1490,7 +1491,13 @@ impl LineIndex {
         // A worker that could not open fonts leaves a hole; rather than a partial
         // index, fall back to a full sequential build.
         if outs.iter().any(Option::is_none) {
-            return Self::build(fonts, rope, wrap_width, body_size, images);
+            return Self::build(
+                ctx.fonts,
+                ctx.rope,
+                ctx.wrap_width,
+                ctx.body_size,
+                ctx.images,
+            );
         }
         let outs: Vec<ChunkOut> = outs.into_iter().flatten().collect();
 
@@ -1498,20 +1505,15 @@ impl LineIndex {
         // entry state, and re-measure (sequentially, with the caller's fonts) any
         // chunk a fence or list carried into.
         let mut recs: Vec<LineRec> = Vec::with_capacity(n);
-        let mut fence: Option<usize> = None;
-        let mut list_depth: Option<usize> = None;
+        let mut carry = LineCarry::default();
         for (out, &(lo, hi)) in outs.iter().zip(&ranges) {
-            if fence.is_none() && list_depth.is_none() {
+            if carry == LineCarry::default() {
                 recs.extend_from_slice(&out.recs);
-                fence = out.end_fence;
-                list_depth = out.end_depth;
+                carry = out.end;
             } else {
-                let re = measure_chunk(
-                    fonts, rope, lo, hi, n, wrap_width, body_size, images, fence, list_depth,
-                );
+                let re = measure_chunk(ctx, lo, hi, n, carry);
                 recs.extend_from_slice(&re.recs);
-                fence = re.end_fence;
-                list_depth = re.end_depth;
+                carry = re.end;
             }
         }
         Self::from_recs(recs)
@@ -1545,6 +1547,7 @@ impl LineIndex {
             *self = Self::build(fonts, new, wrap_width, body_size, images);
             return;
         }
+        let ctx = LayoutCtx::for_index(fonts, new, wrap_width, body_size, images);
         // Find the changed byte span cheaply (shared leaves compared as raw bytes,
         // never materialized), then map it to a conservative changed line range.
         let prefix = new.common_prefix_len(prev);
@@ -1562,7 +1565,8 @@ impl LineIndex {
         // First line of the unchanged suffix; re-measurement may converge here.
         let resync = new_n - back;
 
-        let (mut fence, mut list_depth) = self.entry_state(front);
+        let (fence, list_depth) = self.entry_state(front);
+        let mut carry = LineCarry::new(fence, list_depth);
         let mut mid: Vec<LineRec> = Vec::new();
         let mut scratch: Vec<VisualLine> = Vec::new();
         let mut pool = LayoutScratch::default();
@@ -1574,7 +1578,7 @@ impl LineIndex {
             // provably identical and reused.
             if i >= resync && old_i >= front as isize && (old_i as usize) < old_n {
                 let old_state = self.entry_state(old_i as usize);
-                if (fence, list_depth) == old_state {
+                if carry.pair() == old_state {
                     break old_i as usize;
                 }
             }
@@ -1582,15 +1586,10 @@ impl LineIndex {
                 break old_n;
             }
             mid.push(Self::measure_line(
-                fonts,
-                new,
+                &ctx,
                 i,
                 new_n,
-                wrap_width,
-                body_size,
-                images,
-                &mut fence,
-                &mut list_depth,
+                &mut carry,
                 &mut pool,
                 &mut scratch,
             ));
@@ -2237,8 +2236,9 @@ mod tests {
         for r in oracle_docs() {
             for &w in ORACLE_WIDTHS {
                 let seq = LineIndex::build(&f, &r, w, BODY, &no_images);
+                let ctx = LayoutCtx::for_index(&f, &r, w, BODY, &no_images);
                 for threads in [2, 3, 7, 32] {
-                    let par = LineIndex::build_chunked(&f, &r, w, BODY, &no_images, threads);
+                    let par = LineIndex::build_chunked(&ctx, threads);
                     assert_eq!(
                         par.recs,
                         seq.recs,

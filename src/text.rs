@@ -221,8 +221,7 @@ impl TextBuffer {
             self.insert_str("\n");
             return true;
         }
-        let (ls, le) = self.line_content_bounds(self.cursor);
-        let line = self.text.byte_slice(ls..le);
+        let (ls, le, line) = self.content_line_at(self.cursor);
         let (style, marker_len) = markdown::classify(&line);
         // Continue the list only while editing the item's content; with the
         // cursor before or within the marker a plain newline is what is meant.
@@ -273,8 +272,7 @@ impl TextBuffer {
     /// list nesting. All the edits land after the cursor's line, so the cursor
     /// never moves.
     fn renumber_following_items(&mut self) {
-        let (ls, le) = self.line_content_bounds(self.cursor);
-        let line = self.text.byte_slice(ls..le);
+        let (.., line) = self.content_line_at(self.cursor);
         let Some((mut number, _)) = markdown::ordered_number(&line) else {
             return;
         };
@@ -324,8 +322,7 @@ impl TextBuffer {
     /// or reveals the line. Returns whether the buffer changed (`false` off a
     /// task line).
     pub fn toggle_task(&mut self, offset: usize) -> bool {
-        let (ls, le) = self.line_content_bounds(offset.min(self.text.len()));
-        let line = self.text.byte_slice(ls..le);
+        let (ls, _, line) = self.content_line_at(offset.min(self.text.len()));
         let (style, marker_len) = markdown::classify(&line);
         let markdown::LineStyle::Task { checked } = style else {
             return false;
@@ -339,17 +336,31 @@ impl TextBuffer {
         true
     }
 
-    /// The content byte range `[ls, le)` of the logical line containing `byte`,
-    /// excluding any trailing `'\n'`.
-    fn line_content_bounds(&self, byte: usize) -> (usize, usize) {
-        self.text.line_content_range(self.text.byte_to_line(byte))
+    /// The content of the logical line containing `byte` (excluding any trailing
+    /// `'\n'`), as `(content_start, content_end, text)`. Materializes just that
+    /// one line of the rope: the shared "resolve the line, take its bounds, slice
+    /// it" step behind the list and markdown line inspections.
+    fn content_line_at(&self, byte: usize) -> (usize, usize, String) {
+        let (ls, le) = self.text.line_content_range(self.text.byte_to_line(byte));
+        (ls, le, self.text.byte_slice(ls..le))
+    }
+
+    /// The full logical line containing `byte`, through its trailing `'\n'` (so
+    /// the newline is present as its own cluster), as `(line_start, text)`. A
+    /// grapheme cluster never spans a `'\n'`, so this one-line window is all the
+    /// cursor-boundary scans need.
+    fn full_line_at(&self, byte: usize) -> (usize, String) {
+        let line = self.text.byte_to_line(byte);
+        let ls = self.text.line_to_byte(line);
+        let le = self.text.line_to_byte(line + 1);
+        (ls, self.text.byte_slice(ls..le))
     }
 
     /// Whether the cursor's line is a list item (bullet or ordered, perhaps
     /// indented), so Tab nests it rather than inserting a soft tab.
     pub fn cursor_on_list_item(&self) -> bool {
-        let (ls, le) = self.line_content_bounds(self.cursor);
-        is_list(&self.text.byte_slice(ls..le))
+        let (.., line) = self.content_line_at(self.cursor);
+        is_list(&line)
     }
 
     /// Nest the cursor's list item one level deeper, or `outdent` it one level
@@ -359,8 +370,7 @@ impl TextBuffer {
     /// position is preserved. Returns whether the buffer changed.
     pub fn nest_list_item(&mut self, outdent: bool) -> bool {
         let line_idx = self.text.byte_to_line(self.cursor);
-        let (ls, le) = self.line_content_bounds(self.cursor);
-        let line = self.text.byte_slice(ls..le);
+        let (ls, _, line) = self.content_line_at(self.cursor);
         if !is_list(&line) {
             return false;
         }
@@ -623,43 +633,37 @@ impl TextBuffer {
     /// selection; without it, a non-empty selection collapses to its left edge.
     /// Returns whether the cursor moved.
     pub fn move_left(&mut self, extend: bool) -> bool {
-        self.group = Coalesce::None;
-        if !extend {
-            if let Some((start, _)) = self.selection() {
-                self.cursor = start;
-                self.anchor = None;
-                return true;
-            }
-        }
-        match self.prev_grapheme() {
-            Some(prev) => {
-                self.set_cursor(prev, extend);
-                true
-            }
-            None => {
-                if !extend {
-                    self.anchor = None;
-                }
-                false
-            }
-        }
+        self.move_cluster(true, extend)
     }
 
     /// Move the cursor one grapheme cluster right. With `extend`, grow the
     /// selection; without it, a non-empty selection collapses to its right edge.
     /// Returns whether the cursor moved.
     pub fn move_right(&mut self, extend: bool) -> bool {
+        self.move_cluster(false, extend)
+    }
+
+    /// Move the cursor one grapheme cluster, `back` (left) or forward (right).
+    /// With `extend`, grow the selection; without it, a non-empty selection
+    /// collapses to the edge in the direction of travel. Returns whether the
+    /// cursor moved.
+    fn move_cluster(&mut self, back: bool, extend: bool) -> bool {
         self.group = Coalesce::None;
         if !extend {
-            if let Some((_, end)) = self.selection() {
-                self.cursor = end;
+            if let Some((start, end)) = self.selection() {
+                self.cursor = if back { start } else { end };
                 self.anchor = None;
                 return true;
             }
         }
-        match self.next_grapheme() {
-            Some(next) => {
-                self.set_cursor(next, extend);
+        let target = if back {
+            self.prev_grapheme()
+        } else {
+            self.next_grapheme()
+        };
+        match target {
+            Some(t) => {
+                self.set_cursor(t, extend);
                 true
             }
             None => {
@@ -783,13 +787,10 @@ impl TextBuffer {
         if offset == 0 || offset == len {
             return offset;
         }
-        let line = self.text.byte_to_line(offset);
-        let ls = self.text.line_to_byte(line);
+        let (ls, s) = self.full_line_at(offset);
         if offset == ls {
             return offset; // a line start is always a boundary
         }
-        let le = self.text.line_to_byte(line + 1);
-        let s = self.text.byte_slice(ls..le);
         ls + grapheme::prev_boundary(&s, offset - ls + 1)
     }
 
@@ -800,10 +801,7 @@ impl TextBuffer {
         if self.cursor == 0 {
             return None;
         }
-        let line = self.text.byte_to_line(self.cursor - 1);
-        let ls = self.text.line_to_byte(line);
-        let le = self.text.line_to_byte(line + 1);
-        let s = self.text.byte_slice(ls..le);
+        let (ls, s) = self.full_line_at(self.cursor - 1);
         Some(ls + grapheme::prev_boundary(&s, self.cursor - ls))
     }
 
@@ -814,10 +812,7 @@ impl TextBuffer {
         if self.cursor == self.text.len() {
             return None;
         }
-        let line = self.text.byte_to_line(self.cursor);
-        let ls = self.text.line_to_byte(line);
-        let le = self.text.line_to_byte(line + 1);
-        let s = self.text.byte_slice(ls..le);
+        let (ls, s) = self.full_line_at(self.cursor);
         Some(ls + grapheme::next_boundary(&s, self.cursor - ls))
     }
 }

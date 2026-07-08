@@ -10,9 +10,9 @@
 //!               └─ Image ─▶ resample cache ──▶ per-image texture batches
 //! ```
 //!
-//! Text traversal mirrors `render.rs draw_text` exactly (the ASCII fast path,
+//! Text traversal matches how layout measured each run (the ASCII fast path,
 //! then grapheme clusters routed to the emoji or per-character path), so the
-//! pixels the GPU composites land where layout measured, same as the CPU path.
+//! pixels the GPU composites land exactly where the caret and wrapping expect.
 
 use std::collections::HashMap;
 
@@ -103,6 +103,19 @@ struct Slot {
     y: u32,
     w: u32,
     h: u32,
+}
+
+/// A glyph's atlas placement plus its pen metrics, cached beside the slot so a
+/// steady-state frame emits the quad without re-rasterizing the glyph. `slot` is
+/// `None` for an inkless glyph (a space, or an emoji that shaped to no ink) or
+/// one the atlas could not fit; the pen still advances by `advance`, so the
+/// caret and the glyphs after it land where layout measured.
+#[derive(Clone, Copy)]
+struct PackedGlyph {
+    slot: Option<Slot>,
+    left: i32,
+    top: i32,
+    advance: f32,
 }
 
 /// A shelf-packing texture atlas with a CPU mirror. Rasters are packed onto
@@ -226,6 +239,19 @@ impl Atlas {
         });
     }
 
+    /// Reserve a slot for a `w` x `h` raster and write `src` into it, returning
+    /// the slot; `None` for a zero-area raster or a full atlas (the caller
+    /// records the empty placement so the pen still advances). `src` is
+    /// `w * h * bpp` bytes, row-major, tight.
+    fn pack(&mut self, w: u32, h: u32, src: &[u8]) -> Option<Slot> {
+        if w == 0 || h == 0 {
+            return None;
+        }
+        let slot = self.reserve(w, h)?;
+        self.write(slot, src);
+        Some(slot)
+    }
+
     /// The bytes of the dirty region (row-contiguous), clearing the flag.
     /// A texture recreated after a grow needs no separate full upload: the
     /// grow wiped the mirror, so everything in it is inside the dirty region.
@@ -254,9 +280,12 @@ impl Atlas {
 pub struct GlyphCache {
     pub glyphs: Atlas,
     pub emoji: Atlas,
-    scalar_slots: HashMap<(FaceKey, char), Option<Slot>>,
+    scalar_slots: HashMap<(FaceKey, char), PackedGlyph>,
     /// Nested so lookups borrow the cluster as `&str` (no per-frame `String`).
-    cluster_slots: HashMap<FaceKey, HashMap<String, Slot>>,
+    /// A `None` value records a cluster that is not color emoji, so a
+    /// steady-state frame takes the per-character path without re-consulting
+    /// the `Face`.
+    cluster_slots: HashMap<FaceKey, HashMap<String, Option<PackedGlyph>>>,
 }
 
 impl GlyphCache {
@@ -361,15 +390,26 @@ impl Batcher<'_> {
         }
     }
 
-    /// Emit one axis-aligned quad (two triangles). `uv0` is the texel
-    /// coordinate at the quad's top-left; uv advances 1:1 with pixels.
-    fn quad(&mut self, rect: Rect, mode: u32, color: u32, uv0: [f32; 2], extra: [f32; 4]) {
+    /// Emit one axis-aligned quad (two triangles) into `image`'s texture, with
+    /// uv running from `[u0, v0]` at the top-left to `[u1, v1]` at the
+    /// bottom-right (`uv` is `[u0, v0, u1, v1]`). The atlases and fills pass
+    /// texel coordinates (uv advancing 1:1 with pixels); an image passes
+    /// normalized `0..1` corners so the sampler scales its native texture across
+    /// the quad.
+    fn quad_uv(
+        &mut self,
+        rect: Rect,
+        mode: u32,
+        color: u32,
+        uv: [f32; 4],
+        extra: [f32; 4],
+        image: Option<ImageKey>,
+    ) {
         if rect.w <= 0 || rect.h <= 0 {
             return;
         }
         let (x0, y0) = (rect.x as f32, rect.y as f32);
         let (x1, y1) = ((rect.x + rect.w) as f32, (rect.y + rect.h) as f32);
-        let (w, h) = (rect.w as f32, rect.h as f32);
         let c = color_f32(color);
         let v = |x: f32, y: f32, u: f32, vv: f32| Vertex {
             pos: [x, y],
@@ -378,8 +418,7 @@ impl Batcher<'_> {
             extra,
             mode,
         };
-        let (u0, v0) = (uv0[0], uv0[1]);
-        let (u1, v1) = (u0 + w, v0 + h);
+        let [u0, v0, u1, v1] = uv;
         self.vertices.extend_from_slice(&[
             v(x0, y0, u0, v0),
             v(x1, y0, u1, v0),
@@ -388,7 +427,20 @@ impl Batcher<'_> {
             v(x1, y1, u1, v1),
             v(x0, y1, u0, v1),
         ]);
-        self.extend_batch(None, 6);
+        self.extend_batch(image, 6);
+    }
+
+    /// Emit one axis-aligned quad with texel UVs: `uv0` is the coordinate at the
+    /// quad's top-left and uv advances 1:1 with pixels. The atlas-bound path (no
+    /// per-image texture), for fills, glyphs, emoji, and rounded corners.
+    fn quad(&mut self, rect: Rect, mode: u32, color: u32, uv0: [f32; 2], extra: [f32; 4]) {
+        let uv = [
+            uv0[0],
+            uv0[1],
+            uv0[0] + rect.w as f32,
+            uv0[1] + rect.h as f32,
+        ];
+        self.quad_uv(rect, mode, color, uv, extra, None);
     }
 
     /// Append `count` vertices to the current batch, or open a new one when
@@ -409,7 +461,8 @@ impl Batcher<'_> {
     }
 
     fn round_rect(&mut self, rect: Rect, color: u32, radius: i32, corners: RoundedCorners) {
-        // Mirror the CPU path's radius clamp (render.rs fill_round_rect).
+        // Clamp the radius to half the shorter side so opposite corners never
+        // overlap; the shader's coverage function assumes this bound holds.
         let r = radius.clamp(0, (rect.w / 2).min(rect.h / 2).max(0));
         let mask = match corners {
             RoundedCorners::None => 0u32,
@@ -440,22 +493,10 @@ impl Batcher<'_> {
             return;
         }
         for (_, cluster) in grapheme::graphemes(text) {
-            // Two-phase borrow: copy the raster facts out of the face's cache
-            // first, then pack and emit (which needs &mut self.cache).
-            let emoji = face.with_cluster_glyph(cluster, |g| {
-                (
-                    g.left,
-                    g.top,
-                    g.width as u32,
-                    g.rows as u32,
-                    g.advance,
-                    g.argb.clone(),
-                )
-            });
-            match emoji {
-                Some((left, top, w, h, advance, argb)) => {
-                    self.emoji(face_key, cluster, left, top, w, h, &argb, pen, baseline);
-                    pen += advance;
+            match self.packed_cluster(face, face_key, cluster) {
+                Some(packed) => {
+                    self.emit_glyph(&packed, pen, baseline, MODE_EMOJI, 0);
+                    pen += packed.advance;
                 }
                 None => {
                     for ch in cluster.chars() {
@@ -466,8 +507,10 @@ impl Batcher<'_> {
         }
     }
 
-    /// One character's glyph quad (or nothing for empty rasters like spaces).
-    /// Returns the advanced pen, exactly as the CPU's `draw_scalar` does.
+    /// One character's glyph quad (or nothing for empty rasters like spaces),
+    /// returning the advanced pen. Its placement is cached beside the atlas
+    /// slot, so a steady-state frame emits the quad without re-rasterizing the
+    /// glyph.
     fn scalar(
         &mut self,
         face: &Face,
@@ -477,99 +520,88 @@ impl Batcher<'_> {
         baseline: i32,
         color: u32,
     ) -> f32 {
-        // Copy the raster facts out first (the face cache borrow ends), then
-        // pack into the atlas.
-        let (left, top, w, h, advance, coverage) = face.with_glyph(ch, |g| {
-            (
-                g.left,
-                g.top,
-                g.width as u32,
-                g.rows as u32,
-                g.advance,
-                if g.width * g.rows > 0 {
-                    g.coverage.clone()
-                } else {
-                    Vec::new()
-                },
-            )
-        });
-        if w > 0 && h > 0 {
-            let slot = match self.cache.scalar_slots.get(&(face_key, ch)) {
-                Some(&slot) => slot,
-                None => {
-                    let slot = self.cache.glyphs.reserve(w, h);
-                    if let Some(s) = slot {
-                        self.cache.glyphs.write(s, &coverage);
-                    }
-                    self.cache.scalar_slots.insert((face_key, ch), slot);
-                    slot
-                }
-            };
-            if let Some(slot) = slot {
-                let rect = Rect {
-                    x: pen.round() as i32 + left,
-                    y: baseline - top,
-                    w: w as i32,
-                    h: h as i32,
-                };
-                self.quad(
-                    rect,
-                    MODE_GLYPH,
-                    color,
-                    [slot.x as f32, slot.y as f32],
-                    [0.0; 4],
-                );
-            }
-        }
-        pen + advance
+        let packed = self.packed_scalar(face, face_key, ch);
+        self.emit_glyph(&packed, pen, baseline, MODE_GLYPH, color);
+        pen + packed.advance
     }
 
-    /// An emoji cluster's color quad from the BGRA atlas.
-    #[allow(clippy::too_many_arguments)]
-    fn emoji(
+    /// The cached placement for a scalar glyph. On the first sight of this
+    /// (face, character) the glyph is rasterized once and its coverage written
+    /// straight into the atlas; later frames read the cached placement. The
+    /// atlas cache is the only glyph raster cache, so its hit and miss are
+    /// reported to the face for the frame stats.
+    fn packed_scalar(&mut self, face: &Face, face_key: FaceKey, ch: char) -> PackedGlyph {
+        if let Some(&packed) = self.cache.scalar_slots.get(&(face_key, ch)) {
+            face.record_glyph_hit();
+            return packed;
+        }
+        face.record_glyph_miss();
+        let g = face.rasterize(ch);
+        let atlas = &mut self.cache.glyphs;
+        let packed = PackedGlyph {
+            slot: atlas.pack(g.width as u32, g.rows as u32, &g.coverage),
+            left: g.left,
+            top: g.top,
+            advance: g.advance,
+        };
+        self.cache.scalar_slots.insert((face_key, ch), packed);
+        packed
+    }
+
+    /// The cached placement for an emoji cluster, or `None` when the cluster is
+    /// not color emoji and the caller should draw its characters instead. The
+    /// raster is packed into the color atlas on first sight and the decision
+    /// cached, so a steady-state frame neither re-shapes nor touches the `Face`
+    /// (beyond reporting the atlas hit for the frame stats). Non-emoji clusters
+    /// are not tallied, matching the pre-atlas emoji-cache accounting.
+    fn packed_cluster(
         &mut self,
+        face: &Face,
         face_key: FaceKey,
         cluster: &str,
-        left: i32,
-        top: i32,
-        w: u32,
-        h: u32,
-        argb: &[u32],
-        pen: f32,
-        baseline: i32,
-    ) {
-        if w == 0 || h == 0 || argb.len() < (w * h) as usize {
-            return;
-        }
-        let by_cluster = self.cache.cluster_slots.entry(face_key).or_default();
-        let slot = match by_cluster.get(cluster) {
-            Some(&slot) => Some(slot),
-            None => {
-                let slot = self.cache.emoji.reserve(w, h);
-                if let Some(s) = slot {
-                    // ARGB words are B,G,R,A bytes in memory: B8G8R8A8 verbatim.
-                    let bytes: Vec<u8> = argb.iter().flat_map(|px| px.to_ne_bytes()).collect();
-                    self.cache.emoji.write(s, &bytes);
-                    by_cluster.insert(cluster.to_string(), s);
-                }
-                slot
+    ) -> Option<PackedGlyph> {
+        if let Some(&packed) = self
+            .cache
+            .cluster_slots
+            .get(&face_key)
+            .and_then(|by| by.get(cluster))
+        {
+            if packed.is_some() {
+                face.record_cluster_hit();
             }
-        };
-        if let Some(slot) = slot {
-            let rect = Rect {
-                x: pen.round() as i32 + left,
-                y: baseline - top,
-                w: w as i32,
-                h: h as i32,
-            };
-            self.quad(
-                rect,
-                MODE_EMOJI,
-                0,
-                [slot.x as f32, slot.y as f32],
-                [0.0; 4],
-            );
+            return packed;
         }
+        let atlas = &mut self.cache.emoji;
+        let packed = face.with_cluster_glyph(cluster, |g| PackedGlyph {
+            slot: pack_argb(atlas, g.width as u32, g.rows as u32, &g.argb),
+            left: g.left,
+            top: g.top,
+            advance: g.advance,
+        });
+        if packed.is_some() {
+            face.record_cluster_miss();
+        }
+        self.cache
+            .cluster_slots
+            .entry(face_key)
+            .or_default()
+            .insert(cluster.to_string(), packed);
+        packed
+    }
+
+    /// Emit a cached glyph's textured quad. An inkless or unplaced glyph (slot
+    /// `None`) draws nothing; the caller advances the pen regardless.
+    fn emit_glyph(&mut self, packed: &PackedGlyph, pen: f32, baseline: i32, mode: u32, color: u32) {
+        let Some(slot) = packed.slot else {
+            return;
+        };
+        let rect = Rect {
+            x: pen.round() as i32 + packed.left,
+            y: baseline - packed.top,
+            w: slot.w as i32,
+            h: slot.h as i32,
+        };
+        self.quad(rect, mode, color, [slot.x as f32, slot.y as f32], [0.0; 4]);
     }
 
     /// An image quad over its own texture, attaching the bitmap when the
@@ -591,31 +623,28 @@ impl Batcher<'_> {
             self.image_uploads.push((key.clone(), img.pixels.clone()));
         }
         // Normalized UVs so texture() samples the whole native texture across the
-        // display rect (quad.frag mode 3).
-        let (x0, y0) = (rect.x as f32, rect.y as f32);
-        let (x1, y1) = ((rect.x + rect.w) as f32, (rect.y + rect.h) as f32);
-        let v = |x: f32, y: f32, u: f32, w: f32| Vertex {
-            pos: [x, y],
-            uv: [u, w],
-            color: [0.0; 4],
-            extra: [0.0; 4],
-            mode: MODE_IMAGE,
-        };
-        let start = self.vertices.len() as u32;
-        self.vertices.extend_from_slice(&[
-            v(x0, y0, 0.0, 0.0),
-            v(x1, y0, 1.0, 0.0),
-            v(x0, y1, 0.0, 1.0),
-            v(x1, y0, 1.0, 0.0),
-            v(x1, y1, 1.0, 1.0),
-            v(x0, y1, 0.0, 1.0),
-        ]);
-        self.batches.push(Batch {
-            start,
-            count: 6,
-            image: Some(key),
-        });
+        // display rect (quad.frag mode 3, which ignores the vertex color).
+        self.quad_uv(
+            rect,
+            MODE_IMAGE,
+            0,
+            [0.0, 0.0, 1.0, 1.0],
+            [0.0; 4],
+            Some(key),
+        );
     }
+}
+
+/// Pack an emoji cluster's straight-`0xAARRGGBB` raster into the color atlas.
+/// `None` for a zero-area or malformed glyph or a full atlas; the placement is
+/// recorded as `None` so the pen advances without drawing.
+fn pack_argb(atlas: &mut Atlas, w: u32, h: u32, argb: &[u32]) -> Option<Slot> {
+    if w == 0 || h == 0 || argb.len() < (w * h) as usize {
+        return None;
+    }
+    // ARGB words are B,G,R,A bytes in memory: B8G8R8A8 verbatim.
+    let bytes: Vec<u8> = argb.iter().flat_map(|px| px.to_ne_bytes()).collect();
+    atlas.pack(w, h, &bytes)
 }
 
 /// A 0x00RRGGBB display-list color as straight-alpha RGBA floats.

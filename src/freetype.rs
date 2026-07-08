@@ -21,9 +21,8 @@ use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::rc::Rc;
 
+use crate::emoji::{wants_emoji, ColorGlyph, EmojiFont};
 use crate::error::{Error, Result};
-use crate::grapheme;
-use crate::shape::Shaper;
 
 /// A monospace family and the four style files the editor draws emphasis with.
 /// The first family whose `regular` file exists wins; a missing bold, italic, or
@@ -148,19 +147,19 @@ type FtFace = *mut FtFaceRec;
 /// Load the glyph and metrics only, no bitmap (FT_LOAD_DEFAULT).
 const FT_LOAD_DEFAULT: i32 = 0x0;
 /// Also rasterize to an 8-bit gray coverage bitmap (FT_LOAD_RENDER).
-const FT_LOAD_RENDER: i32 = 1 << 2;
+pub(crate) const FT_LOAD_RENDER: i32 = 1 << 2;
 /// Ignore embedded bitmap strikes so an outlined glyph renders to 8-bit gray
 /// rather than a mono/color strike (FT_LOAD_NO_BITMAP).
 const FT_LOAD_NO_BITMAP: i32 = 1 << 3;
 /// Load embedded color bitmaps (the CBDT strikes a color emoji font ships)
 /// rather than skipping them (FT_LOAD_COLOR).
-const FT_LOAD_COLOR: i32 = 1 << 20;
+pub(crate) const FT_LOAD_COLOR: i32 = 1 << 20;
 /// One coverage byte per pixel: the only mode whose row width in bytes equals
 /// its pixel width (FT_PIXEL_MODE_GRAY).
 const FT_PIXEL_MODE_GRAY: u8 = 2;
 /// Four bytes per pixel, blue-green-red-alpha, premultiplied: what a CBDT color
 /// strike decodes to (FT_PIXEL_MODE_BGRA).
-const FT_PIXEL_MODE_BGRA: u8 = 7;
+pub(crate) const FT_PIXEL_MODE_BGRA: u8 = 7;
 
 #[link(name = "freetype")]
 #[allow(non_snake_case)]
@@ -178,7 +177,7 @@ extern "C" {
     fn FT_Set_Pixel_Sizes(face: FtFace, pixel_width: c_uint, pixel_height: c_uint) -> FtError;
     fn FT_Select_Size(face: FtFace, strike_index: c_int) -> FtError;
     fn FT_Load_Char(face: FtFace, char_code: c_ulong, load_flags: i32) -> FtError;
-    fn FT_Load_Glyph(face: FtFace, glyph_index: c_uint, load_flags: i32) -> FtError;
+    pub(crate) fn FT_Load_Glyph(face: FtFace, glyph_index: c_uint, load_flags: i32) -> FtError;
     fn FT_Get_Char_Index(face: FtFace, charcode: c_ulong) -> c_uint;
 }
 
@@ -203,13 +202,13 @@ struct FtVector {
 
 #[repr(C)]
 #[allow(dead_code)]
-struct FtBitmap {
-    rows: c_uint,
-    width: c_uint,
-    pitch: c_int,
-    buffer: *const u8,
+pub(crate) struct FtBitmap {
+    pub(crate) rows: c_uint,
+    pub(crate) width: c_uint,
+    pub(crate) pitch: c_int,
+    pub(crate) buffer: *const u8,
     num_grays: c_ushort,
-    pixel_mode: u8,
+    pub(crate) pixel_mode: u8,
     palette_mode: u8,
     palette: *mut c_void,
 }
@@ -229,7 +228,7 @@ struct FtSizeMetrics {
 
 #[repr(C)]
 #[allow(dead_code)]
-struct FtGlyphSlotRec {
+pub(crate) struct FtGlyphSlotRec {
     library: *mut c_void,
     face: *mut c_void,
     next: *mut c_void,
@@ -240,9 +239,9 @@ struct FtGlyphSlotRec {
     linear_vert_advance: c_long,
     advance: FtVector,
     format: c_int,
-    bitmap: FtBitmap,
-    bitmap_left: c_int,
-    bitmap_top: c_int,
+    pub(crate) bitmap: FtBitmap,
+    pub(crate) bitmap_left: c_int,
+    pub(crate) bitmap_top: c_int,
 }
 
 #[repr(C)]
@@ -255,7 +254,7 @@ struct FtSizeRec {
 
 #[repr(C)]
 #[allow(dead_code)]
-struct FtFaceRec {
+pub(crate) struct FtFaceRec {
     num_faces: c_long,
     face_index: c_long,
     face_flags: c_long,
@@ -277,7 +276,7 @@ struct FtFaceRec {
     max_advance_height: c_short,
     underline_position: c_short,
     underline_thickness: c_short,
-    glyph: *mut FtGlyphSlotRec,
+    pub(crate) glyph: *mut FtGlyphSlotRec,
     size: *mut FtSizeRec,
 }
 
@@ -331,23 +330,19 @@ pub struct Face {
     library: NonNull<c_void>,
     face: NonNull<FtFaceRec>,
     _data: Vec<u8>,
-    /// Rasterized glyphs cached by character. A face is opened at one fixed pixel
-    /// size and never resized, so a glyph's bitmap is stable for the face's life:
-    /// the first draw of a character rasterizes it through FreeType, every later
-    /// frame blits the cached coverage. Without this a scroll or caret blink re-runs
-    /// hinting and scan conversion for every glyph on screen, the dominant per-frame
-    /// cost. Interior mutability so drawing through a shared `&Face` can fill it.
-    glyphs: RefCell<HashMap<char, Glyph>>,
-    /// Pen advances cached by character, the measure-only twin of `glyphs`. Layout
-    /// measures every character to wrap and size runs but rasterizes only the ones
-    /// on screen, and the advance is constant for a fixed-size face, so caching it
-    /// turns a per-character `FT_Load_Char` (hinting plus metrics) into a map hit.
-    /// Without this a full re-layout reloads every glyph's metrics through FreeType,
-    /// which dominates the rebuild a selection drag triggers each frame.
+    /// Pen advances cached by character. Layout measures every character to wrap
+    /// and size runs but the GPU atlas rasterizes only the ones on screen, and the
+    /// advance is constant for a fixed-size face, so caching it turns a
+    /// per-character `FT_Load_Char` (hinting plus metrics) into a map hit. Without
+    /// this a full re-layout reloads every glyph's metrics through FreeType, which
+    /// dominates the rebuild a selection drag triggers each frame. Interior
+    /// mutability so measuring through a shared `&Face` can fill it.
     advances: RefCell<HashMap<char, f32>>,
-    /// Glyph-cache hit and miss tallies, bumped on every [`Self::with_glyph`].
-    /// Pure instrumentation (see [`CacheStats`]): a near-zero steady-state miss
-    /// rate is the evidence that the cache is doing its job rather than thrashing.
+    /// Glyph-cache hit and miss tallies, reported by the GPU batcher (which owns
+    /// the atlas-placement cache) via [`Self::record_glyph_hit`] and
+    /// [`Self::record_glyph_miss`]. Pure instrumentation (see [`CacheStats`]): a
+    /// near-zero steady-state miss rate is the evidence that the cache is doing
+    /// its job rather than thrashing.
     hits: Cell<u64>,
     misses: Cell<u64>,
     /// The pixel size this face was opened at, recorded by `set_pixel_size`.
@@ -363,7 +358,7 @@ pub struct Face {
 
 /// A snapshot of a glyph cache's hit and miss tallies. Summing these across every
 /// face turns "scrolling feels smooth" into a number: once the working set is
-/// cached, steady-state frames should add hits and almost no misses.
+/// packed into the GPU atlas, steady-state frames add hits and almost no misses.
 #[derive(Clone, Copy, Default)]
 pub struct CacheStats {
     pub hits: u64,
@@ -441,7 +436,6 @@ impl Face {
             library,
             face,
             _data: data,
-            glyphs: RefCell::new(HashMap::new()),
             advances: RefCell::new(HashMap::new()),
             hits: Cell::new(0),
             misses: Cell::new(0),
@@ -465,26 +459,33 @@ impl Face {
         Ok(())
     }
 
-    /// Run `f` over `ch`'s rasterized glyph, caching it on the face so the
-    /// FreeType render only happens the first time the character is drawn at this
-    /// size. The glyph is handed over by reference, never cloned: the coverage
-    /// buffer stays in the cache and the caller blits straight out of it.
-    pub fn with_glyph<R>(&self, ch: char, f: impl FnOnce(&Glyph) -> R) -> R {
-        use std::collections::hash_map::Entry;
-        let mut cache = self.glyphs.borrow_mut();
-        // `rasterize` reads only FreeType state, never the cache, so filling a
-        // miss while the cache is borrowed cannot reenter this borrow.
-        let glyph = match cache.entry(ch) {
-            Entry::Occupied(e) => {
-                self.hits.set(self.hits.get() + 1);
-                e.into_mut()
-            }
-            Entry::Vacant(e) => {
-                self.misses.set(self.misses.get() + 1);
-                e.insert(self.rasterize(ch))
-            }
-        };
-        f(glyph)
+    /// Record that the GPU batcher served a scalar glyph from its atlas cache
+    /// (the glyph was already packed). Pure instrumentation.
+    pub fn record_glyph_hit(&self) {
+        self.hits.set(self.hits.get() + 1);
+    }
+
+    /// Record that the GPU batcher had to rasterize and pack a scalar glyph (its
+    /// first sight of the character). Pure instrumentation.
+    pub fn record_glyph_miss(&self) {
+        self.misses.set(self.misses.get() + 1);
+    }
+
+    /// Forward a color-cluster cache hit to the shared emoji font, so its tally
+    /// rolls up through [`Fonts::cache_stats`] alongside the scalar counts. A
+    /// no-op when no emoji font is installed.
+    pub fn record_cluster_hit(&self) {
+        if let Some(emoji) = &self.emoji {
+            emoji.record_hit();
+        }
+    }
+
+    /// Forward a color-cluster cache miss (a first-time raster) to the shared
+    /// emoji font. A no-op when no emoji font is installed.
+    pub fn record_cluster_miss(&self) {
+        if let Some(emoji) = &self.emoji {
+            emoji.record_miss();
+        }
     }
 
     /// This face's cumulative glyph-cache hit and miss counts.
@@ -618,10 +619,17 @@ impl Face {
         unsafe { FT_Get_Char_Index(self.face.as_ptr(), ch as u32 as c_ulong) != 0 }
     }
 
+    /// The raw FreeType face handle, for the emoji module to shape and decode
+    /// color strikes through the same face (it reads the glyph slot after a
+    /// load). Confined to `pub(crate)`; the pointer is valid for the face's life.
+    pub(crate) fn ft_face_ptr(&self) -> *mut FtFaceRec {
+        self.face.as_ptr()
+    }
+
     /// Select the face's first fixed bitmap strike and return its nominal pixel
     /// size, or `None` when the face has none (an outline font). Only the emoji
     /// font uses strikes; outline faces size with [`Self::set_pixel_size`].
-    fn select_first_strike(&self) -> Option<f32> {
+    pub(crate) fn select_first_strike(&self) -> Option<f32> {
         // SAFETY: face is valid; num_fixed_sizes is a plain field read.
         let strikes = unsafe { (*self.face.as_ptr()).num_fixed_sizes };
         if strikes <= 0 {
@@ -701,327 +709,6 @@ impl Drop for Face {
     }
 }
 
-/// Whether a grapheme cluster should render as color emoji. `mono_has` reports
-/// whether the text face can draw a character itself, so symbols the text font
-/// covers (dagger, copyright, box drawing) stay text.
-///
-/// The rules, in order:
-/// - a text-presentation selector (U+FE0E) anywhere forces the text path;
-/// - a single scalar goes color only when it is `Extended_Pictographic` *and*
-///   the text face has no glyph for it (a smiley, not a copyright sign);
-/// - a multi-scalar cluster goes color when it carries an emoji-presentation
-///   selector (U+FE0F) or keycap (U+20E3), starts pictographic (ZWJ sequences,
-///   skin tones), or starts with a regional indicator (flags). Anything else
-///   (plain combining marks) is ordinary text.
-fn wants_emoji(cluster: &str, mono_has: impl Fn(char) -> bool) -> bool {
-    let mut chars = cluster.chars();
-    let Some(first) = chars.next() else {
-        return false;
-    };
-    if cluster.contains('\u{FE0E}') {
-        return false;
-    }
-    if chars.next().is_none() {
-        return grapheme::is_extended_pictographic(first) && !mono_has(first);
-    }
-    cluster.contains('\u{FE0F}')
-        || cluster.contains('\u{20E3}')
-        || grapheme::is_extended_pictographic(first)
-        || matches!(first, '\u{1F1E6}'..='\u{1F1FF}')
-}
-
-/// A rasterized emoji cluster at display size: straight (unpremultiplied)
-/// `0xAARRGGBB` pixels, row-major, plus the same pen metrics [`Glyph`] carries.
-/// Owned and cached by [`EmojiFont`]; the blitter draws straight out of it.
-pub struct ColorGlyph {
-    /// Horizontal offset from the pen to the bitmap's left edge.
-    pub left: i32,
-    /// Vertical offset from the baseline up to the bitmap's top edge.
-    pub top: i32,
-    pub width: usize,
-    pub rows: usize,
-    /// Pen advance in pixels.
-    pub advance: f32,
-    pub argb: Vec<u32>,
-}
-
-/// The usual install paths of the Noto color emoji font, tried in order. With none
-/// of them present, the editor draws no emoji.
-const EMOJI_FONTS: &[&str] = &[
-    "/usr/share/fonts/noto/NotoColorEmoji.ttf",
-    "/usr/share/fonts/google-noto/NotoColorEmoji.ttf",
-    "/usr/share/fonts/truetype/noto/NotoColorEmoji.ttf",
-];
-
-/// A cache of cluster results, keyed by target pixel size then by cluster bytes.
-/// Splitting on the size (a cheap `u32` key) lets the inner lookup borrow the
-/// cluster `&str` directly (`Box<str>: Borrow<str>`), so a cache *hit* allocates
-/// nothing; only a miss boxes the cluster to insert it. `None` records that the
-/// font cannot form the cluster, so the miss is not re-shaped every frame.
-type ClusterCache<T> = RefCell<HashMap<u32, HashMap<Box<str>, Option<T>>>>;
-
-/// The color emoji font: a bitmap-strike (CBDT) face plus a HarfBuzz shaper
-/// over it. The shaper is what turns a multi-scalar cluster (ZWJ family, flag,
-/// skin tone, keycap) into the single ligature glyph the font's GSUB table
-/// defines; FreeType then decodes that glyph's color strike, and the result is
-/// scaled to the text size and cached per (cluster, size).
-///
-/// Everything degrades gracefully: no installed font, an outline-only emoji
-/// font, or a cluster the font cannot form all yield `None`, and the caller
-/// falls back to per-character rendering.
-pub struct EmojiFont {
-    /// Declared before `face` deliberately: fields drop in declaration order,
-    /// and the shaper's HarfBuzz font holds a reference to the FreeType face
-    /// that it releases with `FT_Done_Face` on destroy. The face's own `Drop`
-    /// tears down its whole FreeType library, so HarfBuzz must let go first.
-    shaper: Shaper,
-    face: Face,
-    /// The strike's nominal pixel size; glyph bitmaps and shaped positions are
-    /// scaled by `target / strike` to land on the text's em square.
-    strike: f32,
-    /// Rasterized clusters at display size.
-    glyphs: ClusterCache<ColorGlyph>,
-    /// The measure-only twin, filled by shaping alone (no strike decode), so
-    /// layout can measure off-screen emoji without rasterizing them.
-    advances: ClusterCache<f32>,
-    hits: Cell<u64>,
-    misses: Cell<u64>,
-}
-
-impl EmojiFont {
-    /// Open the first installed emoji font, or `None` when there is none, the
-    /// font has no bitmap strikes (an outline-only build), or the shaper cannot
-    /// bind to it.
-    pub fn open() -> Option<Self> {
-        let path = EMOJI_FONTS
-            .iter()
-            .find(|p| std::path::Path::new(p).exists())?;
-        let face = Face::from_path(path).ok()?;
-        let strike = face.select_first_strike()?;
-        // SAFETY: the face handle is valid and has a size selected; the shaper
-        // takes its own FreeType reference, so drop order does not matter.
-        let shaper = unsafe { Shaper::from_ft_face(face.face.as_ptr() as *mut c_void) }?;
-        Some(Self {
-            face,
-            shaper,
-            strike,
-            glyphs: RefCell::new(HashMap::new()),
-            advances: RefCell::new(HashMap::new()),
-            hits: Cell::new(0),
-            misses: Cell::new(0),
-        })
-    }
-
-    /// Pen advance of `cluster` scaled to `target` pixels, or `None` when the
-    /// font cannot form the cluster. Cached; filled by shaping only, no bitmap
-    /// is decoded.
-    fn advance(&self, cluster: &str, target: u32) -> Option<f32> {
-        let mut cache = self.advances.borrow_mut();
-        let by_cluster = cache.entry(target).or_default();
-        // Borrow the cluster to probe: a hit returns without boxing it.
-        if let Some(&hit) = by_cluster.get(cluster) {
-            return hit;
-        }
-        let advance = self
-            .shaped(cluster)
-            .map(|glyphs| glyphs.iter().map(|g| g.x_advance).sum::<f32>() * self.scale(target));
-        by_cluster.insert(cluster.into(), advance);
-        advance
-    }
-
-    /// Run `f` over the cached color glyph for `cluster` at `target` pixels,
-    /// rasterizing (shape, decode strikes, composite, resample) on first use.
-    /// `None` means the font cannot form this cluster, matching what
-    /// [`Self::advance`] reported, since both derive from the same shaping.
-    fn with_glyph<R>(
-        &self,
-        cluster: &str,
-        target: u32,
-        f: impl FnOnce(&ColorGlyph) -> R,
-    ) -> Option<R> {
-        let mut cache = self.glyphs.borrow_mut();
-        let by_cluster = cache.entry(target).or_default();
-        // `raster` reads only FreeType and shaper state, never this cache, so
-        // filling a miss while the cache is borrowed cannot reenter this borrow.
-        // Probe by borrow first (a hit allocates nothing), box the cluster only to
-        // insert a miss.
-        if by_cluster.contains_key(cluster) {
-            self.hits.set(self.hits.get() + 1);
-        } else {
-            self.misses.set(self.misses.get() + 1);
-            let glyph = self.raster(cluster, target);
-            by_cluster.insert(cluster.into(), glyph);
-        }
-        by_cluster.get(cluster).and_then(|g| g.as_ref()).map(f)
-    }
-
-    /// This font's cluster-cache hit and miss counts, folded into the frame
-    /// stats alongside the per-character caches.
-    pub fn cache_stats(&self) -> CacheStats {
-        CacheStats {
-            hits: self.hits.get(),
-            misses: self.misses.get(),
-        }
-    }
-
-    /// Shape `cluster` and keep the result only when the font can really form
-    /// it: at least one glyph and no `.notdef`. The single success predicate
-    /// behind both [`Self::advance`] and [`Self::with_glyph`], which is what
-    /// keeps measuring and drawing in agreement.
-    fn shaped(&self, cluster: &str) -> Option<Vec<crate::shape::ShapedGlyph>> {
-        let glyphs = self.shaper.shape(cluster);
-        if glyphs.is_empty() || glyphs.iter().any(|g| g.id == 0) {
-            return None;
-        }
-        Some(glyphs)
-    }
-
-    /// How much a strike-sized measurement shrinks to land on `target` pixels.
-    fn scale(&self, target: u32) -> f32 {
-        target as f32 / self.strike
-    }
-
-    /// Rasterize `cluster` at `target` pixels: decode each shaped glyph's color
-    /// strike, composite them along the pen into one strike-sized image, then
-    /// resample once to the target size. Emoji clusters almost always shape to
-    /// a single glyph, so the composite loop usually runs once.
-    ///
-    /// The pipeline stays *premultiplied* (as FreeType decodes it) through
-    /// compositing and resampling, and un-premultiplies only the final
-    /// display-size pixels. Filtering straight alpha would mix the black of
-    /// transparent texels into edge colors and fringe the glyph outline dark.
-    fn raster(&self, cluster: &str, target: u32) -> Option<ColorGlyph> {
-        let shaped = self.shaped(cluster)?;
-        let scale = self.scale(target);
-
-        // Decode and place each glyph's bitmap in strike space. x/y are the
-        // bitmap's left and top edges relative to the pen origin and baseline.
-        let mut placed: Vec<(i32, i32, StrikeBitmap)> = Vec::new();
-        let mut pen = 0.0f32;
-        for g in &shaped {
-            if let Some(bitmap) = self.load_strike(g.id) {
-                let x = (pen + g.x_offset).round() as i32 + bitmap.left;
-                let y = bitmap.top + g.y_offset.round() as i32;
-                placed.push((x, y, bitmap));
-            }
-            pen += g.x_advance;
-        }
-        let advance = pen * scale;
-        if placed.is_empty() {
-            // Shaped but inkless; keep the advance so layout stays consistent.
-            return Some(ColorGlyph {
-                left: 0,
-                top: 0,
-                width: 0,
-                rows: 0,
-                advance,
-                argb: Vec::new(),
-            });
-        }
-
-        // The union box of every placed bitmap, still in strike space.
-        let x0 = placed.iter().map(|&(x, _, _)| x).min().unwrap_or(0);
-        let x1 = placed
-            .iter()
-            .map(|&(x, _, ref b)| x + b.width as i32)
-            .max()
-            .unwrap_or(0);
-        let top = placed.iter().map(|&(_, y, _)| y).max().unwrap_or(0);
-        let bottom = placed
-            .iter()
-            .map(|&(_, y, ref b)| y - b.rows as i32)
-            .min()
-            .unwrap_or(0);
-        let (w, h) = ((x1 - x0).max(0) as usize, (top - bottom).max(0) as usize);
-        let mut canvas = vec![0u32; w * h];
-        for (x, y, bitmap) in &placed {
-            for row in 0..bitmap.rows {
-                let dst_row = (top - y) as usize + row;
-                for col in 0..bitmap.width {
-                    let dst_col = (x - x0) as usize + col;
-                    let src = bitmap.argb[row * bitmap.width + col];
-                    let dst = &mut canvas[dst_row * w + dst_col];
-                    *dst = premultiplied_over(src, *dst);
-                }
-            }
-        }
-
-        let dst_w = ((w as f32) * scale).round().max(1.0) as i32;
-        let dst_h = ((h as f32) * scale).round().max(1.0) as i32;
-        let argb: Vec<u32> = resample_argb(&canvas, w as u32, h as u32, dst_w, dst_h)
-            .into_iter()
-            .map(straight_from_premultiplied)
-            .collect();
-        Some(ColorGlyph {
-            left: (x0 as f32 * scale).round() as i32,
-            top: (top as f32 * scale).round() as i32,
-            width: dst_w as usize,
-            rows: dst_h as usize,
-            advance,
-            argb,
-        })
-    }
-
-    /// Decode one glyph's color strike into premultiplied ARGB. `None` for a
-    /// load failure or a non-BGRA result (an inkless or malformed glyph).
-    fn load_strike(&self, glyph_id: u32) -> Option<StrikeBitmap> {
-        // SAFETY: face is valid with a strike selected; FT_LOAD_COLOR decodes
-        // the CBDT strike into the face's shared glyph slot, read out below
-        // before any later FreeType call.
-        let err = unsafe {
-            FT_Load_Glyph(
-                self.face.face.as_ptr(),
-                glyph_id as c_uint,
-                FT_LOAD_RENDER | FT_LOAD_COLOR,
-            )
-        };
-        if err != 0 {
-            return None;
-        }
-        // SAFETY: the load succeeded, so face->glyph points at the populated slot.
-        let slot = unsafe { (*self.face.face.as_ptr()).glyph };
-        let slot = NonNull::new(slot)?;
-        let slot = unsafe { slot.as_ref() };
-        if slot.bitmap.pixel_mode != FT_PIXEL_MODE_BGRA {
-            return None;
-        }
-        Some(StrikeBitmap {
-            left: slot.bitmap_left,
-            top: slot.bitmap_top,
-            width: slot.bitmap.width as usize,
-            rows: slot.bitmap.rows as usize,
-            argb: copy_bgra(&slot.bitmap),
-        })
-    }
-}
-
-/// One glyph's decoded color strike in strike space: premultiplied ARGB plus
-/// its placement relative to the pen and baseline.
-struct StrikeBitmap {
-    left: i32,
-    top: i32,
-    width: usize,
-    rows: usize,
-    argb: Vec<u32>,
-}
-
-/// Premultiplied source-over composite of `src` on `dst`, both premultiplied
-/// `0xAARRGGBB`: every channel, alpha included, is `s + d * (255 - sa) / 255`.
-/// Used only when a shaped cluster places more than one glyph; the common
-/// single-glyph case writes onto transparent pixels where this is a plain copy.
-fn premultiplied_over(src: u32, dst: u32) -> u32 {
-    let sa = src >> 24;
-    if sa == 255 || dst == 0 {
-        return src;
-    }
-    if sa == 0 {
-        return dst;
-    }
-    let inv = 255 - sa;
-    let ch = |shift: u32| ((src >> shift) & 0xff) + ((dst >> shift) & 0xff) * inv / 255;
-    (ch(24) << 24) | (ch(16) << 16) | (ch(8) << 8) | ch(0)
-}
-
 /// The faces for one pixel size: the regular face (always present) plus any
 /// bold/italic/bold-italic variants the family ships, the distinct code face (if
 /// a separate code family is installed), and the cached line metrics. Metrics
@@ -1077,9 +764,7 @@ impl Fonts {
             if size == 0 || sized.iter().any(|s| s.size == size) {
                 continue;
             }
-            let mut regular = Face::from_path(family.regular)?;
-            regular.set_pixel_size(size)?;
-            regular.emoji = emoji.clone();
+            let regular = open_face(family.regular, size, emoji.as_ref())?;
             let metrics = regular.metrics();
             sized.push(SizedFaces {
                 size,
@@ -1161,6 +846,16 @@ impl Fonts {
     }
 }
 
+/// Open `path` at `size` with the shared `emoji` font attached: the three-step
+/// face open (read the file, fix the pixel size, share the emoji font) that
+/// both the required regular face and the optional variants go through.
+fn open_face(path: &str, size: u32, emoji: Option<&Rc<EmojiFont>>) -> Result<Face> {
+    let mut face = Face::from_path(path)?;
+    face.set_pixel_size(size)?;
+    face.emoji = emoji.cloned();
+    Ok(face)
+}
+
 /// Open a style variant at `size`, or `None` if the file is absent or fails to
 /// load, leaving the caller to fall back to the regular face. Keeps a family
 /// that ships only some weights from being a hard error.
@@ -1168,10 +863,7 @@ fn open_variant(path: &str, size: u32, emoji: Option<&Rc<EmojiFont>>) -> Option<
     if !std::path::Path::new(path).exists() {
         return None;
     }
-    let mut face = Face::from_path(path).ok()?;
-    face.set_pixel_size(size).ok()?;
-    face.emoji = emoji.cloned();
-    Some(face)
+    open_face(path, size, emoji).ok()
 }
 
 /// Copy a FreeType bitmap into a tightly packed top-down coverage buffer of
@@ -1199,153 +891,6 @@ fn copy_coverage(bitmap: &FtBitmap) -> Vec<u8> {
     out
 }
 
-/// Copy a BGRA color strike into tightly packed `0xAARRGGBB` pixels, keeping
-/// FreeType's premultiplied alpha as-is (a pure byte reorder). Compositing and
-/// resampling stay premultiplied; [`straight_from_premultiplied`] converts the
-/// final display-size pixels for the straight-alpha blitter. The caller must
-/// confirm FT_PIXEL_MODE_BGRA first.
-fn copy_bgra(bitmap: &FtBitmap) -> Vec<u32> {
-    let width = bitmap.width as usize;
-    let rows = bitmap.rows as usize;
-    if width == 0 || rows == 0 || bitmap.buffer.is_null() {
-        return Vec::new();
-    }
-    let mut out = vec![0u32; width * rows];
-    let pitch = bitmap.pitch as isize;
-    for y in 0..rows {
-        for x in 0..width {
-            // SAFETY: FreeType guarantees |pitch| >= width*4 bytes per BGRA row,
-            // so the 4-byte read at buffer + y*pitch + x*4 stays within the row;
-            // out is a distinct buffer.
-            let [b, g, r, a] = unsafe {
-                let p = bitmap.buffer.offset(y as isize * pitch + (x as isize) * 4);
-                [*p, *p.add(1), *p.add(2), *p.add(3)]
-            };
-            out[y * width + x] = u32::from_be_bytes([a, r, g, b]);
-        }
-    }
-    out
-}
-
-/// Straight-alpha `0xAARRGGBB` from a premultiplied pixel, for the blitter,
-/// which blends straight colors by coverage. Fully transparent maps to zero.
-fn straight_from_premultiplied(px: u32) -> u32 {
-    let a = px >> 24;
-    if a == 0 {
-        return 0;
-    }
-    let un = |shift: u32| (((px >> shift) & 0xff) * 255 / a).min(255) << shift;
-    (a << 24) | un(16) | un(8) | un(0)
-}
-
-/// Resample ARGB `src` (`src_w` x `src_h`) into a fresh `dst_w` x `dst_h`
-/// buffer. A downscale uses an area (box) filter, so every source pixel
-/// contributes its coverage-weighted share — a bilinear tap would read only the
-/// four nearest texels and alias badly past a ~2x reduction (misshapen emoji
-/// eyes, stair-stepped edges). Upscales and 1:1 use bilinear, which is exact at
-/// 1:1 and smooth going up. A color emoji glyph is resampled to its display size
-/// once and the result cached, so this runs per (glyph, size), not per frame.
-/// Returns an empty buffer for degenerate or malformed input.
-pub(crate) fn resample_argb(
-    src: &[u32],
-    src_w: u32,
-    src_h: u32,
-    dst_w: i32,
-    dst_h: i32,
-) -> Vec<u32> {
-    let (sw, sh) = (src_w as i32, src_h as i32);
-    if dst_w <= 0 || dst_h <= 0 || sw <= 0 || sh <= 0 || src.len() < (sw * sh) as usize {
-        return Vec::new();
-    }
-    let mut out = Vec::with_capacity((dst_w * dst_h) as usize);
-    if dst_w < sw || dst_h < sh {
-        // Downscale: average each destination pixel's source footprint.
-        let (fx, fy) = (sw as f32 / dst_w as f32, sh as f32 / dst_h as f32);
-        for dy in 0..dst_h {
-            let (y0, y1) = (dy as f32 * fy, (dy + 1) as f32 * fy);
-            for dx in 0..dst_w {
-                let (x0, x1) = (dx as f32 * fx, (dx + 1) as f32 * fx);
-                out.push(sample_area(src, sw, sh, x0, x1, y0, y1));
-            }
-        }
-        return out;
-    }
-    for dy in 0..dst_h {
-        // Map each destination pixel center back into source space; the -0.5
-        // offsets sample at source pixel centers, so a 1:1 copy is exact.
-        let sy = (dy as f32 + 0.5) * sh as f32 / dst_h as f32 - 0.5;
-        for dx in 0..dst_w {
-            let sx = (dx as f32 + 0.5) * sw as f32 / dst_w as f32 - 0.5;
-            out.push(sample_bilinear(src, sw, sh, sx, sy));
-        }
-    }
-    out
-}
-
-/// Average the ARGB pixels of `src` (`w` x `h`, row-major) over the fractional
-/// box `[x0, x1) x [y0, y1)`, weighting edge rows and columns by how much of
-/// them the box covers. Indices are clamped into the surface, so a box edge
-/// that lands a rounding error past the last row or column stays in bounds.
-/// Each channel, alpha included, is averaged independently; the caller keeps
-/// color meaningful under a varying alpha by passing premultiplied pixels
-/// where that matters (the emoji path does).
-fn sample_area(src: &[u32], w: i32, h: i32, x0: f32, x1: f32, y0: f32, y1: f32) -> u32 {
-    let mut acc = [0.0f32; 4];
-    let mut total = 0.0f32;
-    let mut y = y0.floor();
-    while y < y1 {
-        let weight_y = (y + 1.0).min(y1) - y.max(y0);
-        let row = (y as i32).clamp(0, h - 1) * w;
-        let mut x = x0.floor();
-        while x < x1 {
-            let weight = weight_y * ((x + 1.0).min(x1) - x.max(x0));
-            let px = src[(row + (x as i32).clamp(0, w - 1)) as usize];
-            for (i, a) in acc.iter_mut().enumerate() {
-                *a += ((px >> (i * 8)) & 0xff) as f32 * weight;
-            }
-            total += weight;
-            x += 1.0;
-        }
-        y += 1.0;
-    }
-    if total <= 0.0 {
-        return 0;
-    }
-    let mut out = 0u32;
-    for (i, a) in acc.iter().enumerate() {
-        out |= ((a / total).round().clamp(0.0, 255.0) as u32) << (i * 8);
-    }
-    out
-}
-
-/// Bilinearly sample the ARGB pixels `src` (`w` x `h`, row-major) at fractional
-/// `(fx, fy)`, clamping to the edges. Each channel, alpha included, is
-/// interpolated independently across the four nearest texels. Used for upscales
-/// and 1:1 only; downscales go through [`sample_area`], which averages instead
-/// of skipping source pixels.
-fn sample_bilinear(src: &[u32], w: i32, h: i32, fx: f32, fy: f32) -> u32 {
-    let (x0f, y0f) = (fx.floor(), fy.floor());
-    let (tx, ty) = (fx - x0f, fy - y0f);
-    let (xi, yi) = (x0f as i32, y0f as i32);
-    // Clamp each corner independently, so a coordinate past an edge folds both
-    // texels onto the edge pixel (no wrap, no out-of-range index).
-    let x0 = xi.clamp(0, w - 1);
-    let x1 = (xi + 1).clamp(0, w - 1);
-    let y0 = yi.clamp(0, h - 1);
-    let y1 = (yi + 1).clamp(0, h - 1);
-    let at = |x: i32, y: i32| src[(y * w + x) as usize];
-    let (c00, c10, c01, c11) = (at(x0, y0), at(x1, y0), at(x0, y1), at(x1, y1));
-    let mut out = 0u32;
-    for shift in [0, 8, 16, 24] {
-        let ch = |c: u32| ((c >> shift) & 0xff) as f32;
-        let top = ch(c00) + (ch(c10) - ch(c00)) * tx;
-        let bot = ch(c01) + (ch(c11) - ch(c01)) * tx;
-        let v = (top + (bot - top) * ty).round().clamp(0.0, 255.0) as u32;
-        out |= v << shift;
-    }
-    out
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1368,46 +913,34 @@ mod tests {
     }
 
     #[test]
-    fn with_glyph_matches_the_uncached_rasterization() {
+    fn rasterize_is_deterministic() {
         let face = open();
-        let direct = face.rasterize('g');
-        // First access populates the cache; the handed-over glyph must match the
-        // uncached render byte for byte.
-        face.with_glyph('g', |cached| {
-            assert_eq!(cached.left, direct.left);
-            assert_eq!(cached.top, direct.top);
-            assert_eq!(cached.width, direct.width);
-            assert_eq!(cached.rows, direct.rows);
-            assert_eq!(cached.advance, direct.advance);
-            assert_eq!(cached.coverage, direct.coverage);
-        });
-    }
-
-    #[test]
-    fn with_glyph_reuses_the_cached_entry() {
-        let face = open();
-        // A second access returns the same coverage without re-rasterizing; the
-        // cache holds exactly one entry for the character.
-        let first = face.with_glyph('Q', |g| g.coverage.clone());
-        let second = face.with_glyph('Q', |g| g.coverage.clone());
-        assert_eq!(first, second);
-        assert_eq!(face.glyphs.borrow().len(), 1);
+        // A fixed-size face renders a glyph identically every time, which is what
+        // lets the GPU atlas rasterize each glyph exactly once and reuse it.
+        let a = face.rasterize('g');
+        let b = face.rasterize('g');
+        assert_eq!(a.left, b.left);
+        assert_eq!(a.top, b.top);
+        assert_eq!(a.width, b.width);
+        assert_eq!(a.rows, b.rows);
+        assert_eq!(a.advance, b.advance);
+        assert_eq!(a.coverage, b.coverage);
     }
 
     #[test]
     fn cache_stats_count_misses_then_hits() {
         let face = open();
-        // A fresh face has touched nothing.
+        // A fresh face has been reported no lookups.
         assert_eq!(face.cache_stats().lookups(), 0);
-        // First touch of a character is a miss (it rasterizes), every repeat a hit.
-        face.with_glyph('z', |_| {});
-        face.with_glyph('z', |_| {});
-        face.with_glyph('z', |_| {});
-        // A different character is another miss.
-        face.with_glyph('w', |_| {});
+        // The GPU batcher reports a miss the first time it packs a glyph into the
+        // atlas and a hit on every later frame that reuses the slot.
+        face.record_glyph_miss();
+        face.record_glyph_miss();
+        face.record_glyph_hit();
+        face.record_glyph_hit();
         let stats = face.cache_stats();
-        assert_eq!(stats.misses, 2, "two distinct characters, two misses");
-        assert_eq!(stats.hits, 2, "two repeat lookups of 'z'");
+        assert_eq!(stats.misses, 2);
+        assert_eq!(stats.hits, 2);
         assert!((stats.hit_rate() - 0.5).abs() < 1e-6, "2 hits of 4 lookups");
     }
 
@@ -1415,11 +948,11 @@ mod tests {
     fn fonts_cache_stats_sum_across_faces() {
         let fonts = Fonts::new(&[16, 24]).expect("a default font should be available");
         assert_eq!(fonts.cache_stats().lookups(), 0);
-        // Draw through two different sizes (hence different faces); the rolled-up
-        // tally must see both faces' lookups.
-        fonts.face(16, FontStyle::Regular).with_glyph('a', |_| {});
-        fonts.face(24, FontStyle::Regular).with_glyph('b', |_| {});
-        fonts.face(16, FontStyle::Regular).with_glyph('a', |_| {});
+        // Report through two different sizes (hence different faces); the rolled-up
+        // tally must see both faces' counts.
+        fonts.face(16, FontStyle::Regular).record_glyph_miss();
+        fonts.face(24, FontStyle::Regular).record_glyph_miss();
+        fonts.face(16, FontStyle::Regular).record_glyph_hit();
         let stats = fonts.cache_stats();
         assert_eq!(stats.misses, 2);
         assert_eq!(stats.hits, 1);
@@ -1524,190 +1057,6 @@ mod tests {
                 "code face at {size}px advances"
             );
         }
-    }
-
-    fn emoji() -> EmojiFont {
-        EmojiFont::open().expect("a color emoji font should be installed")
-    }
-
-    #[test]
-    fn wants_emoji_routes_clusters_correctly() {
-        let mono_lacks = |_: char| false;
-        let mono_has = |_: char| true;
-        // Plain text and combining marks never route to emoji.
-        assert!(!wants_emoji("a", mono_lacks));
-        assert!(
-            !wants_emoji("e\u{301}", mono_lacks),
-            "combining mark is text"
-        );
-        // A lone pictographic scalar goes color only when the text face lacks it.
-        assert!(wants_emoji("😀", mono_lacks));
-        assert!(!wants_emoji("😀", mono_has), "the text face covers it");
-        // Presentation selectors win in both directions.
-        assert!(wants_emoji("☺\u{fe0f}", mono_has), "emoji presentation");
-        assert!(!wants_emoji("☺\u{fe0e}", mono_lacks), "text presentation");
-        // Flags, skin tones, ZWJ sequences, and keycaps are emoji outright.
-        assert!(wants_emoji("🇳🇴", mono_has));
-        assert!(wants_emoji("👍🏽", mono_has));
-        assert!(wants_emoji("👨\u{200d}👩\u{200d}👧", mono_has));
-        assert!(wants_emoji("1\u{fe0f}\u{20e3}", mono_has));
-    }
-
-    #[test]
-    fn emoji_font_measures_and_rasters_a_smiley() {
-        let font = emoji();
-        let advance = font.advance("😀", 32).expect("the smiley should shape");
-        assert!(advance > 0.0);
-        let (width, rows, has_ink, glyph_advance) = font
-            .with_glyph("😀", 32, |g| {
-                let ink = g.argb.iter().any(|&p| p >> 24 != 0);
-                (g.width, g.rows, ink, g.advance)
-            })
-            .expect("the smiley should raster");
-        assert!(width > 0 && rows > 0, "the smiley has pixels");
-        assert!(has_ink, "the smiley has visible ink");
-        assert!(
-            rows <= 40,
-            "scaled to the 32px em square, not the strike ({rows} rows)"
-        );
-        assert_eq!(glyph_advance, advance, "measure and raster agree");
-    }
-
-    #[test]
-    fn zwj_and_flag_clusters_ligate_to_one_glyph() {
-        let font = emoji();
-        let single = font.advance("👨", 32).expect("the man emoji shapes");
-        let family = font
-            .advance("👨\u{200d}👩\u{200d}👧", 32)
-            .expect("the family should ligate");
-        assert!(
-            family < single * 2.0,
-            "a family is one ligature, not three glyphs ({family} vs {single})"
-        );
-        let flag = font.advance("🇳🇴", 32).expect("the flag should ligate");
-        assert!(
-            flag < single * 2.0,
-            "a flag is one glyph, not two letter symbols"
-        );
-    }
-
-    #[test]
-    fn emoji_cluster_cache_hits_after_the_first_raster() {
-        let font = emoji();
-        font.with_glyph("🎉", 32, |_| ()).expect("party popper");
-        font.with_glyph("🎉", 32, |_| ())
-            .expect("party popper again");
-        let stats = font.cache_stats();
-        assert_eq!((stats.hits, stats.misses), (1, 1));
-    }
-
-    #[test]
-    fn premultiplied_edges_resample_without_dark_fringe() {
-        // Half yellow, half transparent, averaged to one pixel in premultiplied
-        // space and converted to straight alpha afterwards: the color must stay
-        // pure yellow at half coverage. Filtering straight alpha instead would
-        // mix the transparent texel's black into the color and darken the edge,
-        // which is exactly the fringe this pipeline order exists to avoid.
-        let src = [0xff_ff_ff_00, 0x0000_0000];
-        let avg = resample_argb(&src, 2, 1, 1, 1)[0];
-        let straight = straight_from_premultiplied(avg);
-        assert_eq!(straight >> 24, 0x80, "half coverage");
-        assert_eq!(straight & 0x00ff_ffff, 0x00ff_ff00, "still pure yellow");
-    }
-
-    #[test]
-    fn resample_upscales_a_single_pixel_to_a_solid_block() {
-        // 1x1 red, scaled to 3x3, is nine reds (the cache stores this, blitted later).
-        let scaled = resample_argb(&[0xff_ff_00_00], 1, 1, 3, 3);
-        assert_eq!(scaled.len(), 9);
-        assert!(scaled.iter().all(|&p| p == 0xff_ff_00_00), "all red");
-    }
-
-    #[test]
-    fn resample_downscale_averages_rather_than_skips() {
-        // 4x1 [white, black, black, black] to 1x1: the area filter yields the
-        // 25% average; a bilinear tap between the middle pixels would give
-        // plain black, silently dropping the white pixel.
-        let src = [0xff_ff_ff_ff, 0xff_00_00_00, 0xff_00_00_00, 0xff_00_00_00];
-        let out = resample_argb(&src, 4, 1, 1, 1);
-        let gray = out[0] & 0xff;
-        assert!(
-            (60..=68).contains(&gray),
-            "expected the 25% average, got {:08x}",
-            out[0]
-        );
-    }
-
-    #[test]
-    fn resample_downscale_keeps_every_source_pixel_contributing() {
-        // A lone red corner pixel in an otherwise black 3x3 must tint the 1x1
-        // result; a center-only sample would drop it entirely.
-        let mut src = [0xff_00_00_00; 9];
-        src[0] = 0xff_ff_00_00;
-        let out = resample_argb(&src, 3, 3, 1, 1);
-        let red = (out[0] >> 16) & 0xff;
-        assert!(
-            red > 0,
-            "the corner pixel must contribute, got {:08x}",
-            out[0]
-        );
-    }
-
-    #[test]
-    fn resample_is_exact_at_one_to_one() {
-        let src = [0xff_11_22_33, 0xff_44_55_66, 0xff_77_88_99, 0xff_aa_bb_cc];
-        let out = resample_argb(&src, 2, 2, 2, 2);
-        assert_eq!(out, src, "a 1:1 resample copies the pixels exactly");
-    }
-
-    #[test]
-    fn resample_rejects_malformed_input() {
-        // Claims 2x2 but carries one pixel: empty result rather than reading OOB.
-        assert!(resample_argb(&[0xff_ff_00_00], 2, 2, 4, 4).is_empty());
-        assert!(
-            resample_argb(&[0xff_ff_00_00], 1, 1, 0, 4).is_empty(),
-            "zero dst"
-        );
-    }
-
-    #[test]
-    fn premultiplied_over_keeps_translucent_sources_undarkened() {
-        let half_yellow = 0x80_80_80_00; // premultiplied: a=128, r=g=128, b=0
-        assert_eq!(
-            premultiplied_over(half_yellow, 0),
-            half_yellow,
-            "compositing onto transparent is a plain copy"
-        );
-        let opaque = 0xff_10_20_30;
-        assert_eq!(premultiplied_over(opaque, half_yellow), opaque);
-        assert_eq!(premultiplied_over(0, half_yellow), half_yellow);
-        // A half-alpha source over an opaque background accumulates both.
-        let out = premultiplied_over(half_yellow, 0xff_00_00_ff);
-        assert_eq!(out >> 24, 0xff, "alpha saturates over an opaque ground");
-        assert_eq!((out >> 16) & 0xff, 0x80, "red comes from the source");
-        assert_eq!(out & 0xff, 0x7f, "blue is the ground's remainder");
-    }
-
-    #[test]
-    fn straight_from_premultiplied_recovers_color_and_maps_clear_to_zero() {
-        assert_eq!(straight_from_premultiplied(0), 0);
-        assert_eq!(straight_from_premultiplied(0x80_80_00_40), 0x80_ff_00_7f);
-        let opaque = 0xff_12_34_56;
-        assert_eq!(
-            straight_from_premultiplied(opaque),
-            opaque,
-            "opaque is identity"
-        );
-    }
-
-    #[test]
-    fn an_unformable_cluster_answers_none() {
-        let font = emoji();
-        // A letter with a combining mark is no emoji ligature; the emoji font
-        // has no glyphs for it and must say so rather than render garbage.
-        // (Routing filters this out anyway; the font still answers safely.)
-        assert!(font.advance("e\u{301}", 32).is_none());
-        assert!(font.with_glyph("e\u{301}", 32, |_| ()).is_none());
     }
 
     #[test]

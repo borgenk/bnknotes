@@ -213,104 +213,191 @@ pub(crate) fn build_display_list(
     rope: &crate::rope::Rope,
     p: &PaintParams,
 ) -> DisplayList {
-    let (width, scroll_y) = (p.width, p.scroll_y);
-    let view_h = p.height as i32;
-    // The content's left edge (the column's inner margin). Text, panels, and
-    // images hang off this so a pane's content sits in its own column; the
-    // background clears from the column's outer edge, `MARGIN` to its left.
-    let left = layout.left();
-    // Roughly a few commands per visual line (panel, runs, decorations) plus the
-    // background and caret; one upfront allocation beats growing the list mid-build.
-    let mut list: DisplayList = Vec::with_capacity(layout.lines().len() * 3 + 8);
-
-    // The background, full surface, first so a clipped repaint clears its region
-    // before the rest of the list draws over it.
-    list.push(DrawCmd::Fill {
-        rect: Rect {
-            x: left - MARGIN,
-            y: 0,
-            w: width as i32,
-            h: view_h,
-        },
-        color: BACKGROUND,
-    });
-
-    // Block backgrounds paint first, beneath both the selection highlight and the
-    // text: a fenced code block sits on a full-width tinted panel, one line box
-    // tall so consecutive lines tile into a continuous block, and that panel must
-    // sit behind the selection rather than cover it (otherwise a selection inside
-    // the block would vanish). A collapsed fence row still paints, so an unfocused
-    // block keeps blank top and bottom rows that read as vertical padding. The
-    // block's first row rounds its top corners and its last row its bottom ones, so
-    // the whole panel reads as one softly rounded block.
-    let lines = layout.lines();
-    let panel_w = (width as i32 - 2 * MARGIN).max(0);
-    for (i, line) in lines.iter().enumerate() {
-        if !line.code_block {
-            continue;
-        }
-        let m = fonts.metrics(line.size);
-        let top = line.baseline - scroll_y - m.ascent;
-        let h = m.line_height;
-        if top + h <= 0 || top >= view_h {
-            continue;
-        }
-        let first = i == 0 || !lines[i - 1].code_block;
-        let last = i + 1 >= lines.len() || !lines[i + 1].code_block;
-        let corners = match (first, last) {
-            (true, true) => display::RoundedCorners::Both,
-            (true, false) => display::RoundedCorners::Top,
-            (false, true) => display::RoundedCorners::Bottom,
-            (false, false) => display::RoundedCorners::None,
-        };
-        list.push(DrawCmd::RoundRect {
-            rect: Rect {
-                x: left,
-                y: top,
-                w: panel_w,
-                h,
-            },
-            color: CODE_BG,
-            radius: CODE_RADIUS,
-            corners,
-        });
-    }
-
-    // Inline code spans get their own tinted panel, also beneath the selection so a
-    // selection over inline code shows through (the glyphs still draw on top in the
-    // text loop). Block code is excluded here; its full-width panel above covers it.
-    for rect in layout.code_rects(fonts, rope) {
-        let y = rect.y - scroll_y;
-        if y + rect.h <= 0 || y >= view_h {
-            continue;
-        }
-        list.push(DrawCmd::Fill {
-            rect: Rect { y, ..rect },
-            color: CODE_BG,
-        });
-    }
-
-    // Everything is laid out in content space; the viewport scroll shifts it up by
-    // `scroll_y`. Off-screen rectangles are dropped from the list.
+    let mut painter = Painter::new(fonts, layout, rope, p);
+    // Bottom-to-top stacking order. This sequence is also the damage-diff order,
+    // so the passes must run in exactly this order; each is one method below.
+    painter.background();
+    painter.code_block_panels();
+    painter.inline_code_panels();
     if let Some((start, end)) = p.selection {
-        for rect in layout.selection_rects(fonts, rope, start, end) {
-            let y = rect.y - scroll_y;
-            if y + rect.h <= 0 || y >= view_h {
+        painter.selection(start, end);
+    }
+    if let Some(find) = &p.find {
+        painter.find_matches(find);
+    }
+    painter.text();
+    if p.caret_visible {
+        painter.caret(p.cursor);
+    }
+    // The find bar and its match ticks float over everything else, so they go last.
+    if let Some(find) = &p.find {
+        painter.find_ticks(find);
+        painter.find_bar(find);
+    }
+    painter.list
+}
+
+/// Accumulates one frame's display list from the layout and rope. The read-only
+/// context (`fonts`/`layout`/`rope`) plus the viewport (`scroll_y`/`view_h`/
+/// `width`) and the content's left edge are held once so each pass reads them
+/// without re-plumbing; [`Self::screen`] and [`Self::push_text`] fold the
+/// shift-and-cull and measure-then-emit patterns the passes repeat.
+struct Painter<'a> {
+    list: DisplayList,
+    fonts: &'a Fonts,
+    layout: &'a Layout,
+    rope: &'a crate::rope::Rope,
+    scroll_y: i32,
+    view_h: i32,
+    width: i32,
+    /// The content's left edge (the column's inner margin). Text, panels, and
+    /// images hang off this so a pane's content sits in its own column; the
+    /// background clears from the column's outer edge, `MARGIN` to its left.
+    left: i32,
+}
+
+impl<'a> Painter<'a> {
+    fn new(
+        fonts: &'a Fonts,
+        layout: &'a Layout,
+        rope: &'a crate::rope::Rope,
+        p: &PaintParams,
+    ) -> Self {
+        Self {
+            // Roughly a few commands per visual line (panel, runs, decorations)
+            // plus the background and caret; one upfront allocation beats growing
+            // the list mid-build.
+            list: Vec::with_capacity(layout.lines().len() * 3 + 8),
+            fonts,
+            layout,
+            rope,
+            scroll_y: p.scroll_y,
+            view_h: p.height as i32,
+            width: p.width as i32,
+            left: layout.left(),
+        }
+    }
+
+    /// Shift a content-space rect into screen space (up by the scroll) and cull
+    /// it when it falls entirely above or below the viewport. `None` means the
+    /// caller emits nothing for it.
+    fn screen(&self, rect: Rect) -> Option<Rect> {
+        let y = rect.y - self.scroll_y;
+        if y + rect.h <= 0 || y >= self.view_h {
+            return None;
+        }
+        Some(Rect { y, ..rect })
+    }
+
+    /// Measure `text` in `face` and emit its run from `x` along `baseline` in
+    /// `color`, returning the pen x after the run (its drawn right edge).
+    fn push_text(
+        &mut self,
+        face: FaceKey,
+        x: i32,
+        baseline: i32,
+        color: u32,
+        text: String,
+        m: Metrics,
+    ) -> i32 {
+        let end = (x as f32 + shape::text_advance(self.fonts.face_for(face), &text)).round() as i32;
+        self.list
+            .push(text_cmd(face, x, baseline, end, color, text, m));
+        end
+    }
+
+    /// The background, full surface, first so a clipped repaint clears its region
+    /// before the rest of the list draws over it.
+    fn background(&mut self) {
+        self.list.push(DrawCmd::Fill {
+            rect: Rect {
+                x: self.left - MARGIN,
+                y: 0,
+                w: self.width,
+                h: self.view_h,
+            },
+            color: BACKGROUND,
+        });
+    }
+
+    /// Block backgrounds paint first, beneath both the selection highlight and the
+    /// text: a fenced code block sits on a full-width tinted panel, one line box
+    /// tall so consecutive lines tile into a continuous block, and that panel must
+    /// sit behind the selection rather than cover it (otherwise a selection inside
+    /// the block would vanish). A collapsed fence row still paints, so an unfocused
+    /// block keeps blank top and bottom rows that read as vertical padding. The
+    /// block's first row rounds its top corners and its last row its bottom ones, so
+    /// the whole panel reads as one softly rounded block.
+    fn code_block_panels(&mut self) {
+        let lines = self.layout.lines();
+        let panel_w = (self.width - 2 * MARGIN).max(0);
+        for (i, line) in lines.iter().enumerate() {
+            if !line.code_block {
                 continue;
             }
-            list.push(DrawCmd::Fill {
-                rect: Rect { y, ..rect },
-                color: SELECTION_COLOR,
+            let m = self.fonts.metrics(line.size);
+            let Some(rect) = self.screen(Rect {
+                x: self.left,
+                y: line.baseline - m.ascent,
+                w: panel_w,
+                h: m.line_height,
+            }) else {
+                continue;
+            };
+            let first = i == 0 || !lines[i - 1].code_block;
+            let last = i + 1 >= lines.len() || !lines[i + 1].code_block;
+            let corners = match (first, last) {
+                (true, true) => display::RoundedCorners::Both,
+                (true, false) => display::RoundedCorners::Top,
+                (false, true) => display::RoundedCorners::Bottom,
+                (false, false) => display::RoundedCorners::None,
+            };
+            self.list.push(DrawCmd::RoundRect {
+                rect,
+                color: CODE_BG,
+                radius: CODE_RADIUS,
+                corners,
             });
         }
     }
 
-    // Find matches, filled like a dimmer selection beneath the text. The current
-    // match is skipped: the app mirrors it into the buffer selection, which was
-    // just painted. Only matches inside the visible byte range are measured, so a
-    // short query with thousands of hits does not price every frame by them.
-    if let Some(find) = &p.find {
-        let visible = visible_byte_range(fonts, layout, scroll_y, view_h);
+    /// Inline code spans get their own tinted panel, also beneath the selection so a
+    /// selection over inline code shows through (the glyphs still draw on top in the
+    /// text loop). Block code is excluded here; its full-width panel above covers it.
+    fn inline_code_panels(&mut self) {
+        for rect in self.layout.code_rects(self.fonts, self.rope) {
+            if let Some(rect) = self.screen(rect) {
+                self.list.push(DrawCmd::Fill {
+                    rect,
+                    color: CODE_BG,
+                });
+            }
+        }
+    }
+
+    /// The selection highlight. Everything is laid out in content space; the
+    /// viewport scroll shifts it up by `scroll_y`, and off-screen rectangles are
+    /// dropped from the list.
+    fn selection(&mut self, start: usize, end: usize) {
+        for rect in self
+            .layout
+            .selection_rects(self.fonts, self.rope, start, end)
+        {
+            if let Some(rect) = self.screen(rect) {
+                self.list.push(DrawCmd::Fill {
+                    rect,
+                    color: SELECTION_COLOR,
+                });
+            }
+        }
+    }
+
+    /// Find matches, filled like a dimmer selection beneath the text. The current
+    /// match is skipped: the app mirrors it into the buffer selection, which was
+    /// just painted. Only matches inside the visible byte range are measured, so a
+    /// short query with thousands of hits does not price every frame by them.
+    fn find_matches(&mut self, find: &FindPaint) {
+        let visible = visible_byte_range(self.fonts, self.layout, self.scroll_y, self.view_h);
         let lo = find.matches.partition_point(|&(_, end)| end <= visible.0);
         let hi = find
             .matches
@@ -319,215 +406,219 @@ pub(crate) fn build_display_list(
             if i == find.current {
                 continue;
             }
-            for rect in layout.selection_rects(fonts, rope, start, end) {
-                let y = rect.y - scroll_y;
-                if y + rect.h <= 0 || y >= view_h {
-                    continue;
+            for rect in self
+                .layout
+                .selection_rects(self.fonts, self.rope, start, end)
+            {
+                if let Some(rect) = self.screen(rect) {
+                    self.list.push(DrawCmd::Fill {
+                        rect,
+                        color: FIND_MATCH_COLOR,
+                    });
                 }
-                list.push(DrawCmd::Fill {
-                    rect: Rect { y, ..rect },
-                    color: FIND_MATCH_COLOR,
-                });
             }
         }
     }
 
-    // The text, one visual line at a time, each at its own font size, materialized
-    // from the rope. A line is a sequence of inline runs: regular text, code spans
-    // (drawn in the code face on a tinted panel), and the delimiter markers, which
-    // are dimmed on the cursor's line and collapse to nothing (skipped) once it
-    // leaves, the live-preview reveal that `layout` bakes into each run's `visible`.
-    for line in lines {
-        let m = fonts.metrics(line.size);
-        let baseline = line.baseline - scroll_y;
-        // An image line blits its decoded picture into its (taller-than-text) box,
-        // centered with the layout's vertical padding, and nothing else draws on the
-        // line. Cull on the full box height so a tall image straddling a viewport
-        // edge still paints. A picture that has not decoded leaves the box blank.
-        if let Some(img) = line.image {
-            let box_top = baseline - m.ascent;
-            if box_top < view_h && box_top + img.box_height() > 0 {
-                let pic = Rect {
-                    x: left + line.indent,
-                    y: box_top + (img.box_height() - img.height) / 2,
-                    w: img.width,
-                    h: img.height,
-                };
-                // Blit the cached display-size bitmap (resampled once, not per
-                // frame); a no-op at paint time if the image is not decoded.
-                list.push(DrawCmd::Image {
-                    rect: pic,
-                    path: rope.byte_slice(img.path_start..img.path_end),
-                });
-                // A selected image gets an accent border (four thin edge fills) and
-                // a corner toggle button: a rounded panel with a centered `</>`
-                // "source" glyph, the affordance to reveal its markdown.
-                if img.selected {
-                    push_image_chrome(&mut list, fonts, &pic);
+    /// The text, one visual line at a time, each at its own font size, materialized
+    /// from the rope. A line is a sequence of inline runs: regular text, code spans
+    /// (drawn in the code face on a tinted panel), and the delimiter markers, which
+    /// are dimmed on the cursor's line and collapse to nothing (skipped) once it
+    /// leaves, the live-preview reveal that `layout` bakes into each run's `visible`.
+    fn text(&mut self) {
+        let (fonts, layout, rope) = (self.fonts, self.layout, self.rope);
+        let (scroll_y, view_h, left) = (self.scroll_y, self.view_h, self.left);
+        for line in layout.lines() {
+            let m = fonts.metrics(line.size);
+            let baseline = line.baseline - scroll_y;
+            // An image line blits its decoded picture into its (taller-than-text)
+            // box, centered with the layout's vertical padding, and nothing else
+            // draws on the line. Cull on the full box height so a tall image
+            // straddling a viewport edge still paints. A picture that has not
+            // decoded leaves the box blank.
+            if let Some(img) = line.image {
+                let box_top = baseline - m.ascent;
+                if box_top < view_h && box_top + img.box_height() > 0 {
+                    let pic = Rect {
+                        x: left + line.indent,
+                        y: box_top + (img.box_height() - img.height) / 2,
+                        w: img.width,
+                        h: img.height,
+                    };
+                    // Blit the cached display-size bitmap (resampled once, not per
+                    // frame); a no-op at paint time if the image is not decoded.
+                    self.list.push(DrawCmd::Image {
+                        rect: pic,
+                        path: rope.byte_slice(img.path_start..img.path_end),
+                    });
+                    // A selected image gets an accent border (four thin edge fills)
+                    // and a corner toggle button: a rounded panel with a centered
+                    // `</>` "source" glyph, the affordance to reveal its markdown.
+                    if img.selected {
+                        push_image_chrome(&mut self.list, fonts, &pic);
+                    }
                 }
-            }
-            continue;
-        }
-        // Skip lines fully above or below the viewport, so a frame only rasterizes
-        // what is on screen.
-        if baseline + m.descent <= 0 || baseline - m.ascent >= view_h {
-            continue;
-        }
-        // A blockquote draws a bar down its gutter, on every wrapped line.
-        if matches!(line.gutter, Gutter::QuoteBar { .. }) {
-            list.push(DrawCmd::Fill {
-                rect: Rect {
-                    x: left,
-                    y: baseline - m.ascent,
-                    w: QUOTE_BAR_WIDTH,
-                    h: m.line_height,
-                },
-                color: QUOTE_BAR_COLOR,
-            });
-        }
-        // A thematic break draws a horizontal line centered in its row; the raw `---`
-        // is collapsed (its runs are hidden), so nothing else paints on the line.
-        if line.rule {
-            let mid = baseline - m.ascent + m.line_height / 2;
-            list.push(DrawCmd::Fill {
-                rect: Rect {
-                    x: left,
-                    y: mid - RULE_THICKNESS / 2,
-                    w: (width as i32 - 2 * MARGIN).max(0),
-                    h: RULE_THICKNESS,
-                },
-                color: RULE_COLOR,
-            });
-        }
-        // Content is inset by the line's hanging indent (0 unless this is a wrapped
-        // list/quote continuation).
-        let heading = line.heading.is_some();
-        // A completed task's text reads dim and struck through, over the whole
-        // item (wrapped continuations included), so done items scan as done.
-        let done = line.task == Some(true);
-        let mut pen = left + line.indent;
-        for (i, run) in layout.run_slice(line).iter().enumerate() {
-            if !run.visible {
                 continue;
             }
-            // Each run draws in its own face, so bold/italic emphasis is carried by
-            // the glyphs, not color: only code and markers recolor, the rest
-            // (regular and emphasized prose) is FG.
-            let fk = face_key(line.size, run.kind, heading);
-            let face = fonts.face_for(fk);
-            let slice = rope.byte_slice(run.start..run.end);
-            // The block marker (the first run on a list/quote line) gives way to its
-            // gutter decoration: a bullet glyph for a list, nothing for a quote (the
-            // bar above replaces it). Either keeps the source width, so text never
-            // shifts.
-            if i == 0 && matches!(run.kind, markdown::SpanKind::Marker) {
-                let advance = shape::text_advance(face, &slice).round() as i32;
-                match line.gutter {
-                    Gutter::Bullet => {
-                        // Place the marker's leading indentation first, so a nested
-                        // item's dot sits at its depth, then the dot in place of the
-                        // dash. The dot stands in for the `- ` marker, so it takes
-                        // the muted marker color (MARKER_COLOR), not the body FG.
-                        let indent = slice.len() - slice.trim_start().len();
-                        let dot_x =
-                            pen + shape::text_advance(face, &slice[..indent]).round() as i32;
-                        let end = (dot_x as f32 + shape::text_advance(face, BULLET)).round() as i32;
-                        list.push(text_cmd(
-                            fk,
-                            dot_x,
-                            baseline,
-                            end,
-                            MARKER_COLOR,
-                            BULLET.to_string(),
-                            m,
-                        ));
-                        pen += advance;
-                        continue;
-                    }
-                    // A task item's raw `- [ ]` gives way to a checkbox drawn
-                    // with fills (the prose face carries no ☐/☑ glyphs), placed
-                    // by the same geometry clicks hit-test against. The pen
-                    // still advances by the full marker, so the text never
-                    // shifts between the box and the revealed source.
-                    Gutter::Checkbox { checked } => {
-                        if let Some(rect) = layout.checkbox_rect(fonts, rope, line) {
-                            let rect = Rect {
-                                y: rect.y - scroll_y,
-                                ..rect
-                            };
-                            push_checkbox(&mut list, rect, checked);
-                        }
-                        pen += advance;
-                        continue;
-                    }
-                    Gutter::QuoteBar { marker: true } => {
-                        pen += advance;
-                        continue;
-                    }
-                    _ => {}
-                }
+            // Skip lines fully above or below the viewport, so a frame only
+            // rasterizes what is on screen.
+            if baseline + m.descent <= 0 || baseline - m.ascent >= view_h {
+                continue;
             }
-            let color = match run.kind {
-                markdown::SpanKind::Marker => MARKER_COLOR,
-                // Every text run of a done task dims to the marker color, so
-                // the whole item (its code and links included) reads muted.
-                markdown::SpanKind::Text(_) if done => MARKER_COLOR,
-                markdown::SpanKind::Text(markdown::Emphasis::Code) => CODE_COLOR,
-                markdown::SpanKind::Text(markdown::Emphasis::Link) => LINK_COLOR,
-                // Heading prose takes the level's color (the marker and any inline
-                // code on the line keep their own); body prose is FG.
-                markdown::SpanKind::Text(_) => match line.heading {
-                    Some(level) => HEADING_COLORS
-                        .get(level.saturating_sub(1) as usize)
-                        .copied()
-                        .unwrap_or(FOREGROUND),
-                    None => FOREGROUND,
-                },
-            };
-            // Code backgrounds (inline panels and the full-width block panel) are
-            // emitted in the pre-pass above, beneath the selection; here we only
-            // draw the glyphs over them.
-            let run_x = pen;
-            let end = (run_x as f32 + shape::text_advance(face, &slice)).round() as i32;
-            list.push(text_cmd(fk, run_x, baseline, end, color, slice, m));
-            pen = end;
-            // Inline decorations over the glyphs, each spanning the run's drawn
-            // width: a link is underlined and struck text gets a line through its
-            // middle, both in the run's own color. Thickness scales with the
-            // line's size so it stays proportionate on larger headings. A done
-            // task strikes through all of its text instead.
-            let deco = match run.kind {
-                markdown::SpanKind::Text(_) if done => Some(baseline - m.ascent / 3),
-                markdown::SpanKind::Text(markdown::Emphasis::Link) => {
-                    Some(baseline + m.descent / 3)
-                }
-                markdown::SpanKind::Text(markdown::Emphasis::Strikethrough) => {
-                    Some(baseline - m.ascent / 3)
-                }
-                _ => None,
-            };
-            if let Some(y) = deco {
-                let thickness = (line.size as i32 / 14).max(1);
-                list.push(DrawCmd::Fill {
+            // A blockquote draws a bar down its gutter, on every wrapped line.
+            if matches!(line.gutter, Gutter::QuoteBar { .. }) {
+                self.list.push(DrawCmd::Fill {
                     rect: Rect {
-                        x: run_x,
-                        y,
-                        w: end - run_x,
-                        h: thickness,
+                        x: left,
+                        y: baseline - m.ascent,
+                        w: QUOTE_BAR_WIDTH,
+                        h: m.line_height,
                     },
-                    color,
+                    color: QUOTE_BAR_COLOR,
                 });
+            }
+            // A thematic break draws a horizontal line centered in its row; the raw
+            // `---` is collapsed (its runs are hidden), so nothing else paints on
+            // the line.
+            if line.rule {
+                let mid = baseline - m.ascent + m.line_height / 2;
+                self.list.push(DrawCmd::Fill {
+                    rect: Rect {
+                        x: left,
+                        y: mid - RULE_THICKNESS / 2,
+                        w: (self.width - 2 * MARGIN).max(0),
+                        h: RULE_THICKNESS,
+                    },
+                    color: RULE_COLOR,
+                });
+            }
+            // Content is inset by the line's hanging indent (0 unless this is a
+            // wrapped list/quote continuation).
+            let heading = line.heading.is_some();
+            // A completed task's text reads dim and struck through, over the whole
+            // item (wrapped continuations included), so done items scan as done.
+            let done = line.task == Some(true);
+            let mut pen = left + line.indent;
+            for (i, run) in layout.run_slice(line).iter().enumerate() {
+                if !run.visible {
+                    continue;
+                }
+                // Each run draws in its own face, so bold/italic emphasis is carried
+                // by the glyphs, not color: only code and markers recolor, the
+                // rest (regular and emphasized prose) is FG.
+                let fk = face_key(line.size, run.kind, heading);
+                let face = fonts.face_for(fk);
+                let slice = rope.byte_slice(run.start..run.end);
+                // The block marker (the first run on a list/quote line) gives way to
+                // its gutter decoration: a bullet glyph for a list, nothing for a
+                // quote (the bar above replaces it). Either keeps the source width,
+                // so text never shifts.
+                if i == 0 && matches!(run.kind, markdown::SpanKind::Marker) {
+                    let advance = shape::text_advance(face, &slice).round() as i32;
+                    match line.gutter {
+                        Gutter::Bullet => {
+                            // Place the marker's leading indentation first, so a
+                            // nested item's dot sits at its depth, then the dot in
+                            // place of the dash. The dot stands in for the `- `
+                            // marker, so it takes the muted marker color
+                            // (MARKER_COLOR), not the body FG.
+                            let indent = slice.len() - slice.trim_start().len();
+                            let dot_x =
+                                pen + shape::text_advance(face, &slice[..indent]).round() as i32;
+                            self.push_text(
+                                fk,
+                                dot_x,
+                                baseline,
+                                MARKER_COLOR,
+                                BULLET.to_string(),
+                                m,
+                            );
+                            pen += advance;
+                            continue;
+                        }
+                        // A task item's raw `- [ ]` gives way to a checkbox drawn
+                        // with fills (the prose face carries no ☐/☑ glyphs), placed
+                        // by the same geometry clicks hit-test against. The pen
+                        // still advances by the full marker, so the text never
+                        // shifts between the box and the revealed source.
+                        Gutter::Checkbox { checked } => {
+                            if let Some(rect) = layout.checkbox_rect(fonts, rope, line) {
+                                let rect = Rect {
+                                    y: rect.y - scroll_y,
+                                    ..rect
+                                };
+                                push_checkbox(&mut self.list, rect, checked);
+                            }
+                            pen += advance;
+                            continue;
+                        }
+                        Gutter::QuoteBar { marker: true } => {
+                            pen += advance;
+                            continue;
+                        }
+                        _ => {}
+                    }
+                }
+                let color = match run.kind {
+                    markdown::SpanKind::Marker => MARKER_COLOR,
+                    // Every text run of a done task dims to the marker color, so
+                    // the whole item (its code and links included) reads muted.
+                    markdown::SpanKind::Text(_) if done => MARKER_COLOR,
+                    markdown::SpanKind::Text(markdown::Emphasis::Code) => CODE_COLOR,
+                    markdown::SpanKind::Text(markdown::Emphasis::Link) => LINK_COLOR,
+                    // Heading prose takes the level's color (the marker and any
+                    // inline code on the line keep their own); body prose is FG.
+                    markdown::SpanKind::Text(_) => match line.heading {
+                        Some(level) => HEADING_COLORS
+                            .get(level.saturating_sub(1) as usize)
+                            .copied()
+                            .unwrap_or(FOREGROUND),
+                        None => FOREGROUND,
+                    },
+                };
+                // Code backgrounds (inline panels and the full-width block panel)
+                // are emitted in the pre-pass above, beneath the selection; here we
+                // only draw the glyphs over them.
+                let run_x = pen;
+                pen = self.push_text(fk, run_x, baseline, color, slice, m);
+                // Inline decorations over the glyphs, each spanning the run's drawn
+                // width: a link is underlined and struck text gets a line through its
+                // middle, both in the run's own color. Thickness scales with the
+                // line's size so it stays proportionate on larger headings. A done
+                // task strikes through all of its text instead.
+                let deco = match run.kind {
+                    markdown::SpanKind::Text(_) if done => Some(baseline - m.ascent / 3),
+                    markdown::SpanKind::Text(markdown::Emphasis::Link) => {
+                        Some(baseline + m.descent / 3)
+                    }
+                    markdown::SpanKind::Text(markdown::Emphasis::Strikethrough) => {
+                        Some(baseline - m.ascent / 3)
+                    }
+                    _ => None,
+                };
+                if let Some(y) = deco {
+                    let thickness = (line.size as i32 / 14).max(1);
+                    self.list.push(DrawCmd::Fill {
+                        rect: Rect {
+                            x: run_x,
+                            y,
+                            w: pen - run_x,
+                            h: thickness,
+                        },
+                        color,
+                    });
+                }
             }
         }
     }
 
-    // The caret, drawn only on the visible half of its blink cycle.
-    if p.caret_visible {
-        let (cx, cy, ch) = layout.caret(fonts, rope, p.cursor);
-        list.push(DrawCmd::Fill {
+    /// The caret, drawn only on the visible half of its blink cycle.
+    fn caret(&mut self, cursor: usize) {
+        let (cx, cy, ch) = self.layout.caret(self.fonts, self.rope, cursor);
+        self.list.push(DrawCmd::Fill {
             rect: Rect {
                 x: cx,
-                y: cy - scroll_y,
+                y: cy - self.scroll_y,
                 w: CARET_WIDTH,
                 h: ch,
             },
@@ -535,14 +626,15 @@ pub(crate) fn build_display_list(
         });
     }
 
-    // The find bar and its match ticks float over everything else, so they go
-    // last.
-    if let Some(find) = &p.find {
-        push_find_ticks(&mut list, find, width as i32, view_h);
-        push_find_bar(&mut list, fonts, find, width as i32);
+    /// The right-edge match tick strip, floating over the content.
+    fn find_ticks(&mut self, find: &FindPaint) {
+        push_find_ticks(&mut self.list, find, self.width, self.view_h);
     }
 
-    list
+    /// The find bar panel, floating top-right over everything else.
+    fn find_bar(&mut self, find: &FindPaint) {
+        push_find_bar(&mut self.list, self.fonts, find, self.width);
+    }
 }
 
 /// Append the right-edge tick strip while find is open: one mark per match at

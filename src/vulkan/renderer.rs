@@ -563,8 +563,9 @@ fn create_pipeline(
         alpha_to_coverage_enable: 0,
         alpha_to_one_enable: 0,
     };
-    // Straight-alpha blending, the GPU twin of render.rs blend_over. Solid
-    // quads carry alpha 1 and come out exact.
+    // Straight-alpha source-over blending: the fragment color, weighted by its
+    // own alpha, over one-minus-alpha of the destination. Solid quads carry
+    // alpha 1 and come out exact.
     let blend_attachment = VkPipelineColorBlendAttachmentState {
         blend_enable: 1,
         src_color_blend_factor: VK_BLEND_FACTOR_SRC_ALPHA,

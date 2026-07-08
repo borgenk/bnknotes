@@ -82,6 +82,42 @@ enum Ast {
     Quest(Box<Ast>),
 }
 
+/// Reusable Pike VM scratch: the two thread lists (the set live at the current
+/// position and the set being built for the next character) with a dedup bitmap
+/// each. [`Regex::find_all`] keeps one across every starting byte and character,
+/// so scanning a long non-matching document reuses these buffers instead of
+/// allocating a fresh pair per step.
+struct Threads {
+    /// Program counters live at the current position.
+    current: Vec<usize>,
+    /// Program counters reached by consuming the current character.
+    next: Vec<usize>,
+    /// Which counters `current` already holds, to dedup threads within a step.
+    current_seen: Vec<bool>,
+    /// The same dedup bitmap for `next`.
+    next_seen: Vec<bool>,
+}
+
+impl Threads {
+    fn new(prog_len: usize) -> Self {
+        Self {
+            current: Vec::new(),
+            next: Vec::new(),
+            current_seen: vec![false; prog_len],
+            next_seen: vec![false; prog_len],
+        }
+    }
+
+    /// Empty both lists and clear both dedup bitmaps for a fresh `match_at` at a
+    /// new starting position.
+    fn reset(&mut self) {
+        self.current.clear();
+        self.next.clear();
+        self.current_seen.fill(false);
+        self.next_seen.fill(false);
+    }
+}
+
 impl Regex {
     /// Compile `pattern`, or a one-line reason it is not a valid pattern.
     pub fn compile(pattern: &str) -> Result<Self, &'static str> {
@@ -105,9 +141,10 @@ impl Regex {
     /// every position.
     pub fn find_all(&self, text: &str, limit: usize) -> Vec<(usize, usize)> {
         let mut out = Vec::new();
+        let mut threads = Threads::new(self.prog.len());
         let mut i = 0;
         while i <= text.len() {
-            if let Some(end) = self.match_at(text, i) {
+            if let Some(end) = self.match_at(text, i, &mut threads) {
                 if end > i {
                     out.push((i, end));
                     if out.len() >= limit {
@@ -128,26 +165,32 @@ impl Regex {
     /// The end of the longest match starting exactly at byte `start` (a char
     /// boundary), or `None`. Runs every automaton alternative in lockstep over
     /// the text, recording the furthest position where an `Accept` was live.
-    fn match_at(&self, text: &str, start: usize) -> Option<usize> {
+    fn match_at(&self, text: &str, start: usize, threads: &mut Threads) -> Option<usize> {
+        threads.reset();
         let mut best = None;
-        let mut current = Vec::new();
-        let mut visited = vec![false; self.prog.len()];
-        self.add_thread(&mut current, &mut visited, 0, text, start, &mut best);
+        self.add_thread(
+            &mut threads.current,
+            &mut threads.current_seen,
+            0,
+            text,
+            start,
+            &mut best,
+        );
 
         let mut pos = start;
-        while pos < text.len() && !current.is_empty() {
+        while pos < text.len() && !threads.current.is_empty() {
             let Some(c) = text[pos..].chars().next() else {
                 break;
             };
             let next_pos = pos + c.len_utf8();
-            let mut next = Vec::new();
-            let mut next_visited = vec![false; self.prog.len()];
-            for &pc in &current {
+            threads.next.clear();
+            threads.next_seen.fill(false);
+            for &pc in &threads.current {
                 if let Inst::Class(class) = &self.prog[pc] {
                     if class.matches(c) {
                         self.add_thread(
-                            &mut next,
-                            &mut next_visited,
+                            &mut threads.next,
+                            &mut threads.next_seen,
                             pc + 1,
                             text,
                             next_pos,
@@ -156,7 +199,8 @@ impl Regex {
                     }
                 }
             }
-            current = next;
+            std::mem::swap(&mut threads.current, &mut threads.next);
+            std::mem::swap(&mut threads.current_seen, &mut threads.next_seen);
             pos = next_pos;
         }
         best

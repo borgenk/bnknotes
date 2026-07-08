@@ -39,6 +39,7 @@ use crate::markdown;
 use crate::paint::{build_display_list, PaintParams};
 use crate::rope::Rope;
 use crate::sys;
+use crate::text::TextBuffer;
 use crate::theme::{FONT_SIZE, MARGIN};
 
 /// Where the committed baseline lives, where each run records its numbers, and
@@ -252,7 +253,7 @@ fn measure() -> Result<Vec<Sample>> {
     // this guards the resampler itself (now used for color-emoji glyph strikes).
     let native: Vec<u32> = vec![0xff_30_60_90; 400 * 300];
     out.push(sample("image_resample", 200, || {
-        crate::freetype::resample_argb(&native, 400, 300, 200, 150).len()
+        crate::pixel::resample_argb(&native, 400, 300, 200, 150).len()
     }));
 
     // Re-laying-out a document containing an image at a fresh width, as a splitter
@@ -552,6 +553,7 @@ pub fn run_lab(args: &[String]) -> Result<()> {
 
         let cpu_before = sys::cpu_time();
 
+        let find_buf = TextBuffer::from_text(text.clone());
         let results = [
             lab("rope_build", LAB_REPS, true, || Rope::from_str(&text).len()),
             lab("layout", LAB_REPS, true, || {
@@ -564,8 +566,8 @@ pub fn run_lab(args: &[String]) -> Result<()> {
             }),
             lab("find", LAB_REPS, true, || {
                 let mut f = FindState::new();
-                f.open_at(0, &text);
-                f.push_str("the", &text);
+                f.open_at(0, &find_buf);
+                f.push_str("the", &find_buf);
                 f.matches().len()
             }),
             lab("window", LAB_REPS, false, || {

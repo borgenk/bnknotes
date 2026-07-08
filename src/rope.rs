@@ -214,43 +214,28 @@ impl Rope {
         if Arc::ptr_eq(&self.root, &other.root) {
             return self.root.bytes;
         }
-        let mut ia = Leaves::forward(&self.root);
-        let mut ib = Leaves::forward(&other.root);
-        let (mut a, mut b): (&[u8], &[u8]) = (&[], &[]);
-        let mut matched = 0;
-        loop {
-            if a.is_empty() {
-                match ia.next() {
-                    Some(s) => a = s.as_bytes(),
-                    None => return matched,
-                }
-            }
-            if b.is_empty() {
-                match ib.next() {
-                    Some(s) => b = s.as_bytes(),
-                    None => return matched,
-                }
-            }
-            let n = a.len().min(b.len());
-            let mut i = 0;
-            while i < n && a[i] == b[i] {
-                i += 1;
-            }
-            matched += i;
-            if i < n {
-                return matched;
-            }
-            a = &a[n..];
-            b = &b[n..];
-        }
+        self.common_len(other, usize::MAX, true)
     }
 
     /// The number of trailing bytes this rope shares with `other`, up to `cap`
     /// bytes (so a caller can keep the suffix from overlapping a known common
     /// prefix). Walks both leaf-byte streams from the back.
     pub fn common_suffix_len(&self, other: &Rope, cap: usize) -> usize {
-        let mut ia = Leaves::backward(&self.root);
-        let mut ib = Leaves::backward(&other.root);
+        self.common_len(other, cap, false)
+    }
+
+    /// The bytes `self` and `other` share from one end, up to `cap`: from the
+    /// front when `forward`, else from the back. Walks both leaf-byte streams in
+    /// lockstep, refilling from whichever ran dry, at byte-comparison speed and
+    /// without materializing either text. The directional core of
+    /// [`common_prefix_len`](Self::common_prefix_len) and
+    /// [`common_suffix_len`](Self::common_suffix_len).
+    fn common_len(&self, other: &Rope, cap: usize, forward: bool) -> usize {
+        let (mut ia, mut ib) = if forward {
+            (Leaves::forward(&self.root), Leaves::forward(&other.root))
+        } else {
+            (Leaves::backward(&self.root), Leaves::backward(&other.root))
+        };
         let (mut a, mut b): (&[u8], &[u8]) = (&[], &[]);
         let mut matched = 0;
         while matched < cap {
@@ -268,17 +253,35 @@ impl Rope {
             }
             let n = a.len().min(b.len()).min(cap - matched);
             let mut i = 0;
-            while i < n && a[a.len() - 1 - i] == b[b.len() - 1 - i] {
+            while i < n && nth(a, i, forward) == nth(b, i, forward) {
                 i += 1;
             }
             matched += i;
             if i < n {
                 return matched;
             }
-            a = &a[..a.len() - n];
-            b = &b[..b.len() - n];
+            a = trimmed(a, n, forward);
+            b = trimmed(b, n, forward);
         }
         matched
+    }
+}
+
+/// The `i`-th byte of `s` counted from the front (`forward`) or the back.
+fn nth(s: &[u8], i: usize, forward: bool) -> u8 {
+    if forward {
+        s[i]
+    } else {
+        s[s.len() - 1 - i]
+    }
+}
+
+/// `s` with its first `n` bytes dropped (`forward`) or its last `n`.
+fn trimmed(s: &[u8], n: usize, forward: bool) -> &[u8] {
+    if forward {
+        &s[n..]
+    } else {
+        &s[..s.len() - n]
     }
 }
 
@@ -331,8 +334,8 @@ impl<'a> RopeSlice<'a> {
     /// Append the slice's bytes to `out`, reusing the caller's buffer instead of
     /// allocating a fresh `String`.
     pub fn append_to(&self, out: &mut String) {
-        if self.start < self.end {
-            append_range(self.root, self.start, self.end, out);
+        for chunk in self.chunks() {
+            out.push_str(chunk);
         }
     }
 }
@@ -523,7 +526,10 @@ impl Default for Rope {
 
 impl fmt::Display for Rope {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write_node(&self.root, f)
+        for chunk in self.slice(0..self.root.bytes).chunks() {
+            f.write_str(chunk)?;
+        }
+        Ok(())
     }
 }
 
@@ -661,39 +667,6 @@ fn fib(n: u32) -> u64 {
 }
 
 // --- Traversal ---------------------------------------------------------------
-
-fn write_node(node: &Inner, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-    match &node.kind {
-        Kind::Leaf(s) => f.write_str(s),
-        Kind::Branch(l, r) => {
-            write_node(l, f)?;
-            write_node(r, f)
-        }
-    }
-}
-
-/// Append the bytes of `node` in `[start, end)` to `out`. Bounds are within the
-/// node and `char`-aligned (leaf boundaries fall on `char` boundaries).
-fn append_range(node: &Inner, start: usize, end: usize, out: &mut String) {
-    match &node.kind {
-        Kind::Leaf(s) => {
-            debug_assert!(
-                start <= end && end <= s.len(),
-                "append_range within the leaf"
-            );
-            out.push_str(&s[start..end]);
-        }
-        Kind::Branch(l, r) => {
-            let lb = l.bytes;
-            if start < lb {
-                append_range(l, start, end.min(lb), out);
-            }
-            if end > lb {
-                append_range(r, start.saturating_sub(lb), end - lb, out);
-            }
-        }
-    }
-}
 
 /// The byte offset just after the `line`-th newline (the start of line `line`),
 /// for `1 <= line <= newlines`.

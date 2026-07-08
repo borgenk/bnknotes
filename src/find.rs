@@ -17,6 +17,7 @@
 
 use crate::grapheme;
 use crate::regex::Regex;
+use crate::text::TextBuffer;
 
 /// Which of the bar's fields the keyboard currently edits.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -62,6 +63,11 @@ pub struct FindState {
     /// at or after this point, so refining a query narrows in place instead of
     /// jumping around the document.
     anchor: usize,
+    /// The document text a scan runs over, keyed by the buffer version it was
+    /// materialized from. A find session scans once per keystroke against an
+    /// unchanging buffer; caching by version re-materializes the rope only when
+    /// an edit (a replacement) actually changed it.
+    cache: Option<(u64, String)>,
 }
 
 impl FindState {
@@ -79,6 +85,7 @@ impl FindState {
             matches: Vec::new(),
             current: 0,
             anchor: 0,
+            cache: None,
         }
     }
 
@@ -139,23 +146,27 @@ impl FindState {
     /// Open the bar searching from `cursor`. The previous query is kept,
     /// selected, and searched immediately, so Enter repeats the last search
     /// and typing starts a fresh one. Returns the range the app should select.
-    pub fn open_at(&mut self, cursor: usize, text: &str) -> Option<(usize, usize)> {
+    pub fn open_at(&mut self, cursor: usize, buffer: &TextBuffer) -> Option<(usize, usize)> {
         self.open = true;
         self.focus = Field::Query;
         self.selected = !self.query.is_empty();
         self.anchor = cursor;
-        self.rescan(text)
+        self.rescan(buffer)
     }
 
     /// Open (or, when already open, reveal) the replace row. Focus lands on
     /// the replace field when a query is already in place — the usual flow is
     /// "search, then decide to replace".
-    pub fn open_replace_at(&mut self, cursor: usize, text: &str) -> Option<(usize, usize)> {
+    pub fn open_replace_at(
+        &mut self,
+        cursor: usize,
+        buffer: &TextBuffer,
+    ) -> Option<(usize, usize)> {
         let was_open = self.open;
         let target = if was_open {
             self.current_match()
         } else {
-            self.open_at(cursor, text)
+            self.open_at(cursor, buffer)
         };
         self.show_replace = true;
         if !self.query.is_empty() {
@@ -190,59 +201,36 @@ impl FindState {
 
     /// Append `c` to the focused field (replacing its selected content) and
     /// rescan. Returns the range the app should select.
-    pub fn push(&mut self, c: char, text: &str) -> Option<(usize, usize)> {
-        self.edit_focused(text, |field| field.push(c))
+    pub fn push(&mut self, c: char, buffer: &TextBuffer) -> Option<(usize, usize)> {
+        self.edit_focused(buffer, |field| field.push(c))
     }
 
     /// Append a pasted string to the focused field, dropping control
     /// characters (the fields are single-line). Returns the range to select.
-    pub fn push_str(&mut self, s: &str, text: &str) -> Option<(usize, usize)> {
-        self.edit_focused(text, |field| {
+    pub fn push_str(&mut self, s: &str, buffer: &TextBuffer) -> Option<(usize, usize)> {
+        self.edit_focused(buffer, |field| {
             field.extend(s.chars().filter(|c| !c.is_control()))
         })
     }
 
     /// Delete the focused field's last grapheme cluster (a selected field
     /// clears wholesale) and rescan. Returns the range to select.
-    pub fn pop(&mut self, text: &str) -> Option<(usize, usize)> {
-        if self.selected {
-            self.selected = false;
-            match self.focus {
-                Field::Query => {
-                    self.query.clear();
-                    return self.rescan(text);
-                }
-                Field::Replace => {
-                    self.replace.clear();
-                    return None;
-                }
-            }
-        }
-        let field = match self.focus {
-            Field::Query => &mut self.query,
-            Field::Replace => &mut self.replace,
-        };
-        if field.is_empty() {
-            return None;
-        }
-        let cut = grapheme::prev_boundary(field, field.len());
-        field.truncate(cut);
-        match self.focus {
-            Field::Query => self.rescan(text),
-            Field::Replace => None,
-        }
+    pub fn pop(&mut self, buffer: &TextBuffer) -> Option<(usize, usize)> {
+        self.edit_focused(buffer, |field| {
+            field.truncate(grapheme::prev_boundary(field, field.len()));
+        })
     }
 
     /// Toggle whole-word matching and rescan.
-    pub fn toggle_word(&mut self, text: &str) -> Option<(usize, usize)> {
+    pub fn toggle_word(&mut self, buffer: &TextBuffer) -> Option<(usize, usize)> {
         self.word = !self.word;
-        self.rescan(text)
+        self.rescan(buffer)
     }
 
     /// Toggle regex interpretation of the query and rescan.
-    pub fn toggle_regex(&mut self, text: &str) -> Option<(usize, usize)> {
+    pub fn toggle_regex(&mut self, buffer: &TextBuffer) -> Option<(usize, usize)> {
         self.regex = !self.regex;
-        self.rescan(text)
+        self.rescan(buffer)
     }
 
     /// Step to the next match, wrapping past the last. `None` when there are
@@ -269,29 +257,33 @@ impl FindState {
 
     /// Rescan after the document changed (a replacement was applied),
     /// continuing from byte `from`. Returns the range the app should select.
-    pub fn refresh(&mut self, text: &str, from: usize) -> Option<(usize, usize)> {
+    pub fn refresh(&mut self, buffer: &TextBuffer, from: usize) -> Option<(usize, usize)> {
         self.anchor = from;
-        self.rescan(text)
+        self.rescan(buffer)
+    }
+
+    /// The field the keyboard is editing (the query or the replacement).
+    fn focused_field(&mut self) -> &mut String {
+        match self.focus {
+            Field::Query => &mut self.query,
+            Field::Replace => &mut self.replace,
+        }
     }
 
     /// Run `edit` on the focused field (replacing its selected content first)
     /// and rescan when the query changed.
     fn edit_focused(
         &mut self,
-        text: &str,
+        buffer: &TextBuffer,
         edit: impl FnOnce(&mut String),
     ) -> Option<(usize, usize)> {
-        let field = match self.focus {
-            Field::Query => &mut self.query,
-            Field::Replace => &mut self.replace,
-        };
         if self.selected {
             self.selected = false;
-            field.clear();
+            self.focused_field().clear();
         }
-        edit(field);
+        edit(self.focused_field());
         match self.focus {
-            Field::Query => self.rescan(text),
+            Field::Query => self.rescan(buffer),
             Field::Replace => None,
         }
     }
@@ -299,11 +291,7 @@ impl FindState {
     /// Select the focused field's entire content (Ctrl+A while the bar is
     /// open), so the next edit replaces it. A no-op on an empty field.
     pub fn select_all(&mut self) {
-        let field = match self.focus {
-            Field::Query => &self.query,
-            Field::Replace => &self.replace,
-        };
-        if !field.is_empty() {
+        if !self.focused_field().is_empty() {
             self.selected = true;
         }
     }
@@ -311,7 +299,17 @@ impl FindState {
     /// Rebuild the match set for the current query and modes, and re-aim
     /// `current` at the first match at or after the anchor (wrapping to the
     /// first overall).
-    fn rescan(&mut self, text: &str) -> Option<(usize, usize)> {
+    fn rescan(&mut self, buffer: &TextBuffer) -> Option<(usize, usize)> {
+        // Materialize the document only when it changed since the last scan; the
+        // version is a sound key for the contents (see `TextBuffer::version`).
+        let version = buffer.version();
+        if self.cache.as_ref().is_none_or(|(v, _)| *v != version) {
+            self.cache = Some((version, buffer.text()));
+        }
+        // Borrow the cached text out of `self` so the scan can also read and write
+        // the other fields; it goes straight back once the matches are collected.
+        let cache = self.cache.take();
+        let text = cache.as_ref().map_or("", |(_, t)| t.as_str());
         self.error = false;
         let mut found = if self.query.is_empty() {
             Vec::new()
@@ -329,6 +327,7 @@ impl FindState {
         if self.word {
             found.retain(|&(start, end)| on_word_boundaries(text, start, end));
         }
+        self.cache = cache;
         self.matches = found;
         self.current = self
             .matches
@@ -385,6 +384,12 @@ mod tests {
         super::scan(text, query, usize::MAX)
     }
 
+    /// The find methods scan the buffer the app hands them; a test drives them
+    /// through a buffer built from the document `text`.
+    fn buffer(text: &str) -> TextBuffer {
+        TextBuffer::from_text(text.to_string())
+    }
+
     #[test]
     fn scan_finds_all_occurrences_in_order() {
         assert_eq!(scan("one two one", "one"), vec![(0, 3), (8, 11)]);
@@ -427,7 +432,8 @@ mod tests {
 
     #[test]
     fn typing_narrows_from_the_anchor() {
-        let text = "cat catalog cathedral";
+        let buf = buffer("cat catalog cathedral");
+        let text = &buf;
         let mut f = FindState::new();
         f.open_at(4, text); // cursor at the start of "catalog"
         assert_eq!(
@@ -445,7 +451,8 @@ mod tests {
 
     #[test]
     fn the_anchor_wraps_to_the_first_match() {
-        let text = "alpha beta";
+        let buf = buffer("alpha beta");
+        let text = &buf;
         let mut f = FindState::new();
         f.open_at(8, text); // past the only "alpha"
         assert_eq!(f.push('a', text), Some((9, 10)), "the a in beta");
@@ -458,7 +465,8 @@ mod tests {
 
     #[test]
     fn enter_steps_and_wraps_both_ways() {
-        let text = "x.x.x";
+        let buf = buffer("x.x.x");
+        let text = &buf;
         let mut f = FindState::new();
         f.open_at(0, text);
         assert_eq!(f.push('x', text), Some((0, 1)));
@@ -471,7 +479,8 @@ mod tests {
 
     #[test]
     fn backspace_pops_a_whole_grapheme_and_rescans() {
-        let text = "cafe caf";
+        let buf = buffer("cafe caf");
+        let text = &buf;
         let mut f = FindState::new();
         f.open_at(0, text);
         for c in "caf".chars() {
@@ -496,25 +505,27 @@ mod tests {
 
     #[test]
     fn popping_to_empty_clears_matches_and_selects_nothing() {
+        let buf = buffer("aaa");
         let mut f = FindState::new();
-        f.open_at(0, "aaa");
-        f.push('a', "aaa");
-        assert_eq!(f.pop("aaa"), None);
+        f.open_at(0, &buf);
+        f.push('a', &buf);
+        assert_eq!(f.pop(&buf), None);
         assert!(f.matches().is_empty());
-        assert_eq!(f.pop("aaa"), None, "popping an empty query is a no-op");
+        assert_eq!(f.pop(&buf), None, "popping an empty query is a no-op");
     }
 
     #[test]
     fn stepping_with_no_matches_is_a_no_op() {
         let mut f = FindState::new();
-        f.open_at(0, "abc");
+        f.open_at(0, &buffer("abc"));
         assert_eq!(f.next(), None);
         assert_eq!(f.prev(), None);
     }
 
     #[test]
     fn reopening_preselects_the_last_query_and_searches_it() {
-        let text = "ab ab ab";
+        let buf = buffer("ab ab ab");
+        let text = &buf;
         let mut f = FindState::new();
         f.open_at(0, text);
         f.push('a', text);
@@ -535,7 +546,8 @@ mod tests {
 
     #[test]
     fn backspace_clears_a_selected_query() {
-        let text = "hay hay";
+        let buf = buffer("hay hay");
+        let text = &buf;
         let mut f = FindState::new();
         f.open_at(0, text);
         f.push('h', text);
@@ -549,7 +561,8 @@ mod tests {
 
     #[test]
     fn stepping_keeps_a_selected_query() {
-        let text = "ab ab";
+        let buf = buffer("ab ab");
+        let text = &buf;
         let mut f = FindState::new();
         f.open_at(0, text);
         f.push('a', text);
@@ -562,7 +575,8 @@ mod tests {
 
     #[test]
     fn paste_appends_and_strips_control_characters() {
-        let text = "one two";
+        let buf = buffer("one two");
+        let text = &buf;
         let mut f = FindState::new();
         f.open_at(0, text);
         assert_eq!(f.push_str("tw\no", text), Some((4, 7)), "newline dropped");
@@ -571,7 +585,8 @@ mod tests {
 
     #[test]
     fn whole_word_filters_substring_hits() {
-        let text = "cat catalog cat_x scat";
+        let buf = buffer("cat catalog cat_x scat");
+        let text = &buf;
         let mut f = FindState::new();
         f.open_at(0, text);
         for c in "cat".chars() {
@@ -587,7 +602,8 @@ mod tests {
 
     #[test]
     fn regex_mode_matches_and_flags_errors() {
-        let text = "a1 b22 c3";
+        let buf = buffer("a1 b22 c3");
+        let text = &buf;
         let mut f = FindState::new();
         f.open_at(0, text);
         for c in r"\d+".chars() {
@@ -612,7 +628,8 @@ mod tests {
 
     #[test]
     fn replace_field_edits_do_not_rescan() {
-        let text = "aa aa";
+        let buf = buffer("aa aa");
+        let text = &buf;
         let mut f = FindState::new();
         f.open_replace_at(0, text);
         assert!(f.show_replace());
@@ -631,7 +648,8 @@ mod tests {
 
     #[test]
     fn opening_replace_with_a_kept_query_focuses_the_replacement() {
-        let text = "hit hit";
+        let buf = buffer("hit hit");
+        let text = &buf;
         let mut f = FindState::new();
         f.open_at(0, text);
         for c in "hit".chars() {
@@ -649,7 +667,8 @@ mod tests {
 
     #[test]
     fn refresh_rescans_from_a_position() {
-        let text = "aa aa aa";
+        let buf = buffer("aa aa aa");
+        let text = &buf;
         let mut f = FindState::new();
         f.open_at(0, text);
         f.push('a', text);
@@ -663,7 +682,8 @@ mod tests {
 
     #[test]
     fn select_all_then_typing_replaces_the_query() {
-        let text = "old new old";
+        let buf = buffer("old new old");
+        let text = &buf;
         let mut f = FindState::new();
         f.open_at(0, text);
         for c in "old".chars() {
@@ -679,7 +699,8 @@ mod tests {
 
     #[test]
     fn select_all_then_backspace_clears_the_field() {
-        let text = "aaa";
+        let buf = buffer("aaa");
+        let text = &buf;
         let mut f = FindState::new();
         f.open_at(0, text);
         f.push('a', text);
@@ -691,7 +712,8 @@ mod tests {
 
     #[test]
     fn select_all_works_on_the_replace_field_without_touching_the_query() {
-        let text = "hit hit";
+        let buf = buffer("hit hit");
+        let text = &buf;
         let mut f = FindState::new();
         f.open_replace_at(0, text);
         f.push('h', text);
@@ -707,17 +729,19 @@ mod tests {
 
     #[test]
     fn select_all_on_an_empty_field_is_a_no_op() {
+        let buf = buffer("abc");
         let mut f = FindState::new();
-        f.open_at(0, "abc");
+        f.open_at(0, &buf);
         f.select_all();
         assert!(!f.selected());
-        f.push('a', "abc");
+        f.push('a', &buf);
         assert_eq!(f.query(), "a", "typing appended normally");
     }
 
     #[test]
     fn switching_fields_drops_the_selection() {
-        let text = "q q";
+        let buf = buffer("q q");
+        let text = &buf;
         let mut f = FindState::new();
         f.open_replace_at(0, text);
         f.push('q', text);
@@ -731,7 +755,8 @@ mod tests {
 
     #[test]
     fn reopening_replace_selects_the_kept_replacement() {
-        let text = "a b a";
+        let buf = buffer("a b a");
+        let text = &buf;
         let mut f = FindState::new();
         f.open_replace_at(0, text);
         f.push('a', text);
@@ -748,7 +773,8 @@ mod tests {
     #[test]
     fn word_boundaries_respect_unicode_letters() {
         // æ is a letter: "cat" inside "cætcat" borders it and is not a word.
-        let text = "cat æcat";
+        let buf = buffer("cat æcat");
+        let text = &buf;
         let mut f = FindState::new();
         f.open_at(0, text);
         for c in "cat".chars() {

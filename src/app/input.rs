@@ -311,12 +311,12 @@ impl State {
             return Ok(());
         }
         if matches!(action, KeyAction::Find | KeyAction::Replace) {
-            let text = self.editors[i].text.text();
-            let cursor = self.editors[i].text.cursor();
+            let ed = &mut self.editors[i];
+            let cursor = ed.text.cursor();
             let target = if action == KeyAction::Find {
-                self.editors[i].find.open_at(cursor, &text)
+                ed.find.open_at(cursor, &ed.text)
             } else {
-                self.editors[i].find.open_replace_at(cursor, &text)
+                ed.find.open_replace_at(cursor, &ed.text)
             };
             self.land_on_match(target);
             return Ok(());
@@ -380,20 +380,20 @@ impl State {
         let i = self.active_editor();
         let target = match action {
             KeyAction::Char(c) if alt => {
-                let text = self.editors[i].text.text();
+                let ed = &mut self.editors[i];
                 match c.to_ascii_lowercase() {
-                    'w' => self.editors[i].find.toggle_word(&text),
-                    'r' => self.editors[i].find.toggle_regex(&text),
+                    'w' => ed.find.toggle_word(&ed.text),
+                    'r' => ed.find.toggle_regex(&ed.text),
                     _ => return,
                 }
             }
             KeyAction::Char(c) => {
-                let text = self.editors[i].text.text();
-                self.editors[i].find.push(c, &text)
+                let ed = &mut self.editors[i];
+                ed.find.push(c, &ed.text)
             }
             KeyAction::Backspace => {
-                let text = self.editors[i].text.text();
-                self.editors[i].find.pop(&text)
+                let ed = &mut self.editors[i];
+                ed.find.pop(&ed.text)
             }
             KeyAction::Tab => {
                 self.editors[i].find.toggle_focus();
@@ -405,8 +405,8 @@ impl State {
             }
             KeyAction::Paste => match self.clipboard_text() {
                 Ok(Some(pasted)) => {
-                    let text = self.editors[i].text.text();
-                    self.editors[i].find.push_str(&pasted, &text)
+                    let ed = &mut self.editors[i];
+                    ed.find.push_str(&pasted, &ed.text)
                 }
                 Ok(None) => None,
                 Err(e) => {
@@ -428,9 +428,9 @@ impl State {
             }
             KeyAction::Enter => self.editors[i].find.next(),
             KeyAction::Replace => {
-                let text = self.editors[i].text.text();
-                let cursor = self.editors[i].text.cursor();
-                self.editors[i].find.open_replace_at(cursor, &text)
+                let ed = &mut self.editors[i];
+                let cursor = ed.text.cursor();
+                ed.find.open_replace_at(cursor, &ed.text)
             }
             KeyAction::Escape | KeyAction::Find => {
                 self.editors[i].find.close();
@@ -467,8 +467,8 @@ impl State {
         self.editors[i].text.select_range(start, end);
         self.editors[i].text.insert_str(&with);
         self.after_edit();
-        let text = self.editors[i].text.text();
-        let target = self.editors[i].find.refresh(&text, start + with.len());
+        let ed = &mut self.editors[i];
+        let target = ed.find.refresh(&ed.text, start + with.len());
         self.land_on_match(target);
     }
 
@@ -481,9 +481,9 @@ impl State {
             return;
         }
         self.after_edit();
-        let text = self.editors[i].text.text();
-        let cursor = self.editors[i].text.cursor();
-        let target = self.editors[i].find.refresh(&text, cursor);
+        let ed = &mut self.editors[i];
+        let cursor = ed.text.cursor();
+        let target = ed.find.refresh(&ed.text, cursor);
         self.land_on_match(target);
     }
 

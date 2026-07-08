@@ -38,10 +38,34 @@ const MULTI_CLICK_RADIUS: f32 = 5.0;
 const AUTOSCROLL_INTERVAL: Duration = Duration::from_millis(16);
 
 /// Fallback auto-repeat timing if the compositor never sends repeat_info.
-pub(super) const DEFAULT_REPEAT_DELAY_MS: u64 = 400;
-pub(super) const DEFAULT_REPEAT_RATE: u32 = 25;
+const DEFAULT_REPEAT_DELAY_MS: u64 = 400;
+const DEFAULT_REPEAT_RATE: u32 = 25;
 /// Cap on repeats fired per wake-up, so a stalled frame cannot flood input.
 const REPEAT_CATCHUP_CAP: u32 = 16;
+
+/// Key auto-repeat timers. The compositor sends a single press; the loop refires
+/// the held key on `interval` after the initial `delay`, until it is released.
+pub(super) struct KeyRepeat {
+    /// Delay before the first repeat.
+    pub(super) delay: Duration,
+    /// `None` disables repeat (the compositor reported a zero rate).
+    pub(super) interval: Option<Duration>,
+    /// The key currently repeating, or `None` when nothing is held.
+    pub(super) key: Option<u32>,
+    /// When the next repeat is due.
+    pub(super) at: Option<Instant>,
+}
+
+impl KeyRepeat {
+    pub(super) fn new() -> Self {
+        Self {
+            delay: Duration::from_millis(DEFAULT_REPEAT_DELAY_MS),
+            interval: Some(Duration::from_secs(1) / DEFAULT_REPEAT_RATE),
+            key: None,
+            at: None,
+        }
+    }
+}
 
 impl State {
     pub(super) fn on_keyboard(&mut self, opcode: u16, r: &mut Reader) -> Result<()> {
@@ -64,7 +88,7 @@ impl State {
                 if key_state == wl_keyboard::KEY_STATE_PRESSED {
                     self.apply_action(self.xkb.action(keycode))?;
                     self.start_repeat(keycode);
-                } else if self.repeat_key == Some(keycode) {
+                } else if self.key_repeat.key == Some(keycode) {
                     self.stop_repeat();
                 }
             }
@@ -79,12 +103,12 @@ impl State {
             wl_keyboard::EV_REPEAT_INFO => {
                 let rate = r.u32()?;
                 let delay = r.u32()?;
-                self.repeat_interval = if rate == 0 {
+                self.key_repeat.interval = if rate == 0 {
                     None
                 } else {
                     Some(Duration::from_secs(1) / rate)
                 };
-                self.repeat_delay = Duration::from_millis(u64::from(delay));
+                self.key_repeat.delay = Duration::from_millis(u64::from(delay));
             }
             wl_keyboard::EV_ENTER => {
                 self.last_serial = r.u32()?;
@@ -967,23 +991,25 @@ impl State {
     /// Begin repeating `keycode` after the delay, if repeat is enabled and the
     /// keymap marks the key as repeatable.
     pub(super) fn start_repeat(&mut self, keycode: u32) {
-        if self.repeat_interval.is_some() && self.xkb.key_repeats(keycode) {
-            self.repeat_key = Some(keycode);
-            self.repeat_at = Some(Instant::now() + self.repeat_delay);
+        if self.key_repeat.interval.is_some() && self.xkb.key_repeats(keycode) {
+            self.key_repeat.key = Some(keycode);
+            self.key_repeat.at = Some(Instant::now() + self.key_repeat.delay);
         }
     }
 
     pub(super) fn stop_repeat(&mut self) {
-        self.repeat_key = None;
-        self.repeat_at = None;
+        self.key_repeat.key = None;
+        self.key_repeat.at = None;
     }
 
     /// Fire every repeat whose deadline has passed, re-running the held key's
     /// action (so modifiers held with it still apply).
     pub(super) fn fire_repeats(&mut self) -> Result<()> {
-        let (Some(keycode), Some(mut at), Some(interval)) =
-            (self.repeat_key, self.repeat_at, self.repeat_interval)
-        else {
+        let (Some(keycode), Some(mut at), Some(interval)) = (
+            self.key_repeat.key,
+            self.key_repeat.at,
+            self.key_repeat.interval,
+        ) else {
             return Ok(());
         };
         let now = Instant::now();
@@ -993,15 +1019,15 @@ impl State {
             at += interval;
             fired += 1;
         }
-        self.repeat_at = Some(at);
+        self.key_repeat.at = Some(at);
         Ok(())
     }
 
     /// How long to wait for input before the next repeat is due, or `None` to
     /// block indefinitely when nothing is repeating.
     pub(super) fn repeat_timeout(&self) -> Option<Duration> {
-        let at = self.repeat_at?;
-        self.repeat_interval?;
+        let at = self.key_repeat.at?;
+        self.key_repeat.interval?;
         Some(
             at.saturating_duration_since(Instant::now())
                 .max(Duration::from_millis(1)),

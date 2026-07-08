@@ -27,8 +27,8 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
-use self::clipboard::{is_text_mime, CLIPBOARD_MIMES};
-use self::input::{DEFAULT_REPEAT_DELAY_MS, DEFAULT_REPEAT_RATE};
+use self::clipboard::{is_text_mime, ClipboardState, CLIPBOARD_MIMES};
+use self::input::KeyRepeat;
 use self::present::GpuPresentation;
 use crate::conn::{Connection, Fill};
 use crate::display::DisplayList;
@@ -140,28 +140,14 @@ struct State {
     /// while focused; an unfocused window hides the caret and stays idle.
     focused: bool,
 
-    // Key auto-repeat. The compositor sends one press; the client repeats the
-    // held key on a timer until it is released.
-    repeat_delay: Duration,
-    /// `None` disables repeat (the compositor reported a zero rate).
-    repeat_interval: Option<Duration>,
-    repeat_key: Option<u32>,
-    repeat_at: Option<Instant>,
+    /// Key auto-repeat timers (delay, interval, held key, next deadline).
+    key_repeat: KeyRepeat,
     /// The latest input event serial, needed to set the clipboard selection.
     last_serial: u32,
 
-    // Clipboard. When we own the selection, `clipboard_source` is our live
-    // wl_data_source; `clipboard_data` is the bytes it serves and `clipboard_mimes`
-    // the types it advertises (text for a text selection, `image/png`/`image/jpeg`
-    // for a copied image). Incoming offers are tracked so a paste can request the
-    // right MIME type.
-    clipboard_source: u32,
-    clipboard_data: Vec<u8>,
-    clipboard_mimes: Vec<&'static str>,
-    incoming_offer: u32,
-    incoming_text_mime: Option<String>,
-    selection_offer: u32,
-    selection_text_mime: Option<String>,
+    /// Clipboard: the source we own while holding the selection, the bytes and
+    /// MIME types it serves, and the incoming/selection offers a paste reads.
+    clipboard: ClipboardState,
 
     // Id allocation: a bump counter plus a free list fed by `delete_id`.
     next_id: u32,
@@ -296,18 +282,9 @@ impl State {
             caret_visible: true,
             caret_blink_at: None,
             focused: false,
-            repeat_delay: Duration::from_millis(DEFAULT_REPEAT_DELAY_MS),
-            repeat_interval: Some(Duration::from_secs(1) / DEFAULT_REPEAT_RATE),
-            repeat_key: None,
-            repeat_at: None,
+            key_repeat: KeyRepeat::new(),
             last_serial: 0,
-            clipboard_source: 0,
-            clipboard_data: Vec::new(),
-            clipboard_mimes: Vec::new(),
-            incoming_offer: 0,
-            incoming_text_mime: None,
-            selection_offer: 0,
-            selection_text_mime: None,
+            clipboard: ClipboardState::new(),
             next_id: 2, // 1 is wl_display
             free_ids: Vec::new(),
             pending_sync: None,
@@ -704,16 +681,16 @@ impl State {
             return self.on_data_device(msg.opcode, &mut r);
         }
 
-        if self.clipboard_source != 0 && msg.object == self.clipboard_source {
+        if self.clipboard.source != 0 && msg.object == self.clipboard.source {
             return self.on_data_source(msg.opcode, &mut r);
         }
 
-        if msg.object == self.incoming_offer && msg.opcode == wl_data_offer::EV_OFFER {
+        if msg.object == self.clipboard.incoming_offer && msg.opcode == wl_data_offer::EV_OFFER {
             let mime = r.string()?;
             if is_text_mime(mime)
-                && (self.incoming_text_mime.is_none() || mime == CLIPBOARD_MIMES[0])
+                && (self.clipboard.incoming_text_mime.is_none() || mime == CLIPBOARD_MIMES[0])
             {
-                self.incoming_text_mime = Some(mime.to_string());
+                self.clipboard.incoming_text_mime = Some(mime.to_string());
             }
             return Ok(());
         }

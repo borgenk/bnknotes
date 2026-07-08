@@ -34,7 +34,7 @@ use crate::error::{Error, Result};
 use crate::find::FindState;
 use crate::freetype::Fonts;
 use crate::image::{Image, ImageStore};
-use crate::layout::{ImageUi, Layout, LineIndex};
+use crate::layout::{ImageUi, Layout, LayoutCtx, LineIndex};
 use crate::markdown;
 use crate::paint::{build_display_list, PaintParams};
 use crate::rope::Rope;
@@ -164,23 +164,19 @@ fn measure() -> Result<Vec<Sample>> {
     // per-edit cost, guarded separately below).
     let index = LineIndex::build(&fonts, &rope, wrap, FONT_SIZE, &images);
     let band = 30.min(index.len());
+    let window_ctx = LayoutCtx::new(
+        &fonts,
+        &rope,
+        wrap,
+        FONT_SIZE,
+        (0, 0),
+        &images,
+        ImageUi::default(),
+    );
     out.push(sample("layout_window", 500, || {
-        Layout::build_window(
-            &fonts,
-            &rope,
-            MARGIN,
-            MARGIN,
-            wrap,
-            FONT_SIZE,
-            (0, 0),
-            &images,
-            ImageUi::default(),
-            &index,
-            0,
-            band,
-        )
-        .lines()
-        .len()
+        Layout::build_window(&window_ctx, MARGIN, MARGIN, &index, 0, band)
+            .lines()
+            .len()
     }));
 
     // Incremental index update after a one-character edit: the per-keystroke cost
@@ -188,9 +184,10 @@ fn measure() -> Result<Vec<Sample>> {
     // reuses the rest, so it stays flat as documents grow. (The clone per iteration
     // is measurement scaffolding, since `update` mutates in place.)
     let edited = edited_middle(&text);
+    let update_ctx = LayoutCtx::for_index(&fonts, &edited, wrap, FONT_SIZE, &images);
     out.push(sample("index_update", 500, || {
         let mut idx = index.clone();
-        idx.update(&fonts, &edited, &rope, wrap, FONT_SIZE, &images);
+        idx.update(&update_ctx, &rope);
         idx.len()
     }));
 
@@ -210,17 +207,17 @@ fn measure() -> Result<Vec<Sample>> {
             height: 300,
         },
     )]);
-    let image_layout = Layout::build_with_images(
+    // Cursor on the heading (active `(0, 0)`): the image renders as a picture.
+    let image_ctx = LayoutCtx::new(
         &fonts,
         &image_rope,
-        MARGIN,
-        MARGIN,
         wrap,
         FONT_SIZE,
-        (0, 0), // cursor on the heading: the image renders as a picture
+        (0, 0),
         &image_store,
         ImageUi::default(),
     );
+    let image_layout = Layout::build_with_images(&image_ctx, MARGIN, MARGIN);
 
     // Raw glyph rasterization of printable ASCII (the uncached FreeType path), so a
     // regression in the rasterizer itself is visible independent of the cache. The
@@ -260,19 +257,17 @@ fn measure() -> Result<Vec<Sample>> {
 
     // Re-laying-out a document containing an image at a fresh width, as a splitter
     // or window resize does on every drag event (the layout build has no cache).
+    let reflow_ctx = LayoutCtx::new(
+        &fonts,
+        &image_rope,
+        wrap - 40,
+        FONT_SIZE,
+        (0, 0),
+        &image_store,
+        ImageUi::default(),
+    );
     out.push(sample("layout_reflow_image", 200, || {
-        Layout::build_with_images(
-            &fonts,
-            &image_rope,
-            MARGIN,
-            MARGIN,
-            wrap - 40,
-            FONT_SIZE,
-            (0, 0),
-            &image_store,
-            ImageUi::default(),
-        )
-        .text_height()
+        Layout::build_with_images(&reflow_ctx, MARGIN, MARGIN).text_height()
     }));
 
     // The GPU frame build for an image the renderer does not yet hold: it uploads
@@ -544,6 +539,16 @@ pub fn run_lab(args: &[String]) -> Result<()> {
         let index = LineIndex::build(&fonts, &rope, wrap, FONT_SIZE, &images);
         let band = 30.min(index.len());
         let edited = edited_middle(&text);
+        let window_ctx = LayoutCtx::new(
+            &fonts,
+            &rope,
+            wrap,
+            FONT_SIZE,
+            (0, 0),
+            &images,
+            ImageUi::default(),
+        );
+        let update_ctx = LayoutCtx::for_index(&fonts, &edited, wrap, FONT_SIZE, &images);
 
         let cpu_before = sys::cpu_time();
 
@@ -564,26 +569,13 @@ pub fn run_lab(args: &[String]) -> Result<()> {
                 f.matches().len()
             }),
             lab("window", LAB_REPS, false, || {
-                Layout::build_window(
-                    &fonts,
-                    &rope,
-                    MARGIN,
-                    MARGIN,
-                    wrap,
-                    FONT_SIZE,
-                    (0, 0),
-                    &images,
-                    ImageUi::default(),
-                    &index,
-                    0,
-                    band,
-                )
-                .lines()
-                .len()
+                Layout::build_window(&window_ctx, MARGIN, MARGIN, &index, 0, band)
+                    .lines()
+                    .len()
             }),
             lab("index_upd", LAB_REPS, false, || {
                 let mut idx = index.clone();
-                idx.update(&fonts, &edited, &rope, wrap, FONT_SIZE, &images);
+                idx.update(&update_ctx, &rope);
                 idx.len()
             }),
         ];
@@ -988,21 +980,17 @@ pub fn run_load_bench(args: &[String]) -> Result<()> {
     report_stage(&format!("index ({threads} cores)"), index_ns, n);
 
     let band = 60.min(index.len());
-    let t = Instant::now();
-    let window = Layout::build_window(
+    let window_ctx = LayoutCtx::new(
         &fonts,
         &rope,
-        MARGIN,
-        MARGIN,
         wrap,
         FONT_SIZE,
         (0, 0),
         &images,
         ImageUi::default(),
-        &index,
-        0,
-        band,
     );
+    let t = Instant::now();
+    let window = Layout::build_window(&window_ctx, MARGIN, MARGIN, &index, 0, band);
     let window_ns = t.elapsed().as_nanos() as u64;
     report_stage("first window", window_ns, n);
 

@@ -311,9 +311,11 @@ pub struct Layout {
     text_height: i32,
 }
 
-/// Shared layout/index inputs for one width and reveal state.
+/// Shared layout/index inputs for one width and reveal state. Built once by a
+/// caller (a pane, the perf harness) and threaded through the public entry points
+/// so they take one context instead of re-exploding the same argument bundle.
 #[derive(Clone, Copy)]
-struct LayoutCtx<'a> {
+pub struct LayoutCtx<'a> {
     fonts: &'a Fonts,
     rope: &'a Rope,
     wrap_width: i32,
@@ -324,7 +326,7 @@ struct LayoutCtx<'a> {
 }
 
 impl<'a> LayoutCtx<'a> {
-    fn new(
+    pub fn new(
         fonts: &'a Fonts,
         rope: &'a Rope,
         wrap_width: i32,
@@ -352,7 +354,7 @@ impl<'a> LayoutCtx<'a> {
     /// off ([`NO_REVEAL`], no image UI), so the geometry it feeds stays a pure
     /// function of `(version, width)` by construction rather than by each caller
     /// remembering to pass the no-reveal inputs.
-    fn for_index(
+    pub fn for_index(
         fonts: &'a Fonts,
         rope: &'a Rope,
         wrap_width: i32,
@@ -435,17 +437,17 @@ impl Layout {
         active: (usize, usize),
     ) -> Self {
         // No image store: any `![](...)` line lays out as its plain source text.
-        Self::build_with_images(
+        let images = ImageStore::new(None);
+        let ctx = LayoutCtx::new(
             fonts,
             rope,
-            left,
-            top,
             wrap_width,
             body_size,
             active,
-            &ImageStore::new(None),
+            &images,
             ImageUi::default(),
-        )
+        );
+        Self::build_with_images(&ctx, left, top)
     }
 
     /// Like [`Self::build`], but resolves a standalone `![alt](path)` line to a
@@ -457,21 +459,9 @@ impl Layout {
     /// open (the corner button). A selected image (`image_ui.selected`) carries a
     /// border and button. A missing or undecodable image falls back to plain
     /// source, so a broken link stays visible and editable.
-    #[allow(clippy::too_many_arguments)]
-    pub fn build_with_images(
-        fonts: &Fonts,
-        rope: &Rope,
-        left: i32,
-        top: i32,
-        wrap_width: i32,
-        body_size: u32,
-        active: (usize, usize),
-        images: &ImageStore,
-        image_ui: ImageUi,
-    ) -> Self {
-        let n = rope.len_lines();
-        let ctx = LayoutCtx::new(fonts, rope, wrap_width, body_size, active, images, image_ui);
-        Self::build_range(&ctx, left, top, 0, n, LineCarry::default())
+    pub fn build_with_images(ctx: &LayoutCtx, left: i32, top: i32) -> Self {
+        let n = ctx.rope.len_lines();
+        Self::build_range(ctx, left, top, 0, n, LineCarry::default())
     }
 
     /// Lay out only the logical lines `[band_start, band_end)`, seeding the running
@@ -483,28 +473,20 @@ impl Layout {
     /// callers guarantee the offsets they ask about fall inside the band. This is
     /// the windowed counterpart of [`Self::build_with_images`]: same per-line
     /// [`lay_line`], a bounded slice of the loop.
-    #[allow(clippy::too_many_arguments)]
     pub fn build_window(
-        fonts: &Fonts,
-        rope: &Rope,
+        ctx: &LayoutCtx,
         left: i32,
         box_top_seed: i32,
-        wrap_width: i32,
-        body_size: u32,
-        active: (usize, usize),
-        images: &ImageStore,
-        image_ui: ImageUi,
         index: &LineIndex,
         band_start: usize,
         band_end: usize,
     ) -> Self {
-        let n = rope.len_lines();
+        let n = ctx.rope.len_lines();
         let start = band_start.min(n);
         let end = band_end.min(n).max(start);
         let (fence, list_depth) = index.entry_state(start);
-        let ctx = LayoutCtx::new(fonts, rope, wrap_width, body_size, active, images, image_ui);
         Self::build_range(
-            &ctx,
+            ctx,
             left,
             box_top_seed,
             start,
@@ -1446,6 +1428,10 @@ impl LineIndex {
     /// the small-document threshold, so a test can force many small chunks to
     /// exercise the stitch and fence/list fix-up paths.
     fn build_chunked(ctx: &LayoutCtx, threads: usize) -> Self {
+        debug_assert!(
+            ctx.active == NO_REVEAL,
+            "build_chunked measures base index geometry; its ctx must be reveal-free"
+        );
         let n = ctx.rope.len_lines();
         let chunk = n.div_ceil(threads);
         let ranges: Vec<(usize, usize)> = (0..threads)
@@ -1455,13 +1441,13 @@ impl LineIndex {
         // Copy out the ctx's `Send` fields so each worker rebuilds its ctx from
         // these rather than capturing `ctx` itself: `Fonts` is `!Sync` (FreeType
         // faces are not shareable), so `&LayoutCtx` is not `Send` and cannot cross
-        // the thread boundary. Each worker opens its own `fonts` instead.
+        // the thread boundary. Each worker opens its own `fonts` and rebuilds a
+        // reveal-free ctx via `for_index`, so the base-geometry precondition holds
+        // by construction rather than by copying `active`/`image_ui` across.
         let rope = ctx.rope;
         let wrap_width = ctx.wrap_width;
         let body_size = ctx.body_size;
-        let active = ctx.active;
         let images = ctx.images;
-        let image_ui = ctx.image_ui;
 
         // Measure every chunk from ground state. The main thread takes the first
         // chunk with the caller's fonts; each other chunk gets a worker that opens
@@ -1473,9 +1459,8 @@ impl LineIndex {
                 .map(|&(lo, hi)| {
                     s.spawn(move || {
                         let fonts = Fonts::new(&markdown::all_sizes(body_size)).ok()?;
-                        let worker_ctx = LayoutCtx::new(
-                            &fonts, rope, wrap_width, body_size, active, images, image_ui,
-                        );
+                        let worker_ctx =
+                            LayoutCtx::for_index(&fonts, rope, wrap_width, body_size, images);
                         Some(measure_chunk(&worker_ctx, lo, hi, n, LineCarry::default()))
                     })
                 })
@@ -1531,23 +1516,18 @@ impl LineIndex {
     /// re-syncs (an unterminated fence flipping every following line) re-measures to
     /// EOF, exactly as a full rebuild would. If `prev` does not match this index,
     /// it falls back to a full rebuild.
-    #[allow(clippy::too_many_arguments)]
-    pub fn update(
-        &mut self,
-        fonts: &Fonts,
-        new: &Rope,
-        prev: &Rope,
-        wrap_width: i32,
-        body_size: u32,
-        images: &ImageStore,
-    ) {
+    pub fn update(&mut self, ctx: &LayoutCtx, prev: &Rope) {
+        debug_assert!(
+            ctx.active == NO_REVEAL,
+            "LineIndex::update measures base geometry; its ctx must be reveal-free"
+        );
+        let new = ctx.rope;
         let new_n = new.len_lines();
         let old_n = self.recs.len();
         if old_n != prev.len_lines() {
-            *self = Self::build(fonts, new, wrap_width, body_size, images);
+            *self = Self::build(ctx.fonts, new, ctx.wrap_width, ctx.body_size, ctx.images);
             return;
         }
-        let ctx = LayoutCtx::for_index(fonts, new, wrap_width, body_size, images);
         // Find the changed byte span cheaply (shared leaves compared as raw bytes,
         // never materialized), then map it to a conservative changed line range.
         let prefix = new.common_prefix_len(prev);
@@ -1586,7 +1566,7 @@ impl LineIndex {
                 break old_n;
             }
             mid.push(Self::measure_line(
-                &ctx,
+                ctx,
                 i,
                 new_n,
                 &mut carry,
@@ -2105,17 +2085,8 @@ mod tests {
         assert_eq!(idx.reveal_extra(2), 0);
 
         // Base height (nothing revealed) matches a full no-reveal build.
-        let base = Layout::build_with_images(
-            &f,
-            &r,
-            LEFT,
-            TOP,
-            w,
-            BODY,
-            NO_REVEAL,
-            &s,
-            ImageUi::default(),
-        );
+        let base_ctx = LayoutCtx::for_index(&f, &r, w, BODY, &s);
+        let base = Layout::build_with_images(&base_ctx, LEFT, TOP);
         assert_eq!(
             idx.content_height(&RevealAdjust::default()),
             base.text_height()
@@ -2125,8 +2096,8 @@ mod tests {
         // that reveals the same line.
         let ls = r.line_to_byte(img_line);
         let le = r.line_to_byte(img_line + 1) - 1;
-        let revealed =
-            Layout::build_with_images(&f, &r, LEFT, TOP, w, BODY, (ls, le), &s, ImageUi::default());
+        let revealed_ctx = LayoutCtx::new(&f, &r, w, BODY, (ls, le), &s, ImageUi::default());
+        let revealed = Layout::build_with_images(&revealed_ctx, LEFT, TOP);
         let mut adj = RevealAdjust::default();
         adj.push(img_line, idx.reveal_extra(img_line));
         assert_eq!(idx.content_height(&adj), revealed.text_height());
@@ -2154,20 +2125,8 @@ mod tests {
                 ];
                 for (bs, be) in bands {
                     let seed = TOP + idx.logical_top(bs, &RevealAdjust::default());
-                    let win = Layout::build_window(
-                        &f,
-                        &r,
-                        LEFT,
-                        seed,
-                        w,
-                        BODY,
-                        NO_REVEAL,
-                        &no_images,
-                        ImageUi::default(),
-                        &idx,
-                        bs,
-                        be,
-                    );
+                    let win_ctx = LayoutCtx::for_index(&f, &r, w, BODY, &no_images);
+                    let win = Layout::build_window(&win_ctx, LEFT, seed, &idx, bs, be);
                     let expected: Vec<_> = full_fp
                         .iter()
                         .filter(|fp| {
@@ -2213,7 +2172,8 @@ mod tests {
             let prev = rope.clone();
             text.replace_range(pos..pos + needle.len(), repl);
             rope = Rope::from_str(&text);
-            index.update(&f, &rope, &prev, w, BODY, &no_images);
+            let update_ctx = LayoutCtx::for_index(&f, &rope, w, BODY, &no_images);
+            index.update(&update_ctx, &prev);
             let rebuilt = LineIndex::build(&f, &rope, w, BODY, &no_images);
             assert_eq!(
                 index.recs, rebuilt.recs,
@@ -3517,7 +3477,8 @@ mod tests {
         s: &ImageStore,
         ui: ImageUi,
     ) -> Layout {
-        Layout::build_with_images(f, r, LEFT, TOP, 1_000_000, BODY, active, s, ui)
+        let ctx = LayoutCtx::new(f, r, 1_000_000, BODY, active, s, ui);
+        Layout::build_with_images(&ctx, LEFT, TOP)
     }
 
     #[test]

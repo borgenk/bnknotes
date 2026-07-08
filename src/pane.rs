@@ -6,7 +6,7 @@ use crate::file::{self, FileFormat};
 use crate::find::FindState;
 use crate::freetype::Fonts;
 use crate::image::ImageStore;
-use crate::layout::{ImageUi, Layout, LineIndex, Rect, RevealAdjust};
+use crate::layout::{ImageUi, Layout, LayoutCtx, LineIndex, Rect, RevealAdjust};
 use crate::markdown;
 use crate::protocol::wp_cursor_shape_device_v1;
 use crate::rope::Rope;
@@ -340,14 +340,14 @@ impl EditorPane {
             if incremental {
                 let mut index = self.line_index.take().expect("checked");
                 let prev = self.prev_rope.take().expect("checked");
-                index.update(
+                let ctx = LayoutCtx::for_index(
                     fonts,
                     self.text.rope(),
-                    &prev,
                     wrap_width,
                     FONT_SIZE,
                     &self.images,
                 );
+                index.update(&ctx, &prev);
                 self.line_index = Some(index);
             } else {
                 // A first build or a resize: no prior index to re-measure against,
@@ -376,6 +376,26 @@ impl EditorPane {
         if let Some(index) = self.line_index.as_ref() {
             self.content_height = index.content_height(&adjust) + 2 * MARGIN;
         }
+    }
+
+    /// The shared layout context for a windowed build: this pane's rope and image
+    /// store at `wrap_width`, with the reveal `active` range and current image UI.
+    /// Both windowed builders go through this so their inputs cannot drift apart.
+    fn layout_ctx<'a>(
+        &'a self,
+        fonts: &'a Fonts,
+        active: (usize, usize),
+        wrap_width: i32,
+    ) -> LayoutCtx<'a> {
+        LayoutCtx::new(
+            fonts,
+            self.text.rope(),
+            wrap_width,
+            FONT_SIZE,
+            active,
+            &self.images,
+            self.image_ui(),
+        )
     }
 
     /// Rebuild the windowed layout when the viewport leaves the built band or the
@@ -422,22 +442,10 @@ impl EditorPane {
         let end = (vis_bot + over + 1).min(n).max(start);
         let wrap_width = rect.w - 2 * MARGIN;
         let layout = {
+            let ctx = self.layout_ctx(fonts, active, wrap_width);
             let index = self.line_index.as_ref().expect("index built above");
             let seed = rect.y + MARGIN + index.logical_top(start, &adjust);
-            Layout::build_window(
-                fonts,
-                self.text.rope(),
-                rect.x + MARGIN,
-                seed,
-                wrap_width,
-                FONT_SIZE,
-                active,
-                &self.images,
-                self.image_ui(),
-                index,
-                start,
-                end,
-            )
+            Layout::build_window(&ctx, rect.x + MARGIN, seed, index, start, end)
         };
         self.layout_cache = Some(layout);
         self.layout_band = (start, end);
@@ -459,26 +467,20 @@ impl EditorPane {
     /// is O(viewport), never O(document). Requires the index (call `ensure_index`).
     fn cursor_window(&self, fonts: &Fonts, rect: Rect) -> Option<Layout> {
         let index = self.line_index.as_ref()?;
-        let rope = self.text.rope();
         let adjust = self.reveal_adjust();
         let active = self.reveal_range();
-        let cursor_line = rope.byte_to_line(self.text.cursor());
+        let cursor_line = self.text.rope().byte_to_line(self.text.cursor());
         let span = self.page_lines(fonts, rect) + 4;
         let n = index.len();
         let start = cursor_line.saturating_sub(span);
         let end = (cursor_line + span + 1).min(n).max(start);
         let seed = rect.y + MARGIN + index.logical_top(start, &adjust);
         let wrap_width = rect.w - 2 * MARGIN;
+        let ctx = self.layout_ctx(fonts, active, wrap_width);
         Some(Layout::build_window(
-            fonts,
-            rope,
+            &ctx,
             rect.x + MARGIN,
             seed,
-            wrap_width,
-            FONT_SIZE,
-            active,
-            &self.images,
-            self.image_ui(),
             index,
             start,
             end,

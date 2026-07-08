@@ -12,26 +12,55 @@ use crate::wire::{Arg, Reader};
 /// pasting. The charset variant is listed first as the preferred form.
 pub(super) const CLIPBOARD_MIMES: &[&str] = &["text/plain;charset=utf-8", "text/plain"];
 
+/// Clipboard state. When we own the selection, `source` is our live
+/// `wl_data_source`; `data` is the bytes it serves and `mimes` the types it
+/// advertises (text for a text selection, `image/png`/`image/jpeg` for a copied
+/// image). Incoming offers are tracked so a paste can request the right MIME type.
+pub(super) struct ClipboardState {
+    pub(super) source: u32,
+    pub(super) data: Vec<u8>,
+    pub(super) mimes: Vec<&'static str>,
+    pub(super) incoming_offer: u32,
+    pub(super) incoming_text_mime: Option<String>,
+    pub(super) selection_offer: u32,
+    pub(super) selection_text_mime: Option<String>,
+}
+
+impl ClipboardState {
+    pub(super) fn new() -> Self {
+        Self {
+            source: 0,
+            data: Vec::new(),
+            mimes: Vec::new(),
+            incoming_offer: 0,
+            incoming_text_mime: None,
+            selection_offer: 0,
+            selection_text_mime: None,
+        }
+    }
+}
+
 impl State {
     pub(super) fn on_data_device(&mut self, opcode: u16, r: &mut Reader) -> Result<()> {
         match opcode {
             wl_data_device::EV_DATA_OFFER => {
                 // The compositor introduces a new offer; its MIME types follow.
-                self.incoming_offer = r.u32()?;
-                self.incoming_text_mime = None;
+                self.clipboard.incoming_offer = r.u32()?;
+                self.clipboard.incoming_text_mime = None;
             }
             wl_data_device::EV_SELECTION => {
                 let offer = r.u32()?;
-                if self.selection_offer != 0 && self.selection_offer != offer {
+                if self.clipboard.selection_offer != 0 && self.clipboard.selection_offer != offer {
                     self.conn
-                        .request(self.selection_offer, wl_data_offer::DESTROY, &[]);
+                        .request(self.clipboard.selection_offer, wl_data_offer::DESTROY, &[]);
                 }
-                self.selection_offer = offer;
-                self.selection_text_mime = if offer != 0 && offer == self.incoming_offer {
-                    self.incoming_text_mime.clone()
-                } else {
-                    None
-                };
+                self.clipboard.selection_offer = offer;
+                self.clipboard.selection_text_mime =
+                    if offer != 0 && offer == self.clipboard.incoming_offer {
+                        self.clipboard.incoming_text_mime.clone()
+                    } else {
+                        None
+                    };
             }
             _ => {}
         }
@@ -53,19 +82,19 @@ impl State {
                 // (EPIPE). Serving the clipboard must not bring the editor down, so
                 // report and swallow the I/O error rather than propagate it out of
                 // the event loop (the protocol-parse errors above stay fatal).
-                if let Err(e) = ffi::write_all(fd.as_raw_fd(), &self.clipboard_data) {
+                if let Err(e) = ffi::write_all(fd.as_raw_fd(), &self.clipboard.data) {
                     eprintln!("bnknotes: clipboard serve failed: {e}");
                 }
             }
             wl_data_source::EV_CANCELLED => {
                 // Another selection replaced ours; tear the source down.
-                if self.clipboard_source != 0 {
+                if self.clipboard.source != 0 {
                     self.conn
-                        .request(self.clipboard_source, wl_data_source::DESTROY, &[]);
+                        .request(self.clipboard.source, wl_data_source::DESTROY, &[]);
                 }
-                self.clipboard_source = 0;
-                self.clipboard_data.clear();
-                self.clipboard_mimes.clear();
+                self.clipboard.source = 0;
+                self.clipboard.data.clear();
+                self.clipboard.mimes.clear();
             }
             _ => {}
         }
@@ -127,9 +156,9 @@ impl State {
         let (Some(manager), true) = (self.data_device_manager, self.data_device != 0) else {
             return;
         };
-        if self.clipboard_source != 0 {
+        if self.clipboard.source != 0 {
             self.conn
-                .request(self.clipboard_source, wl_data_source::DESTROY, &[]);
+                .request(self.clipboard.source, wl_data_source::DESTROY, &[]);
         }
         let source = self.alloc_id();
         self.conn.request(
@@ -146,9 +175,9 @@ impl State {
             wl_data_device::SET_SELECTION,
             &[Arg::Object(source), Arg::Uint(self.last_serial)],
         );
-        self.clipboard_source = source;
-        self.clipboard_data = data;
-        self.clipboard_mimes = mimes;
+        self.clipboard.source = source;
+        self.clipboard.data = data;
+        self.clipboard.mimes = mimes;
     }
 
     /// Insert the clipboard's text at the cursor.
@@ -166,21 +195,23 @@ impl State {
     /// write end to the compositor, close our copy, read the read end to EOF).
     /// A copied image has no text representation and yields `None`.
     pub(super) fn clipboard_text(&mut self) -> Result<Option<String>> {
-        if self.clipboard_source != 0 {
-            if self.clipboard_mimes.iter().any(|m| is_text_mime(m)) {
+        if self.clipboard.source != 0 {
+            if self.clipboard.mimes.iter().any(|m| is_text_mime(m)) {
                 return Ok(Some(
-                    String::from_utf8_lossy(&self.clipboard_data).into_owned(),
+                    String::from_utf8_lossy(&self.clipboard.data).into_owned(),
                 ));
             }
             return Ok(None);
         }
-        let (Some(mime), true) = (self.selection_text_mime.clone(), self.selection_offer != 0)
-        else {
+        let (Some(mime), true) = (
+            self.clipboard.selection_text_mime.clone(),
+            self.clipboard.selection_offer != 0,
+        ) else {
             return Ok(None);
         };
         let (read_end, write_end) = ffi::pipe()?;
         self.conn.request_with_fd(
-            self.selection_offer,
+            self.clipboard.selection_offer,
             wl_data_offer::RECEIVE,
             &[Arg::Str(&mime)],
             write_end.as_raw_fd(),

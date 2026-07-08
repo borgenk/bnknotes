@@ -11,7 +11,7 @@
 //! reports allocations per operation, a deterministic signal that gates too.
 //!
 //! **Tier 2, the lab** (`bnknotes --perf-lab`): whole-pipeline scenarios over large
-//! generated stress corpora (see [`crate::corpus`]), reporting throughput,
+//! generated stress corpora (see [`crate::dev::corpus`]), reporting throughput,
 //! CPU-seconds, resident memory, and allocations, and appending each run to
 //! `perf/history.jsonl` keyed by the git commit. This is for finding work and
 //! learning, not gating; it needs no GPU either, but it is not deterministic in
@@ -28,8 +28,9 @@ use std::path::Path;
 use std::process::Command;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
-use crate::alloc;
-use crate::corpus;
+use crate::dev::alloc;
+use crate::dev::corpus;
+use crate::dev::sys;
 use crate::error::{Error, Result};
 use crate::find::FindState;
 use crate::freetype::Fonts;
@@ -38,7 +39,6 @@ use crate::layout::{ImageUi, Layout, LayoutCtx, LineIndex};
 use crate::markdown;
 use crate::paint::{build_display_list, PaintParams};
 use crate::rope::Rope;
-use crate::sys;
 use crate::text::TextBuffer;
 use crate::theme::{FONT_SIZE, MARGIN};
 

@@ -18,7 +18,7 @@ zune-png = { version = "0.5", default-features = false, features = ["std"] }
 zune-jpeg = { version = "0.5", default-features = false, features = ["std"] }
 
 [features]
-# Install the counting global allocator (src/alloc.rs) so the perf harness can
+# Install the counting global allocator (src/dev/alloc.rs) so the perf harness can
 # report allocations per operation. Off by default: a global allocator taxes
 # every allocation, so the shipping editor never carries it. `make perf` and
 # `make perf-lab` enable it.

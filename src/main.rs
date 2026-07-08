@@ -1,12 +1,11 @@
 //! bnknotes: a minimal, GPU-rendered markdown notes editor and a native
 //! Wayland client (no winit, no smithay, almost no crates).
 
-mod alloc;
 mod app;
 mod browser;
 mod bytes;
 mod conn;
-mod corpus;
+mod dev;
 mod display;
 mod dmabuf;
 mod emoji;
@@ -22,7 +21,6 @@ mod layout;
 mod markdown;
 mod paint;
 mod pane;
-mod perf;
 mod pixel;
 mod protocol;
 mod regex;
@@ -30,7 +28,6 @@ mod rope;
 mod scroll;
 mod shape;
 mod store;
-mod sys;
 mod text;
 mod theme;
 mod tree;
@@ -45,13 +42,13 @@ fn main() {
     // launches the editor (with an optional file path).
     let args: Vec<String> = std::env::args().skip(1).collect();
     let result = if args.iter().any(|a| a == "--perf-lab") {
-        perf::run_lab(&args)
+        dev::perf::run_lab(&args)
     } else if args.iter().any(|a| a == "--load-bench") {
-        perf::run_load_bench(&args)
+        dev::perf::run_load_bench(&args)
     } else if args.iter().any(|a| a == "--mem-report") {
-        perf::run_mem_report(&args)
+        dev::perf::run_mem_report(&args)
     } else if args.iter().any(|a| a == "--perf") {
-        perf::run(&args)
+        dev::perf::run(&args)
     } else if args.iter().any(|a| a == "--gpu-probe") {
         app::gpu_probe()
     } else {

@@ -2070,8 +2070,8 @@ mod tests {
     /// to diff layout variants against.
     fn oracle_docs() -> Vec<Rope> {
         let mut docs: Vec<Rope> = FIXTURES.iter().map(|s| Rope::from_str(s)).collect();
-        for name in crate::corpus::NAMES {
-            if let Some(text) = crate::corpus::generate(name, 12 * 1024) {
+        for name in crate::dev::corpus::NAMES {
+            if let Some(text) = crate::dev::corpus::generate(name, 12 * 1024) {
                 docs.push(Rope::from_str(&text));
             }
         }

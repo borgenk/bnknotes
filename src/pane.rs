@@ -793,8 +793,33 @@ impl EditorPane {
         false
     }
 
+    /// Handle a press on a table's add-row / add-column hover strip: grow the table
+    /// by a row or a column. Returns whether it was consumed.
+    pub(crate) fn press_table_button(
+        &mut self,
+        fonts: &Fonts,
+        rect: Rect,
+        px: f32,
+        py: f32,
+    ) -> bool {
+        let button = {
+            let Some((layout, rope, y)) = self.layout_at(fonts, rect, py) else {
+                return false;
+            };
+            layout.table_button_at(fonts, rope, px, y)
+        };
+        let Some(button) = button else {
+            return false;
+        };
+        match button.kind {
+            crate::layout::TableButtonKind::AddRow => self.text.add_table_row(button.block),
+            crate::layout::TableButtonKind::AddColumn => self.text.add_table_column(button.block),
+        }
+    }
+
     /// The pointer shape for a window position within this pane: a hand over a
-    /// link/checkbox/image-button, the arrow over a picture, the I-beam elsewhere.
+    /// link/checkbox/image-button or a table add-row/add-column strip, the arrow
+    /// over a picture, the I-beam elsewhere.
     pub(crate) fn cursor_shape_at(&mut self, fonts: &Fonts, rect: Rect, px: f32, py: f32) -> u32 {
         use wp_cursor_shape_device_v1::{SHAPE_DEFAULT, SHAPE_POINTER, SHAPE_TEXT};
         let over_link = self.link_under_pointer(fonts, rect, px, py).is_some();
@@ -803,6 +828,9 @@ impl EditorPane {
             return SHAPE_POINTER;
         }
         match self.layout_at(fonts, rect, py) {
+            Some((layout, rope, y)) if layout.table_button_at(fonts, rope, px, y).is_some() => {
+                SHAPE_POINTER
+            }
             Some((layout, _, y)) if layout.image_button_at(fonts, px, y).is_some() => SHAPE_POINTER,
             Some((layout, _, y)) if layout.image_at(fonts, px, y).is_some() => SHAPE_DEFAULT,
             _ => SHAPE_TEXT,

@@ -72,17 +72,31 @@ fn apply_editor_action(
     action: KeyAction,
 ) -> bool {
     let changed = match action {
+        // A typed `|` inside a table is escaped to `\|` so it cannot be mistaken
+        // for a cell divider; everywhere else a character inserts verbatim.
+        KeyAction::Char('|') if ed.text.cursor_in_table() => {
+            ed.text.insert_str("\\|");
+            true
+        }
         KeyAction::Char(c) => {
             let mut encoded = [0u8; 4];
             ed.text.insert_str(c.encode_utf8(&mut encoded));
             true
         }
+        // In a table cell, Shift+Enter is a line break within the cell (`<br>`) and
+        // a bare Enter adds a new row; elsewhere Enter continues a list or breaks.
+        KeyAction::Enter if extend && ed.text.cursor_in_table() => {
+            ed.text.insert_str("<br>");
+            true
+        }
         KeyAction::Enter => ed.text.enter(),
-        // On a list item, Tab nests it one level deeper and Shift+Tab one
-        // shallower. Anywhere else, Tab inserts a soft tab and Shift+Tab is a
-        // no-op (there is nothing to dedent).
+        // In a table, Tab moves to the next cell and Shift+Tab to the previous. On a
+        // list item, Tab nests it one level deeper and Shift+Tab one shallower.
+        // Anywhere else, Tab inserts a soft tab and Shift+Tab is a no-op.
         KeyAction::Tab => {
-            if ed.text.cursor_on_list_item() {
+            if ed.text.cursor_in_table() {
+                ed.text.tab_cell(!extend)
+            } else if ed.text.cursor_on_list_item() {
                 ed.text.nest_list_item(extend)
             } else if extend {
                 false
@@ -93,6 +107,15 @@ fn apply_editor_action(
         }
         KeyAction::Backspace => ed.text.backspace(),
         KeyAction::Delete => ed.text.delete_forward(),
+        // In a table, Ctrl+Shift+Backspace removes the current row and
+        // Ctrl+Shift+Delete the current column (the shift distinguishes them from
+        // the plain Ctrl word-deletes); outside a table they stay word-deletes.
+        KeyAction::DeleteWordBack if extend && ed.text.cursor_in_table() => {
+            ed.text.remove_table_row()
+        }
+        KeyAction::DeleteWordForward if extend && ed.text.cursor_in_table() => {
+            ed.text.remove_table_column()
+        }
         KeyAction::DeleteWordBack => ed.text.delete_word_back(),
         KeyAction::DeleteWordForward => ed.text.delete_word_forward(),
         KeyAction::DeleteLine => ed.text.delete_line(),
@@ -817,6 +840,12 @@ impl State {
             self.dirty = true;
         }
         self.editors[i].goal_x = None;
+        // A click on a table's add-row / add-column hover strip grows the table.
+        if self.editors[i].press_table_button(&self.fonts, rect, px, py) {
+            self.dirty = true;
+            self.bump_caret();
+            return;
+        }
         // Image interactions win over text.
         if self.editors[i].image_press(&self.fonts, rect, px, py) {
             self.dirty = true;

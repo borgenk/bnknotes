@@ -89,6 +89,22 @@ const IMAGE_PAD_Y: i32 = 8;
 /// so the small square is comfortable to hit.
 const CHECKBOX_HIT_PAD: i32 = 3;
 
+/// Horizontal padding between a table cell's border and its text, on each side of
+/// the content; vertical padding above and below a row's text; and the width of a
+/// grid border line. The cell content width plus twice the x padding plus the
+/// borders is the column's drawn width.
+const TABLE_CELL_PAD_X: i32 = 8;
+pub(crate) const TABLE_CELL_PAD_Y: i32 = 4;
+pub(crate) const TABLE_BORDER: i32 = 1;
+
+/// The narrowest a table column's content is squeezed to when the natural widths
+/// overflow the available width, so a column never collapses to nothing.
+const TABLE_MIN_COL: i32 = 24;
+
+/// Thickness of the add-row strip below a table and the add-column strip to its
+/// right: the hover targets that grow the table by a row or a column.
+const TABLE_ADD_THICKNESS: i32 = 16;
+
 /// The selected-image toggle button: a rounded panel this wide and tall (wide
 /// enough for the `</>` glyph), inset this far from the picture's top-right corner.
 /// Shared by the painter (to draw it) and hit-testing (to catch clicks), so the
@@ -153,6 +169,11 @@ pub struct VisualLine {
     /// vertical extent consult this rather than the font metrics. A widget line is
     /// never a keyboard caret target (the source line above it is).
     pub image: Option<ImageBox>,
+    /// Set when this line renders one grid row of a markdown table (a header or a
+    /// body row). Like [`Self::image`], it is a widget line: taller than text, with
+    /// its own internal cell layout, and (for now) not a caret target. A table's
+    /// delimiter row emits no visual line at all. `None` on every other line.
+    pub table: Option<TableRow>,
 }
 
 impl VisualLine {
@@ -182,6 +203,7 @@ impl VisualLine {
             task: None,
             rule: false,
             image: Some(image),
+            table: None,
         }
     }
 }
@@ -211,6 +233,90 @@ impl ImageBox {
     /// The painter centers the image in this box and culls on it.
     pub(crate) fn box_height(&self) -> i32 {
         self.height + 2 * IMAGE_PAD_Y
+    }
+}
+
+/// One grid row of a markdown table, laid out as a widget line. It owns its cells
+/// and the table's shared column geometry, so the painter reads everything it
+/// needs off the row without re-measuring. Every row of one table carries the same
+/// `columns`, so a row can draw its own separators and the block's outer border.
+#[derive(Clone)]
+pub struct TableRow {
+    /// True for the header row (the line above the delimiter), which draws bold and
+    /// sits above the header rule. False for a body row.
+    pub header: bool,
+    /// True on the table's first drawn row (the header), so the painter draws the
+    /// table's top edge; every row draws its own bottom edge. A table split across a
+    /// window edge may have `first` unset on the rows in view.
+    pub first: bool,
+    /// Left edge and content width of each column, relative to the row's left
+    /// (`Layout::left` plus the row's `indent`). Length matches `cells`.
+    pub columns: Vec<Column>,
+    /// One entry per column, in column order.
+    pub cells: Vec<TableCell>,
+    /// The x of every vertical grid line, relative to the row's left: the left
+    /// outer edge, each column separator, and the right outer edge. Precomputed so
+    /// the painter draws the borders without the layout's padding constants.
+    pub borders: Vec<i32>,
+    /// The table's total width in pixels (its right outer edge).
+    pub width: i32,
+    /// Full height of the row's box in pixels (the tallest cell plus vertical cell
+    /// padding), standing in for a text line's line-height.
+    pub height: i32,
+}
+
+/// A hover affordance that grows a table: an add-row strip just below its last
+/// row, or an add-column strip just off its right edge. Carried from a hover/click
+/// hit-test to the painter (which draws it) and the editor (which applies it).
+#[derive(Clone, Copy)]
+pub struct TableButton {
+    pub kind: TableButtonKind,
+    /// The strip's rectangle in content space (also the click target).
+    pub rect: Rect,
+    /// The table to grow, as its logical-line extent.
+    pub block: crate::table::Block,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum TableButtonKind {
+    AddRow,
+    AddColumn,
+}
+
+/// A table column's horizontal geometry, shared by every row of the table.
+#[derive(Clone, Copy)]
+pub struct Column {
+    /// Left x of the cell's content, relative to the row's left.
+    pub x: i32,
+    /// Content width the cell text wraps within.
+    pub width: i32,
+    pub align: markdown::Align,
+}
+
+/// One cell of a table row: its trimmed content byte range (absolute) and its
+/// wrapped text lines, each a run of styled spans. Runs carry absolute byte ranges
+/// into the buffer, so a cell maps back to its source; the range lets the caret and
+/// click hit-testing land in a cell even when it is empty (no runs).
+#[derive(Clone)]
+pub struct TableCell {
+    pub start: usize,
+    pub end: usize,
+    pub lines: Vec<CellLine>,
+}
+
+/// One wrapped line within a table cell: the runs to draw and their pixel width
+/// (so the painter can right-align or center without re-measuring).
+#[derive(Clone)]
+pub struct CellLine {
+    pub runs: Vec<Run>,
+    pub width: i32,
+}
+
+impl TableRow {
+    /// The full box height of the row, standing in for a text line's line-height in
+    /// the few places that measure a line's vertical extent.
+    pub(crate) fn box_height(&self) -> i32 {
+        self.height
     }
 }
 
@@ -537,7 +643,9 @@ impl Layout {
         let mut lines = Vec::new();
         for i in start..end {
             let line = LogicalLine::at(ctx.rope, i, n);
-            box_top += lay_line(ctx, line, box_top, &mut carry, &mut pool, false, &mut lines);
+            box_top += lay_line(
+                ctx, line, i, box_top, &mut carry, &mut pool, false, &mut lines,
+            );
         }
         Self {
             lines,
@@ -570,10 +678,22 @@ impl Layout {
         self.left
     }
 
-    /// The byte range `(start, end)` of the visual line containing `offset`,
-    /// for Home/End motion.
+    /// The byte range `(start, end)` of the visual line containing `offset`, for
+    /// Home/End motion. In a table row this is the range of the cell holding the
+    /// offset, so Home/End land at the cell's content edges rather than on the
+    /// structural pipes (where a type would corrupt the row).
     pub fn line_bounds(&self, offset: usize) -> (usize, usize) {
         let line = self.line_for(offset);
+        if let Some(t) = &line.table {
+            if let Some(cell) = t
+                .cells
+                .iter()
+                .find(|c| offset <= c.end)
+                .or_else(|| t.cells.last())
+            {
+                return (cell.start, cell.end);
+            }
+        }
         (line.start, line.end)
     }
 
@@ -583,6 +703,9 @@ impl Layout {
     /// never falls inside a hidden run.
     pub fn caret(&self, fonts: &Fonts, rope: &Rope, offset: usize) -> (i32, i32, i32) {
         let line = self.line_for(offset);
+        if let Some(t) = &line.table {
+            return self.table_caret(fonts, rope, line, t, offset);
+        }
         let m = fonts.metrics(line.size);
         let x = self.left as f32 + line.indent as f32 + self.advance_to(fonts, rope, line, offset);
         (
@@ -595,7 +718,17 @@ impl Layout {
     /// The byte offset nearest a click at window `(x, y)`.
     pub fn offset_at(&self, fonts: &Fonts, rope: &Rope, x: f32, y: f32) -> usize {
         let line = self.line_for_y(fonts, y);
-        self.hit_line(fonts, rope, line, x)
+        self.hit(fonts, rope, line, x, y)
+    }
+
+    /// Hit-test a click at content-space `(x, y)` against `line`, dispatching a
+    /// table row to its cell-aware hit-test and any other line to the run-walk. A
+    /// non-table line ignores `y` (its band already picked the line).
+    fn hit(&self, fonts: &Fonts, rope: &Rope, line: &VisualLine, x: f32, y: f32) -> usize {
+        match &line.table {
+            Some(t) => self.table_hit(fonts, rope, line, t, x, y),
+            None => self.hit_line(fonts, rope, line, x),
+        }
     }
 
     /// If the visual line at content-space `y` is a rendered horizontal rule (a
@@ -711,7 +844,8 @@ impl Layout {
         let mut target = idx + dir;
         // Step over the picture half of a revealed image (its source line is the
         // caret target). A picture-only line is not skipped, so the caret can land
-        // on it (at its start), revealing the source on the next build.
+        // on it (at its start), revealing the source on the next build. Table rows
+        // are caret targets and are not skipped: motion lands in a cell at goal_x.
         while target >= 0
             && (target as usize) < self.lines.len()
             && self.is_stacked_widget(target as usize)
@@ -721,7 +855,11 @@ impl Layout {
         if target < 0 || target as usize >= self.lines.len() {
             return offset;
         }
-        self.hit_line(fonts, rope, &self.lines[target as usize], goal_x)
+        // A table row needs a y to pick the wrapped line within a cell; entering it
+        // from above/below lands on its first row of text (the box top).
+        let line = &self.lines[target as usize];
+        let y = (line.baseline - fonts.metrics(line.size).ascent) as f32;
+        self.hit(fonts, rope, line, goal_x, y)
     }
 
     /// The highlight rectangles covering the byte range `[start, end)`, one per
@@ -742,6 +880,21 @@ impl Layout {
             // line's text into the break. Soft wraps have no newline to select.
             let newline_selected = line.hard && start <= line.end && end > line.end;
             if sel_start >= sel_end && !newline_selected {
+                continue;
+            }
+            // A table row selects row-granular: any selection touching the row
+            // highlights its whole box (in-cell partial selection is not drawn), so
+            // marking cells reads as marking rows, matching how a delete removes
+            // whole rows.
+            if let Some(t) = &line.table {
+                if start <= line.end && end > line.start {
+                    rects.push(Rect {
+                        x: self.left + line.indent,
+                        y: line.baseline - m.ascent,
+                        w: t.width,
+                        h: t.height,
+                    });
+                }
                 continue;
             }
             // An image line has no text to run-walk. The picture is highlighted
@@ -824,7 +977,9 @@ impl Layout {
     /// given to the later line; one at a hard newline stays on its line. Image
     /// picture lines are skipped: they are never caret targets, so the caret lands
     /// on the source text line (which a revealed image always has above its
-    /// picture). Falls back to the last text line for an offset at the document end.
+    /// picture). A table row is a caret target (its cells hold the caret), so it is
+    /// not skipped. Falls back to the last text line for an offset at the document
+    /// end.
     fn line_for(&self, offset: usize) -> &VisualLine {
         &self.lines[self.line_index_for(offset)]
     }
@@ -845,11 +1000,14 @@ impl Layout {
             .iter()
             .find(|l| {
                 let m = fonts.metrics(l.size);
-                let bottom = match l.image {
-                    // An image line's band spans its full (taller) box, so a click
-                    // anywhere on the picture lands on it and reveals its source.
-                    Some(img) => l.baseline - m.ascent + img.box_height(),
-                    None => l.baseline + m.descent,
+                // A widget line's band spans its full (taller) box, so a click
+                // anywhere on the picture or table row lands on that line.
+                let bottom = if let Some(img) = l.image {
+                    l.baseline - m.ascent + img.box_height()
+                } else if let Some(table) = &l.table {
+                    l.baseline - m.ascent + table.box_height()
+                } else {
+                    l.baseline + m.descent
                 };
                 y < bottom as f32
             })
@@ -913,6 +1071,194 @@ impl Layout {
         // build always pushes at least one line, so this never panics.
         debug_assert!(!self.lines.is_empty());
         &self.lines[self.lines.len() - 1]
+    }
+
+    /// The caret rectangle for `offset` inside table row `line`: the cell holding
+    /// the offset, the wrapped line within it, and the pen advance to the offset,
+    /// resolved against the shared column geometry and each column's alignment. An
+    /// empty cell places the caret at its content left.
+    fn table_caret(
+        &self,
+        fonts: &Fonts,
+        rope: &Rope,
+        line: &VisualLine,
+        t: &TableRow,
+        offset: usize,
+    ) -> (i32, i32, i32) {
+        let m = fonts.metrics(line.size);
+        let box_top = line.baseline - m.ascent;
+        let row_left = self.left + line.indent;
+        let idx = t
+            .cells
+            .iter()
+            .position(|c| offset <= c.end)
+            .unwrap_or(t.cells.len().saturating_sub(1));
+        let height = m.ascent + m.descent;
+        let Some(cell) = t.cells.get(idx) else {
+            return (row_left, box_top + TABLE_CELL_PAD_Y, height);
+        };
+        let (k, adv, line_w) = self.cell_offset_x(fonts, rope, line.size, t.header, cell, offset);
+        let content_x = t.columns.get(idx).map_or(0, |c| aligned_x(*c, line_w));
+        let x = row_left + content_x + adv.round() as i32;
+        let y = box_top + TABLE_CELL_PAD_Y + k as i32 * m.line_height;
+        (x, y, height)
+    }
+
+    /// The wrapped line index within `cell` holding `offset`, the pen advance to
+    /// the offset in that line's visible runs, and that line's drawn width (for
+    /// alignment). An empty cell yields the first line, zero advance, zero width.
+    fn cell_offset_x(
+        &self,
+        fonts: &Fonts,
+        rope: &Rope,
+        size: u32,
+        header: bool,
+        cell: &TableCell,
+        offset: usize,
+    ) -> (usize, f32, i32) {
+        if cell.lines.is_empty() {
+            return (0, 0.0, 0);
+        }
+        // The last wrapped line starting at or before the offset.
+        let mut k = 0;
+        for (i, cl) in cell.lines.iter().enumerate() {
+            let start = cl.runs.first().map_or(cell.start, |r| r.start);
+            if offset >= start {
+                k = i;
+            }
+        }
+        let cl = &cell.lines[k];
+        let mut adv = 0.0;
+        for run in &cl.runs {
+            if !run.visible || offset <= run.start {
+                continue;
+            }
+            let end = offset.min(run.end);
+            let face = run_face(fonts, size, run.kind, header);
+            adv += shape::text_advance(face, &rope.slice(run.start..end).as_cow());
+        }
+        (k, adv, cl.width)
+    }
+
+    /// The byte offset nearest content-space `(x, y)` inside table row `line`: the
+    /// column under `x`, the wrapped line under `y`, then the nearest glyph in that
+    /// cell line. An empty cell (or a click before its text) lands at the cell start.
+    fn table_hit(
+        &self,
+        fonts: &Fonts,
+        rope: &Rope,
+        line: &VisualLine,
+        t: &TableRow,
+        x: f32,
+        y: f32,
+    ) -> usize {
+        let m = fonts.metrics(line.size);
+        let row_left = self.left + line.indent;
+        let box_top = line.baseline - m.ascent;
+        let ncols = t.cells.len();
+        if ncols == 0 {
+            return line.start;
+        }
+        // The column whose right grid line is the first past x; a click past the
+        // last column falls to it.
+        let rel_x = (x - row_left as f32) as i32;
+        let col = t
+            .borders
+            .windows(2)
+            .position(|w| rel_x < w[1])
+            .unwrap_or(ncols - 1)
+            .min(ncols - 1);
+        let cell = &t.cells[col];
+        if cell.lines.is_empty() {
+            return cell.start;
+        }
+        let rel_y = (y - (box_top + TABLE_CELL_PAD_Y) as f32).max(0.0);
+        let k = ((rel_y / m.line_height as f32) as usize).min(cell.lines.len() - 1);
+        let cl = &cell.lines[k];
+        let content_x = t.columns.get(col).map_or(0, |c| aligned_x(*c, cl.width));
+        let mut acc = (row_left + content_x) as f32;
+        for run in &cl.runs {
+            if !run.visible {
+                continue;
+            }
+            let face = run_face(fonts, line.size, run.kind, t.header);
+            let text = rope.slice(run.start..run.end).as_cow();
+            for (off, cluster) in grapheme::graphemes(&text) {
+                let w = shape::text_advance(face, cluster);
+                if x < acc + w / 2.0 {
+                    return run.start + off;
+                }
+                acc += w;
+            }
+        }
+        // Past every glyph: the end of the last visible run, else the cell start.
+        cl.runs
+            .iter()
+            .rev()
+            .find(|r| r.visible)
+            .map_or(cell.start, |r| r.end)
+    }
+
+    /// The table-grow affordance under content-space `(x, y)`, if any: the add-row
+    /// strip just below a table's last visible row, or the add-column strip just
+    /// off its right edge. Each maximal run of table-row lines is one table; the
+    /// strips sit outside its box so they never overlap a cell. `rope` resolves the
+    /// run back to its logical-line block for the edit.
+    pub fn table_button_at(
+        &self,
+        fonts: &Fonts,
+        rope: &Rope,
+        x: f32,
+        y: f32,
+    ) -> Option<TableButton> {
+        let mut i = 0;
+        while i < self.lines.len() {
+            if self.lines[i].table.is_none() {
+                i += 1;
+                continue;
+            }
+            let start = i;
+            let mut end = i;
+            while end + 1 < self.lines.len() && self.lines[end + 1].table.is_some() {
+                end += 1;
+            }
+            i = end + 1;
+            let (top, bot) = (&self.lines[start], &self.lines[end]);
+            let width = top.table.as_ref().map_or(0, |t| t.width);
+            let left = self.left + top.indent;
+            let box_top = top.baseline - fonts.metrics(top.size).ascent;
+            let box_bottom = bot.baseline - fonts.metrics(bot.size).ascent
+                + bot.table.as_ref().map_or(0, |t| t.box_height());
+            let add_row = Rect {
+                x: left,
+                y: box_bottom,
+                w: width,
+                h: TABLE_ADD_THICKNESS,
+            };
+            if rect_contains(&add_row, x, y) {
+                let block = crate::table::block_at(rope, rope.byte_to_line(bot.start))?;
+                return Some(TableButton {
+                    kind: TableButtonKind::AddRow,
+                    rect: add_row,
+                    block,
+                });
+            }
+            let add_col = Rect {
+                x: left + width,
+                y: box_top,
+                w: TABLE_ADD_THICKNESS,
+                h: box_bottom - box_top,
+            };
+            if rect_contains(&add_col, x, y) {
+                let block = crate::table::block_at(rope, rope.byte_to_line(top.start))?;
+                return Some(TableButton {
+                    kind: TableButtonKind::AddColumn,
+                    rect: add_col,
+                    block,
+                });
+            }
+        }
+        None
     }
 
     /// Whether the visual line at `idx` is the picture half of a revealed image,
@@ -1100,9 +1446,11 @@ fn classify_line(
 /// `pool` supplies the per-line scratch buffers (`clusters`, `segments`), owned by
 /// the caller's build loop and reused across every line so laying out a line
 /// clears and refills them instead of allocating fresh Vecs.
+#[allow(clippy::too_many_arguments)]
 fn lay_line(
     ctx: &LayoutCtx,
     logical: LogicalLine,
+    line_no: usize,
     box_top: i32,
     carry: &mut LineCarry,
     pool: &mut LayoutScratch,
@@ -1132,6 +1480,19 @@ fn lay_line(
     // never reaching the text path.
     let mut pending_image: Option<ImageBox> = None;
     if carry.fence.is_none() {
+        // A table renders as a grid of widget rows: its delimiter row draws
+        // nothing, and every other row is one table widget line. A table ends any
+        // open list, and is never a caret target (for now). Detection is by rope
+        // scan (`table_block_at`), so no table state threads the carry.
+        if let Some(block) = table_block_at(ctx.rope, line_no) {
+            carry.list_depth = None;
+            return match block.role {
+                TableRole::Delimiter => 0,
+                TableRole::Header | TableRole::Body => {
+                    lay_table_row(ctx, &block, line_no, box_top, measure_only, pool, out)
+                }
+            };
+        }
         if let Some(link) = markdown::standalone_image(&line) {
             if let Some((iw, ih)) = ctx.images.dimensions(&line[link.path.0..link.path.1]) {
                 carry.list_depth = None;
@@ -1252,6 +1613,7 @@ fn lay_line(
             task,
             rule,
             image: None,
+            table: None,
         });
         y += metrics.line_height;
     }
@@ -1398,7 +1760,7 @@ impl LineIndex {
         let logical = LogicalLine::at(ctx.rope, i, n);
         let carry_in = *carry;
         scratch.clear();
-        let height = lay_line(ctx, logical, 0, carry, pool, true, scratch);
+        let height = lay_line(ctx, logical, i, 0, carry, pool, true, scratch);
         // Only a decoded standalone image changes height when revealed; measure
         // that once here. Re-running from the pre-line carry reproduces the same
         // state mutation (an image forces list_depth=None, fence must be None), so
@@ -1410,6 +1772,7 @@ impl LineIndex {
             let revealed = lay_line(
                 &revealed_ctx,
                 logical,
+                i,
                 0,
                 &mut revealed_carry,
                 pool,
@@ -1953,6 +2316,322 @@ fn wrap_segments(
     }
 }
 
+// --- Table layout -----------------------------------------------------------
+//
+// A markdown table lays out as a run of widget lines, one per source row (the
+// header and each body row; the delimiter row is structural and draws nothing).
+// Column widths are shared across the whole table, so each row measures the block
+// to find them, then wraps its own cells to those widths and takes the tallest
+// cell as its height. `table_block_at` recovers the block from any of its lines by
+// a bounded rope scan, so a row's geometry is a pure function of the table text
+// and the wrap width, and the windowed index needs no cross-line table state.
+
+/// Where a queried line sits within a table block.
+enum TableRole {
+    Header,
+    Delimiter,
+    Body,
+}
+
+/// A table block located around a logical line: the header and delimiter line
+/// numbers, one past the last body row, the column alignments, and the queried
+/// line's role.
+struct TableBlock {
+    header: usize,
+    delim: usize,
+    end: usize,
+    aligns: Vec<markdown::Align>,
+    role: TableRole,
+}
+
+impl TableBlock {
+    /// The drawn rows in order: the header, then every body row. The delimiter is
+    /// skipped, since it renders nothing.
+    fn drawn_rows(&self) -> impl Iterator<Item = usize> {
+        std::iter::once(self.header).chain(self.delim + 1..self.end)
+    }
+}
+
+/// If logical line `i` belongs to a table, the block around it, with its column
+/// alignments and `i`'s role. The line extent comes from [`crate::table::block_at`]
+/// (shared with the editing model, so caret navigation and rendering agree on a
+/// table's bounds); the alignments and role are resolved here for layout.
+fn table_block_at(rope: &Rope, i: usize) -> Option<TableBlock> {
+    let block = crate::table::block_at(rope, i)?;
+    let text = |k: usize| {
+        let l = LogicalLine::at(rope, k, rope.len_lines());
+        rope.slice(l.start..l.end).as_cow()
+    };
+    let aligns = markdown::table_head(&text(block.header), &text(block.delim))?;
+    let role = if i == block.header {
+        TableRole::Header
+    } else if i == block.delim {
+        TableRole::Delimiter
+    } else {
+        TableRole::Body
+    };
+    Some(TableBlock {
+        header: block.header,
+        delim: block.delim,
+        end: block.end,
+        aligns,
+        role,
+    })
+}
+
+/// The shared, positioned column geometry of `block`, fitted to the wrap width.
+/// Each column's natural width is its widest unwrapped cell (header cells measured
+/// in the bold face they draw in); if the columns overflow the available width
+/// they shrink proportionally, never past [`TABLE_MIN_COL`], so wide cells wrap.
+fn table_columns(ctx: &LayoutCtx, block: &TableBlock) -> Vec<Column> {
+    let n = ctx.rope.len_lines();
+    let cols = block.aligns.len();
+    let size = ctx.body_size;
+    let regular = markdown::SpanKind::Text(markdown::Emphasis::Regular);
+    let mut natural = vec![0i32; cols];
+    let mut ranges: Vec<(usize, usize)> = Vec::new();
+    for row in block.drawn_rows() {
+        let l = LogicalLine::at(ctx.rope, row, n);
+        let line = ctx.rope.slice(l.start..l.end).as_cow();
+        markdown::table_row_cells(&line, &mut ranges);
+        let header = row == block.header;
+        for (c, &(s, e)) in ranges.iter().take(cols).enumerate() {
+            let face = run_face(ctx.fonts, size, regular, header);
+            let w = shape::text_advance(face, &line[s..e]).ceil() as i32;
+            natural[c] = natural[c].max(w);
+        }
+    }
+    let border_pad = (cols as i32 + 1) * TABLE_BORDER + cols as i32 * 2 * TABLE_CELL_PAD_X;
+    let avail = if ctx.wrap_width > 0 {
+        (ctx.wrap_width - border_pad).max(cols as i32 * TABLE_MIN_COL)
+    } else {
+        natural.iter().sum::<i32>().max(1)
+    };
+    let widths = fit_columns(&natural, avail);
+    let mut out = Vec::with_capacity(cols);
+    let mut x = TABLE_BORDER;
+    for (&w, &align) in widths.iter().zip(&block.aligns) {
+        let cx = x + TABLE_CELL_PAD_X;
+        let w = w.max(1);
+        out.push(Column {
+            x: cx,
+            width: w,
+            align,
+        });
+        x = cx + w + TABLE_CELL_PAD_X + TABLE_BORDER;
+    }
+    out
+}
+
+/// The left x of a cell line within its column, honoring the column's alignment:
+/// left sits at the content edge, right and center shift by the free space. Shared
+/// by the painter (drawing) and the caret/hit-test (positioning) so they agree.
+pub(crate) fn aligned_x(col: Column, line_w: i32) -> i32 {
+    match col.align {
+        markdown::Align::Left => col.x,
+        markdown::Align::Right => col.x + col.width - line_w,
+        markdown::Align::Center => col.x + (col.width - line_w) / 2,
+    }
+}
+
+/// Fit natural column widths to `avail` pixels: keep them if they fit, else shrink
+/// each in proportion to its share, clamped to a floor so none vanishes.
+fn fit_columns(natural: &[i32], avail: i32) -> Vec<i32> {
+    let total: i32 = natural.iter().sum();
+    if total <= avail || total == 0 {
+        return natural.to_vec();
+    }
+    natural
+        .iter()
+        .map(|&w| ((w as i64 * avail as i64 / total as i64) as i32).max(TABLE_MIN_COL))
+        .collect()
+}
+
+/// Lay out one table row (`row_line`, a header or body row) at content-space top
+/// `box_top`, appending its widget line to `out` (unless `measure_only`) and
+/// returning the row's box height. Cells wrap to the shared column widths; the row
+/// is as tall as its tallest cell.
+fn lay_table_row(
+    ctx: &LayoutCtx,
+    block: &TableBlock,
+    row_line: usize,
+    box_top: i32,
+    measure_only: bool,
+    pool: &mut LayoutScratch,
+    out: &mut Vec<VisualLine>,
+) -> i32 {
+    let n = ctx.rope.len_lines();
+    let cols = block.aligns.len();
+    let size = ctx.body_size;
+    let metrics = ctx.fonts.metrics(size);
+    let columns = table_columns(ctx, block);
+    let l = LogicalLine::at(ctx.rope, row_line, n);
+    let line = ctx.rope.slice(l.start..l.end).as_cow();
+    let header = row_line == block.header;
+    let mut ranges: Vec<(usize, usize)> = Vec::new();
+    markdown::table_row_cells(&line, &mut ranges);
+    let mut cells = Vec::with_capacity(cols);
+    let mut max_lines = 1usize;
+    for (c, col) in columns.iter().enumerate() {
+        // A row shorter than the header pads with empty cells; a longer one is
+        // truncated to the column count.
+        let (s, e) = ranges.get(c).copied().unwrap_or((line.len(), line.len()));
+        let cell = build_cell(
+            ctx,
+            &line[s..e],
+            l.start + s,
+            l.start + e,
+            col.width,
+            header,
+            measure_only,
+            pool,
+        );
+        max_lines = max_lines.max(cell.lines.len().max(1));
+        cells.push(cell);
+    }
+    let height = max_lines as i32 * metrics.line_height + 2 * TABLE_CELL_PAD_Y;
+    if !measure_only {
+        // Vertical grid lines: the left outer edge, each column separator (just past
+        // a column's content and right padding), and the right outer edge.
+        let mut borders = Vec::with_capacity(columns.len() + 1);
+        borders.push(0);
+        for col in &columns {
+            borders.push(col.x + col.width + TABLE_CELL_PAD_X);
+        }
+        let width = borders.last().copied().unwrap_or(0) + TABLE_BORDER;
+        out.push(VisualLine {
+            start: l.start,
+            end: l.end,
+            // Baseline sits at the row's top plus the ascent, so `baseline - ascent`
+            // is the box top (the widget convention images use); the painter applies
+            // the vertical cell padding when placing text.
+            baseline: box_top + metrics.ascent,
+            hard: l.has_newline,
+            size,
+            runs: 0..0,
+            indent: 0,
+            gutter: Gutter::None,
+            code_block: false,
+            heading: None,
+            task: None,
+            rule: false,
+            image: None,
+            table: Some(TableRow {
+                header,
+                first: row_line == block.header,
+                columns,
+                cells,
+                borders,
+                width,
+                height,
+            }),
+        });
+    }
+    height
+}
+
+/// The pieces of a cell's text between `<br>` hard breaks, as byte ranges into it.
+/// A cell with no `<br>` yields one piece spanning the whole text, so the common
+/// case is unchanged; each `<br>` (the in-cell line break Shift+Enter inserts)
+/// forces the next piece onto its own line.
+fn br_pieces(text: &str) -> impl Iterator<Item = (usize, usize)> + '_ {
+    const BR: &str = "<br>";
+    let mut start = 0;
+    let mut done = false;
+    std::iter::from_fn(move || {
+        if done {
+            return None;
+        }
+        match text[start..].find(BR) {
+            Some(rel) => {
+                let at = start + rel;
+                let piece = (start, at);
+                start = at + BR.len();
+                Some(piece)
+            }
+            None => {
+                done = true;
+                Some((start, text.len()))
+            }
+        }
+    })
+}
+
+/// Lay out one table cell: its inline markup wrapped to the column `width`, as a
+/// list of drawn lines. A `<br>` splits the cell onto a fresh line; header cells
+/// draw in the bold face. On `measure_only` the runs and widths are skipped (the
+/// caller wants only the wrapped line count for the row height), matching the
+/// index's measure pass.
+#[allow(clippy::too_many_arguments)]
+fn build_cell(
+    ctx: &LayoutCtx,
+    cell_text: &str,
+    start: usize,
+    end: usize,
+    width: i32,
+    header: bool,
+    measure_only: bool,
+    pool: &mut LayoutScratch,
+) -> TableCell {
+    let size = ctx.body_size;
+    // A cell shows its inline text with markers collapsed, like any off-cursor
+    // line; it carries no block marker of its own.
+    let class = LineClass {
+        style: markdown::LineStyle::Body,
+        size,
+        block_marker: 0,
+        block_persists: false,
+        revealed: false,
+        code_block: false,
+    };
+    let mut lines = Vec::new();
+    for (ps, pe) in br_pieces(cell_text) {
+        let piece = &cell_text[ps..pe];
+        let piece_abs = start + ps;
+        pool.spans.clear();
+        markdown::inline_spans_append(piece, &mut pool.inline, &mut pool.spans);
+        wrap_segments(
+            ctx.fonts,
+            size,
+            piece,
+            &pool.spans,
+            width,
+            0,
+            header,
+            &mut pool.clusters,
+            &mut pool.segments,
+        );
+        for k in 0..pool.segments.len() {
+            let (ss, se) = pool.segments[k];
+            let mut runs = Vec::new();
+            if !measure_only {
+                clip_runs_into(&pool.spans, ss, se, piece_abs, &class, &mut runs);
+            }
+            let width = if measure_only {
+                0
+            } else {
+                cell_line_width(ctx, size, &runs, header)
+            };
+            lines.push(CellLine { runs, width });
+        }
+    }
+    TableCell { start, end, lines }
+}
+
+/// The drawn width of a cell line: the sum of its visible runs' advances, in the
+/// faces they draw in. Feeds the painter's right/center alignment.
+fn cell_line_width(ctx: &LayoutCtx, size: u32, runs: &[Run], header: bool) -> i32 {
+    let mut w = 0.0;
+    for run in runs {
+        if !run.visible {
+            continue;
+        }
+        let face = run_face(ctx.fonts, size, run.kind, header);
+        w += shape::text_advance(face, &ctx.rope.slice(run.start..run.end).as_cow());
+    }
+    w.round() as i32
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2008,6 +2687,26 @@ mod tests {
         rule: bool,
         image: Option<(usize, usize, i32, i32, bool)>,
         runs: Vec<(usize, usize, markdown::SpanKind, bool)>,
+        /// A table row's pixel-complete shape: header/first flags, width, height,
+        /// each column's (x, width, align), and every cell's wrapped lines as their
+        /// runs. `None` off table rows.
+        table: Option<TableFp>,
+    }
+
+    /// One run in a fingerprinted cell line: byte range, kind, visibility, and its
+    /// line's drawn width.
+    type CellRunFp = (usize, usize, markdown::SpanKind, bool, i32);
+
+    #[derive(Clone, PartialEq, Debug)]
+    struct TableFp {
+        header: bool,
+        first: bool,
+        width: i32,
+        height: i32,
+        borders: Vec<i32>,
+        columns: Vec<(i32, i32, markdown::Align)>,
+        /// Per cell, per wrapped line, the line's runs.
+        cells: Vec<Vec<Vec<CellRunFp>>>,
     }
 
     fn fingerprint(l: &Layout) -> Vec<LineFp> {
@@ -2033,6 +2732,29 @@ mod tests {
                     .iter()
                     .map(|r| (r.start, r.end, r.kind, r.visible))
                     .collect(),
+                table: v.table.as_ref().map(|t| TableFp {
+                    header: t.header,
+                    first: t.first,
+                    width: t.width,
+                    height: t.height,
+                    borders: t.borders.clone(),
+                    columns: t.columns.iter().map(|c| (c.x, c.width, c.align)).collect(),
+                    cells: t
+                        .cells
+                        .iter()
+                        .map(|cell| {
+                            cell.lines
+                                .iter()
+                                .map(|cl| {
+                                    cl.runs
+                                        .iter()
+                                        .map(|r| (r.start, r.end, r.kind, r.visible, cl.width))
+                                        .collect()
+                                })
+                                .collect()
+                        })
+                        .collect(),
+                }),
             })
             .collect()
     }
@@ -2056,6 +2778,8 @@ mod tests {
         "trailing line with no newline",
         "windows\r\nline\r\nendings\r\n",
         "mix **bold** and *italic* and `code` and [link](x) inline here\n",
+        "| Name | Role | Score |\n| --- | :---: | ---: |\n| Ada | engineer who writes prose long enough to wrap a cell | 92 |\n| Linus | kernel | 100 |\n",
+        "before the table\n\n| a | b |\n| - | - |\n| 1 | 2 |\n\nafter the table\n",
     ];
 
     /// Every fixture plus each seeded corpus (kept small for fast tests) as a doc
@@ -3795,5 +4519,221 @@ mod tests {
             );
             x += 3.0;
         }
+    }
+
+    // --- Tables -------------------------------------------------------------
+
+    /// The table rows of a layout, in order, paired with the visual line's start.
+    fn table_rows(l: &Layout) -> Vec<(usize, &TableRow)> {
+        l.lines()
+            .iter()
+            .filter_map(|v| v.table.as_ref().map(|t| (v.start, t)))
+            .collect()
+    }
+
+    #[test]
+    fn a_table_lays_out_as_grid_rows_with_no_delimiter_line() {
+        let f = fonts();
+        let r = rope("| A | B |\n| --- | ---: |\n| 1 | 2 |\n");
+        let l = layout(&f, &r);
+        let rows = table_rows(&l);
+        // Header and one body row become grid rows; the delimiter row draws nothing.
+        assert_eq!(rows.len(), 2, "header + body, no delimiter row");
+        assert_eq!(
+            rows.iter().map(|&(s, _)| s).collect::<Vec<_>>(),
+            vec![r.line_to_byte(0), r.line_to_byte(2)],
+            "grid rows are the header and body lines"
+        );
+        let header = rows[0].1;
+        assert!(header.header && header.first);
+        assert_eq!(header.columns.len(), 2);
+        assert_eq!(header.columns[0].align, markdown::Align::Left);
+        assert_eq!(header.columns[1].align, markdown::Align::Right);
+        assert!(!rows[1].1.header && !rows[1].1.first, "body row");
+        // Every row of a table shares the same column geometry and width.
+        assert_eq!(header.width, rows[1].1.width);
+        assert_eq!(
+            header.columns.iter().map(|c| c.x).collect::<Vec<_>>(),
+            rows[1].1.columns.iter().map(|c| c.x).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn a_wide_cell_wraps_and_grows_the_row() {
+        let f = fonts();
+        let r = rope("| h |\n| --- |\n| several words that must wrap in a narrow column |\n");
+        let l = Layout::build(&f, &r, LEFT, TOP, 160, BODY, NO_REVEAL);
+        let body = table_rows(&l)
+            .into_iter()
+            .find(|(_, t)| !t.header)
+            .expect("a body row")
+            .1;
+        assert!(
+            body.cells[0].lines.len() > 1,
+            "the long cell wrapped to several lines"
+        );
+        let lh = f.metrics(BODY).line_height;
+        assert!(
+            body.height >= 2 * lh,
+            "the row grew to fit the wrapped cell"
+        );
+    }
+
+    #[test]
+    fn prose_around_a_table_is_not_swallowed() {
+        let f = fonts();
+        let r = rope("intro\n\n| a | b |\n| - | - |\n| 1 | 2 |\n\noutro\n");
+        let l = layout(&f, &r);
+        // The paragraphs above and below still render as ordinary text lines.
+        let has = |s: &str| {
+            l.lines()
+                .iter()
+                .any(|v| v.table.is_none() && r.byte_slice(v.start..v.end) == s)
+        };
+        assert!(has("intro") && has("outro"), "prose kept as text");
+        assert_eq!(table_rows(&l).len(), 2, "only the header and body row");
+    }
+
+    #[test]
+    fn pipe_lines_without_a_delimiter_stay_source() {
+        let f = fonts();
+        // Two piped lines but no delimiter row: ordinary text, never a table.
+        let r = rope("| a | b |\n| c | d |\n");
+        let l = layout(&f, &r);
+        assert!(l.lines().iter().all(|v| v.table.is_none()));
+    }
+
+    #[test]
+    fn a_body_row_short_or_long_pads_or_truncates_to_the_columns() {
+        let f = fonts();
+        let r = rope("| a | b | c |\n| - | - | - |\n| x |\n| p | q | r | s |\n");
+        let l = layout(&f, &r);
+        for (_, t) in table_rows(&l) {
+            assert_eq!(
+                t.cells.len(),
+                3,
+                "every row has exactly the header's columns"
+            );
+        }
+    }
+
+    #[test]
+    fn caret_and_click_map_into_the_right_cell() {
+        let f = fonts();
+        let r = rope("| A | B |\n| --- | --- |\n| ab | cd |\n");
+        let l = layout(&f, &r);
+        let body = l
+            .lines()
+            .iter()
+            .find(|v| v.table.as_ref().is_some_and(|t| !t.header))
+            .expect("a body row");
+        let t = body.table.as_ref().unwrap();
+        let cells = crate::table::row_cells(&r, r.byte_to_line(body.start));
+        let col1 = t.columns[1];
+        let row_left = l.left() + body.indent;
+        // The caret at the start of the "cd" cell lands at column 1's left edge
+        // (both columns left-aligned) and within the row's vertical box.
+        let (cx, cy, ch) = l.caret(&f, &r, cells[1].0);
+        assert_eq!(cx, row_left + col1.x, "caret at column 1's content left");
+        let box_top = body.baseline - f.metrics(body.size).ascent;
+        assert!(
+            cy >= box_top && cy + ch <= box_top + t.height,
+            "caret within the row box"
+        );
+        // A click just inside that cell returns an offset within the "cd" cell.
+        let hit = l.offset_at(&f, &r, cx as f32 + 2.0, cy as f32 + 2.0);
+        assert!(
+            hit >= cells[1].0 && hit <= cells[1].1,
+            "click at {hit} lands inside the cd cell {:?}",
+            cells[1]
+        );
+    }
+
+    #[test]
+    fn vertical_motion_enters_table_rows_skips_the_delimiter_and_exits() {
+        let f = fonts();
+        let r = rope("top\n| aa | bb |\n| - | - |\n| cc | dd |\nbot\n");
+        let l = layout(&f, &r);
+        // Aim for the caret's own column from inside "top".
+        let start = 1;
+        let goal = l.caret(&f, &r, start).0 as f32;
+        // Down enters the header row's first cell.
+        let header = l.offset_vertical(&f, &r, start, 1, goal);
+        assert!(
+            crate::table::cell_at(&r, header).is_some(),
+            "Down lands in the header row"
+        );
+        // Down again skips the (invisible) delimiter row and lands in the body.
+        let body = l.offset_vertical(&f, &r, header, 1, goal);
+        assert_eq!(
+            r.byte_to_line(body),
+            3,
+            "in the body row, past the delimiter"
+        );
+        // Down once more leaves the table for the prose below.
+        let out = l.offset_vertical(&f, &r, body, 1, goal);
+        assert!(
+            crate::table::cell_at(&r, out).is_none(),
+            "Down leaves the table"
+        );
+        assert_eq!(
+            r.byte_slice(l.line_bounds(out).0..l.line_bounds(out).1),
+            "bot"
+        );
+    }
+
+    #[test]
+    fn a_br_breaks_a_cell_onto_another_line() {
+        let f = fonts();
+        let r = rope("| a<br>b | c |\n| - | - |\n");
+        let l = layout(&f, &r);
+        let (_, t) = table_rows(&l)[0];
+        assert_eq!(t.cells[0].lines.len(), 2, "the <br> split the cell");
+        assert_eq!(t.cells[1].lines.len(), 1, "the other cell is one line");
+        let lh = f.metrics(BODY).line_height;
+        assert!(t.height >= 2 * lh, "the row is two text lines tall");
+    }
+
+    #[test]
+    fn hover_finds_the_add_row_and_add_column_zones() {
+        let f = fonts();
+        let r = rope("| a | b |\n| - | - |\n| c | d |\n");
+        let l = layout(&f, &r);
+        let rows: Vec<&VisualLine> = l.lines().iter().filter(|v| v.table.is_some()).collect();
+        let (top, bot) = (rows[0], *rows.last().unwrap());
+        let width = top.table.as_ref().unwrap().width;
+        let left = l.left() + top.indent;
+        let box_top = top.baseline - f.metrics(top.size).ascent;
+        let box_bottom =
+            bot.baseline - f.metrics(bot.size).ascent + bot.table.as_ref().unwrap().box_height();
+        // Just below the last row: the add-row strip, tied to this table.
+        let add_row = l
+            .table_button_at(&f, &r, (left + 5) as f32, (box_bottom + 4) as f32)
+            .expect("add-row zone");
+        assert_eq!(add_row.kind, TableButtonKind::AddRow);
+        assert_eq!(add_row.block, crate::table::block_at(&r, 0).unwrap());
+        // Just right of the box: the add-column strip.
+        let add_col = l
+            .table_button_at(&f, &r, (left + width + 4) as f32, (box_top + 4) as f32)
+            .expect("add-column zone");
+        assert_eq!(add_col.kind, TableButtonKind::AddColumn);
+        // Inside a cell: no button.
+        assert!(l
+            .table_button_at(&f, &r, (left + 5) as f32, (box_top + 4) as f32)
+            .is_none());
+    }
+
+    #[test]
+    fn a_table_selection_highlights_whole_rows() {
+        let f = fonts();
+        let r = rope("| a | b |\n| - | - |\n| c | d |\n");
+        let l = layout(&f, &r);
+        let cells = crate::table::row_cells(&r, 2);
+        // A selection within the body row's cells lights up the whole row box.
+        let rects = l.selection_rects(&f, &r, cells[0].0, cells[1].0);
+        assert_eq!(rects.len(), 1, "one full-row highlight, not per-cell");
+        let (_, t) = table_rows(&l)[1]; // the body row
+        assert_eq!(rects[0].w, t.width, "spans the table width");
+        assert_eq!(rects[0].h, t.height, "spans the row height");
     }
 }

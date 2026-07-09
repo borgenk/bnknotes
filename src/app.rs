@@ -564,6 +564,21 @@ impl State {
             let ed = &self.editors[i];
             // Owned so it outlives the `FindPaint` that borrows it for this frame.
             let tick_tops = ed.find_tick_tops();
+            // The table add-row/add-column strip under the pointer, when it hovers
+            // this pane and no drag is in flight, recomputed each frame so it never
+            // goes stale after a scroll or edit.
+            let (px, py) = (self.pointer_x, self.pointer_y);
+            let over = px >= rect.x as f32
+                && px < (rect.x + rect.w) as f32
+                && py >= rect.y as f32
+                && py < (rect.y + rect.h) as f32;
+            let table_hover = if over && !ed.selecting && self.drag_splitter.is_none() {
+                ed.layout_cache.as_ref().and_then(|l| {
+                    l.table_button_at(&self.fonts, ed.text.rope(), px, ed.content_y(rect, py))
+                })
+            } else {
+                None
+            };
             let params = PaintParams {
                 width: rect.w as usize,
                 height: rect.h as usize,
@@ -575,6 +590,7 @@ impl State {
                 // from the cursor it is off screen and simply not drawn.
                 caret_visible: focused && self.caret_visible && ed.cursor_in_window(),
                 find: build_find_paint(&ed.find, &tick_tops, ed.content_height),
+                table_hover,
             };
             if let Some(layout) = ed.layout_cache.as_ref() {
                 list.append(&mut build_display_list(

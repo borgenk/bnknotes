@@ -1,5 +1,8 @@
 use crate::find::{self, FindState};
-use crate::layout::{face_key, image_button_rect, Gutter, Layout};
+use crate::layout::{
+    aligned_x, face_key, image_button_rect, CellLine, Gutter, Layout, TableRow, TABLE_BORDER,
+    TABLE_CELL_PAD_Y,
+};
 use crate::markdown;
 use crate::pane::TreePane;
 use crate::platform::freetype::{FaceKey, FontStyle, Fonts, Metrics};
@@ -13,8 +16,8 @@ use crate::theme::{
     FIND_ERROR_COLOR, FIND_MATCH_COLOR, FIND_TICK_COLOR, FONT_SIZE, FOREGROUND, HEADING_COLORS,
     IMAGE_BORDER_COLOR, IMAGE_BORDER_THICKNESS, IMAGE_BUTTON_BG, IMAGE_BUTTON_RADIUS, LINK_COLOR,
     MARGIN, MARKER_COLOR, QUOTE_BAR_COLOR, QUOTE_BAR_WIDTH, RULE_COLOR, RULE_THICKNESS,
-    SELECTION_COLOR, SPLITTER_COLOR, TICK_HEIGHT, TICK_WIDTH, TREE_BG, TREE_DIR_COLOR,
-    TREE_HOVER_BG, TREE_INDENT, TREE_PAD,
+    SELECTION_COLOR, SPLITTER_COLOR, TABLE_BORDER_COLOR, TABLE_HEADER_BG, TICK_HEIGHT, TICK_WIDTH,
+    TREE_BG, TREE_DIR_COLOR, TREE_HOVER_BG, TREE_INDENT, TREE_PAD,
 };
 
 /// The per-frame inputs [`build_display_list`] needs beyond the layout itself:
@@ -31,6 +34,9 @@ pub(crate) struct PaintParams<'a> {
     /// The find bar's paint state while it is open; `None` draws no bar and no
     /// match highlights.
     pub find: Option<FindPaint<'a>>,
+    /// The table add-row / add-column strip under the pointer, drawn as a hover
+    /// affordance; `None` when the pointer is not over one.
+    pub table_hover: Option<crate::layout::TableButton>,
 }
 
 /// What the painter needs from an open find bar: the [`FindState`] itself,
@@ -212,6 +218,9 @@ pub(crate) fn build_display_list(
         painter.find_matches(find);
     }
     painter.text();
+    if let Some(button) = p.table_hover {
+        painter.table_button(button);
+    }
     if p.caret_visible {
         painter.caret(p.cursor);
     }
@@ -445,6 +454,16 @@ impl<'a> Painter<'a> {
                 }
                 continue;
             }
+            // A table row draws its grid box (header tint, borders, separators) and
+            // its cells' wrapped, aligned text, and nothing else. Cull on the full
+            // (taller) row box.
+            if let Some(table) = &line.table {
+                let box_top = baseline - m.ascent;
+                if box_top < view_h && box_top + table.box_height() > 0 {
+                    self.table_row(left + line.indent, box_top, line.size, table, m);
+                }
+                continue;
+            }
             // Skip lines fully above or below the viewport, so a frame only
             // rasterizes what is on screen.
             if baseline + m.descent <= 0 || baseline - m.ascent >= view_h {
@@ -595,6 +614,146 @@ impl<'a> Painter<'a> {
                 }
             }
         }
+    }
+
+    /// Draw one table row: the header tint (header rows only), the grid borders
+    /// (a vertical at every column edge full row height, a top border on the
+    /// table's first row and a bottom border under every row so the rows read as a
+    /// continuous grid), then each cell's wrapped text, aligned within its column.
+    /// `box_top` is already in screen space.
+    fn table_row(&mut self, row_x: i32, box_top: i32, size: u32, t: &TableRow, m: Metrics) {
+        if t.header {
+            self.list.push(DrawCmd::Fill {
+                rect: Rect {
+                    x: row_x,
+                    y: box_top,
+                    w: t.width,
+                    h: t.height,
+                },
+                color: TABLE_HEADER_BG,
+            });
+        }
+        for &bx in &t.borders {
+            self.list.push(DrawCmd::Fill {
+                rect: Rect {
+                    x: row_x + bx,
+                    y: box_top,
+                    w: TABLE_BORDER,
+                    h: t.height,
+                },
+                color: TABLE_BORDER_COLOR,
+            });
+        }
+        // The first row draws the table's top edge; every row draws its own bottom
+        // edge, which doubles as the separator to the row below.
+        if t.first {
+            self.list.push(DrawCmd::Fill {
+                rect: Rect {
+                    x: row_x,
+                    y: box_top,
+                    w: t.width,
+                    h: TABLE_BORDER,
+                },
+                color: TABLE_BORDER_COLOR,
+            });
+        }
+        self.list.push(DrawCmd::Fill {
+            rect: Rect {
+                x: row_x,
+                y: box_top + t.height - TABLE_BORDER,
+                w: t.width,
+                h: TABLE_BORDER,
+            },
+            color: TABLE_BORDER_COLOR,
+        });
+        for (col, cell) in t.columns.iter().zip(&t.cells) {
+            for (k, cl) in cell.lines.iter().enumerate() {
+                let baseline = box_top + TABLE_CELL_PAD_Y + k as i32 * m.line_height + m.ascent;
+                // Align the wrapped line within the column's content width.
+                let tx = aligned_x(*col, cl.width);
+                self.push_cell_line(row_x + tx, baseline, size, t.header, cl, m);
+            }
+        }
+    }
+
+    /// Draw one wrapped line of a table cell: its visible runs in their own faces
+    /// and colors, header cells emboldened, with the same link/strike decorations
+    /// the body text loop draws. Markers are already hidden in a cell's runs.
+    fn push_cell_line(
+        &mut self,
+        x: i32,
+        baseline: i32,
+        size: u32,
+        header: bool,
+        cl: &CellLine,
+        m: Metrics,
+    ) {
+        let mut pen = x;
+        for run in &cl.runs {
+            if !run.visible {
+                continue;
+            }
+            let fk = face_key(size, run.kind, header);
+            let color = match run.kind {
+                markdown::SpanKind::Marker => MARKER_COLOR,
+                markdown::SpanKind::Text(markdown::Emphasis::Code) => CODE_COLOR,
+                markdown::SpanKind::Text(markdown::Emphasis::Link) => LINK_COLOR,
+                markdown::SpanKind::Text(_) => FOREGROUND,
+            };
+            let run_x = pen;
+            pen = self.push_text(
+                fk,
+                run_x,
+                baseline,
+                color,
+                self.rope.byte_slice(run.start..run.end),
+                m,
+            );
+            let deco = match run.kind {
+                markdown::SpanKind::Text(markdown::Emphasis::Link) => {
+                    Some(baseline + m.descent / 3)
+                }
+                markdown::SpanKind::Text(markdown::Emphasis::Strikethrough) => {
+                    Some(baseline - m.ascent / 3)
+                }
+                _ => None,
+            };
+            if let Some(y) = deco {
+                let thickness = (size as i32 / 14).max(1);
+                self.list.push(DrawCmd::Fill {
+                    rect: Rect {
+                        x: run_x,
+                        y,
+                        w: pen - run_x,
+                        h: thickness,
+                    },
+                    color,
+                });
+            }
+        }
+    }
+
+    /// Draw a table add-row / add-column hover strip: a subtle rounded fill with a
+    /// centered "+", inviting a click to grow the table by a row or a column.
+    fn table_button(&mut self, button: crate::layout::TableButton) {
+        let Some(rect) = self.screen(button.rect) else {
+            return;
+        };
+        self.list.push(DrawCmd::RoundRect {
+            rect,
+            color: TABLE_HEADER_BG,
+            radius: CODE_RADIUS,
+            corners: display::RoundedCorners::Both,
+        });
+        let face = FaceKey::Prose {
+            size: FONT_SIZE,
+            style: FontStyle::Regular,
+        };
+        let m = self.fonts.metrics(FONT_SIZE);
+        let plus_w = shape::text_advance(self.fonts.face_for(face), "+").round() as i32;
+        let x = rect.x + (rect.w - plus_w) / 2;
+        let baseline = rect.y + (rect.h + m.ascent - m.descent) / 2;
+        self.push_text(face, x, baseline, MARKER_COLOR, "+".to_string(), m);
     }
 
     /// The caret, drawn only on the visible half of its blink cycle.
@@ -1047,6 +1206,7 @@ mod tests {
             cursor: 0,
             caret_visible: false,
             find: None,
+            table_hover: None,
         }
     }
 
@@ -1158,6 +1318,7 @@ mod tests {
             cursor: 11,
             caret_visible: false,
             find: build_find_paint(&bar, &tops, doc_h),
+            table_hover: None,
         };
         let list = build_display_list(&fonts, &layout, &rope, &params);
         let match_fills = list
@@ -1211,6 +1372,7 @@ mod tests {
             cursor: 3,
             caret_visible: false,
             find: build_find_paint(&bar, &tops, doc_h),
+            table_hover: None,
         };
         let list = build_display_list(&fonts, &layout, &rope, &params);
         let texts: Vec<&str> = list
@@ -1239,6 +1401,74 @@ mod tests {
         assert!(
             ticks >= 2,
             "expected match ticks at the right edge, got {ticks}"
+        );
+    }
+
+    #[test]
+    fn a_table_reaches_the_display_list_as_grid_and_cells() {
+        let fonts = Fonts::new(&markdown::all_sizes(FONT_SIZE)).expect("a default font");
+        let src = "| Name | Score |\n| --- | ---: |\n| Ada | 92 |\n";
+        let rope = Rope::from_str(src);
+        let (w, h) = (600usize, 300usize);
+        let wrap = w as i32 - 2 * MARGIN;
+        // Tables render as a grid regardless of the cursor, so `active` is moot.
+        let layout = Layout::build(&fonts, &rope, MARGIN, MARGIN, wrap, FONT_SIZE, (0, 0));
+        let list = build_display_list(&fonts, &layout, &rope, &paint_params(w, h));
+
+        let fills = |color: u32| {
+            list.iter()
+                .filter(|c| matches!(c, DrawCmd::Fill { color: c2, .. } if *c2 == color))
+                .count()
+        };
+        assert_eq!(fills(TABLE_HEADER_BG), 1, "the header row's tint");
+        // Two columns: three verticals plus a top and bottom edge on the header,
+        // and three verticals plus a bottom edge on the body row.
+        assert!(
+            fills(TABLE_BORDER_COLOR) >= 8,
+            "grid border lines, got {}",
+            fills(TABLE_BORDER_COLOR)
+        );
+        // Cell text is drawn from the source; the pipes are not.
+        let texts: String = list
+            .iter()
+            .filter_map(|c| match c {
+                DrawCmd::Text { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        for cell in ["Name", "Score", "Ada", "92"] {
+            assert!(texts.contains(cell), "cell {cell:?} drawn, got {texts:?}");
+        }
+        assert!(!texts.contains('|'), "the pipes are not drawn");
+    }
+
+    #[test]
+    fn a_hovered_table_button_reaches_the_display_list() {
+        let fonts = Fonts::new(&markdown::all_sizes(FONT_SIZE)).expect("a default font");
+        let rope = Rope::from_str("| a | b |\n| - | - |\n| c | d |\n");
+        let (w, h) = (600usize, 300usize);
+        let wrap = w as i32 - 2 * MARGIN;
+        let layout = Layout::build(&fonts, &rope, MARGIN, MARGIN, wrap, FONT_SIZE, (0, 0));
+        // Point just below the last row: the add-row strip.
+        let bot = layout
+            .lines()
+            .iter()
+            .rev()
+            .find(|v| v.table.is_some())
+            .unwrap();
+        let box_bottom = bot.baseline - fonts.metrics(bot.size).ascent
+            + bot.table.as_ref().unwrap().box_height();
+        let button = layout
+            .table_button_at(&fonts, &rope, (MARGIN + 5) as f32, (box_bottom + 4) as f32)
+            .expect("an add-row button");
+        let mut params = paint_params(w, h);
+        params.table_hover = Some(button);
+        let list = build_display_list(&fonts, &layout, &rope, &params);
+        // The strip's "+" is drawn for the affordance.
+        assert!(
+            list.iter()
+                .any(|c| matches!(c, DrawCmd::Text { text, .. } if text == "+")),
+            "the add button's + reaches the list"
         );
     }
 }

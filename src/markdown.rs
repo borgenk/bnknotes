@@ -896,6 +896,155 @@ fn path_of_dest(line: &str, start: usize, end: usize) -> (usize, usize) {
     (s, e)
 }
 
+// --- Tables -----------------------------------------------------------------
+//
+// A GFM pipe table is a cross-line block, like a fenced code block: a header row,
+// a delimiter row that both confirms the header and sets each column's alignment,
+// then zero or more body rows. The delimiter row is the signal, so a table begins
+// only where a header line sits directly above a valid delimiter line with the
+// same column count. [`crate::layout`] gathers the block and lays it out as a
+// grid; this layer supplies the pure recognition and cell splitting.
+//
+// Deliberate simplifications: a body row is any following line holding an
+// unescaped pipe (a blank or pipeless line ends the table), cells split on
+// unescaped pipes only (`\|` stays literal), and a bare `---` alignment reads as
+// left (GitHub renders an un-colonned column left-aligned).
+
+/// The horizontal alignment of a table column, read from its delimiter cell:
+/// `:---` is left, `:-:` center, `---:` right, and a bare `---` left.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Align {
+    Left,
+    Center,
+    Right,
+}
+
+/// Whether `line` holds a `|` that is not backslash-escaped, the mark of a table
+/// row. A run of backslashes toggles the escape, so `\|` is escaped but `\\|` is
+/// a live pipe.
+fn has_unescaped_pipe(line: &str) -> bool {
+    let mut escaped = false;
+    for &b in line.as_bytes() {
+        match b {
+            b'\\' => escaped = !escaped,
+            b'|' if !escaped => return true,
+            _ => escaped = false,
+        }
+    }
+    false
+}
+
+/// Whether `line` can continue a table body: it carries an unescaped pipe. A
+/// blank line (no pipe) or a pipeless paragraph line ends the table.
+pub fn is_table_row(line: &str) -> bool {
+    has_unescaped_pipe(line)
+}
+
+/// Split table row `line` into the trimmed byte ranges of its cells, into `out`
+/// (cleared first). Cells divide on unescaped `|`; a `\|` stays inside a cell.
+/// Optional outer pipes contribute no empty end cells. Ranges index into `line`.
+pub fn table_row_cells(line: &str, out: &mut Vec<(usize, usize)>) {
+    out.clear();
+    let bytes = line.as_bytes();
+    let n = bytes.len();
+    let mut start = 0;
+    let mut escaped = false;
+    let mut i = 0;
+    while i < n {
+        match bytes[i] {
+            b'\\' => escaped = !escaped,
+            b'|' if !escaped => {
+                out.push(trim_span(line, start, i));
+                start = i + 1;
+            }
+            _ => escaped = false,
+        }
+        i += 1;
+    }
+    out.push(trim_span(line, start, n));
+    // Optional outer pipes leave an empty cell at each end; drop them.
+    if out.first().is_some_and(|&(s, e)| s == e) {
+        out.remove(0);
+    }
+    if out.last().is_some_and(|&(s, e)| s == e) {
+        out.pop();
+    }
+}
+
+/// The byte range `[start, end)` of `line` with surrounding ASCII whitespace
+/// trimmed off, staying in the line's own coordinates so a cell maps back to its
+/// source bytes.
+fn trim_span(line: &str, start: usize, end: usize) -> (usize, usize) {
+    let seg = &line[start..end];
+    let s = start + (seg.len() - seg.trim_start().len());
+    let e = s + line[s..end].trim_end().len();
+    (s, e)
+}
+
+/// The alignment of one delimiter cell (already trimmed): a run of `-` optionally
+/// flanked by `:`, or `None` if it holds anything else. `-` alone and `:-` are
+/// left, `-:` right, `:-:` center.
+fn delimiter_cell(cell: &str) -> Option<Align> {
+    let c = cell.as_bytes();
+    if c.is_empty() {
+        return None;
+    }
+    let left = c[0] == b':';
+    let right = c[c.len() - 1] == b':';
+    let start = left as usize;
+    let end = c.len() - right as usize;
+    if start >= end || c[start..end].iter().any(|&b| b != b'-') {
+        return None;
+    }
+    Some(match (left, right) {
+        (true, true) => Align::Center,
+        (false, true) => Align::Right,
+        _ => Align::Left,
+    })
+}
+
+/// The per-column alignments if `line` is a table delimiter row (`| --- | :-: |
+/// ---: |`), else `None`. A delimiter row holds only `|`, `-`, `:`, and spaces,
+/// carries at least one `|` (so a bare `---`, a thematic break, is never taken
+/// for a one-column table) and one `-`, and every cell is a valid delimiter cell.
+/// Outer pipes are optional.
+pub fn table_delimiter(line: &str) -> Option<Vec<Align>> {
+    let trimmed = line.trim();
+    // Fast reject before allocating: prose fails the byte-set test at once.
+    if !trimmed.contains('|')
+        || !trimmed
+            .bytes()
+            .all(|b| matches!(b, b'|' | b'-' | b':' | b' ' | b'\t'))
+        || !trimmed.bytes().any(|b| b == b'-')
+    {
+        return None;
+    }
+    let mut cells = Vec::new();
+    table_row_cells(trimmed, &mut cells);
+    if cells.is_empty() {
+        return None;
+    }
+    let mut aligns = Vec::with_capacity(cells.len());
+    for &(s, e) in &cells {
+        aligns.push(delimiter_cell(&trimmed[s..e])?);
+    }
+    Some(aligns)
+}
+
+/// The column alignments if logical line `header` and the line directly below it,
+/// `delim`, open a table: `delim` is a delimiter row, `header` carries an
+/// unescaped pipe, and the two split into the same number of cells (GFM requires
+/// the counts match). This is the signal that a table block begins at `header`.
+pub fn table_head(header: &str, delim: &str) -> Option<Vec<Align>> {
+    if !has_unescaped_pipe(header) {
+        return None;
+    }
+    let aligns = table_delimiter(delim)?;
+    let mut header_cells = Vec::new();
+    table_row_cells(header, &mut header_cells);
+    (header_cells.len() == aligns.len()).then_some(aligns)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1666,5 +1815,75 @@ mod tests {
         assert!(img("![x]()").is_none(), "empty destination");
         assert!(img("plain text").is_none());
         assert!(img("[x](a.png)").is_none(), "a link, not an image");
+    }
+
+    // --- Tables -------------------------------------------------------------
+
+    /// The trimmed cell strings of a table row, terse enough to assert against.
+    fn cells(line: &str) -> Vec<&str> {
+        let mut out = Vec::new();
+        table_row_cells(line, &mut out);
+        out.iter().map(|&(s, e)| &line[s..e]).collect()
+    }
+
+    #[test]
+    fn splits_rows_with_optional_outer_pipes() {
+        assert_eq!(cells("| a | b | c |"), vec!["a", "b", "c"]);
+        assert_eq!(cells("a | b | c"), vec!["a", "b", "c"]);
+        assert_eq!(cells("| a | b"), vec!["a", "b"]);
+        assert_eq!(cells("a | b |"), vec!["a", "b"]);
+        // An empty interior cell survives; only the outer-pipe ends are dropped.
+        assert_eq!(cells("| a |  | c |"), vec!["a", "", "c"]);
+        assert_eq!(cells("| x |"), vec!["x"]);
+    }
+
+    #[test]
+    fn an_escaped_pipe_stays_inside_a_cell() {
+        // `\|` is literal, so "a|b" is one cell, not two.
+        assert_eq!(cells(r"| a \| b | c |"), vec![r"a \| b", "c"]);
+        assert!(!is_table_row(r"no pipes here"));
+        assert!(!is_table_row(r"only escaped \| pipe"));
+        assert!(is_table_row("a | b"));
+    }
+
+    #[test]
+    fn recognizes_delimiter_rows_and_alignment() {
+        assert_eq!(
+            table_delimiter("| --- | :--- | :---: | ---: |"),
+            Some(vec![Align::Left, Align::Left, Align::Center, Align::Right])
+        );
+        // Outer pipes optional, and a single dash per cell is enough.
+        assert_eq!(
+            table_delimiter("- | -"),
+            Some(vec![Align::Left, Align::Left])
+        );
+        assert_eq!(table_delimiter("| :-: |"), Some(vec![Align::Center]));
+    }
+
+    #[test]
+    fn a_thematic_break_is_not_a_delimiter_row() {
+        // `---` carries no pipe, so it stays a thematic break, never a 1-col table.
+        assert_eq!(table_delimiter("---"), None);
+        assert_eq!(table_delimiter("- - -"), None);
+        // A cell needs at least one dash; bare colons or other text disqualify it.
+        assert_eq!(table_delimiter("| :: |"), None);
+        assert_eq!(table_delimiter("| :- | x |"), None);
+        assert_eq!(table_delimiter("| a | b |"), None);
+    }
+
+    #[test]
+    fn table_head_needs_a_piped_header_and_matching_columns() {
+        assert_eq!(
+            table_head("| Name | Score |", "| --- | ---: |"),
+            Some(vec![Align::Left, Align::Right])
+        );
+        // Header cell count must equal the delimiter's.
+        assert_eq!(table_head("| a | b | c |", "| --- | --- |"), None);
+        assert_eq!(table_head("| a |", "| --- | --- |"), None);
+        // A header with no pipe never opens a table (guards stray prose above a
+        // coincidental delimiter-looking line).
+        assert_eq!(table_head("just prose", "| --- |"), None);
+        // The second line must be a real delimiter row.
+        assert_eq!(table_head("| a | b |", "| a | b |"), None);
     }
 }

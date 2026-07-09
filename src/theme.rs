@@ -59,6 +59,10 @@ pub(crate) const BULLET: &str = "•";
 /// width once the cursor leaves it, in a muted line tone.
 pub(crate) const RULE_COLOR: u32 = 0x003f_444b;
 pub(crate) const RULE_THICKNESS: i32 = 2;
+/// A markdown table's grid: the border/separator lines and a subtle tint behind
+/// the header row so it reads as a header.
+pub(crate) const TABLE_BORDER_COLOR: u32 = 0x003f_444b;
+pub(crate) const TABLE_HEADER_BG: u32 = 0x0028_2c34;
 /// Body text pixel size; headings scale up from it (see [`crate::markdown::font_size`]).
 pub(crate) const FONT_SIZE: u32 = 14;
 /// Inset of the text from the top-left corner (both axes).

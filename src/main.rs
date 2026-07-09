@@ -14,6 +14,7 @@ mod regex;
 mod render;
 mod rope;
 mod store;
+mod table;
 mod text;
 mod theme;
 mod tree;

@@ -303,6 +303,7 @@ fn params(scroll_y: i32, selection: Option<(usize, usize)>) -> PaintParams<'stat
         height: HEIGHT,
         scroll_y,
         selection,
+        table_hover: None,
         cursor: 0,
         caret_visible: true,
         find: None,

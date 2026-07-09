@@ -30,6 +30,7 @@ use std::collections::VecDeque;
 use crate::markdown;
 use crate::platform::grapheme;
 use crate::rope::Rope;
+use crate::table;
 
 /// Cap on undo history, so a long session cannot grow the stacks without bound.
 const UNDO_CAP: usize = 500;
@@ -219,6 +220,12 @@ impl TextBuffer {
     pub fn enter(&mut self) -> bool {
         if self.selection().is_some() {
             self.insert_str("\n");
+            return true;
+        }
+        // Anywhere in a table (a cell, or the header/delimiter edge right after the
+        // table is typed), Enter adds a fresh body row and drops the caret into it.
+        if let Some(block) = table::block_at(&self.text, self.text.byte_to_line(self.cursor)) {
+            self.insert_body_row(block, self.text.byte_to_line(self.cursor));
             return true;
         }
         let (ls, le, line) = self.content_line_at(self.cursor);
@@ -495,15 +502,169 @@ impl TextBuffer {
     }
 
     /// Delete the selection if there is one, else the grapheme cluster before
-    /// the cursor. Returns whether anything changed.
+    /// the cursor. Returns whether anything changed. At the start of a table cell,
+    /// Backspace moves to the previous cell rather than deleting a structural pipe,
+    /// so the table cannot be broken by a stray delete; at the first cell it is a
+    /// no-op.
     pub fn backspace(&mut self) -> bool {
         if self.take_selection() {
             return true;
+        }
+        if let Some(cell) = table::cell_at(&self.text, self.cursor) {
+            if self.cursor <= cell.start {
+                return match table::prev_cell_end(&self.text, cell) {
+                    Some(target) => self.set_cursor_changed(target, false),
+                    None => false,
+                };
+            }
         }
         match self.prev_grapheme() {
             Some(prev) => self.delete_to(prev, Coalesce::Delete),
             None => false,
         }
+    }
+
+    /// Whether the caret sits in a table cell, so the caller routes Tab, a typed
+    /// `|`, and Shift+Enter to their in-table behavior.
+    pub fn cursor_in_table(&self) -> bool {
+        table::cell_at(&self.text, self.cursor).is_some()
+    }
+
+    /// Move the caret to the next cell (`forward`) or the previous cell, for Tab and
+    /// Shift+Tab. At the last cell, Tab adds a new row and lands in it; at the first
+    /// cell, Shift+Tab does nothing. Returns whether the buffer or caret changed.
+    pub fn tab_cell(&mut self, forward: bool) -> bool {
+        let Some(cell) = table::cell_at(&self.text, self.cursor) else {
+            return false;
+        };
+        let target = if forward {
+            table::next_cell_start(&self.text, cell)
+        } else {
+            table::prev_cell_start(&self.text, cell)
+        };
+        match target {
+            Some(t) => self.set_cursor_changed(t, false),
+            None if forward => {
+                self.insert_body_row(cell.block, cell.row);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Insert a fresh empty body row into table `block`, coming from `from_row`, and
+    /// drop the caret into its first cell. From a body row the new row lands just
+    /// below it; from the header or delimiter it lands just after the delimiter (the
+    /// first body position), never between the header and the delimiter, which would
+    /// break the table.
+    fn insert_body_row(&mut self, block: table::Block, from_row: usize) {
+        let cols = table::row_cells(&self.text, block.delim).len().max(1);
+        let after = if from_row <= block.delim {
+            block.delim
+        } else {
+            from_row
+        };
+        self.insert_row_after(after, cols);
+    }
+
+    /// Add an empty row to the bottom of the table `block` (the add-row affordance),
+    /// caret into its first cell. Returns true.
+    pub fn add_table_row(&mut self, block: table::Block) -> bool {
+        let cols = table::row_cells(&self.text, block.delim).len().max(1);
+        self.insert_row_after(block.end - 1, cols);
+        true
+    }
+
+    /// Insert an empty `cols`-column row just after logical line `row`, as one undo
+    /// step, and move the caret to the new row's first cell.
+    fn insert_row_after(&mut self, row: usize, cols: usize) {
+        let (_, ce) = self.text.line_content_range(row);
+        self.checkpoint(Coalesce::None);
+        self.text
+            .insert(ce, &format!("\n{}", table::empty_row(cols)));
+        let new_line = self.text.byte_to_line(ce + 1);
+        self.cursor = table::row_cells(&self.text, new_line)
+            .first()
+            .map_or(ce + 1, |c| c.0);
+        self.anchor = None;
+        self.touch();
+    }
+
+    /// Remove the caret's table row (Ctrl+Shift+Backspace), moving the caret into
+    /// the row that takes its place (or out of the table). One undo step. `false`
+    /// when the caret is not in a table cell.
+    pub fn remove_table_row(&mut self) -> bool {
+        let Some(cell) = table::cell_at(&self.text, self.cursor) else {
+            return false;
+        };
+        let start = self.text.line_to_byte(cell.row);
+        let end = self.text.line_to_byte(cell.row + 1).min(self.text.len());
+        if start >= end {
+            return false;
+        }
+        self.checkpoint(Coalesce::None);
+        self.text.remove(start..end);
+        // Land in the first cell of whatever row now sits here, else at the seam.
+        let start = start.min(self.text.len());
+        self.cursor = table::block_at(&self.text, self.text.byte_to_line(start))
+            .and_then(|_| {
+                table::row_cells(&self.text, self.text.byte_to_line(start))
+                    .first()
+                    .copied()
+            })
+            .map_or_else(|| self.snap(start), |c| c.0);
+        self.anchor = None;
+        self.touch();
+        true
+    }
+
+    /// Remove the caret's table column from every row, delimiter included
+    /// (Ctrl+Shift+Delete), then reseat the caret in the same row at a clamped
+    /// column. A no-op on a single-column table (its last column cannot go) or off
+    /// a cell. One undo step; rows edited back to front so cuts do not shift.
+    pub fn remove_table_column(&mut self) -> bool {
+        let Some(cell) = table::cell_at(&self.text, self.cursor) else {
+            return false;
+        };
+        if table::row_cells(&self.text, cell.block.delim).len() <= 1 {
+            return false;
+        }
+        let (col, row) = (cell.col, cell.row);
+        self.checkpoint(Coalesce::None);
+        for r in (cell.block.header..cell.block.end).rev() {
+            if let Some((s, e)) = table::column_cut(&self.text, r, col) {
+                self.text.remove(s..e);
+            }
+        }
+        let cells = table::row_cells(&self.text, row);
+        let target = col.min(cells.len().saturating_sub(1));
+        self.cursor = cells
+            .get(target)
+            .map_or_else(|| self.text.line_to_byte(row), |c| c.0);
+        self.anchor = None;
+        self.touch();
+        true
+    }
+
+    /// Add a trailing column to every row of the table `block` (the add-column
+    /// affordance): an empty cell on each header/body row and a left-aligned
+    /// delimiter cell on the delimiter row. One undo step. Rows are edited back to
+    /// front so earlier insertions do not shift later ones.
+    pub fn add_table_column(&mut self, block: table::Block) -> bool {
+        self.checkpoint(Coalesce::None);
+        for row in (block.header..block.end).rev() {
+            let (ls, le) = self.text.line_content_range(row);
+            let ends_pipe = self.text.byte_slice(ls..le).trim_end().ends_with('|');
+            let cell = if row == block.delim { " --- " } else { "  " };
+            let insert = if ends_pipe {
+                format!("{cell}|")
+            } else {
+                format!(" |{cell}|")
+            };
+            self.text.insert(le, &insert);
+        }
+        self.touch();
+        true
     }
 
     /// Delete the selection if there is one, else the grapheme cluster after the
@@ -656,6 +817,21 @@ impl TextBuffer {
                 return true;
             }
         }
+        // Inside a table, a step off a cell's edge jumps to the adjacent cell (over
+        // the hidden pipes and padding), or leaves the table at its outer edge.
+        if let Some(cell) = table::cell_at(&self.text, self.cursor) {
+            if back && self.cursor <= cell.start {
+                let target = table::prev_cell_end(&self.text, cell)
+                    .unwrap_or_else(|| table::exit_before(&self.text, cell.block));
+                return self.set_cursor_changed(target, extend);
+            }
+            if !back && self.cursor >= cell.end {
+                let target = table::next_cell_start(&self.text, cell)
+                    .unwrap_or_else(|| table::exit_after(&self.text, cell.block));
+                return self.set_cursor_changed(target, extend);
+            }
+            // Within the cell's content: fall through to grapheme movement.
+        }
         let target = if back {
             self.prev_grapheme()
         } else {
@@ -766,15 +942,32 @@ impl TextBuffer {
     }
 
     /// Delete the active selection, collapsing the cursor to its start. Returns
-    /// whether a selection was removed.
+    /// whether a selection was removed. A selection anchored in a table removes the
+    /// whole rows it spans (see [`Self::selection_for_delete`]).
     fn delete_selection(&mut self) -> bool {
-        let Some((start, end)) = self.selection() else {
+        let Some((start, end)) = self.selection_for_delete() else {
             return false;
         };
         self.text.remove(start..end);
         self.cursor = start;
         self.anchor = None;
         true
+    }
+
+    /// The byte range a delete of the current selection removes: the selection
+    /// itself, except a selection anchored in a table cell removes the whole rows
+    /// it spans, so selecting cells and pressing Delete removes those rows rather
+    /// than shredding the pipes. `None` when there is no selection.
+    fn selection_for_delete(&self) -> Option<(usize, usize)> {
+        let (s, e) = self.selection()?;
+        if table::cell_at(&self.text, s).is_none() {
+            return Some((s, e));
+        }
+        let lo = self.text.byte_to_line(s);
+        let hi = self.text.byte_to_line(e.saturating_sub(1).max(s));
+        let start = self.text.line_to_byte(lo);
+        let end = self.text.line_to_byte(hi + 1).min(self.text.len());
+        Some((start, end))
     }
 
     /// Snap `offset` into `[0, len]` and back to the nearest grapheme cluster
@@ -1036,6 +1229,217 @@ mod tests {
         b.insert_str("hi");
         assert_eq!(b.text(), "hi");
         assert_eq!(b.cursor, 2);
+    }
+
+    // --- In-grid table editing ---------------------------------------------
+
+    /// A buffer holding one table, with the caret at the start of `row`'s cell
+    /// `col`. `row` and `col` index the drawn cells (the delimiter is line 1).
+    fn table_buf(text: &str, row: usize, col: usize) -> TextBuffer {
+        let mut b = TextBuffer::from_text(text.to_string());
+        b.set_cursor(table::row_cells(b.rope(), row)[col].0, false);
+        b
+    }
+
+    const TBL: &str = "| ab | cd |\n| - | - |\n| ef | gh |\n";
+
+    #[test]
+    fn cursor_in_table_tracks_prose_versus_cells() {
+        let mut b = TextBuffer::from_text(format!("hi\n{TBL}"));
+        b.set_cursor(1, false);
+        assert!(!b.cursor_in_table(), "in the prose line");
+        b.set_cursor(table::row_cells(b.rope(), 1)[0].0, false);
+        assert!(b.cursor_in_table(), "in a header cell");
+    }
+
+    #[test]
+    fn move_right_steps_within_a_cell_then_hops_to_the_next() {
+        let mut b = table_buf(TBL, 0, 0); // start of "ab"
+        let cells = table::row_cells(b.rope(), 0);
+        b.move_right(false);
+        assert_eq!(b.cursor(), cells[0].0 + 1, "one grapheme inside the cell");
+        b.set_cursor(cells[0].1, false); // end of "ab"
+        b.move_right(false);
+        assert_eq!(b.cursor(), cells[1].0, "hopped to the next cell's start");
+    }
+
+    #[test]
+    fn move_left_hops_to_the_previous_cell_and_exits_the_table() {
+        let mut b = table_buf(TBL, 0, 1); // start of "cd"
+        let cells = table::row_cells(b.rope(), 0);
+        b.move_left(false);
+        assert_eq!(b.cursor(), cells[0].1, "back to the previous cell's end");
+        // Left from the very first cell leaves the table (it opens the document).
+        b.set_cursor(cells[0].0, false);
+        b.move_left(false);
+        assert_eq!(b.cursor(), 0, "exited before the table");
+    }
+
+    #[test]
+    fn tab_walks_cells_and_appends_a_row_at_the_end() {
+        let mut b = table_buf(TBL, 0, 0);
+        assert!(b.tab_cell(true));
+        assert_eq!(b.cursor(), table::row_cells(b.rope(), 0)[1].0, "next cell");
+        // From the last cell of the last row, Tab adds a fresh row.
+        let last = table::row_cells(b.rope(), 2);
+        b.set_cursor(last[1].0, false);
+        let n = b.rope().len_lines();
+        assert!(b.tab_cell(true));
+        assert_eq!(b.rope().len_lines(), n + 1, "a row was appended");
+        assert!(b.cursor_in_table(), "and the caret is in it");
+    }
+
+    #[test]
+    fn enter_adds_a_row_below_with_the_right_column_count() {
+        let mut b = table_buf(TBL, 2, 0); // in the body row
+        let n = b.rope().len_lines();
+        assert!(b.enter());
+        assert_eq!(b.rope().len_lines(), n + 1);
+        let new_line = b.rope().byte_to_line(b.cursor());
+        assert_eq!(table::row_cells(b.rope(), new_line).len(), 2, "two cells");
+        assert!(b.cursor_in_table());
+    }
+
+    #[test]
+    fn backspace_at_a_cell_start_moves_left_and_keeps_the_structure() {
+        let mut b = table_buf(TBL, 0, 1); // start of "cd"
+        let before = b.text();
+        let cells = table::row_cells(b.rope(), 0);
+        assert!(b.backspace());
+        assert_eq!(b.text(), before, "no structural byte deleted");
+        assert_eq!(b.cursor(), cells[0].1, "moved to the previous cell's end");
+    }
+
+    #[test]
+    fn typing_inside_a_cell_edits_only_that_cell() {
+        let mut b = table_buf(TBL, 0, 0);
+        b.set_cursor(table::row_cells(b.rope(), 0)[0].1, false); // end of "ab"
+        b.insert_str("X");
+        assert_eq!(b.text(), "| abX | cd |\n| - | - |\n| ef | gh |\n");
+    }
+
+    #[test]
+    fn enter_at_the_header_edge_adds_a_body_row_not_a_break() {
+        // Regression: with the caret at the end of a just-typed 1-column table's
+        // header line, Enter used to insert a row *between* the header and the
+        // delimiter, which reparsed "|test|" as plain text above a shifted table.
+        let mut b = TextBuffer::from_text("|test|\n|-".to_string());
+        b.set_cursor(6, false); // end of the header content, on the newline
+        assert!(b.enter());
+        assert_eq!(
+            b.text(),
+            "|test|\n|-\n|  |",
+            "a body row is added after the delimiter, header intact"
+        );
+        let block = table::block_at(b.rope(), 0).expect("still one table from line 0");
+        assert_eq!((block.header, block.delim, block.end), (0, 1, 3));
+        assert!(b.cursor_in_table(), "caret in the new body row");
+        assert_eq!(b.rope().byte_to_line(b.cursor()), 2);
+    }
+
+    #[test]
+    fn enter_on_the_delimiter_row_also_adds_a_body_row() {
+        // Right after typing the delimiter, the caret sits on it; Enter should still
+        // grow the table rather than drop a blank line below it.
+        let mut b = TextBuffer::from_text("|test|\n|-".to_string());
+        b.set_cursor(b.rope().len(), false); // end of "|-"
+        assert!(b.enter());
+        assert_eq!(b.text(), "|test|\n|-\n|  |");
+        assert_eq!(
+            b.rope().byte_to_line(b.cursor()),
+            2,
+            "caret in the body row"
+        );
+    }
+
+    #[test]
+    fn shift_selecting_in_a_row_then_delete_removes_that_row() {
+        let mut b = table_buf(TBL, 2, 0); // body row "ef gh" (line 2, past the delimiter)
+        b.move_right(true); // Shift+Right marks the row (row-granular)
+        assert!(b.backspace(), "delete consumed the selection");
+        assert_eq!(b.text(), "| ab | cd |\n| - | - |\n", "the body row is gone");
+    }
+
+    #[test]
+    fn selecting_across_cells_of_two_rows_deletes_both_rows() {
+        let text = "| a | b |\n| - | - |\n| c | d |\n| e | f |\n";
+        let mut b = TextBuffer::from_text(text.to_string());
+        let r2 = table::row_cells(b.rope(), 2); // "c d"
+        let r3 = table::row_cells(b.rope(), 3); // "e f"
+        b.set_cursor(r2[0].0, false); // anchor in row 2
+        b.set_cursor(r3[1].0, true); // extend into row 3
+        assert!(b.delete_forward());
+        assert_eq!(b.text(), "| a | b |\n| - | - |\n", "both body rows removed");
+    }
+
+    #[test]
+    fn add_row_appends_an_empty_row_to_the_bottom() {
+        let mut b = TextBuffer::from_text(TBL.to_string());
+        let block = table::block_at(b.rope(), 0).unwrap();
+        let n = b.rope().len_lines();
+        assert!(b.add_table_row(block));
+        assert_eq!(b.rope().len_lines(), n + 1);
+        // The new row is the last table row and has the table's column count.
+        let last = table::block_at(b.rope(), 0).unwrap().end - 1;
+        assert_eq!(table::row_cells(b.rope(), last).len(), 2);
+    }
+
+    #[test]
+    fn remove_row_deletes_the_carets_row() {
+        let mut b = table_buf(TBL, 2, 0); // body row "ef gh"
+        assert!(b.remove_table_row());
+        assert_eq!(b.text(), "| ab | cd |\n| - | - |\n", "the row is gone");
+    }
+
+    #[test]
+    fn remove_column_drops_it_from_every_row() {
+        let text = "| a | b | c |\n| - | - | - |\n| d | e | f |\n";
+        let mut b = TextBuffer::from_text(text.to_string());
+        let cells = table::row_cells(b.rope(), 2); // caret in the middle column
+        b.set_cursor(cells[1].0, false);
+        assert!(b.remove_table_column());
+        assert_eq!(
+            table::row_cells(b.rope(), 0).len(),
+            2,
+            "header lost a column"
+        );
+        assert_eq!(table::row_cells(b.rope(), 2).len(), 2, "body lost a column");
+        assert!(
+            table::block_at(b.rope(), 0).is_some(),
+            "still a valid table"
+        );
+        assert!(
+            !b.text().contains('b') && !b.text().contains('e'),
+            "the middle column's cells are gone: {:?}",
+            b.text()
+        );
+    }
+
+    #[test]
+    fn remove_column_refuses_the_last_one() {
+        let mut b = TextBuffer::from_text("| a |\n| - |\n| b |\n".to_string());
+        b.set_cursor(table::row_cells(b.rope(), 0)[0].0, false);
+        assert!(
+            !b.remove_table_column(),
+            "a one-column table keeps its column"
+        );
+    }
+
+    #[test]
+    fn add_column_widens_every_row_including_the_delimiter() {
+        let mut b = TextBuffer::from_text(TBL.to_string());
+        let block = table::block_at(b.rope(), 0).unwrap();
+        assert!(b.add_table_column(block));
+        // Header, delimiter, and each body row all gain a cell.
+        assert_eq!(table::row_cells(b.rope(), 0).len(), 3, "header widened");
+        assert_eq!(table::row_cells(b.rope(), 2).len(), 3, "body widened");
+        // The table still parses (the delimiter grew a valid cell).
+        assert!(table::block_at(b.rope(), 0).is_some(), "still a table");
+        assert_eq!(
+            table::block_at(b.rope(), 0).unwrap().end,
+            block.end,
+            "no rows added"
+        );
     }
 
     #[test]

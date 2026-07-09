@@ -86,7 +86,9 @@ impl Default for FontConfig {
             // so code blocks and inline code read in their own typeface. Code
             // never renders bold or italic, so only the regular face is listed.
             code: vec![
-                // Noto Sans Mono first, the monospace companion to Noto Sans.
+                // JetBrains Mono first, the preferred code face. Noto Sans Mono next as a
+                // near-universal fallback when JetBrains Mono is not installed.
+                "/usr/share/fonts/TTF/JetBrainsMono-Regular.ttf".into(),
                 "/usr/share/fonts/noto/NotoSansMono-Regular.ttf".into(),
                 "/usr/share/fonts/Adwaita/AdwaitaMono-Regular.ttf".into(),
                 "/usr/share/fonts/liberation/LiberationMono-Regular.ttf".into(),

@@ -22,12 +22,16 @@ pub(crate) const TICK_HEIGHT: i32 = 3;
 /// Dimmed color for markdown syntax markers (a heading's `#`s, a code span's
 /// backticks), so they read as syntax rather than content.
 pub(crate) const MARKER_COLOR: u32 = 0x005d_6c7e;
-/// Inline code: a tinted background panel and a distinct foreground, so a code
-/// span stands out from prose the way it does in a rendered document.
-pub(crate) const CODE_COLOR: u32 = 0x00f3_8ba8;
+/// Inline code: a tinted, padded panel with the body foreground drawn on top. A
+/// span is set apart by its monospace face and the panel rather than by hue.
+pub(crate) const CODE_COLOR: u32 = FOREGROUND;
 pub(crate) const CODE_BG: u32 = 0x0028_2c34;
-/// Corner radius of a fenced code block's panel: a very subtle rounding, no border.
+/// Corner radius of a code panel, fenced block or inline span: a subtle rounding.
 pub(crate) const CODE_RADIUS: i32 = 4;
+/// Padding baked into an inline code panel so the tint reads as a rounded pill
+/// with breathing room around the glyphs rather than a box hugging them.
+pub(crate) const CODE_PAD_X: i32 = 4;
+pub(crate) const CODE_PAD_Y: i32 = 1;
 /// An inline link's text color (the accent blue, `hsl(215,75%,70%)`); the
 /// text is also underlined so a link reads as a link without its `[..](..)` markup.
 pub(crate) const LINK_COLOR: u32 = 0x005c_9cf6;

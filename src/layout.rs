@@ -388,6 +388,21 @@ pub(crate) fn run_face(fonts: &Fonts, size: u32, kind: markdown::SpanKind, headi
     fonts.face_for(face_key(size, kind, heading))
 }
 
+/// An inline code run's tinted pill extends [`crate::theme::CODE_PAD_X`] beyond its
+/// glyphs on each side. That padding is real horizontal space: the glyphs sit it in
+/// from the run's flow start and text after the span clears the pill, so the panel
+/// frames the code without painting over the ordinary spaces around it. Every
+/// run-walk (advance, hit-test, panel, draw pen) folds it in so they agree. Zero for
+/// a fenced line (its own full-width panel, drawn by the app) and for anything but
+/// inline code. The local [`CODE_PAD_X`] here is the unrelated fenced-block inset.
+pub(crate) fn inline_code_pad(kind: markdown::SpanKind, code_block: bool) -> i32 {
+    if !code_block && matches!(kind, markdown::SpanKind::Text(markdown::Emphasis::Code)) {
+        crate::theme::CODE_PAD_X
+    } else {
+        0
+    }
+}
+
 /// The [`FaceKey`] a run of `kind` at `size` draws in, the borrow-free twin of
 /// [`run_face`]: the display list records this so a painted run can resolve its
 /// face later without holding a borrow of [`Fonts`]. Same decision as `run_face`,
@@ -955,9 +970,13 @@ impl Layout {
                 {
                     continue;
                 }
+                // `advance_to(run.start)` lands at the run's flow start; the glyphs
+                // (and so the panel the app expands from them) sit the pill pad in
+                // from there, leaving the space before the span uncovered.
                 let x0 = self.left as f32
                     + line.indent as f32
-                    + self.advance_to(fonts, rope, line, run.start);
+                    + self.advance_to(fonts, rope, line, run.start)
+                    + inline_code_pad(run.kind, line.code_block) as f32;
                 let w = shape::text_advance(
                     run_face(fonts, line.size, run.kind, line.heading.is_some()),
                     &rope.slice(run.start..run.end).as_cow(),
@@ -1028,6 +1047,11 @@ impl Layout {
             drew_text = true;
             let face = run_face(fonts, line.size, run.kind, line.heading.is_some());
             let text = rope.slice(run.start..run.end).as_cow();
+            // A code run's pill pad sits before its glyphs, so a click in that gap
+            // lands at the run start; the trailing pad pushes the pen past the glyphs
+            // so a click there lands after the span.
+            let pad = inline_code_pad(run.kind, line.code_block) as f32;
+            acc += pad;
             for (off, cluster) in grapheme::graphemes(&text) {
                 let w = shape::text_advance(face, cluster);
                 if x < acc + w / 2.0 {
@@ -1035,6 +1059,7 @@ impl Layout {
                 }
                 acc += w;
             }
+            acc += pad;
         }
         // Past every glyph: a line that drew text ends at its logical end, which
         // sits *after* any trailing collapsed marker (the closing `*` of `*word*`);
@@ -1060,9 +1085,17 @@ impl Layout {
             if !run.visible || offset <= run.start {
                 continue;
             }
-            let end = offset.min(run.end);
             let face = run_face(fonts, line.size, run.kind, line.heading.is_some());
-            x += shape::text_advance(face, &rope.slice(run.start..end).as_cow());
+            let pad = inline_code_pad(run.kind, line.code_block) as f32;
+            // A run fully before the offset contributes its glyphs plus its pill pad
+            // on both sides; one containing the offset contributes its leading pad
+            // plus the glyphs up to the offset.
+            if offset >= run.end {
+                x +=
+                    2.0 * pad + shape::text_advance(face, &rope.slice(run.start..run.end).as_cow());
+            } else {
+                x += pad + shape::text_advance(face, &rope.slice(run.start..offset).as_cow());
+            }
         }
         x
     }
@@ -1568,6 +1601,7 @@ fn lay_line(
         line_wrap,
         block_indent,
         heading.is_some(),
+        !code_block,
         &mut pool.clusters,
         &mut pool.segments,
     );
@@ -2257,6 +2291,7 @@ fn wrap_segments(
     wrap_width: i32,
     block_indent: i32,
     heading: bool,
+    pad_code: bool,
     clusters: &mut Vec<(usize, f32, bool)>,
     segments: &mut Vec<(usize, usize)>,
 ) {
@@ -2270,9 +2305,21 @@ fn wrap_segments(
     // cleared and refilled, so it reuses its capacity across lines instead of
     // allocating one sized to the line on every call.
     clusters.clear();
+    let mut prev_code = false;
     clusters.extend(grapheme::graphemes(line).map(|(off, cluster)| {
-        let face = run_face(fonts, size, kind_at(spans, off), heading);
-        (off, shape::text_advance(face, cluster), cluster == " ")
+        let kind = kind_at(spans, off);
+        let face = run_face(fonts, size, kind, heading);
+        let mut w = shape::text_advance(face, cluster);
+        // Fold both of an inline code span's pill pads onto its first cluster, so a
+        // wrap keeps the pill's full width on one line. The exact placement within
+        // the run does not change the total width the line has to fit. A fenced block
+        // and a table cell draw no pill and pass `pad_code` false, skipping this.
+        let is_code = matches!(kind, markdown::SpanKind::Text(markdown::Emphasis::Code));
+        if pad_code && is_code && !prev_code {
+            w += (2 * crate::theme::CODE_PAD_X) as f32;
+        }
+        prev_code = is_code;
+        (off, w, cluster == " ")
     }));
     if clusters.is_empty() {
         segments.push((0, line.len()));
@@ -2598,6 +2645,9 @@ fn build_cell(
             width,
             0,
             header,
+            // A table cell draws inline code without a pill, so it pads nothing;
+            // wrapping matches the drawn width.
+            false,
             &mut pool.clusters,
             &mut pool.segments,
         );
@@ -3413,6 +3463,94 @@ mod tests {
         assert!(
             seen.contains(&0) && seen.contains(&7),
             "the line's ends stay reachable"
+        );
+    }
+
+    #[test]
+    fn an_inline_code_pill_frames_only_the_code_leaving_spaces_uncovered() {
+        let f = fonts();
+        // Cursor on line two, so line one's backticks collapse and the pill (not the
+        // raw source) is what lays out.
+        let r = rope("a `b` c\nx");
+        let l = Layout::build(&f, &r, LEFT, TOP, 1_000_000, BODY, (8, 8));
+        let pad = crate::theme::CODE_PAD_X;
+        let pill = l.code_rects(&f, &r);
+        assert_eq!(pill.len(), 1, "one inline code pill");
+        // The drawn panel is the glyph rect expanded by the pad on each side. Its
+        // left edge sits exactly where the space before the span ends (byte 3, the
+        // "b" run's flow start), so that space stays visible rather than tinted.
+        let space_right = l.caret(&f, &r, 3).0;
+        assert_eq!(
+            pill[0].x - pad,
+            space_right,
+            "the panel starts at the preceding space's right edge"
+        );
+        // And its right edge sits where the trailing space begins (byte 5, the " c"
+        // run's flow start), within the 1 px slack from rounding the glyph width and
+        // the integer pad separately.
+        let next_space_left = l.caret(&f, &r, 5).0;
+        assert!(
+            ((pill[0].x + pill[0].w + pad) - next_space_left).abs() <= 1,
+            "the panel ends at the trailing space's left edge"
+        );
+    }
+
+    #[test]
+    fn clicks_round_trip_across_an_inline_code_pill() {
+        let f = fonts();
+        let r = rope("a `b` c\nx");
+        let l = Layout::build(&f, &r, LEFT, TOP, 1_000_000, BODY, (8, 8));
+        let y = l.lines()[0].baseline as f32;
+        // Every visible offset around the span round-trips through the caret and back,
+        // so the pad folded into the advance and into the hit-test agree.
+        for off in [0usize, 3, 6, 7] {
+            let x = l.caret(&f, &r, off).0 as f32;
+            assert_eq!(
+                l.offset_at(&f, &r, x, y),
+                off,
+                "caret x at {off} maps back to {off}"
+            );
+        }
+        // A click in the pad before the glyphs lands at the code start, not short.
+        let flow_start = l.caret(&f, &r, 3).0 as f32;
+        assert_eq!(
+            l.offset_at(
+                &f,
+                &r,
+                flow_start + crate::theme::CODE_PAD_X as f32 / 2.0,
+                y
+            ),
+            3,
+            "the leading pad belongs to the code start"
+        );
+    }
+
+    #[test]
+    fn a_fenced_code_line_gets_no_inline_pad() {
+        let f = fonts();
+        // Cursor on the trailing line, off the fence.
+        let r = rope("```\nmn\n```\nx");
+        let l = Layout::build(&f, &r, LEFT, TOP, 1_000_000, BODY, (11, 11));
+        // A fence draws one full-width panel, not per-span pills, so it lists none.
+        assert!(
+            l.code_rects(&f, &r).is_empty(),
+            "fenced code is not an inline pill"
+        );
+        // Its glyphs advance by pure width with no pad folded in: the caret at the end
+        // of "mn" sits exactly its two-glyph advance past the fenced inset.
+        let content = &l.lines()[1];
+        assert!(content.code_block, "the 'mn' line is fenced");
+        let face = run_face(
+            &f,
+            content.size,
+            markdown::SpanKind::Text(markdown::Emphasis::Code),
+            false,
+        );
+        let mn_w = shape::text_advance(face, "mn").round() as i32;
+        assert_eq!(
+            l.caret(&f, &r, 6).0,
+            LEFT + content.indent + mn_w,
+            "no pad on a fenced line"
         );
     }
 

@@ -38,6 +38,13 @@ struct FontFamily {
 }
 
 const FONT_FAMILIES: &[FontFamily] = &[
+    // The first family installed wins, so the order is the preference.
+    FontFamily {
+        regular: "/usr/share/fonts/noto/NotoSans-Regular.ttf",
+        bold: "/usr/share/fonts/noto/NotoSans-Bold.ttf",
+        italic: "/usr/share/fonts/noto/NotoSans-Italic.ttf",
+        bold_italic: "/usr/share/fonts/noto/NotoSans-BoldItalic.ttf",
+    },
     FontFamily {
         regular: "/usr/share/fonts/TTF/Hack-Regular.ttf",
         bold: "/usr/share/fonts/TTF/Hack-Bold.ttf",
@@ -86,8 +93,9 @@ fn default_family() -> Result<&'static FontFamily> {
 /// the regular face is ever needed (code never renders bold or italic), so this
 /// is a flat list of paths rather than full families.
 const CODE_FONT_FAMILIES: &[&str] = &[
-    "/usr/share/fonts/Adwaita/AdwaitaMono-Regular.ttf",
+    // Noto Sans Mono first, the monospace companion to Noto Sans.
     "/usr/share/fonts/noto/NotoSansMono-Regular.ttf",
+    "/usr/share/fonts/Adwaita/AdwaitaMono-Regular.ttf",
     "/usr/share/fonts/liberation/LiberationMono-Regular.ttf",
     "/usr/share/fonts/TTF/DejaVuSansMono.ttf",
     "/usr/share/fonts/gnu-free/FreeMono.otf",
@@ -675,20 +683,18 @@ impl Face {
     }
 
     /// Render-ready [`Metrics`] at the current pixel size: ascent and descent
-    /// rounded up to whole pixels, and the baseline-to-baseline line height
-    /// (falling back to ascent + descent if the font reports none).
+    /// rounded up to whole pixels, and the baseline-to-baseline line height,
+    /// held to at least the ink height so stacked lines never overlap.
+    ///
+    /// FreeType rounds the ascender up and the descender down independently of
+    /// the height it reports, so a font can hand back a baseline-to-baseline
+    /// height a pixel below the rounded ascent + descent (Noto Sans does at some
+    /// sizes). Taking the max keeps the line box honest for any font.
     pub fn metrics(&self) -> Metrics {
         let (ascent, descent) = self.line_metrics();
         let ascent = ascent.ceil() as i32;
         let descent = (-descent).ceil() as i32;
-        let line_height = {
-            let h = self.line_height().ceil() as i32;
-            if h > 0 {
-                h
-            } else {
-                ascent + descent
-            }
-        };
+        let line_height = (self.line_height().ceil() as i32).max(ascent + descent);
         Metrics {
             ascent,
             descent,
@@ -989,13 +995,13 @@ mod tests {
     }
 
     #[test]
-    fn line_height_covers_ascent_plus_descent() {
-        let face = open();
-        let (ascent, descent) = face.line_metrics();
-        let height = face.line_height();
-        // Baseline-to-baseline spacing is at least the ink height (ascent above
-        // the baseline plus the descent below it).
-        assert!(height >= ascent - descent, "height {height} too small");
+    fn render_metrics_never_overlap_lines() {
+        // FreeType can report a baseline-to-baseline height a pixel under the
+        // rounded ink height (it rounds ascender up and descender down apart from
+        // the height). The render metrics clamp so a line box always covers its
+        // own ink, whatever the raw font reports.
+        let m = open().metrics();
+        assert!(m.line_height >= m.ascent + m.descent);
     }
 
     #[test]

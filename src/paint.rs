@@ -1,7 +1,7 @@
 use crate::find::{self, FindState};
 use crate::layout::{
-    aligned_x, face_key, image_button_rect, CellLine, Gutter, Layout, TableRow, TABLE_BORDER,
-    TABLE_CELL_PAD_Y,
+    aligned_x, face_key, image_button_rect, inline_code_pad, CellLine, Gutter, Layout, TableRow,
+    TABLE_BORDER, TABLE_CELL_PAD_Y,
 };
 use crate::markdown;
 use crate::pane::TreePane;
@@ -12,12 +12,13 @@ use crate::platform::scroll;
 use crate::platform::shape;
 use crate::render::display::{self, DisplayList, DrawCmd};
 use crate::theme::{
-    BACKGROUND, BULLET, CARET_COLOR, CARET_WIDTH, CODE_BG, CODE_COLOR, CODE_RADIUS, FIND_BG,
-    FIND_ERROR_COLOR, FIND_MATCH_COLOR, FIND_TICK_COLOR, FONT_SIZE, FOREGROUND, HEADING_COLORS,
-    IMAGE_BORDER_COLOR, IMAGE_BORDER_THICKNESS, IMAGE_BUTTON_BG, IMAGE_BUTTON_RADIUS, LINK_COLOR,
-    MARGIN, MARKER_COLOR, QUOTE_BAR_COLOR, QUOTE_BAR_WIDTH, RULE_COLOR, RULE_THICKNESS,
-    SELECTION_COLOR, SPLITTER_COLOR, TABLE_BORDER_COLOR, TABLE_HEADER_BG, TICK_HEIGHT, TICK_WIDTH,
-    TREE_BG, TREE_DIR_COLOR, TREE_HOVER_BG, TREE_INDENT, TREE_PAD,
+    BACKGROUND, BULLET, CARET_COLOR, CARET_WIDTH, CODE_BG, CODE_COLOR, CODE_PAD_X, CODE_PAD_Y,
+    CODE_RADIUS, FIND_BG, FIND_ERROR_COLOR, FIND_MATCH_COLOR, FIND_TICK_COLOR, FONT_SIZE,
+    FOREGROUND, HEADING_COLORS, IMAGE_BORDER_COLOR, IMAGE_BORDER_THICKNESS, IMAGE_BUTTON_BG,
+    IMAGE_BUTTON_RADIUS, LINK_COLOR, MARGIN, MARKER_COLOR, QUOTE_BAR_COLOR, QUOTE_BAR_WIDTH,
+    RULE_COLOR, RULE_THICKNESS, SELECTION_COLOR, SPLITTER_COLOR, TABLE_BORDER_COLOR,
+    TABLE_HEADER_BG, TICK_HEIGHT, TICK_WIDTH, TREE_BG, TREE_DIR_COLOR, TREE_HOVER_BG, TREE_INDENT,
+    TREE_PAD,
 };
 
 /// The per-frame inputs [`build_display_list`] needs beyond the layout itself:
@@ -361,10 +362,18 @@ impl<'a> Painter<'a> {
     /// text loop). Block code is excluded here; its full-width panel above covers it.
     fn inline_code_panels(&mut self) {
         for rect in self.layout.code_rects(self.fonts, self.rope) {
-            if let Some(rect) = self.screen(rect) {
-                self.list.push(DrawCmd::Fill {
+            let panel = Rect {
+                x: rect.x - CODE_PAD_X,
+                y: rect.y - CODE_PAD_Y,
+                w: rect.w + 2 * CODE_PAD_X,
+                h: rect.h + 2 * CODE_PAD_Y,
+            };
+            if let Some(rect) = self.screen(panel) {
+                self.list.push(DrawCmd::RoundRect {
                     rect,
                     color: CODE_BG,
+                    radius: CODE_RADIUS,
+                    corners: display::RoundedCorners::Both,
                 });
             }
         }
@@ -582,9 +591,14 @@ impl<'a> Painter<'a> {
                 };
                 // Code backgrounds (inline panels and the full-width block panel)
                 // are emitted in the pre-pass above, beneath the selection; here we
-                // only draw the glyphs over them.
-                let run_x = pen;
-                pen = self.push_text(fk, run_x, baseline, color, slice, m);
+                // only draw the glyphs over them. An inline code run's glyphs sit its
+                // pill pad in from the pen, and the pen clears the pad after them, so
+                // the panel (drawn from the same geometry) frames the code without
+                // painting over the spaces around it.
+                let pad = inline_code_pad(run.kind, line.code_block);
+                let run_x = pen + pad;
+                let run_end = self.push_text(fk, run_x, baseline, color, slice, m);
+                pen = run_end + pad;
                 // Inline decorations over the glyphs, each spanning the run's drawn
                 // width: a link is underlined and struck text gets a line through its
                 // middle, both in the run's own color. Thickness scales with the
@@ -606,7 +620,7 @@ impl<'a> Painter<'a> {
                         rect: Rect {
                             x: run_x,
                             y,
-                            w: pen - run_x,
+                            w: run_end - run_x,
                             h: thickness,
                         },
                         color,
@@ -1100,12 +1114,16 @@ fn push_check_mark(list: &mut DisplayList, b: Rect) {
         (mx + 3 * u, my - 3 * u),
     ];
     for (x, y) in cells {
+        // Clip to the box so the tip cell, which the integer step can carry a
+        // pixel past the right edge, never leaves a stray fleck in the gutter.
+        let x1 = (x + u + 1).min(b.x + b.w);
+        let y1 = (y + u + 1).min(b.y + b.h);
         list.push(DrawCmd::Fill {
             rect: Rect {
                 x,
                 y,
-                w: u + 1,
-                h: u + 1,
+                w: (x1 - x).max(0),
+                h: (y1 - y).max(0),
             },
             color: BACKGROUND,
         });

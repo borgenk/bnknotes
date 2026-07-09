@@ -18,6 +18,13 @@ layout(set = 1, binding = 0) uniform sampler2D image_tex;
 
 layout(location = 0) out vec4 out_color;
 
+// Shared with the vertex stage (which reads viewport). The fragment stage reads
+// only the glyph mask gamma; both members sit at the offsets the CPU packs.
+layout(push_constant) uniform Push {
+    vec2 viewport;
+    float glyph_coverage_gamma;
+} push;
+
 // sRGB to linear. Vertex colors and the emoji atlas carry sRGB-encoded bytes
 // and are decoded here; the image texture is an sRGB format the sampler decodes
 // on its own. The color attachment is an sRGB view, so blending runs in linear
@@ -56,7 +63,12 @@ void main() {
     if (v_mode == 0u) {
         out_color = vec4(srgb_to_linear(v_color.rgb), v_color.a);
     } else if (v_mode == 1u) {
-        float cov = texelFetch(glyph_atlas, ivec2(v_uv), 0).r;
+        // Mask gamma thins the anti-aliased edges: linear-light compositing is
+        // physically correct but renders light-on-dark text heavier than the
+        // gamma-space stacks beside it, so raising coverage to this power lowers
+        // partial-coverage alpha back to a matching weight. Solid pixels
+        // (coverage 1) are unchanged, so color fills keep full strength.
+        float cov = pow(texelFetch(glyph_atlas, ivec2(v_uv), 0).r, push.glyph_coverage_gamma);
         out_color = vec4(srgb_to_linear(v_color.rgb), v_color.a * cov);
     } else if (v_mode == 2u) {
         vec4 e = texelFetch(emoji_atlas, ivec2(v_uv), 0);

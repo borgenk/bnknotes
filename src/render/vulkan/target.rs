@@ -521,6 +521,7 @@ impl Gpu {
         img: &mut GpuImage,
         frame: &FrameData,
         background: [f32; 4],
+        glyph_gamma: f32,
     ) -> Result<()> {
         let d = self.device.raw;
         let f = &self.fns;
@@ -574,7 +575,7 @@ impl Gpu {
             }
         }
 
-        self.record_frame(img, frame, &uploads, background)?;
+        self.record_frame(img, frame, &uploads, background, glyph_gamma)?;
         Ok(())
     }
 
@@ -588,8 +589,9 @@ impl Gpu {
         img: &mut GpuImage,
         frame: &FrameData,
         background: [f32; 4],
+        glyph_gamma: f32,
     ) -> Result<()> {
-        self.prepare_frame(img, frame, background)?;
+        self.prepare_frame(img, frame, background, glyph_gamma)?;
         // Acquire: the compositor's unfinished reads become a wait semaphore.
         let wait_acquire = self.import_read_fences(img)?;
         self.submit_frame(img, wait_acquire)
@@ -607,9 +609,10 @@ impl Gpu {
         img: &mut GpuImage,
         frame: &FrameData,
         background: [f32; 4],
+        glyph_gamma: f32,
         release_wait: Option<OwnedFd>,
     ) -> Result<Option<OwnedFd>> {
-        self.prepare_frame(img, frame, background)?;
+        self.prepare_frame(img, frame, background, glyph_gamma)?;
         let wait_acquire = self.import_acquire(img, release_wait)?;
         self.submit_frame_explicit(img, wait_acquire)
     }
@@ -778,6 +781,7 @@ impl Gpu {
         frame: &FrameData,
         uploads: &[PendingUpload],
         background: [f32; 4],
+        glyph_gamma: f32,
     ) -> Result<()> {
         let f = &self.fns;
         let begin = VkCommandBufferBeginInfo {
@@ -872,13 +876,15 @@ impl Gpu {
                 (f.cmd_set_scissor)(img.cmd, 0, 1, &scissor);
                 let offset = 0u64;
                 (f.cmd_bind_vertex_buffers)(img.cmd, 0, 1, &img.vertices.buf, &offset);
-                let push: [f32; 2] = [img.width as f32, img.height as f32];
+                // Viewport for the vertex stage, glyph mask gamma for the
+                // fragment stage, in one push-constant range spanning both.
+                let push: [f32; 3] = [img.width as f32, img.height as f32, glyph_gamma];
                 (f.cmd_push_constants)(
                     img.cmd,
                     self.renderer.pipeline_layout,
-                    VK_SHADER_STAGE_VERTEX_BIT,
+                    VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
                     0,
-                    8,
+                    12,
                     push.as_ptr().cast(),
                 );
                 (f.cmd_bind_descriptor_sets)(

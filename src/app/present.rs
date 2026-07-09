@@ -446,6 +446,7 @@ impl State {
         // images resolve against both panes' stores, so a picture renders in
         // whichever pane it belongs to.
         let images = [&self.editors[0].images, &self.editors[1].images];
+        let glyph_gamma = self.glyph_gamma;
         let render_done = {
             let Some(gpu) = self.presentation.backend.as_mut() else {
                 return Err(Error::msg("gpu frame without a gpu backend"));
@@ -464,10 +465,16 @@ impl State {
             match self.presentation.explicit_sync.as_ref() {
                 Some(es) => {
                     let release_wait = es.release_fence(idx)?;
-                    gpu.render_list_explicit(img, &frame, color_f32(BACKGROUND), release_wait)?
+                    gpu.render_list_explicit(
+                        img,
+                        &frame,
+                        color_f32(BACKGROUND),
+                        glyph_gamma,
+                        release_wait,
+                    )?
                 }
                 None => {
-                    gpu.render_list(img, &frame, color_f32(BACKGROUND))?;
+                    gpu.render_list(img, &frame, color_f32(BACKGROUND), glyph_gamma)?;
                     None
                 }
             }

@@ -24,91 +24,61 @@ use std::rc::Rc;
 use crate::platform::emoji::{wants_emoji, ColorGlyph, EmojiFont};
 use crate::platform::error::{Error, Result};
 
-/// A monospace family and the four style files the editor draws emphasis with.
-/// The first family whose `regular` file exists wins; a missing bold, italic, or
-/// bold-italic variant falls back to the regular face at render time, so a family
-/// that ships only some weights still renders (just without the slant or weight).
-/// Paths are hardcoded by design; a short list keeps the editor runnable
-/// across machines without a font-discovery crate.
-struct FontFamily {
-    regular: &'static str,
-    bold: &'static str,
-    italic: &'static str,
-    bold_italic: &'static str,
+/// A font family and the four style files the editor draws emphasis with. A
+/// missing bold, italic, or bold-italic variant falls back to the regular face
+/// at render time, so a family that ships only some weights still renders (just
+/// without the slant or weight). Paths are owned so a config, the built-in
+/// default now and a loaded file later, can supply them.
+#[derive(Clone, Debug)]
+pub struct FontFamily {
+    pub regular: String,
+    pub bold: String,
+    pub italic: String,
+    pub bold_italic: String,
 }
 
-const FONT_FAMILIES: &[FontFamily] = &[
-    // The first family installed wins, so the order is the preference.
-    FontFamily {
-        regular: "/usr/share/fonts/noto/NotoSans-Regular.ttf",
-        bold: "/usr/share/fonts/noto/NotoSans-Bold.ttf",
-        italic: "/usr/share/fonts/noto/NotoSans-Italic.ttf",
-        bold_italic: "/usr/share/fonts/noto/NotoSans-BoldItalic.ttf",
-    },
-    FontFamily {
-        regular: "/usr/share/fonts/TTF/Hack-Regular.ttf",
-        bold: "/usr/share/fonts/TTF/Hack-Bold.ttf",
-        italic: "/usr/share/fonts/TTF/Hack-Italic.ttf",
-        bold_italic: "/usr/share/fonts/TTF/Hack-BoldItalic.ttf",
-    },
-    FontFamily {
-        regular: "/usr/share/fonts/noto/NotoSansMono-Regular.ttf",
-        bold: "/usr/share/fonts/noto/NotoSansMono-Bold.ttf",
-        // Noto Sans Mono ships no italic; these paths simply will not exist, and
-        // the lookup falls back to the regular face.
-        italic: "/usr/share/fonts/noto/NotoSansMono-Italic.ttf",
-        bold_italic: "/usr/share/fonts/noto/NotoSansMono-BoldItalic.ttf",
-    },
-    FontFamily {
-        regular: "/usr/share/fonts/Adwaita/AdwaitaMono-Regular.ttf",
-        bold: "/usr/share/fonts/Adwaita/AdwaitaMono-Bold.ttf",
-        italic: "/usr/share/fonts/Adwaita/AdwaitaMono-Italic.ttf",
-        bold_italic: "/usr/share/fonts/Adwaita/AdwaitaMono-BoldItalic.ttf",
-    },
-    FontFamily {
-        regular: "/usr/share/fonts/TTF/DejaVuSansMono.ttf",
-        bold: "/usr/share/fonts/TTF/DejaVuSansMono-Bold.ttf",
-        // DejaVu calls its slanted styles Oblique rather than Italic.
-        italic: "/usr/share/fonts/TTF/DejaVuSansMono-Oblique.ttf",
-        bold_italic: "/usr/share/fonts/TTF/DejaVuSansMono-BoldOblique.ttf",
-    },
-    FontFamily {
-        regular: "/usr/share/fonts/TTF/Roboto-Regular.ttf",
-        bold: "/usr/share/fonts/TTF/Roboto-Bold.ttf",
-        italic: "/usr/share/fonts/TTF/Roboto-Italic.ttf",
-        bold_italic: "/usr/share/fonts/TTF/Roboto-BoldItalic.ttf",
-    },
-];
-
-/// The first family whose regular face is installed on this machine.
-fn default_family() -> Result<&'static FontFamily> {
-    FONT_FAMILIES
-        .iter()
-        .find(|f| std::path::Path::new(f.regular).exists())
-        .ok_or_else(|| Error::msg("no usable font family found in the candidate list"))
+impl FontFamily {
+    /// A family from its four style paths.
+    pub fn new(regular: &str, bold: &str, italic: &str, bold_italic: &str) -> Self {
+        Self {
+            regular: regular.into(),
+            bold: bold.into(),
+            italic: italic.into(),
+            bold_italic: bold_italic.into(),
+        }
+    }
 }
 
-/// Candidate regular faces for code: a monospace deliberately distinct from the
-/// prose family, so code blocks and inline code read in their own typeface. Only
-/// the regular face is ever needed (code never renders bold or italic), so this
-/// is a flat list of paths rather than full families.
-const CODE_FONT_FAMILIES: &[&str] = &[
-    // Noto Sans Mono first, the monospace companion to Noto Sans.
-    "/usr/share/fonts/noto/NotoSansMono-Regular.ttf",
-    "/usr/share/fonts/Adwaita/AdwaitaMono-Regular.ttf",
-    "/usr/share/fonts/liberation/LiberationMono-Regular.ttf",
-    "/usr/share/fonts/TTF/DejaVuSansMono.ttf",
-    "/usr/share/fonts/gnu-free/FreeMono.otf",
-];
+/// Which fonts the editor opens: an ordered list of prose family candidates and
+/// an ordered list of code face candidates. The first prose family whose regular
+/// file exists is used; the first installed code face distinct from that regular
+/// renders code, else code shares the prose face. The concrete selection is the
+/// app's to supply: its `Default` impl lives with the app config, keeping this
+/// portable layer free of the app's own font paths. A loader can later replace it.
+#[derive(Clone, Debug)]
+pub struct FontConfig {
+    pub families: Vec<FontFamily>,
+    pub code: Vec<String>,
+}
 
-/// The first installed code face whose path differs from the prose family's
-/// regular face, or `None` if none is available. A `None` leaves code sharing the
-/// prose face: still readable, just without the visual distinction.
-fn code_regular_path(prose: &FontFamily) -> Option<&'static str> {
-    CODE_FONT_FAMILIES
-        .iter()
-        .copied()
-        .find(|&p| p != prose.regular && std::path::Path::new(p).exists())
+impl FontConfig {
+    /// The first prose family whose regular face is installed on this machine.
+    fn default_family(&self) -> Result<&FontFamily> {
+        self.families
+            .iter()
+            .find(|f| std::path::Path::new(&f.regular).exists())
+            .ok_or_else(|| Error::msg("no usable font family found in the candidate list"))
+    }
+
+    /// The first installed code face whose path differs from the prose family's
+    /// regular face, or `None` if none is available. A `None` leaves code sharing
+    /// the prose face: still readable, just without the visual distinction.
+    fn code_regular_path(&self, prose: &FontFamily) -> Option<&str> {
+        self.code
+            .iter()
+            .map(String::as_str)
+            .find(|&p| p != prose.regular.as_str() && std::path::Path::new(p).exists())
+    }
 }
 
 /// Which variant of the font family a run renders in. Body text and syntax
@@ -401,7 +371,8 @@ impl Face {
     /// family's variants per size itself.
     #[cfg(test)]
     pub fn open_default(pixel_size: u32) -> Result<Self> {
-        let face = Self::from_path(default_family()?.regular)?;
+        let config = FontConfig::default();
+        let face = Self::from_path(&config.default_family()?.regular)?;
         face.set_pixel_size(pixel_size)?;
         Ok(face)
     }
@@ -758,26 +729,34 @@ pub struct Fonts {
 }
 
 impl Fonts {
-    /// Open the default family at each of `sizes` (zeros and duplicates skipped),
-    /// loading every available style per size. At least one nonzero size is
-    /// required; the first opened becomes the fallback.
+    /// Open the default font selection at each of `sizes`. A convenience over
+    /// [`Self::with_config`] using [`FontConfig::default`]; tests and the perf
+    /// harness use it, while the editor threads its own config through
+    /// [`Self::with_config`].
     pub fn new(sizes: &[u32]) -> Result<Self> {
-        let family = default_family()?;
-        let code_path = code_regular_path(family);
+        Self::with_config(&FontConfig::default(), sizes)
+    }
+
+    /// Open `config`'s prose family and code face at each of `sizes` (zeros and
+    /// duplicates skipped), loading every available style per size. At least one
+    /// nonzero size is required; the first opened becomes the fallback.
+    pub fn with_config(config: &FontConfig, sizes: &[u32]) -> Result<Self> {
+        let family = config.default_family()?;
+        let code_path = config.code_regular_path(family);
         let emoji = EmojiFont::open().map(Rc::new);
         let mut sized: Vec<SizedFaces> = Vec::new();
         for &size in sizes {
             if size == 0 || sized.iter().any(|s| s.size == size) {
                 continue;
             }
-            let regular = open_face(family.regular, size, emoji.as_ref())?;
+            let regular = open_face(&family.regular, size, emoji.as_ref())?;
             let metrics = regular.metrics();
             sized.push(SizedFaces {
                 size,
                 regular,
-                bold: open_variant(family.bold, size, emoji.as_ref()),
-                italic: open_variant(family.italic, size, emoji.as_ref()),
-                bold_italic: open_variant(family.bold_italic, size, emoji.as_ref()),
+                bold: open_variant(&family.bold, size, emoji.as_ref()),
+                italic: open_variant(&family.italic, size, emoji.as_ref()),
+                bold_italic: open_variant(&family.bold_italic, size, emoji.as_ref()),
                 code: code_path.and_then(|p| open_variant(p, size, emoji.as_ref())),
                 metrics,
             });

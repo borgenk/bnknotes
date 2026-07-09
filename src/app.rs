@@ -30,6 +30,7 @@ use std::time::{Duration, Instant};
 use self::clipboard::{is_text_mime, ClipboardState, CLIPBOARD_MIMES};
 use self::input::KeyRepeat;
 use self::present::GpuPresentation;
+use crate::config::Config;
 use crate::file;
 use crate::markdown;
 use crate::paint::{build_display_list, build_find_paint, push_splitter, push_tree, PaintParams};
@@ -78,6 +79,9 @@ struct State {
     /// The font opened at every size the styles need (body and heading sizes),
     /// so each line can render at its own size.
     fonts: Fonts,
+    /// Mask gamma for glyph coverage, read from the app config at startup and
+    /// handed to the shader each frame (see [`crate::config::Config`]).
+    glyph_gamma: f32,
     xkb: Xkb,
     /// The two content panes (editor A and B) and the file-tree sidebar, laid
     /// out as adjustable full-height columns. `focus` selects which region takes
@@ -230,9 +234,11 @@ fn initial_focus(
 impl State {
     fn new(path: Option<PathBuf>) -> Result<Self> {
         let conn = Connection::connect()?;
-        // Open the font at every size the styles use, so headings can render
-        // larger than body text without re-opening mid-frame.
-        let fonts = Fonts::new(&markdown::all_sizes(FONT_SIZE))?;
+        // Font selection lives in the app config (defaults for now; no on-disk
+        // config yet). Open every size the styles use so headings render larger
+        // than body text without re-opening mid-frame.
+        let config = Config::default();
+        let fonts = Fonts::with_config(&config.fonts, &markdown::all_sizes(FONT_SIZE))?;
         // The saved layout: window/column sizes, tree root and open folders, and
         // each pane's last file with its caret and scroll. Missing or corrupt
         // falls back to the first-run default without failing.
@@ -273,6 +279,7 @@ impl State {
         Ok(Self {
             conn,
             fonts,
+            glyph_gamma: config.glyph_coverage_gamma,
             xkb: Xkb::new()?,
             editors: [editor_a, editor_b],
             tree,

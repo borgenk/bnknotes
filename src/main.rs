@@ -2,6 +2,7 @@
 //! Wayland client (no winit, no smithay, almost no crates).
 
 mod app;
+mod config;
 mod dev;
 mod file;
 mod find;

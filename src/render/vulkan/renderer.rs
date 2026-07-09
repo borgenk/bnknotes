@@ -327,12 +327,14 @@ fn fill_renderer(r: &mut Renderer, fns: &DeviceFns, device: VkDevice) -> Result<
         &mut r.set_layout_image,
     )?;
 
-    // Pipeline layout: both sets plus the viewport push constant.
+    // Pipeline layout: both sets plus one push-constant range holding the
+    // vertex stage's viewport (vec2) and the fragment stage's glyph mask gamma
+    // (float), so it spans both stages.
     let set_layouts = [r.set_layout_atlas, r.set_layout_image];
     let push_range = VkPushConstantRange {
-        stage_flags: VK_SHADER_STAGE_VERTEX_BIT,
+        stage_flags: VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
         offset: 0,
-        size: 8,
+        size: 12,
     };
     let layout_info = VkPipelineLayoutCreateInfo {
         s_type: VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,

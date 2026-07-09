@@ -49,16 +49,26 @@ impl FontFamily {
     }
 }
 
-/// Which fonts the editor opens: an ordered list of prose family candidates and
-/// an ordered list of code face candidates. The first prose family whose regular
+/// Which fonts the editor opens: an ordered list of prose family candidates, an
+/// ordered list of code face candidates, and an ordered fallback chain for
+/// scalars the chosen family cannot draw. The first prose family whose regular
 /// file exists is used; the first installed code face distinct from that regular
-/// renders code, else code shares the prose face. The concrete selection is the
-/// app's to supply: its `Default` impl lives with the app config, keeping this
-/// portable layer free of the app's own font paths. A loader can later replace it.
+/// renders code, else code shares the prose face; the fallback chain is consulted
+/// glyph by glyph (see [`Fonts::glyph_face`]) for a character the prose or code
+/// face lacks. The concrete selection is the app's to supply: its `Default` impl
+/// lives with the app config, keeping this portable layer free of the app's own
+/// font paths. A loader can later replace it.
 #[derive(Clone, Debug)]
 pub struct FontConfig {
     pub families: Vec<FontFamily>,
     pub code: Vec<String>,
+    /// Regular-weight faces consulted, in order, for a scalar the prose or code
+    /// face has no glyph for: a symbols/icon font (Nerd Font and Powerline glyphs
+    /// live in the private-use area, which text families do not carry) or a
+    /// wider-coverage Unicode fallback. Only installed files open; an empty list
+    /// means no fallback (a missing glyph renders as the `.notdef` tofu box, the
+    /// pre-fallback behavior).
+    pub fallback: Vec<String>,
 }
 
 impl FontConfig {
@@ -702,18 +712,25 @@ struct SizedFaces {
     /// The code family's regular face at this size, or `None` when no distinct
     /// code family is installed (code then falls back to `regular`).
     code: Option<Face>,
+    /// The fallback chain at this size ([`FontConfig::fallback`]), in priority
+    /// order, holding only the faces whose files exist. Consulted by
+    /// [`Fonts::glyph_face`] for a scalar the keyed face cannot draw; empty when
+    /// the config lists none.
+    fallback: Vec<Face>,
     metrics: Metrics,
 }
 
 impl SizedFaces {
     /// Every face this size actually opened: the regular face plus whichever
-    /// variants and code face exist. Used to roll up cache stats across faces.
+    /// variants, code face, and fallback faces exist. Used to roll up cache stats
+    /// across faces.
     fn faces(&self) -> impl Iterator<Item = &Face> {
         std::iter::once(&self.regular)
             .chain(self.bold.as_ref())
             .chain(self.italic.as_ref())
             .chain(self.bold_italic.as_ref())
             .chain(self.code.as_ref())
+            .chain(self.fallback.iter())
     }
 }
 
@@ -762,6 +779,13 @@ impl Fonts {
             // Ascent and descent stay the glyph metrics; the extra sits below.
             let target = (line_height_scale * size as f32).round() as i32;
             metrics.line_height = metrics.line_height.max(target);
+            // Fallback faces draw only scalars the primary lacks and never route
+            // emoji clusters themselves, so they carry no emoji font.
+            let fallback = config
+                .fallback
+                .iter()
+                .filter_map(|p| open_variant(p, size, None))
+                .collect();
             sized.push(SizedFaces {
                 size,
                 regular,
@@ -769,6 +793,7 @@ impl Fonts {
                 italic: open_variant(&family.italic, size, emoji.as_ref()),
                 bold_italic: open_variant(&family.bold_italic, size, emoji.as_ref()),
                 code: code_path.and_then(|p| open_variant(p, size, emoji.as_ref())),
+                fallback,
                 metrics,
             });
         }
@@ -819,6 +844,33 @@ impl Fonts {
             FaceKey::Prose { size, style } => self.face(size, style),
             FaceKey::Code { size } => self.code_face(size),
         }
+    }
+
+    /// The physical face to rasterize `ch` in for `key`: the keyed face when its
+    /// character map covers `ch`, otherwise the first fallback face at that size
+    /// that does, otherwise the keyed face again (so a scalar absent everywhere
+    /// still draws its `.notdef` box, the pre-fallback behavior). This is how a
+    /// Nerd Font / Powerline icon reaches its glyph in a symbols font even though
+    /// the prose or code family has no glyph for it.
+    ///
+    /// Emoji never arrive here: a color cluster is resolved through the emoji
+    /// cluster path before any scalar is drawn. The keyed face's own cmap is
+    /// consulted first and answers every ASCII and Latin glyph without touching a
+    /// fallback face, so the common case pays a single [`FT_Get_Char_Index`], and
+    /// only a genuine miss walks the (short) chain. The GPU batcher caches the
+    /// resolved raster by `(key, ch)`, so this runs once per new glyph, never per
+    /// frame. With an empty [`FontConfig::fallback`] the chain is empty and this
+    /// always returns the keyed face.
+    pub fn glyph_face(&self, key: FaceKey, ch: char) -> &Face {
+        let primary = self.face_for(key);
+        if primary.has_scalar(ch) {
+            return primary;
+        }
+        self.entry(key.size())
+            .fallback
+            .iter()
+            .find(|f| f.has_scalar(ch))
+            .unwrap_or(primary)
     }
 
     /// The metrics for `size`, or the fallback's metrics if `size` was not opened.
@@ -1103,5 +1155,39 @@ mod tests {
             face.advance('a'),
             "a simple cluster measures exactly like its character"
         );
+    }
+
+    #[test]
+    fn glyph_face_falls_back_for_a_nerd_font_icon() {
+        // U+F418 is the Nerd Font octicon "git-branch" (nf-oct-git_branch). It
+        // lives in the private-use area, so a plain text or monospace family never
+        // carries it: the config's fallback chain (a symbols font) must supply it
+        // or it renders as a blank / tofu box. With an empty fallback list the
+        // resolver simply returns the primary and the ink assertion is skipped;
+        // with a symbols font configured it inks.
+        const BRANCH: char = '\u{F418}';
+        let fonts = Fonts::new(&[16]).expect("a default font");
+        let key = FaceKey::Prose {
+            size: 16,
+            style: FontStyle::Regular,
+        };
+
+        // A glyph the primary owns resolves to the primary itself, untouched, so
+        // the common path never walks the fallback chain.
+        let primary = fonts.face_for(key);
+        assert!(primary.has_scalar('A'));
+        assert!(std::ptr::eq(fonts.glyph_face(key, 'A'), primary));
+
+        // Resolving the icon never panics whether or not a fallback is present.
+        // When the primary lacks it but a fallback covers it, the resolved face
+        // must ink it: that inked raster is exactly the fix for the blank box.
+        let resolved = fonts.glyph_face(key, BRANCH);
+        if !primary.has_scalar(BRANCH) && resolved.has_scalar(BRANCH) {
+            let g = resolved.rasterize(BRANCH);
+            assert!(
+                g.coverage.iter().any(|&c| c > 0),
+                "the branch icon should ink from a fallback face"
+            );
+        }
     }
 }

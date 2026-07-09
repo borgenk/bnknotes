@@ -81,6 +81,12 @@ impl Connection {
         })
     }
 
+    /// The socket's raw fd, so an event loop can `poll` it alongside other fds.
+    /// Read-only: the connection keeps ownership and does all the actual I/O.
+    pub fn fd(&self) -> RawFd {
+        self.stream.as_raw_fd()
+    }
+
     /// Queue a request for the next flush.
     pub fn request(&mut self, object: u32, opcode: u16, args: &[Arg]) {
         wire::encode(&mut self.out, object, opcode, args);

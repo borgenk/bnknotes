@@ -93,6 +93,9 @@ impl Default for FontConfig {
                 "/usr/share/fonts/TTF/DejaVuSansMono.ttf".into(),
                 "/usr/share/fonts/gnu-free/FreeMono.otf".into(),
             ],
+            // No icon fallback: the editor renders prose and code, not private-use
+            // Nerd Font / Powerline icons, so a missing glyph stays the `.notdef` box.
+            fallback: vec![],
         }
     }
 }

@@ -723,13 +723,57 @@ impl State {
 }
 
 /// A 0x00RRGGBB color as the linear-float RGBA a Vulkan clear expects. The
-/// bytes are the display (sRGB-encoded) values as authored, passed through as
-/// the same numbers, not a color-space conversion.
+/// authored bytes are sRGB-encoded; the color attachment is an sRGB view, so
+/// the clear value is taken as linear and re-encoded on store. Converting here
+/// makes the cleared background land on the same bytes as the authored color.
 fn color_f32(color: u32) -> [f32; 4] {
+    let srgb_to_linear = |c: u32| {
+        let c = c as f32 / 255.0;
+        if c > 0.04045 {
+            ((c + 0.055) / 1.055).powf(2.4)
+        } else {
+            c / 12.92
+        }
+    };
     [
-        ((color >> 16) & 0xff) as f32 / 255.0,
-        ((color >> 8) & 0xff) as f32 / 255.0,
-        (color & 0xff) as f32 / 255.0,
+        srgb_to_linear((color >> 16) & 0xff),
+        srgb_to_linear((color >> 8) & 0xff),
+        srgb_to_linear(color & 0xff),
         1.0,
     ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The store-side sRGB encode the attachment applies, inverse of the decode
+    /// in color_f32.
+    fn linear_to_srgb(c: f32) -> f32 {
+        if c > 0.003_130_8 {
+            1.055 * c.powf(1.0 / 2.4) - 0.055
+        } else {
+            12.92 * c
+        }
+    }
+
+    #[test]
+    fn clear_color_decode_then_store_encode_reproduces_the_authored_bytes() {
+        for color in [
+            0x0000_0000,
+            0x00ff_ffff,
+            0x0080_8080,
+            0x0012_3456,
+            BACKGROUND,
+        ] {
+            let lin = color_f32(color);
+            let enc = |c: f32| (linear_to_srgb(c) * 255.0).round() as u32;
+            let got = (enc(lin[0]) << 16) | (enc(lin[1]) << 8) | enc(lin[2]);
+            assert_eq!(
+                got, color,
+                "0x{color:08x} must survive decode then re-encode"
+            );
+            assert_eq!(lin[3], 1.0, "the clear is opaque");
+        }
+    }
 }

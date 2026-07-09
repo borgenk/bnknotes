@@ -1,9 +1,10 @@
 // The one fragment shader. Modes (src/gpu.rs): 0 solid fill, 1 glyph coverage
 // from the R8 atlas, 2 emoji from the BGRA atlas, 3 an image texture,
 // 4 rounded-rect coverage. Glyph and emoji reads are texelFetch at integer
-// coords so a 1:1 atlas quad reproduces its source texels exactly. An image
-// samples with texture() and normalized UVs so the GPU (linear sampler) scales
-// its native-size texture to the display quad, keeping resize cheap and smooth.
+// coords so a 1:1 atlas quad reproduces its source texels exactly. An image is
+// an sRGB texture sampled with texture() and normalized UVs, so the GPU decodes
+// and scales its native-size texture to the display quad in linear space,
+// keeping resize cheap and smooth.
 #version 450
 
 layout(location = 0) in vec2 v_uv;
@@ -16,6 +17,18 @@ layout(set = 0, binding = 1) uniform sampler2D emoji_atlas;
 layout(set = 1, binding = 0) uniform sampler2D image_tex;
 
 layout(location = 0) out vec4 out_color;
+
+// sRGB to linear. Vertex colors and the emoji atlas carry sRGB-encoded bytes
+// and are decoded here; the image texture is an sRGB format the sampler decodes
+// on its own. The color attachment is an sRGB view, so blending runs in linear
+// space and the hardware re-encodes on store, leaving opaque fills byte-exact
+// while anti-aliased edges blend gamma-correct.
+vec3 srgb_to_linear(vec3 c) {
+    bvec3 hi = greaterThan(c, vec3(0.04045));
+    vec3 lo = c / 12.92;
+    vec3 hs = pow((c + 0.055) / 1.055, vec3(2.4));
+    return mix(lo, hs, hi);
+}
 
 // Replicates render.rs corner_coverage: full coverage everywhere except
 // inside an active corner cell, where the pixel center's distance to the
@@ -41,19 +54,19 @@ float round_coverage(vec2 p, vec2 size, float r, uint mask) {
 
 void main() {
     if (v_mode == 0u) {
-        out_color = v_color;
+        out_color = vec4(srgb_to_linear(v_color.rgb), v_color.a);
     } else if (v_mode == 1u) {
         float cov = texelFetch(glyph_atlas, ivec2(v_uv), 0).r;
-        out_color = vec4(v_color.rgb, v_color.a * cov);
+        out_color = vec4(srgb_to_linear(v_color.rgb), v_color.a * cov);
     } else if (v_mode == 2u) {
-        out_color = texelFetch(emoji_atlas, ivec2(v_uv), 0);
+        vec4 e = texelFetch(emoji_atlas, ivec2(v_uv), 0);
+        out_color = vec4(srgb_to_linear(e.rgb), e.a);
     } else if (v_mode == 3u) {
-        // Image: normalized UVs sample the native-size texture, so the GPU
-        // scales it to the quad (linear filtering) rather than the CPU
-        // re-resampling on every resize. Glyph/emoji paths keep texelFetch.
+        // Image: the sRGB texture is decoded and scaled to the quad in linear
+        // space by the sampler, so its result is already linear.
         out_color = texture(image_tex, v_uv);
     } else {
         float cov = round_coverage(v_uv, v_extra.xy, v_extra.z, uint(v_extra.w));
-        out_color = vec4(v_color.rgb, v_color.a * cov);
+        out_color = vec4(srgb_to_linear(v_color.rgb), v_color.a * cov);
     }
 }

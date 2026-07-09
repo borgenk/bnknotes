@@ -230,7 +230,9 @@ impl Gpu {
         };
 
         // The image: renderable, clearable, exportable, laid out by one of the
-        // allowed modifiers (driver's choice, queried back below).
+        // allowed modifiers (driver's choice, queried back below). It stores
+        // UNORM bytes for the compositor but is mutable so the render pass can
+        // drive it through an sRGB view; the format list names both.
         let modifier_list = VkImageDrmFormatModifierListCreateInfoEXT {
             s_type: VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_LIST_CREATE_INFO_EXT,
             p_next: core::ptr::null(),
@@ -242,10 +244,17 @@ impl Gpu {
             p_next: (&modifier_list as *const VkImageDrmFormatModifierListCreateInfoEXT).cast(),
             handle_types: VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT,
         };
+        let view_formats = [VK_FORMAT_B8G8R8A8_UNORM, VK_FORMAT_B8G8R8A8_SRGB];
+        let format_list = VkImageFormatListCreateInfo {
+            s_type: VK_STRUCTURE_TYPE_IMAGE_FORMAT_LIST_CREATE_INFO,
+            p_next: (&external as *const VkExternalMemoryImageCreateInfo).cast(),
+            view_format_count: view_formats.len() as u32,
+            p_view_formats: view_formats.as_ptr(),
+        };
         let image_info = VkImageCreateInfo {
             s_type: VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
-            p_next: (&external as *const VkExternalMemoryImageCreateInfo).cast(),
-            flags: 0,
+            p_next: (&format_list as *const VkImageFormatListCreateInfo).cast(),
+            flags: VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT,
             image_type: VK_IMAGE_TYPE_2D,
             format: VK_FORMAT_B8G8R8A8_UNORM,
             extent: VkExtent3D {
@@ -411,8 +420,9 @@ impl Gpu {
             "vkAllocateCommandBuffers",
         )?;
 
-        // The render-pass plumbing: a view of the image and its framebuffer.
-        pending.view = self.create_view(pending.image, VK_FORMAT_B8G8R8A8_UNORM)?;
+        // The render-pass plumbing: an sRGB view of the image and its
+        // framebuffer, so fixed-function blending runs in linear space.
+        pending.view = self.create_view(pending.image, VK_FORMAT_B8G8R8A8_SRGB)?;
         let fb_info = VkFramebufferCreateInfo {
             s_type: VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO,
             p_next: core::ptr::null(),
@@ -1103,7 +1113,9 @@ impl Gpu {
                 continue;
             }
             let (w, h) = (key.1, key.2);
-            let tex = self.create_texture(VK_FORMAT_B8G8R8A8_UNORM, w, h)?;
+            // sRGB format: the sampler decodes and linear-filters when scaling
+            // the image to its display size, matching the linear-space blend.
+            let tex = self.create_texture(VK_FORMAT_B8G8R8A8_SRGB, w, h)?;
             let set = self.allocate_image_set(tex.view)?;
             uploads.push(PendingUpload {
                 image: tex.image,

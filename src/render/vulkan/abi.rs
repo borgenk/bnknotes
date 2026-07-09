@@ -85,6 +85,7 @@ pub(super) const VK_STRUCTURE_TYPE_EXPORT_SEMAPHORE_CREATE_INFO: u32 = 100007700
 pub(super) const VK_STRUCTURE_TYPE_IMPORT_SEMAPHORE_FD_INFO_KHR: u32 = 1000079000;
 pub(super) const VK_STRUCTURE_TYPE_SEMAPHORE_GET_FD_INFO_KHR: u32 = 1000079001;
 pub(super) const VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO: u32 = 1000127001;
+pub(super) const VK_STRUCTURE_TYPE_IMAGE_FORMAT_LIST_CREATE_INFO: u32 = 1000147000;
 pub(super) const VK_STRUCTURE_TYPE_DRM_FORMAT_MODIFIER_PROPERTIES_LIST_EXT: u32 = 1000158000;
 pub(super) const VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_LIST_CREATE_INFO_EXT: u32 = 1000158003;
 pub(super) const VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_PROPERTIES_EXT: u32 = 1000158005;
@@ -96,6 +97,11 @@ pub(super) const VK_QUEUE_GRAPHICS_BIT: u32 = 0x1;
 /// `VK_FORMAT_B8G8R8A8_UNORM`: bytes B,G,R,A in memory, the Vulkan twin of
 /// little-endian DRM XRGB8888 (and of the software canvas's pixel layout).
 pub(super) const VK_FORMAT_B8G8R8A8_UNORM: u32 = 44;
+/// `VK_FORMAT_B8G8R8A8_SRGB`: the same bytes as the UNORM twin, but sampled and
+/// stored through the sRGB transfer function. The presentable image is created
+/// mutable and rendered through a view in this format, so blending runs in
+/// linear space while the exported bytes stay UNORM/XRGB8888 for the compositor.
+pub(super) const VK_FORMAT_B8G8R8A8_SRGB: u32 = 50;
 /// `VK_FORMAT_R8_UNORM`: the glyph coverage atlas.
 pub(super) const VK_FORMAT_R8_UNORM: u32 = 9;
 /// Vertex attribute formats.
@@ -110,6 +116,10 @@ pub(super) const VK_IMAGE_TYPE_2D: u32 = 1;
 pub(super) const VK_IMAGE_VIEW_TYPE_2D: u32 = 1;
 pub(super) const VK_SAMPLE_COUNT_1_BIT: u32 = 1;
 pub(super) const VK_SHARING_MODE_EXCLUSIVE: u32 = 0;
+
+/// `VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT`: lets the presentable image carry both
+/// its UNORM store format and an sRGB view for gamma-correct blending.
+pub(super) const VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT: u32 = 0x8;
 
 pub(super) const VK_IMAGE_USAGE_TRANSFER_SRC_BIT: u32 = 0x1;
 pub(super) const VK_IMAGE_USAGE_TRANSFER_DST_BIT: u32 = 0x2;
@@ -528,6 +538,14 @@ pub(super) struct VkExternalMemoryImageCreateInfo {
     pub(super) s_type: u32,
     pub(super) p_next: *const c_void,
     pub(super) handle_types: u32,
+}
+
+#[repr(C)]
+pub(super) struct VkImageFormatListCreateInfo {
+    pub(super) s_type: u32,
+    pub(super) p_next: *const c_void,
+    pub(super) view_format_count: u32,
+    pub(super) p_view_formats: *const u32,
 }
 
 #[repr(C)]
@@ -1592,6 +1610,7 @@ mod tests {
         assert_eq!(size_of::<VkDrmFormatModifierPropertiesListEXT>(), 32);
         assert_eq!(size_of::<VkImageCreateInfo>(), 88);
         assert_eq!(size_of::<VkExternalMemoryImageCreateInfo>(), 24);
+        assert_eq!(size_of::<VkImageFormatListCreateInfo>(), 32);
         assert_eq!(size_of::<VkImageDrmFormatModifierListCreateInfoEXT>(), 32);
         assert_eq!(size_of::<VkImageDrmFormatModifierPropertiesEXT>(), 24);
         assert_eq!(size_of::<VkMemoryRequirements>(), 24);

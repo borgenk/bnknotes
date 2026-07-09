@@ -2,8 +2,9 @@
 //! presentation path uses, and the bring-up that turns the compositor's dmabuf
 //! feedback into a live device and queue.
 //!
-//! The loader is `dlopen`ed rather than linked, so a machine without Vulkan
-//! falls back to software rendering instead of failing to start; every
+//! The loader is `dlopen`ed rather than linked, so on a machine without Vulkan
+//! the binary still starts and exits with a clear message instead of failing at
+//! load time (the GPU is mandatory, there is no software renderer); every
 //! function pointer is fetched through `vkGetInstanceProcAddr` /
 //! `vkGetDeviceProcAddr` as the spec prescribes. There is no window surface
 //! and no swapchain anywhere in this module: presentation is dmabuf export

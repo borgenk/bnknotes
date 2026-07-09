@@ -262,10 +262,12 @@ pub(super) fn create_renderer(fns: &DeviceFns, device: VkDevice) -> Result<Rende
 
 fn fill_renderer(r: &mut Renderer, fns: &DeviceFns, device: VkDevice) -> Result<()> {
     // The render pass: one B8G8R8A8 color attachment, cleared on load, kept
-    // in COLOR_ATTACHMENT_OPTIMAL (the ownership barriers live outside).
+    // in COLOR_ATTACHMENT_OPTIMAL (the ownership barriers live outside). The
+    // sRGB format matches the image's sRGB view, so blending is gamma-correct
+    // and the store re-encodes to the UNORM bytes the compositor reads.
     let attachment = VkAttachmentDescription {
         flags: 0,
-        format: VK_FORMAT_B8G8R8A8_UNORM,
+        format: VK_FORMAT_B8G8R8A8_SRGB,
         samples: VK_SAMPLE_COUNT_1_BIT,
         load_op: VK_ATTACHMENT_LOAD_OP_CLEAR,
         store_op: VK_ATTACHMENT_STORE_OP_STORE,

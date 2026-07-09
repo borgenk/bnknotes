@@ -714,8 +714,12 @@ impl<'a> Painter<'a> {
                 markdown::SpanKind::Text(markdown::Emphasis::Link) => LINK_COLOR,
                 markdown::SpanKind::Text(_) => FOREGROUND,
             };
-            let run_x = pen;
-            pen = self.push_text(
+            // An inline code run's glyphs sit its pill pad in from the pen, and the
+            // pen clears the pad after them, so the tint panel frames the code without
+            // covering the text around it, the same as the body loop.
+            let pad = inline_code_pad(run.kind, false);
+            let run_x = pen + pad;
+            let run_end = self.push_text(
                 fk,
                 run_x,
                 baseline,
@@ -723,6 +727,7 @@ impl<'a> Painter<'a> {
                 self.rope.byte_slice(run.start..run.end),
                 m,
             );
+            pen = run_end + pad;
             let deco = match run.kind {
                 markdown::SpanKind::Text(markdown::Emphasis::Link) => {
                     Some(baseline + m.descent / 3)
@@ -738,7 +743,7 @@ impl<'a> Painter<'a> {
                     rect: Rect {
                         x: run_x,
                         y,
-                        w: pen - run_x,
+                        w: run_end - run_x,
                         h: thickness,
                     },
                     color,
@@ -1458,6 +1463,57 @@ mod tests {
             assert!(texts.contains(cell), "cell {cell:?} drawn, got {texts:?}");
         }
         assert!(!texts.contains('|'), "the pipes are not drawn");
+    }
+
+    #[test]
+    fn a_table_cell_reveals_its_backticks_when_the_cursor_is_on_the_row() {
+        let fonts = Fonts::new(&markdown::all_sizes(FONT_SIZE)).expect("a default font");
+        let src = "| File |\n| --- |\n| `main.rs`, `error.rs` |\n";
+        let rope = Rope::from_str(src);
+        let (w, h) = (600usize, 300usize);
+        let wrap = w as i32 - 2 * MARGIN;
+        let body = rope.line_to_byte(2);
+
+        // Cursor outside the table: the cell is cooked, so no backtick is drawn but
+        // the two code spans still get their tint pills.
+        let cooked = Layout::build(&fonts, &rope, MARGIN, MARGIN, wrap, FONT_SIZE, (0, 0));
+        let cooked_list = build_display_list(&fonts, &cooked, &rope, &paint_params(w, h));
+        let backticks = |list: &[DrawCmd]| {
+            list.iter()
+                .filter(|c| {
+                    matches!(c, DrawCmd::Text { text, color, .. }
+                    if text.contains('`') && *color == MARKER_COLOR)
+                })
+                .count()
+        };
+        let pills = |list: &[DrawCmd]| {
+            list.iter()
+                .filter(|c| matches!(c, DrawCmd::RoundRect { color, .. } if *color == CODE_BG))
+                .count()
+        };
+        assert_eq!(
+            backticks(&cooked_list),
+            0,
+            "cooked cell hides its backticks"
+        );
+        assert_eq!(
+            pills(&cooked_list),
+            2,
+            "two inline-code pills, one per span"
+        );
+
+        // Cursor in the body cell: the backticks reveal as MARKER_COLOR text.
+        let revealed = Layout::build(&fonts, &rope, MARGIN, MARGIN, wrap, FONT_SIZE, (body, body));
+        let revealed_list = build_display_list(&fonts, &revealed, &rope, &paint_params(w, h));
+        assert!(
+            backticks(&revealed_list) > 0,
+            "the active row draws its backticks so they can be edited"
+        );
+        assert_eq!(
+            pills(&revealed_list),
+            2,
+            "still two pills, now over the backticks"
+        );
     }
 
     #[test]

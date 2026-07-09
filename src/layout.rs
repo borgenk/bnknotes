@@ -59,7 +59,7 @@
 use std::ops::Range;
 
 use crate::markdown;
-use crate::platform::freetype::{Face, FaceKey, FontStyle, Fonts};
+use crate::platform::freetype::{Face, FaceKey, FontStyle, Fonts, Metrics};
 use crate::platform::geom::Rect;
 use crate::platform::grapheme;
 use crate::platform::shape;
@@ -171,8 +171,10 @@ pub struct VisualLine {
     pub image: Option<ImageBox>,
     /// Set when this line renders one grid row of a markdown table (a header or a
     /// body row). Like [`Self::image`], it is a widget line: taller than text, with
-    /// its own internal cell layout, and (for now) not a caret target. A table's
-    /// delimiter row emits no visual line at all. `None` on every other line.
+    /// its own internal cell layout. The caret sits in its cells (via the grid model
+    /// in [`crate::table`]), and on the cursor's row the cells reveal their raw
+    /// markers. A table's delimiter row emits no visual line at all. `None` on every
+    /// other line.
     pub table: Option<TableRow>,
 }
 
@@ -401,6 +403,38 @@ pub(crate) fn inline_code_pad(kind: markdown::SpanKind, code_block: bool) -> i32
     } else {
         0
     }
+}
+
+/// The drawn width of a code span's flanking backtick marker, for growing the
+/// pill in [`Layout::code_rects`] to enclose the revealed delimiters. `after`
+/// picks the run just after the code run at `code` rather than the one before.
+/// Zero unless that neighbor is a visible run of only backticks: a hidden marker
+/// (off the cursor's line) or a different delimiter leaves the pill on the content.
+fn backtick_marker_width(
+    runs: &[Run],
+    code: usize,
+    after: bool,
+    fonts: &Fonts,
+    size: u32,
+    heading: bool,
+    rope: &Rope,
+) -> f32 {
+    let idx = if after {
+        code + 1
+    } else {
+        code.wrapping_sub(1)
+    };
+    let Some(run) = runs.get(idx) else {
+        return 0.0;
+    };
+    if !run.visible || !matches!(run.kind, markdown::SpanKind::Marker) {
+        return 0.0;
+    }
+    let text = rope.slice(run.start..run.end).as_cow();
+    if text.is_empty() || !text.bytes().all(|b| b == b'`') {
+        return 0.0;
+    }
+    shape::text_advance(run_face(fonts, size, run.kind, heading), &text)
 }
 
 /// The [`FaceKey`] a run of `kind` at `size` draws in, the borrow-free twin of
@@ -960,7 +994,15 @@ impl Layout {
                 continue;
             }
             let m = fonts.metrics(line.size);
-            for run in self.run_slice(line) {
+            // Inline code inside a table lives in the cell runs, not the line's
+            // own runs, so its pills come from the cell walk instead.
+            if let Some(t) = &line.table {
+                self.table_code_rects(fonts, rope, line, t, m, &mut rects);
+                continue;
+            }
+            let heading = line.heading.is_some();
+            let runs = self.run_slice(line);
+            for (i, run) in runs.iter().enumerate() {
                 if !run.visible
                     || !matches!(run.kind, markdown::SpanKind::Text(markdown::Emphasis::Code))
                 {
@@ -974,18 +1016,75 @@ impl Layout {
                     + self.advance_to(fonts, rope, line, run.start)
                     + inline_code_pad(run.kind, line.code_block) as f32;
                 let w = shape::text_advance(
-                    run_face(fonts, line.size, run.kind, line.heading.is_some()),
+                    run_face(fonts, line.size, run.kind, heading),
                     &rope.slice(run.start..run.end).as_cow(),
                 );
+                // On the cursor's line the span's backtick markers are revealed;
+                // grow the pill out to enclose them so the delimiters sit inside
+                // the tint. Off the line they are hidden (zero width), leaving the
+                // pill hugging the content as before.
+                let open = backtick_marker_width(runs, i, false, fonts, line.size, heading, rope);
+                let close = backtick_marker_width(runs, i, true, fonts, line.size, heading, rope);
                 rects.push(Rect {
-                    x: x0.round() as i32,
+                    x: (x0 - open).round() as i32,
                     y: line.baseline - m.ascent,
-                    w: (w.round() as i32).max(1),
+                    w: ((w + open + close).round() as i32).max(1),
                     h: m.ascent + m.descent,
                 });
             }
         }
         rects
+    }
+
+    /// Inline-code pills for a table row: the same cell run-walk the painter does
+    /// in [`crate::paint`], reproduced so each tint panel lands under the glyphs it
+    /// backs. On the cursor's row the backtick markers are revealed, so each pill
+    /// grows to enclose them the way [`Self::code_rects`] does for an ordinary line;
+    /// off the row they are hidden and the pill hugs the content. Appends to `rects`.
+    fn table_code_rects(
+        &self,
+        fonts: &Fonts,
+        rope: &Rope,
+        line: &VisualLine,
+        t: &TableRow,
+        m: Metrics,
+        rects: &mut Vec<Rect>,
+    ) {
+        let row_x = self.left + line.indent;
+        let box_top = line.baseline - m.ascent;
+        for (col, cell) in t.columns.iter().zip(&t.cells) {
+            for (k, cl) in cell.lines.iter().enumerate() {
+                let top = box_top + TABLE_CELL_PAD_Y + k as i32 * m.line_height;
+                let mut pen = row_x + aligned_x(*col, cl.width);
+                for (i, run) in cl.runs.iter().enumerate() {
+                    if !run.visible {
+                        continue;
+                    }
+                    // A code run's glyphs sit its pill pad in from the pen, matching
+                    // the draw walk; the pill (which paint then expands by the pad)
+                    // starts at the glyphs and grows over any revealed backticks.
+                    let pad = inline_code_pad(run.kind, false);
+                    let glyph_x = pen + pad;
+                    let face = run_face(fonts, line.size, run.kind, t.header);
+                    let w = shape::text_advance(face, &rope.slice(run.start..run.end).as_cow());
+                    if matches!(run.kind, markdown::SpanKind::Text(markdown::Emphasis::Code)) {
+                        let open = backtick_marker_width(
+                            &cl.runs, i, false, fonts, line.size, t.header, rope,
+                        );
+                        let close = backtick_marker_width(
+                            &cl.runs, i, true, fonts, line.size, t.header, rope,
+                        );
+                        rects.push(Rect {
+                            x: (glyph_x as f32 - open).round() as i32,
+                            y: top,
+                            w: ((w + open + close).round() as i32).max(1),
+                            h: m.ascent + m.descent,
+                        });
+                    }
+                    pen = glyph_x + w.round() as i32 + pad;
+                }
+            }
+        }
     }
 
     /// The visual line containing `offset`. A cursor at a soft-wrap boundary is
@@ -1162,9 +1261,15 @@ impl Layout {
             if !run.visible || offset <= run.start {
                 continue;
             }
+            // A code run's glyphs sit its pill pad in from the pen; add that leading
+            // pad on entry, and the trailing pad once the offset is past the run.
+            let pad = inline_code_pad(run.kind, false) as f32;
             let end = offset.min(run.end);
             let face = run_face(fonts, size, run.kind, header);
-            adv += shape::text_advance(face, &rope.slice(run.start..end).as_cow());
+            adv += pad + shape::text_advance(face, &rope.slice(run.start..end).as_cow());
+            if offset >= run.end {
+                adv += pad;
+            }
         }
         (k, adv, cl.width)
     }
@@ -1210,6 +1315,10 @@ impl Layout {
             if !run.visible {
                 continue;
             }
+            // The pill pad frames a code run's glyphs; a click in the leading pad
+            // falls to the run's first cluster, one in the trailing pad past it.
+            let pad = inline_code_pad(run.kind, false) as f32;
+            acc += pad;
             let face = run_face(fonts, line.size, run.kind, t.header);
             let text = rope.slice(run.start..run.end).as_cow();
             for (off, cluster) in grapheme::graphemes(&text) {
@@ -1219,6 +1328,7 @@ impl Layout {
                 }
                 acc += w;
             }
+            acc += pad;
         }
         // Past every glyph: the end of the last visible run, else the cell start.
         cl.runs
@@ -1511,8 +1621,8 @@ fn lay_line(
     if carry.fence.is_none() {
         // A table renders as a grid of widget rows: its delimiter row draws
         // nothing, and every other row is one table widget line. A table ends any
-        // open list, and is never a caret target (for now). Detection is by rope
-        // scan (`table_block_at`), so no table state threads the carry.
+        // open list. Detection is by rope scan (`table_block_at`), so no table state
+        // threads the carry.
         if let Some(block) = table_block_at(ctx.rope, line_no) {
             carry.list_depth = None;
             return match block.role {
@@ -2423,14 +2533,12 @@ fn table_block_at(rope: &Rope, i: usize) -> Option<TableBlock> {
 }
 
 /// The shared, positioned column geometry of `block`, fitted to the wrap width.
-/// Each column's natural width is its widest unwrapped cell (header cells measured
-/// in the bold face they draw in); if the columns overflow the available width
-/// they shrink proportionally, never past [`TABLE_MIN_COL`], so wide cells wrap.
-fn table_columns(ctx: &LayoutCtx, block: &TableBlock) -> Vec<Column> {
+/// Each column's natural width is its widest unwrapped cell; if the columns overflow
+/// the available width they shrink proportionally, never past [`TABLE_MIN_COL`], so
+/// wide cells wrap.
+fn table_columns(ctx: &LayoutCtx, block: &TableBlock, pool: &mut LayoutScratch) -> Vec<Column> {
     let n = ctx.rope.len_lines();
     let cols = block.aligns.len();
-    let size = ctx.body_size;
-    let regular = markdown::SpanKind::Text(markdown::Emphasis::Regular);
     let mut natural = vec![0i32; cols];
     let mut ranges: Vec<(usize, usize)> = Vec::new();
     for row in block.drawn_rows() {
@@ -2439,8 +2547,7 @@ fn table_columns(ctx: &LayoutCtx, block: &TableBlock) -> Vec<Column> {
         markdown::table_row_cells(&line, &mut ranges);
         let header = row == block.header;
         for (c, &(s, e)) in ranges.iter().take(cols).enumerate() {
-            let face = run_face(ctx.fonts, size, regular, header);
-            let w = shape::text_advance(face, &line[s..e]).ceil() as i32;
+            let w = cell_measure_width(ctx, &line[s..e], header, pool);
             natural[c] = natural[c].max(w);
         }
     }
@@ -2507,10 +2614,13 @@ fn lay_table_row(
     let cols = block.aligns.len();
     let size = ctx.body_size;
     let metrics = ctx.fonts.metrics(size);
-    let columns = table_columns(ctx, block);
+    let columns = table_columns(ctx, block, pool);
     let l = LogicalLine::at(ctx.rope, row_line, n);
     let line = ctx.rope.slice(l.start..l.end).as_cow();
     let header = row_line == block.header;
+    // The cursor is on this row: reveal its cells' raw markers, the same live-preview
+    // test an ordinary line uses, so the grid stays but the backticks become visible.
+    let revealed = ctx.active.0 <= l.end && ctx.active.1 >= l.start;
     let mut ranges: Vec<(usize, usize)> = Vec::new();
     markdown::table_row_cells(&line, &mut ranges);
     let mut cells = Vec::with_capacity(cols);
@@ -2526,6 +2636,7 @@ fn lay_table_row(
             l.start + e,
             col.width,
             header,
+            revealed,
             measure_only,
             pool,
         );
@@ -2600,11 +2711,47 @@ fn br_pieces(text: &str) -> impl Iterator<Item = (usize, usize)> + '_ {
     })
 }
 
+/// The unwrapped width of a cell's source text, measured the way [`build_cell`]
+/// lays it out: each span in its own face, so a code span counts in the wider
+/// monospace face it draws in, not the prose face, plus its pill pad. The markers a
+/// revealed row shows (backticks, `*`) are counted too, so the column reserves their
+/// room and revealing a row never reflows it. A `<br>` splits the cell; the widest
+/// piece wins. Mirrors [`wrap_segments`]' own measurement (`pad_code` true), so a
+/// column sized to it never forces a cell to wrap against its natural width.
+fn cell_measure_width(
+    ctx: &LayoutCtx,
+    cell_text: &str,
+    header: bool,
+    pool: &mut LayoutScratch,
+) -> i32 {
+    let size = ctx.body_size;
+    let mut max_w = 0.0f32;
+    for (ps, pe) in br_pieces(cell_text) {
+        let piece = &cell_text[ps..pe];
+        pool.spans.clear();
+        markdown::inline_spans_append(piece, &mut pool.inline, &mut pool.spans);
+        // Sum each span in its own face. text_advance sums per-cluster advances with
+        // no cross-cluster kerning, so a whole span measures the same as wrap_segments'
+        // per-cluster walk, and a plain cell costs the one measure it always did. A
+        // code span reserves its pill pad on each side, matching the run-walks.
+        let mut w = 0.0;
+        for span in &pool.spans {
+            let face = run_face(ctx.fonts, size, span.kind, header);
+            w += shape::text_advance(face, &piece[span.start..span.end]);
+            w += 2.0 * inline_code_pad(span.kind, false) as f32;
+        }
+        max_w = max_w.max(w);
+    }
+    max_w.ceil() as i32
+}
+
 /// Lay out one table cell: its inline markup wrapped to the column `width`, as a
 /// list of drawn lines. A `<br>` splits the cell onto a fresh line; header cells
-/// draw in the bold face. On `measure_only` the runs and widths are skipped (the
-/// caller wants only the wrapped line count for the row height), matching the
-/// index's measure pass.
+/// draw in the bold face. When `revealed` (the cursor is on this row) the cell's
+/// markers show raw so the backticks and emphasis are editable, matching an ordinary
+/// active line; off the row they collapse. On `measure_only` the runs and widths are
+/// skipped (the caller wants only the wrapped line count for the row height),
+/// matching the index's measure pass.
 #[allow(clippy::too_many_arguments)]
 fn build_cell(
     ctx: &LayoutCtx,
@@ -2613,18 +2760,20 @@ fn build_cell(
     end: usize,
     width: i32,
     header: bool,
+    revealed: bool,
     measure_only: bool,
     pool: &mut LayoutScratch,
 ) -> TableCell {
     let size = ctx.body_size;
-    // A cell shows its inline text with markers collapsed, like any off-cursor
-    // line; it carries no block marker of its own.
+    // Off the cursor's row a cell collapses its markers like any off-cursor line;
+    // on the row (`revealed`) they show raw so the backticks and emphasis are
+    // editable. The cell carries no block marker of its own.
     let class = LineClass {
         style: markdown::LineStyle::Body,
         size,
         block_marker: 0,
         block_persists: false,
-        revealed: false,
+        revealed,
         code_block: false,
     };
     let mut lines = Vec::new();
@@ -2641,9 +2790,9 @@ fn build_cell(
             width,
             0,
             header,
-            // A table cell draws inline code without a pill, so it pads nothing;
-            // wrapping matches the drawn width.
-            false,
+            // Inline code in a cell draws the same padded pill prose does, so reserve
+            // its pad in the wrap; the run-walks below fold the same pad in.
+            true,
             &mut pool.clusters,
             &mut pool.segments,
         );
@@ -2665,15 +2814,17 @@ fn build_cell(
 }
 
 /// The drawn width of a cell line: the sum of its visible runs' advances, in the
-/// faces they draw in. Feeds the painter's right/center alignment.
+/// faces they draw in, each code run widened by its pill pad on both sides. Feeds the
+/// painter's right/center alignment.
 fn cell_line_width(ctx: &LayoutCtx, size: u32, runs: &[Run], header: bool) -> i32 {
     let mut w = 0.0;
     for run in runs {
         if !run.visible {
             continue;
         }
+        let pad = inline_code_pad(run.kind, false) as f32;
         let face = run_face(ctx.fonts, size, run.kind, header);
-        w += shape::text_advance(face, &ctx.rope.slice(run.start..run.end).as_cow());
+        w += pad + shape::text_advance(face, &ctx.rope.slice(run.start..run.end).as_cow()) + pad;
     }
     w.round() as i32
 }
@@ -4278,6 +4429,129 @@ mod tests {
         assert!(
             l2.code_rects(&f, &r2).is_empty(),
             "block code uses the full-width panel, not per-run inline rects"
+        );
+    }
+
+    #[test]
+    fn revealing_the_backticks_grows_the_code_pill_to_enclose_them() {
+        let f = fonts();
+        // The code span is on line 2 after "ab ". With the cursor on line 1 its
+        // backticks are hidden; with the cursor inside the span they reveal.
+        let src = "top\nab `cd`";
+        let r = rope(src);
+        let span = src.find("`cd`").unwrap();
+        let hidden = Layout::build(&f, &r, LEFT, TOP, 1_000_000, BODY, (0, 0)).code_rects(&f, &r);
+        let shown = Layout::build(&f, &r, LEFT, TOP, 1_000_000, BODY, (span + 1, span + 1))
+            .code_rects(&f, &r);
+        assert_eq!(hidden.len(), 1);
+        assert_eq!(shown.len(), 1);
+        // The left edge stays anchored (the hidden opening backtick collapsed to
+        // exactly where the revealed one now begins), and the pill widens to hold
+        // both delimiters.
+        assert_eq!(shown[0].x, hidden[0].x, "the pill's left edge stays put");
+        assert!(
+            shown[0].w > hidden[0].w,
+            "revealed, the pill widens to enclose both backticks"
+        );
+    }
+
+    #[test]
+    fn inline_code_in_a_table_cell_gets_a_pill() {
+        let f = fonts();
+        // Inline code in a cell lives in the cell runs, not the line's own runs,
+        // so it must still pick up its tint panel through the table walk. Cursor is
+        // outside the table, so the cell is cooked (its backticks hidden).
+        let r = rope("| h | j |\n| - | - |\n| `x` | b |\n");
+        let l = Layout::build(&f, &r, LEFT, TOP, 1_000_000, BODY, (0, 0));
+        let rects = l.code_rects(&f, &r);
+        assert_eq!(rects.len(), 1, "one pill behind the cell's inline code");
+        assert!(rects[0].w > 0 && rects[0].h > 0);
+        assert!(
+            rects[0].x > LEFT,
+            "positioned inside the cell, past the margin"
+        );
+    }
+
+    #[test]
+    fn adjacent_code_spans_in_a_cell_stay_on_one_line() {
+        let f = fonts();
+        // The natural column width once measured the raw cell in the prose face, but
+        // the code spans draw in the wider monospace face, so this cell used to wrap
+        // apart at every width. It must now sit on one line with two distinct pills.
+        let r = rope("| File | n |\n| - | - |\n| `main.rs`, `error.rs` | x |\n");
+        let l = Layout::build(&f, &r, LEFT, TOP, 1_000_000, BODY, (0, 0));
+        let (_, t) = table_rows(&l)[1];
+        assert_eq!(t.cells[0].lines.len(), 1, "the cell stays on one line");
+        let rects = l.code_rects(&f, &r);
+        assert_eq!(rects.len(), 2, "two separate pills, one per code span");
+        assert_eq!(rects[0].y, rects[1].y, "both on the same cell line");
+        assert!(
+            rects[1].x >= rects[0].x + rects[0].w,
+            "the pills do not overlap"
+        );
+    }
+
+    #[test]
+    fn a_cell_pill_does_not_cover_the_text_between_two_code_spans() {
+        let f = fonts();
+        // The ", " between the spans is not code; the painter expands each pill by the
+        // pill pad, so that pad must be reserved space, not paint over the comma.
+        let r = rope("| File | n |\n| - | - |\n| `a`, `b` | x |\n");
+        let l = Layout::build(&f, &r, LEFT, TOP, 1_000_000, BODY, (0, 0));
+        let rects = l.code_rects(&f, &r);
+        assert_eq!(rects.len(), 2);
+        let pad = crate::theme::CODE_PAD_X;
+        // The pills as the painter draws them, grown by the pad on each side.
+        let gap = (rects[1].x - pad) - (rects[0].x + rects[0].w + pad);
+        let comma = shape::text_advance(f.face(BODY, FontStyle::Regular), ", ").round() as i32;
+        assert!(
+            gap > 0,
+            "the drawn pills leave a gap for the comma, got {gap}"
+        );
+        assert!(
+            (gap - comma).abs() <= 2,
+            "the gap holds exactly \", \" ({comma}px), got {gap}"
+        );
+    }
+
+    #[test]
+    fn a_table_row_reveals_its_markers_when_the_cursor_is_on_it() {
+        let f = fonts();
+        let r = rope("| h |\n| - |\n| `x` |\n");
+        let markers = |l: &Layout| -> (usize, usize) {
+            let (_, t) = table_rows(l)[1];
+            let runs = &t.cells[0].lines[0].runs;
+            let shown = runs
+                .iter()
+                .filter(|run| matches!(run.kind, markdown::SpanKind::Marker) && run.visible)
+                .count();
+            (shown, t.cells[0].lines.len())
+        };
+        let body = r.line_to_byte(2);
+        // Cursor in the body cell: its two backtick markers reveal.
+        let on = Layout::build(&f, &r, LEFT, TOP, 1_000_000, BODY, (body, body));
+        let (shown_on, lines_on) = markers(&on);
+        assert_eq!(shown_on, 2, "the active row shows both backticks");
+        // Cursor outside the table: the same markers collapse.
+        let off = Layout::build(&f, &r, LEFT, TOP, 1_000_000, BODY, (0, 0));
+        let (shown_off, lines_off) = markers(&off);
+        assert_eq!(shown_off, 0, "an off-cursor row hides its backticks");
+        assert_eq!(lines_on, lines_off, "revealing the markers does not reflow");
+    }
+
+    #[test]
+    fn fenced_code_block_content_draws_in_the_code_face() {
+        let f = fonts();
+        let r = rope("```\ncode\n```");
+        let l = layout(&f, &r);
+        // The middle line is the code content; its run resolves to the code face,
+        // the same one inline code uses, not the prose face.
+        let content = &l.lines()[1];
+        let run = l.run_slice(content).first().expect("a content run");
+        assert_eq!(
+            face_key(content.size, run.kind, content.heading.is_some()),
+            FaceKey::Code { size: content.size },
+            "code block text draws in the code face, matching inline code"
         );
     }
 

@@ -238,7 +238,11 @@ impl State {
         // config yet). Open every size the styles use so headings render larger
         // than body text without re-opening mid-frame.
         let config = Config::default();
-        let fonts = Fonts::with_config(&config.fonts, &markdown::all_sizes(FONT_SIZE))?;
+        let fonts = Fonts::with_config(
+            &config.fonts,
+            &markdown::all_sizes(FONT_SIZE),
+            config.line_height_scale,
+        )?;
         // The saved layout: window/column sizes, tree root and open folders, and
         // each pane's last file with its caret and scroll. Missing or corrupt
         // falls back to the first-run default without failing.

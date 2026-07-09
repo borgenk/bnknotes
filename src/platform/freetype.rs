@@ -290,8 +290,10 @@ impl Glyph {
 }
 
 /// Render-ready line metrics for a face at its current pixel size, rounded to
-/// whole pixels. Ascent and descent are both positive (pixels above and below
-/// the baseline); `line_height` is the baseline-to-baseline distance.
+/// whole pixels. Ascent and descent are both positive glyph metrics (pixels
+/// above and below the baseline); `line_height` is the baseline-to-baseline
+/// distance and may exceed ascent + descent, the surplus being leading that
+/// falls below the line (so text is top-aligned in a taller line box).
 #[derive(Clone, Copy, Debug)]
 pub struct Metrics {
     pub ascent: i32,
@@ -729,18 +731,22 @@ pub struct Fonts {
 }
 
 impl Fonts {
-    /// Open the default font selection at each of `sizes`. A convenience over
+    /// Open the default font selection at each of `sizes`, with the font's own
+    /// line height (a scale of 1.0, no extra leading). A convenience over
     /// [`Self::with_config`] using [`FontConfig::default`]; tests and the perf
     /// harness use it, while the editor threads its own config through
     /// [`Self::with_config`].
     pub fn new(sizes: &[u32]) -> Result<Self> {
-        Self::with_config(&FontConfig::default(), sizes)
+        Self::with_config(&FontConfig::default(), sizes, 1.0)
     }
 
     /// Open `config`'s prose family and code face at each of `sizes` (zeros and
-    /// duplicates skipped), loading every available style per size. At least one
-    /// nonzero size is required; the first opened becomes the fallback.
-    pub fn with_config(config: &FontConfig, sizes: &[u32]) -> Result<Self> {
+    /// duplicates skipped), loading every available style per size. Each size's
+    /// line box is grown to at least `line_height_scale` times the size (the CSS
+    /// line-height model), never below the font's own line height, so lines can
+    /// be spaced out without overlapping. At least one nonzero size is required;
+    /// the first opened becomes the fallback.
+    pub fn with_config(config: &FontConfig, sizes: &[u32], line_height_scale: f32) -> Result<Self> {
         let family = config.default_family()?;
         let code_path = config.code_regular_path(family);
         let emoji = EmojiFont::open().map(Rc::new);
@@ -750,7 +756,12 @@ impl Fonts {
                 continue;
             }
             let regular = open_face(&family.regular, size, emoji.as_ref())?;
-            let metrics = regular.metrics();
+            let mut metrics = regular.metrics();
+            // Grow the line box to the requested multiple of the size, keeping
+            // the font's own line height as the floor so lines never overlap.
+            // Ascent and descent stay the glyph metrics; the extra sits below.
+            let target = (line_height_scale * size as f32).round() as i32;
+            metrics.line_height = metrics.line_height.max(target);
             sized.push(SizedFaces {
                 size,
                 regular,
@@ -996,6 +1007,34 @@ mod tests {
         let small = fonts.metrics(16);
         let large = fonts.metrics(32);
         assert!(large.line_height > small.line_height, "32px is taller");
+    }
+
+    #[test]
+    fn line_height_scale_grows_the_box_and_keeps_glyph_metrics() {
+        let base = Fonts::new(&[14]).expect("a default font").metrics(14);
+        // A scale well above any 14px font's own line height forces the box to
+        // the scaled target; 3.0 gives 42px, past ascent + descent.
+        let big = Fonts::with_config(&FontConfig::default(), &[14], 3.0)
+            .expect("a default font")
+            .metrics(14);
+        assert_eq!(big.ascent, base.ascent, "ascent stays the glyph metric");
+        assert_eq!(big.descent, base.descent, "descent stays the glyph metric");
+        assert_eq!(big.line_height, 42, "line box is round(3.0 * 14)");
+        assert!(
+            big.line_height > big.ascent + big.descent,
+            "the surplus is leading below the line"
+        );
+    }
+
+    #[test]
+    fn line_height_scale_floors_at_the_font_line_height() {
+        // A scale too small to matter leaves the font's own line height, so
+        // lines never overlap.
+        let base = Fonts::new(&[14]).expect("a default font").metrics(14);
+        let tiny = Fonts::with_config(&FontConfig::default(), &[14], 0.1)
+            .expect("a default font")
+            .metrics(14);
+        assert_eq!(tiny.line_height, base.line_height);
     }
 
     #[test]

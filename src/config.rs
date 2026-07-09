@@ -19,6 +19,10 @@ pub struct Config {
     /// beside it; raising coverage to this power thins the anti-aliased edges back
     /// to a matching weight. Higher is thinner; 1.0 disables it.
     pub glyph_coverage_gamma: f32,
+    /// Line height as a multiple of the font size, the CSS model. Each line box is
+    /// grown to at least this many times its size (never below the font's own line
+    /// height), and the extra space falls below the text. The default is 1.5.
+    pub line_height_scale: f32,
 }
 
 impl Default for Config {
@@ -28,6 +32,7 @@ impl Default for Config {
             // Around 1.8 undoes the linear-light fattening on its own; a little
             // above that also matches the browser's edge lightening.
             glyph_coverage_gamma: 2.0,
+            line_height_scale: 1.5,
         }
     }
 }

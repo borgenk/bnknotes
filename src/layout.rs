@@ -723,11 +723,7 @@ impl Layout {
         }
         let m = fonts.metrics(line.size);
         let x = self.left as f32 + line.indent as f32 + self.advance_to(fonts, rope, line, offset);
-        (
-            x.round() as i32,
-            line.baseline - m.ascent,
-            m.ascent + m.descent,
-        )
+        (x.round() as i32, line.baseline - m.ascent, m.line_height)
     }
 
     /// The byte offset nearest a click at window `(x, y)`.
@@ -945,7 +941,7 @@ impl Layout {
                 x: x0.round() as i32,
                 y: line.baseline - m.ascent,
                 w: w.max(1),
-                h: m.ascent + m.descent,
+                h: m.line_height,
             });
         }
         rects
@@ -1026,7 +1022,7 @@ impl Layout {
                 } else if let Some(table) = &l.table {
                     l.baseline - m.ascent + table.box_height()
                 } else {
-                    l.baseline + m.descent
+                    l.baseline - m.ascent + m.line_height
                 };
                 y < bottom as f32
             })
@@ -1126,7 +1122,7 @@ impl Layout {
             .iter()
             .position(|c| offset <= c.end)
             .unwrap_or(t.cells.len().saturating_sub(1));
-        let height = m.ascent + m.descent;
+        let height = m.line_height;
         let Some(cell) = t.cells.get(idx) else {
             return (row_left, box_top + TABLE_CELL_PAD_Y, height);
         };
@@ -3089,7 +3085,7 @@ mod tests {
             top0, TOP,
             "caret top is baseline - ascent, i.e. the box top"
         );
-        assert_eq!(h, m.ascent + m.descent, "caret spans ascent + descent");
+        assert_eq!(h, m.line_height, "caret spans the line box");
         let (x1, top1, _) = l.caret(&f, &r, 6);
         assert_eq!(x1, LEFT, "second line also starts at the margin");
         assert_eq!(top1, TOP + m.line_height, "and one line lower");

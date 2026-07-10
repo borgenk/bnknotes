@@ -1196,4 +1196,29 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn glyph_face_falls_back_for_a_rightwards_arrow() {
+        // U+2192 (→) turns up in ordinary notes but the default text family does
+        // not carry it (Roboto here has ↑ and ↓ yet not → or ←), so it renders as
+        // tofu unless the fallback chain supplies it. Same shape as the nerd-font
+        // case, for a scalar prose actually uses; tolerant of a machine without the
+        // symbols fallback installed (the resolver returns the primary and the ink
+        // assertion is skipped).
+        const ARROW: char = '→';
+        let fonts = Fonts::new(&[16]).expect("a default font");
+        let key = FaceKey::Prose {
+            size: 16,
+            style: FontStyle::Regular,
+        };
+        let primary = fonts.face_for(key);
+        let resolved = fonts.glyph_face(key, ARROW);
+        if !primary.has_scalar(ARROW) && resolved.has_scalar(ARROW) {
+            let g = resolved.rasterize(ARROW);
+            assert!(
+                g.coverage.iter().any(|&c| c > 0),
+                "the arrow should ink from a fallback face"
+            );
+        }
+    }
 }

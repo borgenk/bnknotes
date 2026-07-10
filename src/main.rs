@@ -19,6 +19,7 @@ mod regex;
 mod render;
 mod rope;
 mod store;
+mod syntax;
 mod table;
 mod text;
 mod theme;

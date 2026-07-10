@@ -269,6 +269,23 @@ impl TextBuffer {
         }
     }
 
+    /// Handle Shift+Enter on a list item: insert a continuation line indented to
+    /// the item's content column, with no marker of its own, so it reads as
+    /// belonging to the item above. Splits the line at the cursor like a soft
+    /// break. The indent is the item's full marker width in spaces; the layout
+    /// recognizes such a line and insets it under the item text with no bullet.
+    /// Falls back to a plain break when the cursor is not on an item's content.
+    pub fn list_continuation(&mut self) -> bool {
+        let (ls, _le, line) = self.content_line_at(self.cursor);
+        let (_style, marker_len) = markdown::classify(&line);
+        if marker_len == 0 || self.cursor < ls + marker_len {
+            return self.enter();
+        }
+        let indent = " ".repeat(marker_len);
+        self.insert_str(&format!("\n{indent}"));
+        true
+    }
+
     /// Renumber the ordered items that follow the cursor's line at its list
     /// level, so they continue its number in sequence. Runs after Enter inserts
     /// the next numbered item; edits the rope directly with no checkpoint, so
@@ -1471,6 +1488,24 @@ mod tests {
         assert!(b.enter());
         assert_eq!(b.text(), "- foo\n- ");
         assert_eq!(b.cursor(), 8);
+    }
+
+    #[test]
+    fn shift_enter_continues_a_bullet_with_an_indented_line() {
+        let mut b = TextBuffer::new();
+        b.insert_str("- foo");
+        assert!(b.list_continuation());
+        assert_eq!(b.text(), "- foo\n  ", "an indented continuation, no bullet");
+        assert_eq!(b.cursor(), 8, "the cursor lands after the indent");
+    }
+
+    #[test]
+    fn shift_enter_indents_an_ordered_continuation_under_its_number() {
+        let mut b = TextBuffer::new();
+        b.insert_str("1. foo");
+        assert!(b.list_continuation());
+        assert_eq!(b.text(), "1. foo\n   ", "three spaces, the `1. ` width");
+        assert_eq!(b.cursor(), 10);
     }
 
     #[test]

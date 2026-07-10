@@ -95,9 +95,17 @@ impl Default for FontConfig {
                 "/usr/share/fonts/TTF/DejaVuSansMono.ttf".into(),
                 "/usr/share/fonts/gnu-free/FreeMono.otf".into(),
             ],
-            // No icon fallback: the editor renders prose and code, not private-use
-            // Nerd Font / Powerline icons, so a missing glyph stays the `.notdef` box.
-            fallback: vec![],
+            // Fallback chain for scalars the prose and code faces lack: arrows,
+            // maths and technical signs, and the many symbol blocks a text font
+            // omits. The Symbols faces cover most of them; Noto Sans Mono rounds out
+            // the odd Latin-adjacent glyph. A glyph absent from all of these still
+            // renders its .notdef box, the pre-fallback behavior. Consulted per
+            // missing glyph only, so the common all-Latin path never touches it.
+            fallback: vec![
+                "/usr/share/fonts/noto/NotoSansSymbols-Regular.ttf".into(),
+                "/usr/share/fonts/noto/NotoSansSymbols2-Regular.ttf".into(),
+                "/usr/share/fonts/noto/NotoSansMono-Regular.ttf".into(),
+            ],
         }
     }
 }

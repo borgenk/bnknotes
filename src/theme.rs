@@ -26,6 +26,17 @@ pub(crate) const MARKER_COLOR: u32 = 0x005d_6c7e;
 /// span is set apart by its monospace face and the panel rather than by hue.
 pub(crate) const CODE_COLOR: u32 = FOREGROUND;
 pub(crate) const CODE_BG: u32 = 0x0028_2c34;
+/// A code delimiter's backticks (an inline span's `` ` `` and a fence's ```), drawn
+/// brighter than the muted [`MARKER_COLOR`] the other syntax markers use so the
+/// delimiters stay legible against the code panel's darker tint. A touch below the
+/// body foreground so they still read as syntax rather than content.
+pub(crate) const CODE_MARKER_COLOR: u32 = 0x00c8_ccd4;
+/// Syntax-highlighting colors for code-block tokens, a One Dark palette that pairs
+/// with the code panel's [`CODE_BG`]. Plain code stays [`CODE_COLOR`].
+pub(crate) const CODE_KEYWORD_COLOR: u32 = 0x00c6_78dd;
+pub(crate) const CODE_STRING_COLOR: u32 = 0x0098_c379;
+pub(crate) const CODE_COMMENT_COLOR: u32 = 0x005c_6370;
+pub(crate) const CODE_NUMBER_COLOR: u32 = 0x00d1_9a66;
 /// Corner radius of a code panel, fenced block or inline span: a subtle rounding.
 pub(crate) const CODE_RADIUS: i32 = 4;
 /// Padding baked into an inline code panel so the tint reads as a rounded pill

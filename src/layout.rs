@@ -81,6 +81,12 @@ const CODE_PAD_X: i32 = 10;
 /// continuations add the marker's width on top for the hanging indent.
 const LIST_INDENT: i32 = 14;
 
+/// Extra left indent per nesting level, on top of [`LIST_INDENT`]. The source's two
+/// leading spaces per level advance only a few pixels, too little to read as nesting,
+/// so each depth steps in by this fixed amount as well and the levels separate
+/// clearly. Depth 0 (a top-level item) adds nothing.
+const LIST_NEST_INDENT: i32 = 18;
+
 /// Vertical breathing room above and below a rendered block image, so it does not
 /// butt against the lines around it. Part of the image line's box height.
 const IMAGE_PAD_Y: i32 = 8;
@@ -405,6 +411,17 @@ pub(crate) fn inline_code_pad(kind: markdown::SpanKind, code_block: bool) -> i32
     }
 }
 
+/// True when `run` is a visible marker made only of backtick characters, i.e. an
+/// inline code span's flanking delimiter. Used to grow the pill around a revealed
+/// delimiter and to nudge it in against the code, so the two stay in agreement.
+fn run_is_backticks(rope: &Rope, run: &Run) -> bool {
+    if !run.visible || !matches!(run.kind, markdown::SpanKind::Marker) {
+        return false;
+    }
+    let text = rope.slice(run.start..run.end).as_cow();
+    !text.is_empty() && text.bytes().all(|b| b == b'`')
+}
+
 /// The drawn width of a code span's flanking backtick marker, for growing the
 /// pill in [`Layout::code_rects`] to enclose the revealed delimiters. `after`
 /// picks the run just after the code run at `code` rather than the one before.
@@ -427,14 +444,46 @@ fn backtick_marker_width(
     let Some(run) = runs.get(idx) else {
         return 0.0;
     };
-    if !run.visible || !matches!(run.kind, markdown::SpanKind::Marker) {
+    if !run_is_backticks(rope, run) {
         return 0.0;
     }
     let text = rope.slice(run.start..run.end).as_cow();
-    if text.is_empty() || !text.bytes().all(|b| b == b'`') {
-        return 0.0;
-    }
     shape::text_advance(run_face(fonts, size, run.kind, heading), &text)
+}
+
+/// True when a marker run begins with a backtick: an inline code delimiter or a
+/// fence line (```rust and the like). Such markers recolor to
+/// [`crate::theme::CODE_MARKER_COLOR`] so the delimiters stay legible against the
+/// code panel's darker tint, while the other muted markers keep [`MARKER_COLOR`].
+pub(crate) fn is_code_marker(rope: &Rope, run: &Run) -> bool {
+    matches!(run.kind, markdown::SpanKind::Marker) && rope.byte(run.start) == Some(b'`')
+}
+
+/// The draw-only x nudge for a revealed backtick delimiter at run `i`, pulling it in
+/// against the code so it hugs the glyphs inside the pill instead of floating a pad
+/// width away outside it. The pill pad becomes the pill's outer breathing room. The
+/// run's flow advance is unchanged, so measurement, hit-test, and the pill geometry
+/// stay put; only the drawn glyph moves. Positive for the opening delimiter before
+/// the code, negative for the closing one after it, zero otherwise.
+pub(crate) fn backtick_reveal_shift(rope: &Rope, runs: &[Run], i: usize) -> i32 {
+    let Some(run) = runs.get(i) else {
+        return 0;
+    };
+    if !run_is_backticks(rope, run) {
+        return 0;
+    }
+    let is_code = |j: usize| {
+        runs.get(j).is_some_and(|r| {
+            r.visible && matches!(r.kind, markdown::SpanKind::Text(markdown::Emphasis::Code))
+        })
+    };
+    if is_code(i + 1) {
+        crate::theme::CODE_PAD_X
+    } else if i > 0 && is_code(i - 1) {
+        -crate::theme::CODE_PAD_X
+    } else {
+        0
+    }
 }
 
 /// The [`FaceKey`] a run of `kind` at `size` draws in, the borrow-free twin of
@@ -443,7 +492,9 @@ fn backtick_marker_width(
 /// so the two never disagree on which face (hence which width) a run uses.
 pub(crate) fn face_key(size: u32, kind: markdown::SpanKind, heading: bool) -> FaceKey {
     match kind {
-        markdown::SpanKind::Text(markdown::Emphasis::Code) => FaceKey::Code { size },
+        markdown::SpanKind::Text(markdown::Emphasis::Code) | markdown::SpanKind::Code(_) => {
+            FaceKey::Code { size }
+        }
         markdown::SpanKind::Text(_) if heading => FaceKey::Prose {
             size,
             style: embolden(font_style(kind)),
@@ -575,19 +626,45 @@ impl LogicalLine {
     }
 }
 
+/// An open code fence carried across the lines of its block: how many backticks
+/// opened it (a close needs at least as many) and the language its info string
+/// selected, so every line inside is highlighted the same way.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct Fence {
+    ticks: usize,
+    lang: crate::syntax::Lang,
+}
+
+impl Fence {
+    /// Pack the fence into the line index's `u16` carry: ticks in the low byte,
+    /// language in the high byte. Ticks are never zero inside a fence, so a zero
+    /// packed value cleanly means "no open fence".
+    fn packed(self) -> u16 {
+        (self.ticks as u16 & 0xff) | ((self.lang as u16) << 8)
+    }
+
+    /// The fence a non-zero packed carry value describes.
+    fn unpack(packed: u16) -> Option<Self> {
+        (packed != 0).then(|| Fence {
+            ticks: (packed & 0xff) as usize,
+            lang: crate::syntax::Lang::from_u8((packed >> 8) as u8),
+        })
+    }
+}
+
 /// Cross-line parser state for constructs that carry over logical lines.
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
 struct LineCarry {
-    fence: Option<usize>,
+    fence: Option<Fence>,
     list_depth: Option<usize>,
 }
 
 impl LineCarry {
-    fn new(fence: Option<usize>, list_depth: Option<usize>) -> Self {
+    fn new(fence: Option<Fence>, list_depth: Option<usize>) -> Self {
         Self { fence, list_depth }
     }
 
-    fn pair(self) -> (Option<usize>, Option<usize>) {
+    fn pair(self) -> (Option<Fence>, Option<usize>) {
         (self.fence, self.list_depth)
     }
 }
@@ -746,10 +823,11 @@ impl Layout {
         (line.start, line.end)
     }
 
-    /// The caret rectangle (its x, top y, and height) for the cursor at `offset`,
-    /// sized to the metrics of the line it lands on. The caret only ever lands on
-    /// a revealed line (the cursor's own line shows its markers), so its `offset`
-    /// never falls inside a hidden run.
+    /// The caret rectangle (its x, top y, and height) for the cursor at `offset`.
+    /// The height spans the glyph box (ascent to descent) of the line it lands on,
+    /// so the bar matches the text height rather than the taller padded line box.
+    /// The caret only ever lands on a revealed line (the cursor's own line shows
+    /// its markers), so its `offset` never falls inside a hidden run.
     pub fn caret(&self, fonts: &Fonts, rope: &Rope, offset: usize) -> (i32, i32, i32) {
         let line = self.line_for(offset);
         if let Some(t) = &line.table {
@@ -757,7 +835,11 @@ impl Layout {
         }
         let m = fonts.metrics(line.size);
         let x = self.left as f32 + line.indent as f32 + self.advance_to(fonts, rope, line, offset);
-        (x.round() as i32, line.baseline - m.ascent, m.line_height)
+        (
+            x.round() as i32,
+            line.baseline - m.ascent,
+            m.ascent + m.descent,
+        )
     }
 
     /// The byte offset nearest a click at window `(x, y)`.
@@ -786,13 +868,14 @@ impl Layout {
     }
 
     /// The drawn checkbox's rectangle in content space for a task line whose
-    /// gutter is [`Gutter::Checkbox`]: a square centered over the marker's
-    /// `[ ]`/`[x]` brackets (so toggling the reveal barely shifts it), sized to
-    /// the line's metrics and never wider than the marker it replaces (the
-    /// width-matched substitution the no-reflow invariant needs). The painter
-    /// draws the box here and [`Self::checkbox_at`] hit-tests clicks against it,
-    /// so the two always agree. `None` for any other line, including a revealed
-    /// task line, which shows its raw editable marker instead.
+    /// gutter is [`Gutter::Checkbox`]: a square sized to the line's metrics, inset
+    /// within the marker region a gap short of the text so it crowds neither the
+    /// list indent nor the words. Its size and offset come from the canonical
+    /// `[ ] ` width, not the live `[x]`/`[ ]`, so a checked and an unchecked box in
+    /// a list line up in a column (the source `x` renders wider than a space in the
+    /// proportional face). The painter draws the box here and [`Self::checkbox_at`]
+    /// hit-tests clicks against it, so the two always agree. `None` for any other
+    /// line, including a revealed task line, which shows its raw editable marker.
     pub(crate) fn checkbox_rect(
         &self,
         fonts: &Fonts,
@@ -807,13 +890,24 @@ impl Layout {
         let run = self.run_slice(line).first()?;
         let marker = rope.slice(run.start..run.end).as_cow();
         let indent = markdown::leading_indent(&marker);
-        let brackets = marker.get(indent + 2..indent + 5)?;
+        // Guard: a well-formed task marker has `[c]` here; a marker split mid-way by a
+        // very narrow wrap draws no box.
+        marker.get(indent + 2..indent + 5)?;
         let face = fonts.face(line.size, FontStyle::Regular);
+        // `pre` is the marker up to the `[`; `tail_w` is the canonical `[ ] `
+        // (brackets plus the trailing space before the text). Measuring the
+        // canonical form, not the live `[x]`/`[ ]`, keeps checked and unchecked
+        // boxes aligned in a column (source `x` renders wider than a space).
         let pre = shape::text_advance(face, marker.get(..indent + 2)?);
-        let brackets_w = shape::text_advance(face, brackets);
+        let tail_w = shape::text_advance(face, "[ ] ");
         let m = fonts.metrics(line.size);
-        let side = (m.ascent * 4 / 5).max(8);
-        let x = self.left + line.indent + (pre + (brackets_w - side as f32) / 2.0).round() as i32;
+        let side = m.ascent.max(10);
+        // The text begins at `pre + tail_w`. Right-anchor the box a gap short of it,
+        // so it sits inset from both the list indent and the words rather than
+        // crowding the text; clamp so it never runs off the marker's left.
+        let gap = (m.ascent as f32 / 3.0).max(3.0);
+        let box_left = (pre + tail_w - gap - side as f32).max(0.0);
+        let x = self.left + line.indent + box_left.round() as i32;
         // Centered on the middle of the ascent band, where the glyphs' bulk sits.
         let y = line.baseline - (m.ascent + side) / 2;
         Some(Rect {
@@ -927,12 +1021,15 @@ impl Layout {
             if sel_start >= sel_end && !newline_selected {
                 continue;
             }
-            // A table row selects row-granular: any selection touching the row
-            // highlights its whole box (in-cell partial selection is not drawn), so
-            // marking cells reads as marking rows, matching how a delete removes
-            // whole rows.
+            // A selection confined to one cell highlights just that text, like any
+            // prose. One that leaves the cell (into another column or row) selects
+            // row-granular: the whole box, so marking across cells reads as marking
+            // rows, matching how a delete removes whole rows.
             if let Some(t) = &line.table {
-                if start <= line.end && end > line.start {
+                if start <= line.end
+                    && end > line.start
+                    && !self.table_selection_rects(fonts, rope, line, start, end, &mut rects)
+                {
                     rects.push(Rect {
                         x: self.left + line.indent,
                         y: line.baseline - m.ascent,
@@ -1052,9 +1149,13 @@ impl Layout {
     ) {
         let row_x = self.left + line.indent;
         let box_top = line.baseline - m.ascent;
+        let max_lines = row_max_lines(t.height, m.line_height);
         for (col, cell) in t.columns.iter().zip(&t.cells) {
+            let n_lines = cell.lines.len().max(1);
             for (k, cl) in cell.lines.iter().enumerate() {
-                let top = box_top + TABLE_CELL_PAD_Y + k as i32 * m.line_height;
+                // The pill's glyph-box top matches the centered text baseline, so the
+                // tint sits over the code instead of above it.
+                let top = box_top + TABLE_CELL_PAD_Y + cell_line_top(k, n_lines, max_lines, m);
                 let mut pen = row_x + aligned_x(*col, cl.width);
                 for (i, run) in cl.runs.iter().enumerate() {
                     if !run.visible {
@@ -1221,14 +1322,16 @@ impl Layout {
             .iter()
             .position(|c| offset <= c.end)
             .unwrap_or(t.cells.len().saturating_sub(1));
-        let height = m.line_height;
+        let height = m.ascent + m.descent;
         let Some(cell) = t.cells.get(idx) else {
             return (row_left, box_top + TABLE_CELL_PAD_Y, height);
         };
         let (k, adv, line_w) = self.cell_offset_x(fonts, rope, line.size, t.header, cell, offset);
         let content_x = t.columns.get(idx).map_or(0, |c| aligned_x(*c, line_w));
         let x = row_left + content_x + adv.round() as i32;
-        let y = box_top + TABLE_CELL_PAD_Y + k as i32 * m.line_height;
+        let n_lines = cell.lines.len().max(1);
+        let max_lines = row_max_lines(t.height, m.line_height);
+        let y = box_top + TABLE_CELL_PAD_Y + cell_line_top(k, n_lines, max_lines, m);
         (x, y, height)
     }
 
@@ -1274,6 +1377,62 @@ impl Layout {
         (k, adv, cl.width)
     }
 
+    /// Highlight rects for a selection `[start, end)` that lies wholly inside one
+    /// cell of table row `line`: a precise per-wrapped-line rect, the way ordinary
+    /// text selects, rather than the whole row. Returns `false` when the range is
+    /// not confined to a single cell (it spans columns or rows), so the caller falls
+    /// back to a row-granular highlight. Appends to `out`.
+    fn table_selection_rects(
+        &self,
+        fonts: &Fonts,
+        rope: &Rope,
+        line: &VisualLine,
+        start: usize,
+        end: usize,
+        out: &mut Vec<Rect>,
+    ) -> bool {
+        let Some(t) = &line.table else {
+            return false;
+        };
+        let Some(idx) = t
+            .cells
+            .iter()
+            .position(|c| c.start <= start && end <= c.end)
+        else {
+            return false;
+        };
+        let cell = &t.cells[idx];
+        let m = fonts.metrics(line.size);
+        let row_left = self.left + line.indent;
+        let box_top = line.baseline - m.ascent;
+        let n_lines = cell.lines.len().max(1);
+        let max_lines = row_max_lines(t.height, m.line_height);
+        let block_pad = cell_block_pad(n_lines, max_lines, m.line_height);
+        let (k0, adv0, _) = self.cell_offset_x(fonts, rope, line.size, t.header, cell, start);
+        let (k1, adv1, _) = self.cell_offset_x(fonts, rope, line.size, t.header, cell, end);
+        let column = t.columns.get(idx).copied();
+        for k in k0..=k1 {
+            let Some(cl) = cell.lines.get(k) else { break };
+            let content_x = column.map_or(0, |c| aligned_x(c, cl.width));
+            let left = row_left + content_x + if k == k0 { adv0.round() as i32 } else { 0 };
+            let right = row_left
+                + content_x
+                + if k == k1 {
+                    adv1.round() as i32
+                } else {
+                    cl.width
+                };
+            let y = box_top + TABLE_CELL_PAD_Y + block_pad + k as i32 * m.line_height;
+            out.push(Rect {
+                x: left,
+                y,
+                w: (right - left).max(1),
+                h: m.line_height,
+            });
+        }
+        true
+    }
+
     /// The byte offset nearest content-space `(x, y)` inside table row `line`: the
     /// column under `x`, the wrapped line under `y`, then the nearest glyph in that
     /// cell line. An empty cell (or a click before its text) lands at the cell start.
@@ -1306,7 +1465,9 @@ impl Layout {
         if cell.lines.is_empty() {
             return cell.start;
         }
-        let rel_y = (y - (box_top + TABLE_CELL_PAD_Y) as f32).max(0.0);
+        let max_lines = row_max_lines(t.height, m.line_height);
+        let block_pad = cell_block_pad(cell.lines.len(), max_lines, m.line_height);
+        let rel_y = (y - (box_top + TABLE_CELL_PAD_Y + block_pad) as f32).max(0.0);
         let k = ((rel_y / m.line_height as f32) as usize).min(cell.lines.len() - 1);
         let cl = &cell.lines[k];
         let content_x = t.columns.get(col).map_or(0, |c| aligned_x(*c, cl.width));
@@ -1452,6 +1613,12 @@ struct LineClass {
     block_persists: bool,
     revealed: bool,
     code_block: bool,
+    /// The list nesting depth (0 for a top-level item or a non-list line), which
+    /// scales the list's left indent so nested items step in clearly.
+    list_depth: usize,
+    /// True for an indented plain line continuing a list item (a Shift+Enter
+    /// continuation): it takes the list's left indent but draws no bullet.
+    list_continuation: bool,
 }
 
 impl LineClass {
@@ -1493,8 +1660,11 @@ impl LineClass {
     fn seg_pad_and_wrap_reduce(&self) -> (i32, i32) {
         if self.code_block {
             (CODE_PAD_X, 2 * CODE_PAD_X)
-        } else if self.is_list() {
-            (LIST_INDENT, LIST_INDENT)
+        } else if self.is_list() || self.list_continuation {
+            // A continuation takes the same left indent as its item, so its own
+            // leading spaces then carry the text under the item's content.
+            let pad = LIST_INDENT + self.list_depth as i32 * LIST_NEST_INDENT;
+            (pad, pad)
         } else {
             (0, 0)
         }
@@ -1528,15 +1698,15 @@ fn classify_line(
     carry: &mut LineCarry,
     pool: &mut LayoutScratch,
 ) -> LineClass {
-    if let Some(open) = carry.fence {
+    if let Some(fence) = carry.fence {
         // Inside a fence: literal code, not markdown. Only a delimiter line has
         // backticks to hide, and it reveals them on the cursor's own line.
         carry.list_depth = None;
-        let delimiter = markdown::closes_code_fence(line, open);
+        let delimiter = markdown::closes_code_fence(line, fence.ticks);
         if delimiter {
             carry.fence = None;
         }
-        code_block_spans_into(line, delimiter, &mut pool.spans);
+        code_block_spans_into(line, delimiter, fence.lang, &mut pool.spans);
         LineClass {
             style: markdown::LineStyle::Body,
             size: ctx.body_size,
@@ -1544,11 +1714,14 @@ fn classify_line(
             block_persists: false,
             revealed: !delimiter || on_line,
             code_block: true,
+            list_depth: 0,
+            list_continuation: false,
         }
-    } else if let Some(open) = markdown::opens_code_fence(line) {
+    } else if let Some(ticks) = markdown::opens_code_fence(line) {
         carry.list_depth = None;
-        carry.fence = Some(open);
-        code_block_spans_into(line, true, &mut pool.spans);
+        let lang = crate::syntax::Lang::from_info(&line[ticks..]);
+        carry.fence = Some(Fence { ticks, lang });
+        code_block_spans_into(line, true, lang, &mut pool.spans);
         LineClass {
             style: markdown::LineStyle::Body,
             size: ctx.body_size,
@@ -1556,11 +1729,13 @@ fn classify_line(
             block_persists: false,
             revealed: on_line,
             code_block: true,
+            list_depth: 0,
+            list_continuation: false,
         }
     } else {
         // Ordinary markdown. Resolve list nesting across lines: an item deeper than
         // one past the previous item has no parent and renders as body.
-        let (style, marker) = resolve_list(line, &mut carry.list_depth);
+        let (style, marker, continuation) = resolve_list(line, &mut carry.list_depth);
         line_spans_into(line, marker, &mut pool.inline, &mut pool.spans);
         LineClass {
             style,
@@ -1569,6 +1744,8 @@ fn classify_line(
             block_persists: markdown::block_marker_persists(style),
             revealed: on_line,
             code_block: false,
+            list_depth: carry.list_depth.unwrap_or(0),
+            list_continuation: continuation,
         }
     }
 }
@@ -1926,7 +2103,7 @@ impl LineIndex {
         LineRec {
             height,
             reveal_extra,
-            fence_in: carry_in.fence.map_or(0, |c| c as u16),
+            fence_in: carry_in.fence.map_or(0, |f| f.packed()),
             depth_in: carry_in.list_depth.map_or(-1, |d| d as i16),
         }
     }
@@ -2202,13 +2379,13 @@ impl LineIndex {
         self.recs.get(line).map_or(0, |r| r.reveal_extra)
     }
 
-    /// The cross-line carry state entering logical line `line`: the open fence's
-    /// backtick count and the list nesting depth. Used to seed a mid-document
-    /// window and to detect re-sync during an incremental update.
-    pub fn entry_state(&self, line: usize) -> (Option<usize>, Option<usize>) {
+    /// The cross-line carry state entering logical line `line`: the open fence (its
+    /// backtick count and language) and the list nesting depth. Used to seed a
+    /// mid-document window and to detect re-sync during an incremental update.
+    fn entry_state(&self, line: usize) -> (Option<Fence>, Option<usize>) {
         match self.recs.get(line) {
             Some(rec) => (
-                (rec.fence_in != 0).then_some(rec.fence_in as usize),
+                Fence::unpack(rec.fence_in),
                 (rec.depth_in >= 0).then_some(rec.depth_in as usize),
             ),
             None => (None, None),
@@ -2254,12 +2431,16 @@ fn rect_contains(rect: &Rect, x: f32, y: f32) -> bool {
 
 /// Resolve a line's block style against the running list nesting `list_depth`
 /// (the depth of the most recent valid list item, or `None` outside a list),
-/// returning the effective style and its block-marker length. A list item nests
-/// by leading indentation ([`markdown::LIST_INDENT_SPACES`] per level); it only
-/// renders as a list item when its parent, one level shallower, is present above
-/// it, otherwise it falls back to plain body text (marker length `0`). Blank
-/// lines leave the nesting untouched; any other non-list line ends it.
-fn resolve_list(line: &str, list_depth: &mut Option<usize>) -> (markdown::LineStyle, usize) {
+/// returning the effective style, its block-marker length, and whether the line
+/// is a list continuation. A list item nests by leading indentation
+/// ([`markdown::LIST_INDENT_SPACES`] per level); it only renders as a list item
+/// when its parent, one level shallower, is present above it, otherwise it falls
+/// back to plain body text (marker length `0`). An indented plain line under an
+/// open list continues the current item (a Shift+Enter continuation): the nesting
+/// is kept and the line is flagged so the layout insets it under the item text
+/// with no bullet. Blank lines leave the nesting untouched; any other non-list
+/// line ends it.
+fn resolve_list(line: &str, list_depth: &mut Option<usize>) -> (markdown::LineStyle, usize, bool) {
     let (style, marker) = markdown::classify(line);
     match style {
         markdown::LineStyle::Bullet
@@ -2269,18 +2450,27 @@ fn resolve_list(line: &str, list_depth: &mut Option<usize>) -> (markdown::LineSt
             let allowed = list_depth.map_or(0, |d| d + 1);
             if depth <= allowed {
                 *list_depth = Some(depth);
-                (style, marker)
+                (style, marker, false)
             } else {
                 // Over-nested: no parent one level up, so render as plain text.
                 *list_depth = None;
-                (markdown::LineStyle::Body, 0)
+                (markdown::LineStyle::Body, 0, false)
             }
+        }
+        markdown::LineStyle::Body
+            if !line.trim().is_empty()
+                && list_depth.is_some()
+                && markdown::leading_indent(line) >= markdown::LIST_INDENT_SPACES =>
+        {
+            // Indented plain text under an open list: a continuation of the current
+            // item. Keep the nesting so a following sibling still nests correctly.
+            (markdown::LineStyle::Body, 0, true)
         }
         other => {
             if !line.trim().is_empty() {
                 *list_depth = None;
             }
-            (other, marker)
+            (other, marker, false)
         }
     }
 }
@@ -2321,21 +2511,29 @@ fn line_spans_into(
 /// whole-line marker run so the fence and any info string read as dimmed syntax.
 /// No inline parsing happens inside a code block. An empty line has no runs (the
 /// panel still draws). Reuses the pooled `out` buffer.
-fn code_block_spans_into(line: &str, delimiter: bool, out: &mut Vec<markdown::Span>) {
+fn code_block_spans_into(
+    line: &str,
+    delimiter: bool,
+    lang: crate::syntax::Lang,
+    out: &mut Vec<markdown::Span>,
+) {
     out.clear();
     if line.is_empty() {
         return;
     }
-    let kind = if delimiter {
-        markdown::SpanKind::Marker
+    if delimiter {
+        // The ``` fence line (with its info string) is one whole-line marker, drawn
+        // dimmed as syntax and hidden off the cursor's own line.
+        out.push(markdown::Span {
+            start: 0,
+            end: line.len(),
+            kind: markdown::SpanKind::Marker,
+        });
     } else {
-        markdown::SpanKind::Text(markdown::Emphasis::Code)
-    };
-    out.push(markdown::Span {
-        start: 0,
-        end: line.len(),
-        kind,
-    });
+        // A code line is tokenized into colored spans; an unknown language yields
+        // a single plain span, the same flat look as before highlighting.
+        crate::syntax::lex_into(lang, line, out);
+    }
 }
 
 /// Clip line-relative `spans` to the visual segment `[seg_start, seg_end)`,
@@ -2584,6 +2782,29 @@ pub(crate) fn aligned_x(col: Column, line_w: i32) -> i32 {
     }
 }
 
+/// Vertical offset that centers a cell's `n_lines`-line block within a row whose
+/// tallest cell has `max_lines` lines. Zero when the cell already fills the row.
+fn cell_block_pad(n_lines: usize, max_lines: usize, line_height: i32) -> i32 {
+    max_lines.saturating_sub(n_lines) as i32 * line_height / 2
+}
+
+/// The vertical offset from a table row's content top (`box_top + TABLE_CELL_PAD_Y`)
+/// to the top of cell line `k`'s glyph box. It centers the cell's block within the
+/// row (a short cell sits in the middle of a taller row), then centers each line's
+/// glyphs within their line-height slot, so the leading slack splits above and below
+/// instead of all falling below and leaving the text riding high. Shared by the
+/// painter, the caret, and the click hit-test so the three stay in agreement.
+pub(crate) fn cell_line_top(k: usize, n_lines: usize, max_lines: usize, m: Metrics) -> i32 {
+    let slot_pad = (m.line_height - (m.ascent + m.descent)) / 2;
+    cell_block_pad(n_lines, max_lines, m.line_height) + k as i32 * m.line_height + slot_pad
+}
+
+/// The count of the tallest cell's wrapped lines in a laid-out row, recovered from
+/// its box height (`max_lines * line_height + 2 * pad`).
+pub(crate) fn row_max_lines(height: i32, line_height: i32) -> usize {
+    (((height - 2 * TABLE_CELL_PAD_Y) / line_height).max(1)) as usize
+}
+
 /// Fit natural column widths to `avail` pixels: keep them if they fit, else shrink
 /// each in proportion to its share, clamped to a floor so none vanishes.
 fn fit_columns(natural: &[i32], avail: i32) -> Vec<i32> {
@@ -2775,6 +2996,8 @@ fn build_cell(
         block_persists: false,
         revealed,
         code_block: false,
+        list_depth: 0,
+        list_continuation: false,
     };
     let mut lines = Vec::new();
     for (ps, pe) in br_pieces(cell_text) {
@@ -3918,13 +4141,40 @@ mod tests {
             Gutter::Bullet,
             "a nested item with a parent renders as a bullet"
         );
-        assert_eq!(child.indent, LIST_INDENT, "and carries the list indent");
+        assert_eq!(
+            child.indent,
+            LIST_INDENT + LIST_NEST_INDENT,
+            "and carries the list indent stepped in by one nesting level"
+        );
         let marker = l.run_slice(child).first().expect("a marker run");
         assert!(matches!(marker.kind, markdown::SpanKind::Marker));
         assert_eq!(
             marker.end - marker.start,
             4,
             "the marker spans the indentation and the dash (`  - `)"
+        );
+    }
+
+    #[test]
+    fn a_continuation_line_hangs_under_its_list_item_with_no_bullet() {
+        let f = fonts();
+        // An indented plain line under a bullet is a Shift+Enter continuation: it
+        // takes the item's list indent but draws no bullet of its own.
+        let r = rope("- item\n  cont");
+        let l = layout(&f, &r);
+        let cont = &l.lines()[1];
+        assert_eq!(cont.gutter, Gutter::None, "a continuation draws no bullet");
+        assert_eq!(
+            cont.indent, LIST_INDENT,
+            "but carries the item's list indent"
+        );
+        // A following sibling still nests, so the continuation kept the list open.
+        let r2 = rope("- a\n  cont\n- b");
+        let l2 = layout(&f, &r2);
+        assert_eq!(
+            l2.lines()[2].gutter,
+            Gutter::Bullet,
+            "the item after a continuation still renders as a list item"
         );
     }
 
@@ -3963,7 +4213,11 @@ mod tests {
             Gutter::Bullet,
             "the third item still renders as a list item"
         );
-        assert_eq!(third.indent, LIST_INDENT, "and carries the list indent");
+        assert_eq!(
+            third.indent,
+            LIST_INDENT + LIST_NEST_INDENT,
+            "and carries the list indent stepped in by one nesting level"
+        );
         let marker = l.run_slice(third).first().expect("a marker run");
         assert_eq!(
             marker.end - marker.start,
@@ -4177,7 +4431,7 @@ mod tests {
     }
 
     #[test]
-    fn checkbox_rect_sits_over_the_brackets_within_the_marker() {
+    fn checkbox_rect_sits_inset_a_gap_short_of_the_text() {
         let f = fonts();
         // A nested task under a parent, so its indentation offsets the box.
         let r = rope("- a\n  - [ ] sub\nx");
@@ -4188,15 +4442,16 @@ mod tests {
             .checkbox_rect(&f, &r, line)
             .expect("a non-revealed task line has a box");
         let face = f.face(BODY, FontStyle::Regular);
-        let pre = shape::text_advance(face, "  - ");
-        let marker = shape::text_advance(face, "  - [ ] ");
+        // The text begins after the whole `  - [ ] ` marker; the box sits a gap
+        // short of it and stays within the item's content.
+        let text_x = LEFT as f32 + line.indent as f32 + shape::text_advance(face, "  - [ ] ");
         assert!(
-            rect.x as f32 >= LEFT as f32 + line.indent as f32 + pre - 1.0,
-            "the box starts at or after the brackets (past the indent and dash)"
+            rect.x as f32 >= LEFT as f32 + line.indent as f32,
+            "the box stays within the item's content, not off the left"
         );
         assert!(
-            (rect.x + rect.w) as f32 <= LEFT as f32 + line.indent as f32 + marker + 1.0,
-            "and ends within the marker's advance (width-matched substitution)"
+            (rect.x + rect.w) as f32 <= text_x - 2.0,
+            "the box ends a gap short of the text"
         );
         assert!(rect.w >= 8 && rect.h == rect.w, "a sensible square");
         let m = f.metrics(BODY);
@@ -4272,15 +4527,24 @@ mod tests {
             vec![true, true, true, false],
             "the fence lines and the code between are a block; the body is not"
         );
-        // The ``` fences read as markers; the code line is a code run.
-        assert_eq!(
-            first_kinds(&l),
-            vec![
-                Some(markdown::SpanKind::Marker),                         // ```rust
-                Some(markdown::SpanKind::Text(markdown::Emphasis::Code)), // fn x() {}
-                Some(markdown::SpanKind::Marker),                         // ```
-                Some(markdown::SpanKind::Text(markdown::Emphasis::Regular)), // body
-            ]
+        // The ``` fences read as markers; the code line tokenizes (its first token
+        // is the `fn` keyword); the body is prose.
+        let kinds = first_kinds(&l);
+        assert!(
+            matches!(kinds[0], Some(markdown::SpanKind::Marker)),
+            "```rust"
+        );
+        assert!(
+            matches!(kinds[1], Some(markdown::SpanKind::Code(_))),
+            "fn x() {{}} is a code token"
+        );
+        assert!(matches!(kinds[2], Some(markdown::SpanKind::Marker)), "```");
+        assert!(
+            matches!(
+                kinds[3],
+                Some(markdown::SpanKind::Text(markdown::Emphasis::Regular))
+            ),
+            "body is prose"
         );
     }
 
@@ -4297,8 +4561,32 @@ mod tests {
         assert_eq!(l.run_slice(inner).len(), 1);
         assert_eq!(
             l.run_slice(inner)[0].kind,
-            markdown::SpanKind::Text(markdown::Emphasis::Code),
-            "the '#' is code, not a heading marker"
+            markdown::SpanKind::Code(markdown::CodeToken::Plain),
+            "the '#' is plain code (no language), not a heading marker"
+        );
+    }
+
+    #[test]
+    fn a_rust_code_line_tokenizes_into_colored_runs() {
+        let f = fonts();
+        let r = rope("```rust\nlet x = 3;\n```");
+        let l = layout(&f, &r);
+        let code = &l.lines()[1]; // "let x = 3;"
+        let runs = l.run_slice(code);
+        assert!(runs.len() > 1, "the code line splits into token runs");
+        assert!(
+            runs.iter().any(|run| matches!(
+                run.kind,
+                markdown::SpanKind::Code(markdown::CodeToken::Keyword)
+            )),
+            "the `let` keyword is highlighted"
+        );
+        assert!(
+            runs.iter().any(|run| matches!(
+                run.kind,
+                markdown::SpanKind::Code(markdown::CodeToken::Number)
+            )),
+            "the `3` number is highlighted"
         );
     }
 
@@ -4469,6 +4757,27 @@ mod tests {
         assert!(
             rects[0].x > LEFT,
             "positioned inside the cell, past the margin"
+        );
+    }
+
+    #[test]
+    fn a_table_cell_code_pill_lines_up_with_its_centered_text() {
+        let f = fonts();
+        // The second cell has two lines (a <br> b), so the first (code) cell is
+        // block-centered in a taller row. The inline-code pill must drop with the
+        // centered text, not stay pinned to the row's top.
+        let src = "| `x` | a<br>b |\n| - | - |\n";
+        let r = rope(src);
+        let end = src.len();
+        // Cursor outside the table, so the cell is cooked and the pill is drawn.
+        let l = Layout::build(&f, &r, LEFT, TOP, 1_000_000, BODY, (end, end));
+        let pills = l.code_rects(&f, &r);
+        assert_eq!(pills.len(), 1, "one pill for the `x` code span");
+        let x_off = src.find('x').unwrap();
+        let (_, caret_y, _) = l.caret(&f, &r, x_off);
+        assert_eq!(
+            pills[0].y, caret_y,
+            "the code pill sits over the code text, not above it"
         );
     }
 
@@ -5143,5 +5452,27 @@ mod tests {
         let (_, t) = table_rows(&l)[1]; // the body row
         assert_eq!(rects[0].w, t.width, "spans the table width");
         assert_eq!(rects[0].h, t.height, "spans the row height");
+    }
+
+    #[test]
+    fn a_selection_inside_one_table_cell_is_precise_not_the_whole_row() {
+        // Text selected inside a single cell highlights just that text, like prose;
+        // the row-granular box is reserved for a selection that leaves the cell.
+        let f = fonts();
+        let r = rope("| hello | b |\n| - | - |\n| c | d |\n");
+        let l = layout(&f, &r);
+        let (_, t) = table_rows(&l)[0]; // the header row
+        let cell0 = &t.cells[0];
+        let start = cell0.start;
+        let end = (cell0.start + 3).min(cell0.end); // a few chars within "hello"
+        assert!(end > start, "the cell has content to select");
+        let rects = l.selection_rects(&f, &r, start, end);
+        assert_eq!(rects.len(), 1, "one precise rect inside the cell");
+        assert!(rects[0].w > 0, "with real width");
+        assert!(rects[0].w < t.width, "narrower than the whole row");
+        assert!(
+            rects[0].h < t.height,
+            "a text-line height, not the whole box"
+        );
     }
 }

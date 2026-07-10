@@ -536,13 +536,18 @@ impl Batcher<'_> {
             return packed;
         }
         face.record_glyph_miss();
-        let g = face.rasterize(ch);
+        // Rasterize from the fallback face when the keyed face lacks the glyph, so a
+        // scalar the prose font has no glyph for (an arrow, a maths sign) draws
+        // instead of a tofu box. The pen still advances by the keyed face's own
+        // advance, which is what `shape::text_advance` measures, so a fallback glyph
+        // fills the same slot the .notdef box would have and layout never drifts.
+        let g = self.fonts.glyph_face(face_key, ch).rasterize(ch);
         let atlas = &mut self.cache.glyphs;
         let packed = PackedGlyph {
             slot: atlas.pack(g.width as u32, g.rows as u32, &g.coverage),
             left: g.left,
             top: g.top,
-            advance: g.advance,
+            advance: face.advance(ch),
         };
         self.cache.scalar_slots.insert((face_key, ch), packed);
         packed

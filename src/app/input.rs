@@ -89,6 +89,9 @@ fn apply_editor_action(
             ed.text.insert_str("<br>");
             true
         }
+        // On a list item, Shift+Enter adds a continuation line indented under the
+        // item's text (no bullet), so a wrapped thought stays part of the item.
+        KeyAction::Enter if extend && ed.text.cursor_on_list_item() => ed.text.list_continuation(),
         KeyAction::Enter => ed.text.enter(),
         // In a table, Tab moves to the next cell and Shift+Tab to the previous. On a
         // list item, Tab nests it one level deeper and Shift+Tab one shallower.

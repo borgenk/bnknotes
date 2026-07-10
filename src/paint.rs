@@ -1,7 +1,8 @@
 use crate::find::{self, FindState};
 use crate::layout::{
-    aligned_x, face_key, image_button_rect, inline_code_pad, CellLine, Gutter, Layout, TableRow,
-    TABLE_BORDER, TABLE_CELL_PAD_Y,
+    aligned_x, backtick_reveal_shift, cell_line_top, face_key, image_button_rect, inline_code_pad,
+    is_code_marker, row_max_lines, CellLine, Gutter, Layout, TableRow, TABLE_BORDER,
+    TABLE_CELL_PAD_Y,
 };
 use crate::markdown;
 use crate::pane::TreePane;
@@ -12,8 +13,9 @@ use crate::platform::scroll;
 use crate::platform::shape;
 use crate::render::display::{self, DisplayList, DrawCmd};
 use crate::theme::{
-    BACKGROUND, BULLET, CARET_COLOR, CARET_WIDTH, CODE_BG, CODE_COLOR, CODE_PAD_X, CODE_PAD_Y,
-    CODE_RADIUS, FIND_BG, FIND_ERROR_COLOR, FIND_MATCH_COLOR, FIND_TICK_COLOR, FONT_SIZE,
+    BACKGROUND, BULLET, CARET_COLOR, CARET_WIDTH, CODE_BG, CODE_COLOR, CODE_COMMENT_COLOR,
+    CODE_KEYWORD_COLOR, CODE_MARKER_COLOR, CODE_NUMBER_COLOR, CODE_PAD_X, CODE_PAD_Y, CODE_RADIUS,
+    CODE_STRING_COLOR, FIND_BG, FIND_ERROR_COLOR, FIND_MATCH_COLOR, FIND_TICK_COLOR, FONT_SIZE,
     FOREGROUND, HEADING_COLORS, IMAGE_BORDER_COLOR, IMAGE_BORDER_THICKNESS, IMAGE_BUTTON_BG,
     IMAGE_BUTTON_RADIUS, LINK_COLOR, MARGIN, MARKER_COLOR, QUOTE_BAR_COLOR, QUOTE_BAR_WIDTH,
     RULE_COLOR, RULE_THICKNESS, SELECTION_COLOR, SPLITTER_COLOR, TABLE_BORDER_COLOR,
@@ -94,6 +96,18 @@ fn text_cmd(
         face,
         color,
         text,
+    }
+}
+
+/// The color for a code-block token's class (see [`crate::syntax`]); plain code
+/// keeps the body [`CODE_COLOR`].
+fn code_token_color(token: markdown::CodeToken) -> u32 {
+    match token {
+        markdown::CodeToken::Plain => CODE_COLOR,
+        markdown::CodeToken::Keyword => CODE_KEYWORD_COLOR,
+        markdown::CodeToken::Str => CODE_STRING_COLOR,
+        markdown::CodeToken::Comment => CODE_COMMENT_COLOR,
+        markdown::CodeToken::Number => CODE_NUMBER_COLOR,
     }
 }
 
@@ -512,7 +526,8 @@ impl<'a> Painter<'a> {
             // item (wrapped continuations included), so done items scan as done.
             let done = line.task == Some(true);
             let mut pen = left + line.indent;
-            for (i, run) in layout.run_slice(line).iter().enumerate() {
+            let runs = layout.run_slice(line);
+            for (i, run) in runs.iter().enumerate() {
                 if !run.visible {
                     continue;
                 }
@@ -573,7 +588,10 @@ impl<'a> Painter<'a> {
                     }
                 }
                 let color = match run.kind {
+                    markdown::SpanKind::Marker if is_code_marker(rope, run) => CODE_MARKER_COLOR,
                     markdown::SpanKind::Marker => MARKER_COLOR,
+                    // A syntax-highlighted code-block token takes its class color.
+                    markdown::SpanKind::Code(tok) => code_token_color(tok),
                     // Every text run of a done task dims to the marker color, so
                     // the whole item (its code and links included) reads muted.
                     markdown::SpanKind::Text(_) if done => MARKER_COLOR,
@@ -596,9 +614,13 @@ impl<'a> Painter<'a> {
                 // the panel (drawn from the same geometry) frames the code without
                 // painting over the spaces around it.
                 let pad = inline_code_pad(run.kind, line.code_block);
-                let run_x = pen + pad;
+                // A revealed backtick delimiter is nudged in against the code so it
+                // hugs the glyphs inside the pill; the nudge is draw-only, so the pen
+                // still advances by the run's true width (subtract the shift back out).
+                let shift = backtick_reveal_shift(rope, runs, i);
+                let run_x = pen + pad + shift;
                 let run_end = self.push_text(fk, run_x, baseline, color, slice, m);
-                pen = run_end + pad;
+                pen = run_end + pad - shift;
                 // Inline decorations over the glyphs, each spanning the run's drawn
                 // width: a link is underlined and struck text gets a line through its
                 // middle, both in the run's own color. Thickness scales with the
@@ -680,9 +702,12 @@ impl<'a> Painter<'a> {
             },
             color: TABLE_BORDER_COLOR,
         });
+        let max_lines = row_max_lines(t.height, m.line_height);
         for (col, cell) in t.columns.iter().zip(&t.cells) {
+            let n_lines = cell.lines.len().max(1);
             for (k, cl) in cell.lines.iter().enumerate() {
-                let baseline = box_top + TABLE_CELL_PAD_Y + k as i32 * m.line_height + m.ascent;
+                let baseline =
+                    box_top + TABLE_CELL_PAD_Y + cell_line_top(k, n_lines, max_lines, m) + m.ascent;
                 // Align the wrapped line within the column's content width.
                 let tx = aligned_x(*col, cl.width);
                 self.push_cell_line(row_x + tx, baseline, size, t.header, cl, m);
@@ -703,22 +728,26 @@ impl<'a> Painter<'a> {
         m: Metrics,
     ) {
         let mut pen = x;
-        for run in &cl.runs {
+        for (i, run) in cl.runs.iter().enumerate() {
             if !run.visible {
                 continue;
             }
             let fk = face_key(size, run.kind, header);
             let color = match run.kind {
+                markdown::SpanKind::Marker if is_code_marker(self.rope, run) => CODE_MARKER_COLOR,
                 markdown::SpanKind::Marker => MARKER_COLOR,
+                markdown::SpanKind::Code(tok) => code_token_color(tok),
                 markdown::SpanKind::Text(markdown::Emphasis::Code) => CODE_COLOR,
                 markdown::SpanKind::Text(markdown::Emphasis::Link) => LINK_COLOR,
                 markdown::SpanKind::Text(_) => FOREGROUND,
             };
             // An inline code run's glyphs sit its pill pad in from the pen, and the
             // pen clears the pad after them, so the tint panel frames the code without
-            // covering the text around it, the same as the body loop.
+            // covering the text around it, the same as the body loop. A revealed
+            // backtick is nudged in against the code (draw-only, advance unchanged).
             let pad = inline_code_pad(run.kind, false);
-            let run_x = pen + pad;
+            let shift = backtick_reveal_shift(self.rope, &cl.runs, i);
+            let run_x = pen + pad + shift;
             let run_end = self.push_text(
                 fk,
                 run_x,
@@ -727,7 +756,7 @@ impl<'a> Painter<'a> {
                 self.rope.byte_slice(run.start..run.end),
                 m,
             );
-            pen = run_end + pad;
+            pen = run_end + pad - shift;
             let deco = match run.kind {
                 markdown::SpanKind::Text(markdown::Emphasis::Link) => {
                     Some(baseline + m.descent / 3)
@@ -1102,35 +1131,44 @@ fn push_checkbox(list: &mut DisplayList, rect: Rect, checked: bool) {
     }
 }
 
-/// Append a check mark inside the checked box `b`: a small tick built from
-/// overlapping square fills stepping along its two arms (a short down-stroke
-/// meeting a longer up-stroke), in the background color over the accent fill.
+/// Append a check mark inside the checked box `b`: a short arm down to a low vertex
+/// then a longer arm up to the right, in the background color over the accent fill.
+/// The three points are fractions of the box so the tick sits centered. Each arm is
+/// drawn as overlapping round dots (anti-aliased [`DrawCmd::RoundRect`] circles),
+/// so its diagonal edges are smooth rather than the staircase a square fill leaves.
 fn push_check_mark(list: &mut DisplayList, b: Rect) {
-    let u = (b.w / 6).max(1);
-    // The arms meet low and left of center, like a hand-drawn tick.
-    let (mx, my) = (b.x + b.w * 2 / 5, b.y + b.h * 13 / 20);
-    // Steps up-left (the short arm), the meeting point, then up-right (the
-    // long arm); cells one pixel larger than the step so the diagonal connects.
-    let cells = [
-        (mx - u, my - u),
-        (mx, my),
-        (mx + u, my - u),
-        (mx + 2 * u, my - 2 * u),
-        (mx + 3 * u, my - 3 * u),
-    ];
-    for (x, y) in cells {
-        // Clip to the box so the tip cell, which the integer step can carry a
-        // pixel past the right edge, never leaves a stray fleck in the gutter.
-        let x1 = (x + u + 1).min(b.x + b.w);
-        let y1 = (y + u + 1).min(b.y + b.h);
-        list.push(DrawCmd::Fill {
+    let t = (b.w as f32 / 4.5).round().max(2.0) as i32;
+    let bw = b.w as f32;
+    let bh = b.h as f32;
+    let p = |fx: f32, fy: f32| (b.x as f32 + bw * fx, b.y as f32 + bh * fy);
+    let left = p(0.24, 0.52);
+    let vertex = p(0.46, 0.72);
+    let right = p(0.80, 0.28);
+    stroke_check_arm(list, left, vertex, t);
+    stroke_check_arm(list, vertex, right, t);
+}
+
+/// Draw a thickness-`t` stroke from `a` to `b` as a run of overlapping round dots
+/// (radius `t/2`), stepped about a pixel apart so the union reads as one smooth,
+/// anti-aliased line. Shared by the check mark's two arms.
+fn stroke_check_arm(list: &mut DisplayList, a: (f32, f32), b: (f32, f32), t: i32) {
+    let (dx, dy) = (b.0 - a.0, b.1 - a.1);
+    let steps = dx.hypot(dy).ceil().max(1.0) as i32;
+    let radius = (t / 2).max(1);
+    for i in 0..=steps {
+        let f = i as f32 / steps as f32;
+        let cx = (a.0 + dx * f).round() as i32;
+        let cy = (a.1 + dy * f).round() as i32;
+        list.push(DrawCmd::RoundRect {
             rect: Rect {
-                x,
-                y,
-                w: (x1 - x).max(0),
-                h: (y1 - y).max(0),
+                x: cx - t / 2,
+                y: cy - t / 2,
+                w: t,
+                h: t,
             },
             color: BACKGROUND,
+            radius,
+            corners: display::RoundedCorners::Both,
         });
     }
 }
@@ -1253,26 +1291,35 @@ mod tests {
                 .count()
         };
         assert_eq!(round(MARKER_COLOR), 1, "the unchecked shell");
-        assert_eq!(round(BACKGROUND), 1, "its hollowing inset");
         assert_eq!(round(LINK_COLOR), 1, "the checked fill");
-        // The check mark: small background-color cells inside the accent box.
-        let accent = list.iter().find_map(|c| match c {
-            DrawCmd::RoundRect { rect, color, .. } if *color == LINK_COLOR => Some(*rect),
-            _ => None,
-        });
-        let accent = accent.expect("the checked box");
-        let cells = list
+        let accent = list
+            .iter()
+            .find_map(|c| match c {
+                DrawCmd::RoundRect { rect, color, .. } if *color == LINK_COLOR => Some(*rect),
+                _ => None,
+            })
+            .expect("the checked box");
+        let inside = |rect: &Rect| {
+            rect.x >= accent.x
+                && rect.x + rect.w <= accent.x + accent.w
+                && rect.y >= accent.y
+                && rect.y + rect.h <= accent.y + accent.h
+        };
+        // The check mark: overlapping background-color round dots inside the box.
+        let dots = list
             .iter()
             .filter(|c| {
-                matches!(c, DrawCmd::Fill { rect, color }
-                    if *color == BACKGROUND
-                        && rect.x >= accent.x
-                        && rect.x + rect.w <= accent.x + accent.w
-                        && rect.y >= accent.y
-                        && rect.y + rect.h <= accent.y + accent.h)
+                matches!(c, DrawCmd::RoundRect { rect, color, .. } if *color == BACKGROUND && inside(rect))
             })
             .count();
-        assert!(cells >= 5, "a stair of check cells, got {cells}");
+        assert!(dots >= 5, "a stroke of check dots, got {dots}");
+        // The unchecked box is hollowed by a background inset (outside the checked box).
+        assert!(
+            list.iter().any(|c| {
+                matches!(c, DrawCmd::RoundRect { rect, color, .. } if *color == BACKGROUND && !inside(rect))
+            }),
+            "the unchecked shell is hollowed by a background inset"
+        );
         // The raw markers are substituted, not drawn: no bracket glyphs.
         let texts: Vec<&str> = list
             .iter()
@@ -1482,7 +1529,7 @@ mod tests {
             list.iter()
                 .filter(|c| {
                     matches!(c, DrawCmd::Text { text, color, .. }
-                    if text.contains('`') && *color == MARKER_COLOR)
+                    if text.contains('`') && *color == CODE_MARKER_COLOR)
                 })
                 .count()
         };
@@ -1502,7 +1549,7 @@ mod tests {
             "two inline-code pills, one per span"
         );
 
-        // Cursor in the body cell: the backticks reveal as MARKER_COLOR text.
+        // Cursor in the body cell: the backticks reveal as CODE_MARKER_COLOR text.
         let revealed = Layout::build(&fonts, &rope, MARGIN, MARGIN, wrap, FONT_SIZE, (body, body));
         let revealed_list = build_display_list(&fonts, &revealed, &rope, &paint_params(w, h));
         assert!(

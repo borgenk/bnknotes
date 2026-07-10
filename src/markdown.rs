@@ -360,12 +360,28 @@ pub enum Emphasis {
     Strikethrough,
 }
 
-/// What one inline span is: text to render with an [`Emphasis`], or a delimiter
-/// marker (a code span's backticks) that live-preview hides off the active line.
+/// What one inline span is: text to render with an [`Emphasis`], a delimiter
+/// marker (a code span's backticks) that live-preview hides off the active line,
+/// or a syntax-highlighted token inside a fenced code block.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum SpanKind {
     Text(Emphasis),
     Marker,
+    /// A token inside a fenced code block, colored by its [`CodeToken`] class and
+    /// drawn in the code face (see [`crate::syntax`]).
+    Code(CodeToken),
+}
+
+/// The lexical class of a code-block token, mapped to a color by the painter. A
+/// language the lexer does not know yields a single [`CodeToken::Plain`] span, so
+/// the block still reads as flat code in the body foreground.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum CodeToken {
+    Plain,
+    Keyword,
+    Str,
+    Comment,
+    Number,
 }
 
 /// One inline span: a byte range within the scanned content, and what it is.

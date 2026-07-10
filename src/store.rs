@@ -10,7 +10,7 @@
 //! Format (little-endian, no padding):
 //! ```text
 //!   magic          4 bytes "BNKN"
-//!   version        u8 (1)
+//!   version        u8 (2)
 //!   window width   u32
 //!   window height  u32
 //!   tree_width     u32   (sidebar column width, px)
@@ -20,7 +20,8 @@
 //!   focus          u8    (0 = tree, 1 = pane A, 2 = pane B)
 //!   tree_root      opt string (absolute path, u8 tag + u16 len + utf-8)
 //!   expanded count u32; per: u16 len + utf-8 path
-//!   per pane (2):  opt string path, u64 cursor byte offset, i32 scroll_y
+//!   per pane (2):  tab count u32; per tab: opt string path, u64 cursor byte
+//!                  offset, i32 scroll_y; then active tab index u32
 //! ```
 //! A corrupt or wrong-version file is not fatal: losing the last layout must
 //! never stop the editor opening, so [`load`] logs and falls back to
@@ -32,14 +33,22 @@ use crate::platform::error::{Error, Result};
 
 const FILENAME: &str = "state.bin";
 const MAGIC: &[u8; 4] = b"BNKN";
-const VERSION: u8 = 1;
+const VERSION: u8 = 2;
 
-/// A content pane's remembered file and where the caret and viewport sat in it.
+/// One open tab: its file and where the caret and viewport sat in it.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct PaneSession {
     pub path: Option<PathBuf>,
     pub cursor: u64,
     pub scroll_y: i32,
+}
+
+/// A content pane's remembered stack of open tabs and which one was active. An
+/// empty tab list is a never-opened pane, restored as one blank tab.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct PaneGroupSession {
+    pub tabs: Vec<PaneSession>,
+    pub active: u32,
 }
 
 /// Which region last held keyboard focus, so it is restored on reopen.
@@ -81,7 +90,7 @@ pub struct Session {
     pub focus: Focus,
     pub tree_root: Option<PathBuf>,
     pub expanded: Vec<PathBuf>,
-    pub panes: [PaneSession; 2],
+    pub panes: [PaneGroupSession; 2],
 }
 
 /// First-run defaults: sidebar and both content panes shown, an even split, no
@@ -98,7 +107,7 @@ impl Default for Session {
             focus: Focus::PaneA,
             tree_root: None,
             expanded: Vec::new(),
-            panes: [PaneSession::default(), PaneSession::default()],
+            panes: [PaneGroupSession::default(), PaneGroupSession::default()],
         }
     }
 }
@@ -195,9 +204,15 @@ fn encode(s: &Session) -> Result<Vec<u8>> {
         write_path(&mut out, dir)?;
     }
     for pane in &s.panes {
-        write_opt_path(&mut out, pane.path.as_deref())?;
-        out.extend_from_slice(&pane.cursor.to_le_bytes());
-        out.extend_from_slice(&pane.scroll_y.to_le_bytes());
+        let count =
+            u32::try_from(pane.tabs.len()).map_err(|_| Error::msg("too many tabs to persist"))?;
+        out.extend_from_slice(&count.to_le_bytes());
+        for tab in &pane.tabs {
+            write_opt_path(&mut out, tab.path.as_deref())?;
+            out.extend_from_slice(&tab.cursor.to_le_bytes());
+            out.extend_from_slice(&tab.scroll_y.to_le_bytes());
+        }
+        out.extend_from_slice(&pane.active.to_le_bytes());
     }
     Ok(out)
 }
@@ -226,7 +241,7 @@ fn decode(data: &[u8]) -> Result<Session> {
     for _ in 0..expanded_count {
         expanded.push(r.path()?);
     }
-    let panes = [read_pane(&mut r)?, read_pane(&mut r)?];
+    let panes = [read_pane_group(&mut r)?, read_pane_group(&mut r)?];
     r.expect_end()?;
     Ok(Session {
         window,
@@ -239,6 +254,16 @@ fn decode(data: &[u8]) -> Result<Session> {
         expanded,
         panes,
     })
+}
+
+fn read_pane_group(r: &mut Reader) -> Result<PaneGroupSession> {
+    let count = r.u32()? as usize;
+    let mut tabs = Vec::with_capacity(count.min(4096));
+    for _ in 0..count {
+        tabs.push(read_pane(r)?);
+    }
+    let active = r.u32()?;
+    Ok(PaneGroupSession { tabs, active })
 }
 
 fn read_pane(r: &mut Reader) -> Result<PaneSession> {
@@ -376,15 +401,28 @@ mod tests {
                 PathBuf::from("/home/user/notes/journal"),
             ],
             panes: [
-                PaneSession {
-                    path: Some(PathBuf::from("/home/user/notes/todo.md")),
-                    cursor: 42,
-                    scroll_y: 128,
+                PaneGroupSession {
+                    tabs: vec![
+                        PaneSession {
+                            path: Some(PathBuf::from("/home/user/notes/todo.md")),
+                            cursor: 42,
+                            scroll_y: 128,
+                        },
+                        PaneSession {
+                            path: Some(PathBuf::from("/home/user/notes/journal/day.md")),
+                            cursor: 7,
+                            scroll_y: 0,
+                        },
+                    ],
+                    active: 1,
                 },
-                PaneSession {
-                    path: None,
-                    cursor: 0,
-                    scroll_y: -5,
+                PaneGroupSession {
+                    tabs: vec![PaneSession {
+                        path: None,
+                        cursor: 0,
+                        scroll_y: -5,
+                    }],
+                    active: 0,
                 },
             ],
         }
@@ -442,17 +480,31 @@ mod tests {
         let s = Session {
             tree_root: Some(PathBuf::from("/home/user/notità/日本語")),
             panes: [
-                PaneSession {
-                    path: Some(PathBuf::from("/home/user/café.md")),
-                    ..Default::default()
+                PaneGroupSession {
+                    tabs: vec![PaneSession {
+                        path: Some(PathBuf::from("/home/user/café.md")),
+                        ..Default::default()
+                    }],
+                    active: 0,
                 },
-                PaneSession::default(),
+                PaneGroupSession::default(),
             ],
             ..Session::default()
         };
         let loaded = decode(&encode(&s).expect("encode")).expect("decode");
         assert_eq!(loaded.tree_root, s.tree_root);
-        assert_eq!(loaded.panes[0].path, s.panes[0].path);
+        assert_eq!(loaded.panes[0].tabs[0].path, s.panes[0].tabs[0].path);
+    }
+
+    #[test]
+    fn multi_tab_pane_round_trips() {
+        // A pane with several tabs and a non-zero active index survives the codec.
+        let bytes = encode(&sample()).expect("encode");
+        let loaded = decode(&bytes).expect("decode");
+        assert_eq!(loaded.panes[0].tabs.len(), 2);
+        assert_eq!(loaded.panes[0].active, 1);
+        assert_eq!(loaded.panes[1].tabs.len(), 1);
+        assert_eq!(loaded, sample());
     }
 
     #[test]

@@ -33,8 +33,11 @@ use self::present::GpuPresentation;
 use crate::config::Config;
 use crate::file;
 use crate::markdown;
-use crate::paint::{build_display_list, build_find_paint, push_splitter, push_tree, PaintParams};
-use crate::pane::{restore_editor, Columns, EditorPane, Focus, PaneLayout, TreePane};
+use crate::paint::{
+    build_display_list, build_find_paint, push_splitter, push_top_bar, push_tree, top_bar_height,
+    PaintParams, TabStrip,
+};
+use crate::pane::{restore_group, Columns, Focus, PaneGroup, PaneLayout, TreePane};
 use crate::platform::conn::{Connection, Fill};
 use crate::platform::error::{Error, Result};
 use crate::platform::freetype::{FontConfig, Fonts};
@@ -173,15 +176,19 @@ struct State {
     glyph_gamma: f32,
     xkb: Xkb,
     /// The two content panes (editor A and B) and the file-tree sidebar, laid
-    /// out as adjustable full-height columns. `focus` selects which region takes
-    /// keyboard input; a click moves focus (and, on a splitter, starts a drag).
-    editors: [EditorPane; 2],
+    /// out as adjustable columns below the top bar. Each pane is a stack of open
+    /// tabs with one active; `focus` selects which region takes keyboard input; a
+    /// click moves focus (and, on a splitter, starts a drag).
+    editors: [PaneGroup; 2],
     tree: TreePane,
     panes: PaneLayout,
     focus: Focus,
     /// The editor last given focus, so a file opened from the tree (which takes
     /// focus itself) lands in the content pane the user was last editing.
     last_editor: usize,
+    /// The tab the pointer is over (pane, tab index), for the tab-strip hover
+    /// highlight; `None` when the pointer is off every strip.
+    hovered_tab: Option<(usize, usize)>,
     /// While a splitter is dragged, which one: 0 = tree|A edge, 1 = A|B edge.
     drag_splitter: Option<usize>,
     /// The toplevel title last sent, so it is only re-set when it changes.
@@ -355,13 +362,20 @@ impl State {
         let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
         let (root, cli_file) = resolve_root(path.as_deref(), session.tree_root.as_deref(), &cwd);
 
-        // Editor A: the file argument wins; otherwise restore the session's
-        // pane A. Editor B always restores from the session (empty if none).
+        // Editor A: a file argument opens as a single tab; otherwise restore the
+        // session's pane A tabs. Editor B always restores from the session (one
+        // blank tab if it had none).
         let editor_a = match &cli_file {
-            Some(p) => restore_editor(Some(p), &store::PaneSession::default()),
-            None => restore_editor(session.panes[0].path.as_deref(), &session.panes[0]),
+            Some(p) => restore_group(
+                &[store::PaneSession {
+                    path: Some(p.to_path_buf()),
+                    ..Default::default()
+                }],
+                0,
+            ),
+            None => restore_group(&session.panes[0].tabs, session.panes[0].active as usize),
         };
-        let editor_b = restore_editor(session.panes[1].path.as_deref(), &session.panes[1]);
+        let editor_b = restore_group(&session.panes[1].tabs, session.panes[1].active as usize);
 
         let expanded: BTreeSet<PathBuf> = session.expanded.iter().cloned().collect();
         let tree = TreePane {
@@ -399,6 +413,7 @@ impl State {
                 Focus::Editor(i) => i,
                 Focus::Tree => 0,
             },
+            hovered_tab: None,
             drag_splitter: None,
             title: String::new(),
             width: session.window.0,
@@ -473,10 +488,19 @@ impl State {
         })
     }
 
-    /// The current column layout for this window size.
+    /// The current column layout for this window size, below the top bar.
     fn columns(&self) -> Columns {
-        self.panes
-            .columns(self.width as i32, self.height as i32, self.scale())
+        self.panes.columns(
+            self.width as i32,
+            self.height as i32,
+            self.top_bar_h(),
+            self.scale(),
+        )
+    }
+
+    /// The top bar's device-pixel height at the current body size and scale.
+    fn top_bar_h(&self) -> i32 {
+        top_bar_height(self.fonts.metrics(self.body_size), self.scale())
     }
 
     /// The current display scale, derived from the compositor's reported factor.
@@ -690,11 +714,6 @@ impl State {
             Focus::Editor(1) => store::Focus::PaneB,
             Focus::Editor(_) => store::Focus::PaneA,
         };
-        let pane = |i: usize| store::PaneSession {
-            path: self.editors[i].path.clone(),
-            cursor: self.editors[i].text.cursor() as u64,
-            scroll_y: self.editors[i].scroll_y,
-        };
         store::Session {
             // The persisted window is the logical size (scale-free); the device
             // buffer size lives in width/height.
@@ -706,7 +725,7 @@ impl State {
             focus,
             tree_root: Some(self.tree.tree.root().to_path_buf()),
             expanded: self.tree.tree.expanded_dirs(),
-            panes: [pane(0), pane(1)],
+            panes: [self.editors[0].to_session(), self.editors[1].to_session()],
         }
     }
 
@@ -828,6 +847,45 @@ impl State {
         let scale = self.scale();
         for s in cols.splitters.into_iter().flatten() {
             push_splitter(&mut list, s, scale);
+        }
+        // The top bar: the vault label above the sidebar, a tab strip above each
+        // pane. Drawn last; it occupies the reserved strip above every column.
+        let top = self.top_bar_h();
+        if top > 0 {
+            let bar = Rect {
+                x: 0,
+                y: 0,
+                w: self.width as i32,
+                h: top,
+            };
+            let vault_name = self
+                .tree
+                .tree
+                .root()
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "bnknotes".to_string());
+            let labels = [self.editors[0].tab_names(), self.editors[1].tab_names()];
+            let dirty = [self.editors[0].tab_dirty(), self.editors[1].tab_dirty()];
+            let strip = |g: usize| {
+                cols.tab_strips[g].map(|rect| TabStrip {
+                    rect,
+                    labels: &labels[g],
+                    dirty: &dirty[g],
+                    active: self.editors[g].active_index(),
+                    hovered: self.hovered_tab.and_then(|(hg, i)| (hg == g).then_some(i)),
+                })
+            };
+            let vault = cols.vault.map(|r| (r, vault_name.as_str()));
+            push_top_bar(
+                &mut list,
+                &self.fonts,
+                bar,
+                vault,
+                [strip(0), strip(1)],
+                scale,
+                self.body_size,
+            );
         }
         Rc::new(list)
     }

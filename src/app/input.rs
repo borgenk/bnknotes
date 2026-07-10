@@ -4,7 +4,7 @@ use std::time::{Duration, Instant};
 
 use super::State;
 use crate::find;
-use crate::pane::{EditorPane, Focus, Hit, SPLITTER};
+use crate::pane::{Columns, EditorPane, Focus, Hit, SPLITTER};
 use crate::platform::error::{Error, Result};
 use crate::platform::ffi;
 use crate::platform::freetype::Fonts;
@@ -328,7 +328,7 @@ impl State {
             return Ok(());
         }
         if matches!(action, KeyAction::Find | KeyAction::Replace) {
-            let ed = &mut self.editors[i];
+            let ed = self.editors[i].active_doc_mut();
             let cursor = ed.text.cursor();
             let target = if action == KeyAction::Find {
                 ed.find.open_at(cursor, &ed.text)
@@ -397,7 +397,7 @@ impl State {
         let i = self.active_editor();
         let target = match action {
             KeyAction::Char(c) if alt => {
-                let ed = &mut self.editors[i];
+                let ed = self.editors[i].active_doc_mut();
                 match c.to_ascii_lowercase() {
                     'w' => ed.find.toggle_word(&ed.text),
                     'r' => ed.find.toggle_regex(&ed.text),
@@ -405,11 +405,11 @@ impl State {
                 }
             }
             KeyAction::Char(c) => {
-                let ed = &mut self.editors[i];
+                let ed = self.editors[i].active_doc_mut();
                 ed.find.push(c, &ed.text)
             }
             KeyAction::Backspace => {
-                let ed = &mut self.editors[i];
+                let ed = self.editors[i].active_doc_mut();
                 ed.find.pop(&ed.text)
             }
             KeyAction::Tab => {
@@ -422,7 +422,7 @@ impl State {
             }
             KeyAction::Paste => match self.clipboard_text() {
                 Ok(Some(pasted)) => {
-                    let ed = &mut self.editors[i];
+                    let ed = self.editors[i].active_doc_mut();
                     ed.find.push_str(&pasted, &ed.text)
                 }
                 Ok(None) => None,
@@ -445,7 +445,7 @@ impl State {
             }
             KeyAction::Enter => self.editors[i].find.next(),
             KeyAction::Replace => {
-                let ed = &mut self.editors[i];
+                let ed = self.editors[i].active_doc_mut();
                 let cursor = ed.text.cursor();
                 ed.find.open_replace_at(cursor, &ed.text)
             }
@@ -484,7 +484,7 @@ impl State {
         self.editors[i].text.select_range(start, end);
         self.editors[i].text.insert_str(&with);
         self.after_edit();
-        let ed = &mut self.editors[i];
+        let ed = self.editors[i].active_doc_mut();
         let target = ed.find.refresh(&ed.text, start + with.len());
         self.land_on_match(target);
     }
@@ -498,7 +498,7 @@ impl State {
             return;
         }
         self.after_edit();
-        let ed = &mut self.editors[i];
+        let ed = self.editors[i].active_doc_mut();
         let cursor = ed.text.cursor();
         let target = ed.find.refresh(&ed.text, cursor);
         self.land_on_match(target);
@@ -522,9 +522,10 @@ impl State {
                 self.update_cursor_shape();
             }
             wl_pointer::EV_LEAVE => {
-                // The pointer left the surface, so drop the mouse hover highlight;
-                // otherwise the last-hovered tree row stays lit with no pointer on it.
-                if self.tree.hovered.take().is_some() {
+                // The pointer left the surface, so drop the mouse hover highlights;
+                // otherwise the last-hovered tree row or tab stays lit with no
+                // pointer on it.
+                if self.tree.hovered.take().is_some() || self.hovered_tab.take().is_some() {
                     self.dirty = true;
                 }
             }
@@ -550,6 +551,7 @@ impl State {
                     } else {
                         self.update_cursor_shape();
                         self.update_tree_hover();
+                        self.update_tab_hover();
                     }
                 }
             }
@@ -602,12 +604,15 @@ impl State {
         Ok(())
     }
 
-    /// What the window position `(px, py)` lands on. Splitters win over columns
-    /// since they sit in the gaps; columns are full height, so only x decides.
+    /// What the window position `(px, py)` lands on. The top bar wins above every
+    /// column; below it, splitters win over columns (they sit in the gaps), and
+    /// each column is full height, so only x decides.
     pub(super) fn hit_test(&self, px: f32, py: f32) -> Hit {
-        let _ = py;
-        let x = px as i32;
         let cols = self.columns();
+        if (py as i32) < self.top_bar_h() {
+            return self.top_bar_hit(&cols, px, py);
+        }
+        let x = px as i32;
         for (s, rect) in cols.splitters.iter().enumerate() {
             if let Some(r) = rect {
                 if x >= r.x && x < r.x + r.w {
@@ -626,6 +631,33 @@ impl State {
                     return Hit::Editor(i, *r);
                 }
             }
+        }
+        Hit::None
+    }
+
+    /// What a pointer inside the top bar lands on: a tab, its close box, or the
+    /// empty strip. The vault label is inert for now, so it falls to `None`. Tabs
+    /// are measured the same way the painter draws them, so clicks land true.
+    fn top_bar_hit(&self, cols: &Columns, px: f32, py: f32) -> Hit {
+        for g in 0..cols.tab_strips.len() {
+            let Some(strip) = cols.tab_strips[g] else {
+                continue;
+            };
+            if !strip.contains(px, py) {
+                continue;
+            }
+            let labels = self.editors[g].tab_names();
+            let tabs =
+                crate::paint::tab_rects(strip, &labels, &self.fonts, self.body_size, self.scale());
+            for (i, tab) in tabs.iter().enumerate() {
+                if tab.rect.contains(px, py) {
+                    if tab.close.contains(px, py) {
+                        return Hit::TabClose(g, i);
+                    }
+                    return Hit::Tab(g, i);
+                }
+            }
+            return Hit::TabStrip(g);
         }
         Hit::None
     }
@@ -671,6 +703,20 @@ impl State {
         }
     }
 
+    /// Update the hovered tab from the pointer, repainting if it changed (the tab
+    /// shows a soft highlight and its close glyph while hovered).
+    pub(super) fn update_tab_hover(&mut self) {
+        let (px, py) = (self.pointer_x, self.pointer_y);
+        let hovered = match self.hit_test(px, py) {
+            Hit::Tab(g, i) | Hit::TabClose(g, i) => Some((g, i)),
+            _ => None,
+        };
+        if hovered != self.hovered_tab {
+            self.hovered_tab = hovered;
+            self.dirty = true;
+        }
+    }
+
     /// The tree row index at window y `py` within the tree column, if any.
     pub(super) fn tree_row_at(&self, rect: Rect, py: f32) -> Option<usize> {
         let row_h = crate::paint::tree_row_height(self.fonts.metrics(self.body_size), self.scale());
@@ -691,13 +737,13 @@ impl State {
         }
     }
 
-    /// Open `path` into the last-focused content pane and focus it. An unreadable
-    /// file is reported without disturbing the current pane.
+    /// Open `path` as a tab in the last-focused content pane and focus it: a note
+    /// already open there is re-focused rather than duplicated. An unreadable file
+    /// is reported without disturbing the pane.
     pub(super) fn open_file(&mut self, path: &Path) {
-        match EditorPane::open(path) {
-            Ok(pane) => {
-                let i = self.last_editor;
-                self.editors[i] = pane;
+        let i = self.last_editor;
+        match self.editors[i].open_or_focus(path) {
+            Ok(()) => {
                 self.focus_pane(i);
                 self.save_session();
             }
@@ -808,13 +854,14 @@ impl State {
     /// text. Only re-requests when the shape changes, so it is cheap to call on
     /// every motion event. Uses the cached layout (no clone).
     pub(super) fn update_cursor_shape(&mut self) {
-        use wp_cursor_shape_device_v1::{SHAPE_DEFAULT, SHAPE_EW_RESIZE};
+        use wp_cursor_shape_device_v1::{SHAPE_DEFAULT, SHAPE_EW_RESIZE, SHAPE_POINTER};
         let (px, py) = (self.pointer_x, self.pointer_y);
         let shape = match self.hit_test(px, py) {
             Hit::Splitter(_) => SHAPE_EW_RESIZE,
             Hit::Tree(_) => SHAPE_DEFAULT,
             Hit::Editor(i, rect) => self.editors[i].cursor_shape_at(&self.fonts, rect, px, py),
-            Hit::None => SHAPE_DEFAULT,
+            Hit::Tab(..) | Hit::TabClose(..) => SHAPE_POINTER,
+            Hit::TabStrip(_) | Hit::None => SHAPE_DEFAULT,
         };
         if shape != self.cursor_shape {
             self.cursor_shape = shape;
@@ -834,8 +881,28 @@ impl State {
                 self.focus_pane(i);
                 self.editor_press(i, rect, px, py);
             }
+            Hit::Tab(g, i) => self.select_tab(g, i),
+            Hit::TabClose(g, i) => self.close_tab(g, i),
+            // The empty part of a pane's tab strip still focuses that pane.
+            Hit::TabStrip(g) => self.focus_pane(g),
             Hit::None => {}
         }
+    }
+
+    /// Switch pane `g` to tab `i` and focus that pane.
+    fn select_tab(&mut self, g: usize, i: usize) {
+        self.editors[g].activate(i);
+        self.focus_pane(g);
+        self.save_session();
+    }
+
+    /// Close tab `i` of pane `g` (a blank tab remains if it was the last) and focus
+    /// that pane on its now-active tab.
+    fn close_tab(&mut self, g: usize, i: usize) {
+        self.editors[g].close(i);
+        self.hovered_tab = None;
+        self.focus_pane(g);
+        self.save_session();
     }
 
     /// A press in the tree: focus the sidebar, mark the clicked row active, then

@@ -86,6 +86,37 @@ pub(crate) const MARGIN: i32 = 40;
 pub(crate) const CARET_COLOR: u32 = 0x00ff_ffff;
 pub(crate) const CARET_WIDTH: i32 = 2;
 
+/// Top bar (the vault label plus each pane's tab strip) colors and metrics. The
+/// bar shares the sidebar's darker tone; the active tab is filled with the editor
+/// [`BACKGROUND`] so it reads as connected to the pane below it, while inactive
+/// tabs sit muted on the bar. Its height derives from the body line height plus
+/// [`TAB_VPAD`] above and below (see [`crate::paint::top_bar_height`]).
+pub(crate) const TOP_BAR_BG: u32 = 0x0016_1a1f;
+pub(crate) const TAB_ACTIVE_BG: u32 = BACKGROUND;
+pub(crate) const TAB_ACTIVE_TEXT: u32 = FOREGROUND;
+/// Inactive tab label and the close glyph: the muted sidebar-marker tone.
+pub(crate) const TAB_INACTIVE_TEXT: u32 = 0x008c_a0b3;
+/// The soft highlight behind a hovered inactive tab (the tree's hover tone).
+pub(crate) const TAB_HOVER_BG: u32 = 0x0028_2c34;
+/// The unsaved-changes dot shown on a tab that is neither active nor hovered.
+pub(crate) const TAB_DIRTY_COLOR: u32 = 0x008c_a0b3;
+/// Corner radius of a tab's fill (rounded at the top, square where it meets the
+/// pane), and the accent underline marking the active tab.
+pub(crate) const TAB_RADIUS: i32 = 6;
+pub(crate) const TAB_ACCENT_COLOR: u32 = 0x005c_9cf6;
+pub(crate) const TAB_ACCENT_THICKNESS: i32 = 2;
+/// Vertical padding above and below a tab label; with the body line height it
+/// sets the bar height. Horizontal padding inside a tab, and the gap between the
+/// label and its close glyph.
+pub(crate) const TAB_VPAD: i32 = 7;
+pub(crate) const TAB_PAD_X: i32 = 12;
+pub(crate) const TAB_CLOSE_GAP: i32 = 6;
+/// A tab's minimum and maximum width; a longer label truncates with an ellipsis.
+pub(crate) const TAB_MIN_W: i32 = 90;
+pub(crate) const TAB_MAX_W: i32 = 220;
+/// Left padding of the vault label inside its region.
+pub(crate) const VAULT_PAD_X: i32 = 14;
+
 /// File-tree sidebar and splitter colors and metrics.
 pub(crate) const TREE_BG: u32 = 0x0016_1a1f;
 /// The disclosure chevron beside a folder. Folder and file names share

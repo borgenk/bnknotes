@@ -6,7 +6,7 @@ use crate::layout::{
 };
 use crate::markdown;
 use crate::pane::TreePane;
-use crate::platform::freetype::{FaceKey, FontStyle, Fonts, Metrics};
+use crate::platform::freetype::{Face, FaceKey, FontStyle, Fonts, Metrics};
 use crate::platform::geom::Rect;
 use crate::platform::grapheme;
 use crate::platform::scroll;
@@ -20,9 +20,11 @@ use crate::theme::{
     HEADING_COLORS, IMAGE_BORDER_COLOR, IMAGE_BORDER_THICKNESS, IMAGE_BUTTON_BG,
     IMAGE_BUTTON_RADIUS, LINK_COLOR, MARGIN, MARKER_COLOR, QUOTE_BAR_COLOR, QUOTE_BAR_WIDTH,
     RULE_COLOR, RULE_THICKNESS, SELECTION_COLOR, SPLITTER_COLOR, TABLE_BORDER_COLOR,
-    TABLE_HEADER_BG, TICK_HEIGHT, TICK_WIDTH, TREE_BG, TREE_CHEVRON_MAX, TREE_HOVER_BG,
-    TREE_INDENT, TREE_MARKER_COLOR, TREE_MARKER_W, TREE_PAD, TREE_ROW_INSET_Y, TREE_ROW_PAD,
-    TREE_ROW_RADIUS, TREE_ROW_VPAD,
+    TABLE_HEADER_BG, TAB_ACCENT_COLOR, TAB_ACCENT_THICKNESS, TAB_ACTIVE_BG, TAB_ACTIVE_TEXT,
+    TAB_CLOSE_GAP, TAB_DIRTY_COLOR, TAB_HOVER_BG, TAB_INACTIVE_TEXT, TAB_MAX_W, TAB_MIN_W,
+    TAB_PAD_X, TAB_RADIUS, TAB_VPAD, TICK_HEIGHT, TICK_WIDTH, TOP_BAR_BG, TREE_BG,
+    TREE_CHEVRON_MAX, TREE_HOVER_BG, TREE_INDENT, TREE_MARKER_COLOR, TREE_MARKER_W, TREE_PAD,
+    TREE_ROW_INSET_Y, TREE_ROW_PAD, TREE_ROW_RADIUS, TREE_ROW_VPAD, VAULT_PAD_X,
 };
 
 /// The per-frame inputs [`build_display_list`] needs beyond the layout itself:
@@ -244,6 +246,270 @@ pub(crate) fn push_tree(
             row.name.clone(),
             m,
         ));
+    }
+}
+
+/// The pixel height of the top bar: the body line height plus vertical padding
+/// above and below, matching how a tree row is sized. Shared by the layout (which
+/// reserves it) and the painter so they agree.
+pub(crate) fn top_bar_height(m: Metrics, scale: Scale) -> i32 {
+    (m.line_height + 2 * scale.px(TAB_VPAD)).max(1)
+}
+
+/// One tab's geometry within a strip: its full pill, the close-glyph box inside
+/// it, and the label already truncated to fit. Shared by the painter and the
+/// pointer hit-testing so a click lands where the eye expects.
+pub(crate) struct TabHit {
+    pub rect: Rect,
+    pub close: Rect,
+    pub label: String,
+}
+
+/// The paint inputs for one pane's tab strip: where it sits and its tabs' labels,
+/// unsaved flags, active index, and the hovered tab (if the pointer is over one).
+pub(crate) struct TabStrip<'a> {
+    pub rect: Rect,
+    pub labels: &'a [String],
+    pub dirty: &'a [bool],
+    pub active: usize,
+    pub hovered: Option<usize>,
+}
+
+/// The side of a tab's square close-glyph box.
+fn tab_close_side(scale: Scale) -> i32 {
+    scale.px(16)
+}
+
+/// Truncate `label` with a trailing ellipsis until it fits `max_w` pixels in
+/// `face`; returns it unchanged when it already fits.
+fn fit_label(face: &Face, label: &str, max_w: i32) -> String {
+    if shape::text_advance(face, label) as i32 <= max_w {
+        return label.to_string();
+    }
+    let ellipsis = '…';
+    let budget = (max_w - shape::text_advance(face, "…") as i32).max(0);
+    let mut out = String::new();
+    for ch in label.chars() {
+        out.push(ch);
+        if shape::text_advance(face, &out) as i32 > budget {
+            out.pop();
+            break;
+        }
+    }
+    out.push(ellipsis);
+    out
+}
+
+/// The tabs of one strip, laid left to right, each sized to its label between a
+/// min and max width. A tab that would spill past the strip's right edge stops the
+/// run (overflow is clipped this way), but the first tab always draws even in a
+/// narrow strip. Shared by the painter and the hit-testing.
+pub(crate) fn tab_rects(
+    strip: Rect,
+    labels: &[String],
+    fonts: &Fonts,
+    body_size: u32,
+    scale: Scale,
+) -> Vec<TabHit> {
+    let face = fonts.face(body_size, FontStyle::Regular);
+    let pad = scale.px(TAB_PAD_X);
+    let gap = scale.px(TAB_CLOSE_GAP);
+    let min_w = scale.px(TAB_MIN_W);
+    let max_w = scale.px(TAB_MAX_W);
+    let close = tab_close_side(scale);
+    let strip_right = strip.x + strip.w;
+    let mut out = Vec::with_capacity(labels.len());
+    let mut x = strip.x;
+    for label in labels {
+        if x >= strip_right {
+            break;
+        }
+        let label_w = shape::text_advance(face, label).ceil() as i32;
+        let tab_w = (pad + label_w + gap + close + pad).clamp(min_w, max_w);
+        // Stop before a tab that would spill, but never drop the first one.
+        if x + tab_w > strip_right && x > strip.x {
+            break;
+        }
+        let rect = Rect {
+            x,
+            y: strip.y,
+            w: tab_w.min(strip_right - x),
+            h: strip.h,
+        };
+        let close_rect = Rect {
+            x: rect.x + rect.w - pad - close,
+            y: rect.y + (rect.h - close) / 2,
+            w: close,
+            h: close,
+        };
+        let budget = (close_rect.x - gap - (rect.x + pad)).max(0);
+        out.push(TabHit {
+            rect,
+            close: close_rect,
+            label: fit_label(face, label, budget),
+        });
+        x += tab_w;
+    }
+    out
+}
+
+/// Draw the top bar: fill the strip and a bottom divider, the vault label above
+/// the sidebar, and each pane's tab strip above its column. The active tab is
+/// filled with the pane background and reaches the strip bottom, covering the
+/// divider so it reads as joined to its pane; inactive tabs stay muted, with a
+/// soft highlight under the hovered one.
+pub(crate) fn push_top_bar(
+    list: &mut DisplayList,
+    fonts: &Fonts,
+    bar: Rect,
+    vault: Option<(Rect, &str)>,
+    strips: [Option<TabStrip>; 2],
+    scale: Scale,
+    body_size: u32,
+) {
+    let m = fonts.metrics(body_size);
+    list.push(DrawCmd::Fill {
+        rect: bar,
+        color: TOP_BAR_BG,
+    });
+    let divider = scale.px(1).max(1);
+    list.push(DrawCmd::Fill {
+        rect: Rect {
+            x: bar.x,
+            y: bar.y + bar.h - divider,
+            w: bar.w,
+            h: divider,
+        },
+        color: SPLITTER_COLOR,
+    });
+    if let Some((vrect, name)) = vault {
+        let x = vrect.x + scale.px(VAULT_PAD_X);
+        let right = vrect.x + vrect.w - scale.px(VAULT_PAD_X);
+        let baseline = vrect.y + (vrect.h - (m.ascent + m.descent)) / 2 + m.ascent;
+        let fitted = fit_label(
+            fonts.face(body_size, FontStyle::Bold),
+            name,
+            (right - x).max(0),
+        );
+        list.push(text_cmd(
+            FaceKey::Prose {
+                size: body_size,
+                style: FontStyle::Bold,
+            },
+            x,
+            baseline,
+            right,
+            FOREGROUND,
+            fitted,
+            m,
+        ));
+    }
+    for strip in strips.into_iter().flatten() {
+        push_tab_strip(list, fonts, &strip, m, scale, body_size);
+    }
+}
+
+/// Draw one pane's tabs (see [`push_top_bar`]).
+fn push_tab_strip(
+    list: &mut DisplayList,
+    fonts: &Fonts,
+    strip: &TabStrip,
+    m: Metrics,
+    scale: Scale,
+    body_size: u32,
+) {
+    let tabs = tab_rects(strip.rect, strip.labels, fonts, body_size, scale);
+    let radius = scale.px(TAB_RADIUS);
+    let vpad = scale.px(TAB_VPAD);
+    let divider = scale.px(1).max(1);
+    let pad = scale.px(TAB_PAD_X);
+    let face = FaceKey::Prose {
+        size: body_size,
+        style: FontStyle::Regular,
+    };
+    for (i, tab) in tabs.iter().enumerate() {
+        let is_active = i == strip.active;
+        let is_hovered = strip.hovered == Some(i);
+        if is_active {
+            list.push(DrawCmd::RoundRect {
+                rect: tab.rect,
+                color: TAB_ACTIVE_BG,
+                radius,
+                corners: display::RoundedCorners::Top,
+            });
+            let t = scale.px(TAB_ACCENT_THICKNESS);
+            list.push(DrawCmd::Fill {
+                rect: Rect {
+                    x: tab.rect.x,
+                    y: tab.rect.y + tab.rect.h - t,
+                    w: tab.rect.w,
+                    h: t,
+                },
+                color: TAB_ACCENT_COLOR,
+            });
+        } else if is_hovered {
+            list.push(DrawCmd::RoundRect {
+                rect: tab.rect,
+                color: TAB_HOVER_BG,
+                radius,
+                corners: display::RoundedCorners::Top,
+            });
+        } else if i + 1 < tabs.len() {
+            // A hairline between adjacent resting tabs.
+            list.push(DrawCmd::Fill {
+                rect: Rect {
+                    x: tab.rect.x + tab.rect.w - divider,
+                    y: tab.rect.y + vpad,
+                    w: divider,
+                    h: (tab.rect.h - 2 * vpad).max(1),
+                },
+                color: SPLITTER_COLOR,
+            });
+        }
+        let color = if is_active {
+            TAB_ACTIVE_TEXT
+        } else {
+            TAB_INACTIVE_TEXT
+        };
+        let baseline = tab.rect.y + (tab.rect.h - (m.ascent + m.descent)) / 2 + m.ascent;
+        list.push(text_cmd(
+            face,
+            tab.rect.x + pad,
+            baseline,
+            tab.close.x - scale.px(TAB_CLOSE_GAP),
+            color,
+            tab.label.clone(),
+            m,
+        ));
+        // The close glyph shows on the active or hovered tab; a resting unsaved tab
+        // shows a dot in its place instead.
+        let dirty = strip.dirty.get(i).copied().unwrap_or(false);
+        if is_active || is_hovered {
+            let glyph = "×";
+            let gw = shape::text_advance(fonts.face(body_size, FontStyle::Regular), glyph) as i32;
+            list.push(text_cmd(
+                face,
+                tab.close.x + (tab.close.w - gw) / 2,
+                tab.close.y + (tab.close.h - (m.ascent + m.descent)) / 2 + m.ascent,
+                tab.close.x + tab.close.w,
+                TAB_INACTIVE_TEXT,
+                glyph.to_string(),
+                m,
+            ));
+        } else if dirty {
+            let dot = scale.px(7);
+            list.push(DrawCmd::RoundRect {
+                rect: Rect {
+                    x: tab.close.x + (tab.close.w - dot) / 2,
+                    y: tab.close.y + (tab.close.h - dot) / 2,
+                    w: dot,
+                    h: dot,
+                },
+                color: TAB_DIRTY_COLOR,
+                radius: dot / 2,
+                corners: display::RoundedCorners::Both,
+            });
+        }
     }
 }
 
@@ -1315,6 +1581,79 @@ mod tests {
             find: None,
             table_hover: None,
         }
+    }
+
+    #[test]
+    fn top_bar_draws_vault_label_and_tabs_with_the_active_one_highlighted() {
+        let fonts = Fonts::new(&markdown::all_sizes(FONT_SIZE)).expect("a default font");
+        let top = top_bar_height(fonts.metrics(FONT_SIZE), Scale::ONE);
+        let bar = Rect {
+            x: 0,
+            y: 0,
+            w: 800,
+            h: top,
+        };
+        let vrect = Rect {
+            x: 0,
+            y: 0,
+            w: 200,
+            h: top,
+        };
+        let strip_rect = Rect {
+            x: 206,
+            y: 0,
+            w: 594,
+            h: top,
+        };
+        // Two tabs, the second active, the first unsaved.
+        let labels = vec!["intro".to_string(), "todo".to_string()];
+        let dirty = vec![true, false];
+        let strips = [
+            Some(TabStrip {
+                rect: strip_rect,
+                labels: &labels,
+                dirty: &dirty,
+                active: 1,
+                hovered: None,
+            }),
+            None,
+        ];
+        let mut list: DisplayList = Vec::new();
+        push_top_bar(
+            &mut list,
+            &fonts,
+            bar,
+            Some((vrect, "Notes")),
+            strips,
+            Scale::ONE,
+            FONT_SIZE,
+        );
+
+        let has_text = |s: &str| {
+            list.iter()
+                .any(|c| matches!(c, DrawCmd::Text { text, .. } if text == s))
+        };
+        let has_round = |color: u32| {
+            list.iter()
+                .any(|c| matches!(c, DrawCmd::RoundRect { color: c2, .. } if *c2 == color))
+        };
+        // The strip fill, the vault label, and both tab labels reach the list.
+        assert!(
+            list.iter()
+                .any(|c| matches!(c, DrawCmd::Fill { color, .. } if *color == TOP_BAR_BG)),
+            "top bar background"
+        );
+        assert!(has_text("Notes"), "vault label");
+        assert!(has_text("intro"), "resting tab label");
+        assert!(has_text("todo"), "active tab label");
+        // The active tab (index 1) melts into the pane background and shows a close
+        // glyph; the resting unsaved tab (index 0) shows a dirty dot instead.
+        assert!(has_round(TAB_ACTIVE_BG), "active tab highlight");
+        assert!(has_text("×"), "close glyph on the active tab");
+        assert!(
+            has_round(TAB_DIRTY_COLOR),
+            "dirty dot on the resting unsaved tab"
+        );
     }
 
     #[test]

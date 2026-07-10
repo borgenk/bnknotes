@@ -65,6 +65,7 @@ use crate::platform::grapheme;
 use crate::platform::shape;
 use crate::render::image::ImageStore;
 use crate::rope::Rope;
+use crate::scale::Scale;
 
 /// Extra highlight width drawn past a line's text when the selection includes
 /// that line's trailing newline, hinting the break itself is selected.
@@ -229,6 +230,10 @@ pub struct ImageBox {
     /// Display size in pixels (the painted rectangle, padding excluded).
     pub width: i32,
     pub height: i32,
+    /// The vertical breathing room above and below the picture, in device pixels
+    /// ([`IMAGE_PAD_Y`] scaled by the display). Stored so [`Self::box_height`] needs
+    /// no scale at paint time.
+    pad_y: i32,
     /// True while the user has this image selected: the painter draws a border
     /// and the corner toggle button, and `Ctrl+C` copies the image.
     pub selected: bool,
@@ -240,7 +245,7 @@ impl ImageBox {
     /// and its clickable/cull height, standing in for a text line's line-height.
     /// The painter centers the image in this box and culls on it.
     pub(crate) fn box_height(&self) -> i32 {
-        self.height + 2 * IMAGE_PAD_Y
+        self.height + 2 * self.pad_y
     }
 }
 
@@ -403,9 +408,9 @@ pub(crate) fn run_face(fonts: &Fonts, size: u32, kind: markdown::SpanKind, headi
 /// run-walk (advance, hit-test, panel, draw pen) folds it in so they agree. Zero for
 /// a fenced line (its own full-width panel, drawn by the app) and for anything but
 /// inline code. The local [`CODE_PAD_X`] here is the unrelated fenced-block inset.
-pub(crate) fn inline_code_pad(kind: markdown::SpanKind, code_block: bool) -> i32 {
+pub(crate) fn inline_code_pad(kind: markdown::SpanKind, code_block: bool, scale: Scale) -> i32 {
     if !code_block && matches!(kind, markdown::SpanKind::Text(markdown::Emphasis::Code)) {
-        crate::theme::CODE_PAD_X
+        scale.px(crate::theme::CODE_PAD_X)
     } else {
         0
     }
@@ -465,7 +470,7 @@ pub(crate) fn is_code_marker(rope: &Rope, run: &Run) -> bool {
 /// run's flow advance is unchanged, so measurement, hit-test, and the pill geometry
 /// stay put; only the drawn glyph moves. Positive for the opening delimiter before
 /// the code, negative for the closing one after it, zero otherwise.
-pub(crate) fn backtick_reveal_shift(rope: &Rope, runs: &[Run], i: usize) -> i32 {
+pub(crate) fn backtick_reveal_shift(rope: &Rope, runs: &[Run], i: usize, scale: Scale) -> i32 {
     let Some(run) = runs.get(i) else {
         return 0;
     };
@@ -478,9 +483,9 @@ pub(crate) fn backtick_reveal_shift(rope: &Rope, runs: &[Run], i: usize) -> i32 
         })
     };
     if is_code(i + 1) {
-        crate::theme::CODE_PAD_X
+        scale.px(crate::theme::CODE_PAD_X)
     } else if i > 0 && is_code(i - 1) {
-        -crate::theme::CODE_PAD_X
+        -scale.px(crate::theme::CODE_PAD_X)
     } else {
         0
     }
@@ -538,6 +543,10 @@ pub struct Layout {
     /// Total height of the text block in pixels (the sum of every visual line's
     /// line height), for the scroll extent.
     text_height: i32,
+    /// The display scale this layout was built at, so its geometry methods
+    /// (`checkbox_rect`, `code_rects`, table hit-testing) scale their pixel
+    /// constants to match. Identity at [`Scale::ONE`].
+    scale: Scale,
 }
 
 /// Shared layout/index inputs for one width and reveal state. Built once by a
@@ -552,9 +561,13 @@ pub struct LayoutCtx<'a> {
     active: (usize, usize),
     images: &'a ImageStore,
     image_ui: ImageUi,
+    /// The display scale, so the layout's pixel constants (indents, paddings,
+    /// table borders) land at the right device size. Identity at [`Scale::ONE`].
+    scale: Scale,
 }
 
 impl<'a> LayoutCtx<'a> {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         fonts: &'a Fonts,
         rope: &'a Rope,
@@ -563,6 +576,7 @@ impl<'a> LayoutCtx<'a> {
         active: (usize, usize),
         images: &'a ImageStore,
         image_ui: ImageUi,
+        scale: Scale,
     ) -> Self {
         Self {
             fonts,
@@ -572,6 +586,7 @@ impl<'a> LayoutCtx<'a> {
             active,
             images,
             image_ui,
+            scale,
         }
     }
 
@@ -589,6 +604,7 @@ impl<'a> LayoutCtx<'a> {
         wrap_width: i32,
         body_size: u32,
         images: &'a ImageStore,
+        scale: Scale,
     ) -> Self {
         Self::new(
             fonts,
@@ -598,6 +614,7 @@ impl<'a> LayoutCtx<'a> {
             NO_REVEAL,
             images,
             ImageUi::default(),
+            scale,
         )
     }
 }
@@ -692,6 +709,8 @@ impl Layout {
         active: (usize, usize),
     ) -> Self {
         // No image store: any `![](...)` line lays out as its plain source text.
+        // The bare build helper is the tests' entry point, so it fixes the display
+        // scale at unity; the scale-aware paths go through a ctx the caller builds.
         let images = ImageStore::new(None);
         let ctx = LayoutCtx::new(
             fonts,
@@ -701,6 +720,7 @@ impl Layout {
             active,
             &images,
             ImageUi::default(),
+            Scale::ONE,
         );
         Self::build_with_images(&ctx, left, top)
     }
@@ -778,6 +798,7 @@ impl Layout {
             runs: pool.runs,
             left,
             text_height: box_top - box_top_seed,
+            scale: ctx.scale,
         }
     }
 
@@ -926,11 +947,12 @@ impl Layout {
     pub fn checkbox_at(&self, fonts: &Fonts, rope: &Rope, x: f32, y: f32) -> Option<usize> {
         let line = self.line_for_y(fonts, y);
         let rect = self.checkbox_rect(fonts, rope, line)?;
+        let pad = self.scale.px(CHECKBOX_HIT_PAD);
         let target = Rect {
-            x: rect.x - CHECKBOX_HIT_PAD,
-            y: rect.y - CHECKBOX_HIT_PAD,
-            w: rect.w + 2 * CHECKBOX_HIT_PAD,
-            h: rect.h + 2 * CHECKBOX_HIT_PAD,
+            x: rect.x - pad,
+            y: rect.y - pad,
+            w: rect.w + 2 * pad,
+            h: rect.h + 2 * pad,
         };
         rect_contains(&target, x, y).then_some(line.start)
     }
@@ -943,7 +965,7 @@ impl Layout {
         let m = fonts.metrics(line.size);
         Some(Rect {
             x: self.left + line.indent,
-            y: line.baseline - m.ascent + IMAGE_PAD_Y,
+            y: line.baseline - m.ascent + self.scale.px(IMAGE_PAD_Y),
             w: img.width,
             h: img.height,
         })
@@ -965,7 +987,8 @@ impl Layout {
         self.lines.iter().find_map(|line| {
             let img = line.image?;
             let rect = self.image_rect(fonts, line)?;
-            (img.selected && rect_contains(&image_button_rect(&rect), x, y)).then_some(line.start)
+            (img.selected && rect_contains(&image_button_rect(&rect, self.scale), x, y))
+                .then_some(line.start)
         })
     }
 
@@ -1068,7 +1091,7 @@ impl Layout {
                 self.left as f32 + line.indent as f32 + self.advance_to(fonts, rope, line, sel_end);
             let mut w = (x1 - x0).round() as i32;
             if newline_selected {
-                w += NEWLINE_PAD;
+                w += self.scale.px(NEWLINE_PAD);
             }
             // The fill is the full line box centered on the glyph box: start a
             // leading pad above the text so the surplus splits above and below,
@@ -1116,7 +1139,7 @@ impl Layout {
                 let x0 = self.left as f32
                     + line.indent as f32
                     + self.advance_to(fonts, rope, line, run.start)
-                    + inline_code_pad(run.kind, line.code_block) as f32;
+                    + inline_code_pad(run.kind, line.code_block, self.scale) as f32;
                 let w = shape::text_advance(
                     run_face(fonts, line.size, run.kind, heading),
                     &rope.slice(run.start..run.end).as_cow(),
@@ -1154,13 +1177,15 @@ impl Layout {
     ) {
         let row_x = self.left + line.indent;
         let box_top = line.baseline - m.ascent;
-        let max_lines = row_max_lines(t.height, m.line_height);
+        let max_lines = row_max_lines(t.height, m.line_height, self.scale);
         for (col, cell) in t.columns.iter().zip(&t.cells) {
             let n_lines = cell.lines.len().max(1);
             for (k, cl) in cell.lines.iter().enumerate() {
                 // The pill's glyph-box top matches the centered text baseline, so the
                 // tint sits over the code instead of above it.
-                let top = box_top + TABLE_CELL_PAD_Y + cell_line_top(k, n_lines, max_lines, m);
+                let top = box_top
+                    + self.scale.px(TABLE_CELL_PAD_Y)
+                    + cell_line_top(k, n_lines, max_lines, m);
                 let mut pen = row_x + aligned_x(*col, cl.width);
                 for (i, run) in cl.runs.iter().enumerate() {
                     if !run.visible {
@@ -1169,7 +1194,7 @@ impl Layout {
                     // A code run's glyphs sit its pill pad in from the pen, matching
                     // the draw walk; the pill (which paint then expands by the pad)
                     // starts at the glyphs and grows over any revealed backticks.
-                    let pad = inline_code_pad(run.kind, false);
+                    let pad = inline_code_pad(run.kind, false, self.scale);
                     let glyph_x = pen + pad;
                     let face = run_face(fonts, line.size, run.kind, t.header);
                     let w = shape::text_advance(face, &rope.slice(run.start..run.end).as_cow());
@@ -1251,7 +1276,7 @@ impl Layout {
             // A code run's pill pad sits before its glyphs, so a click in that gap
             // lands at the run start; the trailing pad pushes the pen past the glyphs
             // so a click there lands after the span.
-            let pad = inline_code_pad(run.kind, line.code_block) as f32;
+            let pad = inline_code_pad(run.kind, line.code_block, self.scale) as f32;
             acc += pad;
             for (off, cluster) in grapheme::graphemes(&text) {
                 let w = shape::text_advance(face, cluster);
@@ -1287,7 +1312,7 @@ impl Layout {
                 continue;
             }
             let face = run_face(fonts, line.size, run.kind, line.heading.is_some());
-            let pad = inline_code_pad(run.kind, line.code_block) as f32;
+            let pad = inline_code_pad(run.kind, line.code_block, self.scale) as f32;
             // A run fully before the offset contributes its glyphs plus its pill pad
             // on both sides; one containing the offset contributes its leading pad
             // plus the glyphs up to the offset.
@@ -1328,15 +1353,16 @@ impl Layout {
             .position(|c| offset <= c.end)
             .unwrap_or(t.cells.len().saturating_sub(1));
         let height = m.ascent + m.descent;
+        let cell_pad_y = self.scale.px(TABLE_CELL_PAD_Y);
         let Some(cell) = t.cells.get(idx) else {
-            return (row_left, box_top + TABLE_CELL_PAD_Y, height);
+            return (row_left, box_top + cell_pad_y, height);
         };
         let (k, adv, line_w) = self.cell_offset_x(fonts, rope, line.size, t.header, cell, offset);
         let content_x = t.columns.get(idx).map_or(0, |c| aligned_x(*c, line_w));
         let x = row_left + content_x + adv.round() as i32;
         let n_lines = cell.lines.len().max(1);
-        let max_lines = row_max_lines(t.height, m.line_height);
-        let y = box_top + TABLE_CELL_PAD_Y + cell_line_top(k, n_lines, max_lines, m);
+        let max_lines = row_max_lines(t.height, m.line_height, self.scale);
+        let y = box_top + cell_pad_y + cell_line_top(k, n_lines, max_lines, m);
         (x, y, height)
     }
 
@@ -1371,7 +1397,7 @@ impl Layout {
             }
             // A code run's glyphs sit its pill pad in from the pen; add that leading
             // pad on entry, and the trailing pad once the offset is past the run.
-            let pad = inline_code_pad(run.kind, false) as f32;
+            let pad = inline_code_pad(run.kind, false, self.scale) as f32;
             let end = offset.min(run.end);
             let face = run_face(fonts, size, run.kind, header);
             adv += pad + shape::text_advance(face, &rope.slice(run.start..end).as_cow());
@@ -1411,7 +1437,8 @@ impl Layout {
         let row_left = self.left + line.indent;
         let box_top = line.baseline - m.ascent;
         let n_lines = cell.lines.len().max(1);
-        let max_lines = row_max_lines(t.height, m.line_height);
+        let max_lines = row_max_lines(t.height, m.line_height, self.scale);
+        let cell_pad_y = self.scale.px(TABLE_CELL_PAD_Y);
         let (k0, adv0, _) = self.cell_offset_x(fonts, rope, line.size, t.header, cell, start);
         let (k1, adv1, _) = self.cell_offset_x(fonts, rope, line.size, t.header, cell, end);
         let column = t.columns.get(idx).copied();
@@ -1429,8 +1456,7 @@ impl Layout {
             // Fill the line box centered on the glyph box, matching prose: the
             // cell's glyph box is already centered in its slot, so this fills the
             // whole slot and stays balanced around the text.
-            let y = box_top + TABLE_CELL_PAD_Y + cell_line_top(k, n_lines, max_lines, m)
-                - leading_pad(m);
+            let y = box_top + cell_pad_y + cell_line_top(k, n_lines, max_lines, m) - leading_pad(m);
             out.push(Rect {
                 x: left,
                 y,
@@ -1473,9 +1499,9 @@ impl Layout {
         if cell.lines.is_empty() {
             return cell.start;
         }
-        let max_lines = row_max_lines(t.height, m.line_height);
+        let max_lines = row_max_lines(t.height, m.line_height, self.scale);
         let block_pad = cell_block_pad(cell.lines.len(), max_lines, m.line_height);
-        let rel_y = (y - (box_top + TABLE_CELL_PAD_Y + block_pad) as f32).max(0.0);
+        let rel_y = (y - (box_top + self.scale.px(TABLE_CELL_PAD_Y) + block_pad) as f32).max(0.0);
         let k = ((rel_y / m.line_height as f32) as usize).min(cell.lines.len() - 1);
         let cl = &cell.lines[k];
         let content_x = t.columns.get(col).map_or(0, |c| aligned_x(*c, cl.width));
@@ -1486,7 +1512,7 @@ impl Layout {
             }
             // The pill pad frames a code run's glyphs; a click in the leading pad
             // falls to the run's first cluster, one in the trailing pad past it.
-            let pad = inline_code_pad(run.kind, false) as f32;
+            let pad = inline_code_pad(run.kind, false, self.scale) as f32;
             acc += pad;
             let face = run_face(fonts, line.size, run.kind, t.header);
             let text = rope.slice(run.start..run.end).as_cow();
@@ -1537,11 +1563,12 @@ impl Layout {
             let box_top = top.baseline - fonts.metrics(top.size).ascent;
             let box_bottom = bot.baseline - fonts.metrics(bot.size).ascent
                 + bot.table.as_ref().map_or(0, |t| t.box_height());
+            let add_thickness = self.scale.px(TABLE_ADD_THICKNESS);
             let add_row = Rect {
                 x: left,
                 y: box_bottom,
                 w: width,
-                h: TABLE_ADD_THICKNESS,
+                h: add_thickness,
             };
             if rect_contains(&add_row, x, y) {
                 let block = crate::table::block_at(rope, rope.byte_to_line(bot.start))?;
@@ -1554,7 +1581,7 @@ impl Layout {
             let add_col = Rect {
                 x: left + width,
                 y: box_top,
-                w: TABLE_ADD_THICKNESS,
+                w: add_thickness,
                 h: box_bottom - box_top,
             };
             if rect_contains(&add_col, x, y) {
@@ -1665,13 +1692,14 @@ impl LineClass {
     /// The left inset shared by every segment, and how much it narrows the wrap
     /// width: a code block pads both sides inside its panel; a list item shifts
     /// right by a small indent (one side only).
-    fn seg_pad_and_wrap_reduce(&self) -> (i32, i32) {
+    fn seg_pad_and_wrap_reduce(&self, scale: Scale) -> (i32, i32) {
         if self.code_block {
-            (CODE_PAD_X, 2 * CODE_PAD_X)
+            let pad = scale.px(CODE_PAD_X);
+            (pad, 2 * pad)
         } else if self.is_list() || self.list_continuation {
             // A continuation takes the same left indent as its item, so its own
             // leading spaces then carry the text under the item's content.
-            let pad = LIST_INDENT + self.list_depth as i32 * LIST_NEST_INDENT;
+            let pad = scale.px(LIST_INDENT) + self.list_depth as i32 * scale.px(LIST_NEST_INDENT);
             (pad, pad)
         } else {
             (0, 0)
@@ -1831,6 +1859,7 @@ fn lay_line(
                     path_end: ls + link.path.1,
                     width,
                     height,
+                    pad_y: ctx.scale.px(IMAGE_PAD_Y),
                     selected: ctx.image_ui.selected == Some(ls),
                 };
                 if on_line || ctx.image_ui.raw == Some(ls) {
@@ -1874,7 +1903,7 @@ fn lay_line(
     let task = class.task();
     let rule = class.rule();
     let block_indent = class.block_indent(ctx.fonts, &line);
-    let (seg_pad, wrap_reduce) = class.seg_pad_and_wrap_reduce();
+    let (seg_pad, wrap_reduce) = class.seg_pad_and_wrap_reduce(ctx.scale);
     let line_wrap = if ctx.wrap_width > 0 {
         (ctx.wrap_width - wrap_reduce).max(1)
     } else {
@@ -1893,6 +1922,7 @@ fn lay_line(
         block_indent,
         heading.is_some(),
         !code_block,
+        ctx.scale,
         &mut pool.clusters,
         &mut pool.segments,
     );
@@ -2137,9 +2167,10 @@ impl LineIndex {
         wrap_width: i32,
         body_size: u32,
         images: &ImageStore,
+        scale: Scale,
     ) -> Self {
         let n = rope.len_lines();
-        let ctx = LayoutCtx::for_index(fonts, rope, wrap_width, body_size, images);
+        let ctx = LayoutCtx::for_index(fonts, rope, wrap_width, body_size, images, scale);
         let out = measure_chunk(&ctx, 0, n, n, LineCarry::default());
         Self::from_recs(out.recs)
     }
@@ -2165,14 +2196,15 @@ impl LineIndex {
         wrap_width: i32,
         body_size: u32,
         images: &ImageStore,
+        scale: Scale,
         threads: usize,
     ) -> Self {
         let n = rope.len_lines();
         let threads = threads.max(1);
         if threads == 1 || n < PARALLEL_MIN_LINES {
-            return Self::build(fonts, rope, wrap_width, body_size, images);
+            return Self::build(fonts, rope, wrap_width, body_size, images, scale);
         }
-        let ctx = LayoutCtx::for_index(fonts, rope, wrap_width, body_size, images);
+        let ctx = LayoutCtx::for_index(fonts, rope, wrap_width, body_size, images, scale);
         Self::build_chunked(&ctx, threads)
     }
 
@@ -2200,6 +2232,7 @@ impl LineIndex {
         let wrap_width = ctx.wrap_width;
         let body_size = ctx.body_size;
         let images = ctx.images;
+        let scale = ctx.scale;
 
         // Measure every chunk from ground state. The main thread takes the first
         // chunk with the caller's fonts; each other chunk gets a worker that opens
@@ -2211,8 +2244,9 @@ impl LineIndex {
                 .map(|&(lo, hi)| {
                     s.spawn(move || {
                         let fonts = Fonts::new(&markdown::all_sizes(body_size)).ok()?;
-                        let worker_ctx =
-                            LayoutCtx::for_index(&fonts, rope, wrap_width, body_size, images);
+                        let worker_ctx = LayoutCtx::for_index(
+                            &fonts, rope, wrap_width, body_size, images, scale,
+                        );
                         Some(measure_chunk(&worker_ctx, lo, hi, n, LineCarry::default()))
                     })
                 })
@@ -2234,6 +2268,7 @@ impl LineIndex {
                 ctx.wrap_width,
                 ctx.body_size,
                 ctx.images,
+                ctx.scale,
             );
         }
         let outs: Vec<ChunkOut> = outs.into_iter().flatten().collect();
@@ -2277,7 +2312,14 @@ impl LineIndex {
         let new_n = new.len_lines();
         let old_n = self.recs.len();
         if old_n != prev.len_lines() {
-            *self = Self::build(ctx.fonts, new, ctx.wrap_width, ctx.body_size, ctx.images);
+            *self = Self::build(
+                ctx.fonts,
+                new,
+                ctx.wrap_width,
+                ctx.body_size,
+                ctx.images,
+                ctx.scale,
+            );
             return;
         }
         // Find the changed byte span cheaply (shared leaves compared as raw bytes,
@@ -2420,12 +2462,17 @@ fn fit_image(iw: u32, ih: u32, column: i32) -> (i32, i32) {
 /// The toggle button's rectangle, inset into the top-right corner of a picture
 /// `image` rect. Shared by the painter and hit-testing so a click lands where the
 /// button is drawn.
-pub(crate) fn image_button_rect(image: &Rect) -> Rect {
+pub(crate) fn image_button_rect(image: &Rect, scale: Scale) -> Rect {
+    let (w, h, margin) = (
+        scale.px(IMAGE_BUTTON_W),
+        scale.px(IMAGE_BUTTON_H),
+        scale.px(IMAGE_BUTTON_MARGIN),
+    );
     Rect {
-        x: image.x + image.w - IMAGE_BUTTON_W - IMAGE_BUTTON_MARGIN,
-        y: image.y + IMAGE_BUTTON_MARGIN,
-        w: IMAGE_BUTTON_W,
-        h: IMAGE_BUTTON_H,
+        x: image.x + image.w - w - margin,
+        y: image.y + margin,
+        w,
+        h,
     }
 }
 
@@ -2604,6 +2651,7 @@ fn wrap_segments(
     block_indent: i32,
     heading: bool,
     pad_code: bool,
+    scale: Scale,
     clusters: &mut Vec<(usize, f32, bool)>,
     segments: &mut Vec<(usize, usize)>,
 ) {
@@ -2628,7 +2676,7 @@ fn wrap_segments(
         // and a table cell draw no pill and pass `pad_code` false, skipping this.
         let is_code = matches!(kind, markdown::SpanKind::Text(markdown::Emphasis::Code));
         if pad_code && is_code && !prev_code {
-            w += (2 * crate::theme::CODE_PAD_X) as f32;
+            w += (2 * scale.px(crate::theme::CODE_PAD_X)) as f32;
         }
         prev_code = is_code;
         (off, w, cluster == " ")
@@ -2757,24 +2805,27 @@ fn table_columns(ctx: &LayoutCtx, block: &TableBlock, pool: &mut LayoutScratch) 
             natural[c] = natural[c].max(w);
         }
     }
-    let border_pad = (cols as i32 + 1) * TABLE_BORDER + cols as i32 * 2 * TABLE_CELL_PAD_X;
+    let border = ctx.scale.px(TABLE_BORDER);
+    let cell_pad_x = ctx.scale.px(TABLE_CELL_PAD_X);
+    let min_col = ctx.scale.px(TABLE_MIN_COL);
+    let border_pad = (cols as i32 + 1) * border + cols as i32 * 2 * cell_pad_x;
     let avail = if ctx.wrap_width > 0 {
-        (ctx.wrap_width - border_pad).max(cols as i32 * TABLE_MIN_COL)
+        (ctx.wrap_width - border_pad).max(cols as i32 * min_col)
     } else {
         natural.iter().sum::<i32>().max(1)
     };
-    let widths = fit_columns(&natural, avail);
+    let widths = fit_columns(&natural, avail, min_col);
     let mut out = Vec::with_capacity(cols);
-    let mut x = TABLE_BORDER;
+    let mut x = border;
     for (&w, &align) in widths.iter().zip(&block.aligns) {
-        let cx = x + TABLE_CELL_PAD_X;
+        let cx = x + cell_pad_x;
         let w = w.max(1);
         out.push(Column {
             x: cx,
             width: w,
             align,
         });
-        x = cx + w + TABLE_CELL_PAD_X + TABLE_BORDER;
+        x = cx + w + cell_pad_x + border;
     }
     out
 }
@@ -2815,20 +2866,20 @@ pub(crate) fn leading_pad(m: Metrics) -> i32 {
 
 /// The count of the tallest cell's wrapped lines in a laid-out row, recovered from
 /// its box height (`max_lines * line_height + 2 * pad`).
-pub(crate) fn row_max_lines(height: i32, line_height: i32) -> usize {
-    (((height - 2 * TABLE_CELL_PAD_Y) / line_height).max(1)) as usize
+pub(crate) fn row_max_lines(height: i32, line_height: i32, scale: Scale) -> usize {
+    (((height - 2 * scale.px(TABLE_CELL_PAD_Y)) / line_height).max(1)) as usize
 }
 
 /// Fit natural column widths to `avail` pixels: keep them if they fit, else shrink
 /// each in proportion to its share, clamped to a floor so none vanishes.
-fn fit_columns(natural: &[i32], avail: i32) -> Vec<i32> {
+fn fit_columns(natural: &[i32], avail: i32, min_col: i32) -> Vec<i32> {
     let total: i32 = natural.iter().sum();
     if total <= avail || total == 0 {
         return natural.to_vec();
     }
     natural
         .iter()
-        .map(|&w| ((w as i64 * avail as i64 / total as i64) as i32).max(TABLE_MIN_COL))
+        .map(|&w| ((w as i64 * avail as i64 / total as i64) as i32).max(min_col))
         .collect()
 }
 
@@ -2878,16 +2929,16 @@ fn lay_table_row(
         max_lines = max_lines.max(cell.lines.len().max(1));
         cells.push(cell);
     }
-    let height = max_lines as i32 * metrics.line_height + 2 * TABLE_CELL_PAD_Y;
+    let height = max_lines as i32 * metrics.line_height + 2 * ctx.scale.px(TABLE_CELL_PAD_Y);
     if !measure_only {
         // Vertical grid lines: the left outer edge, each column separator (just past
         // a column's content and right padding), and the right outer edge.
         let mut borders = Vec::with_capacity(columns.len() + 1);
         borders.push(0);
         for col in &columns {
-            borders.push(col.x + col.width + TABLE_CELL_PAD_X);
+            borders.push(col.x + col.width + ctx.scale.px(TABLE_CELL_PAD_X));
         }
-        let width = borders.last().copied().unwrap_or(0) + TABLE_BORDER;
+        let width = borders.last().copied().unwrap_or(0) + ctx.scale.px(TABLE_BORDER);
         out.push(VisualLine {
             start: l.start,
             end: l.end,
@@ -2973,7 +3024,7 @@ fn cell_measure_width(
         for span in &pool.spans {
             let face = run_face(ctx.fonts, size, span.kind, header);
             w += shape::text_advance(face, &piece[span.start..span.end]);
-            w += 2.0 * inline_code_pad(span.kind, false) as f32;
+            w += 2.0 * inline_code_pad(span.kind, false, ctx.scale) as f32;
         }
         max_w = max_w.max(w);
     }
@@ -3030,6 +3081,7 @@ fn build_cell(
             // Inline code in a cell draws the same padded pill prose does, so reserve
             // its pad in the wrap; the run-walks below fold the same pad in.
             true,
+            ctx.scale,
             &mut pool.clusters,
             &mut pool.segments,
         );
@@ -3059,7 +3111,7 @@ fn cell_line_width(ctx: &LayoutCtx, size: u32, runs: &[Run], header: bool) -> i3
         if !run.visible {
             continue;
         }
-        let pad = inline_code_pad(run.kind, false) as f32;
+        let pad = inline_code_pad(run.kind, false, ctx.scale) as f32;
         let face = run_face(ctx.fonts, size, run.kind, header);
         w += pad + shape::text_advance(face, &ctx.rope.slice(run.start..run.end).as_cow()) + pad;
     }
@@ -3100,6 +3152,68 @@ mod tests {
     /// Reveal-specific tests build explicitly with a narrower active range.
     fn layout(f: &Fonts, r: &Rope) -> Layout {
         Layout::build(f, r, LEFT, TOP, 1_000_000, BODY, (0, r.len()))
+    }
+
+    #[test]
+    fn image_button_rect_scales_exactly_with_the_display() {
+        let pic = Rect {
+            x: 0,
+            y: 0,
+            w: 400,
+            h: 300,
+        };
+        let one = image_button_rect(&pic, Scale::ONE);
+        let two = image_button_rect(&pic, Scale::from_120(240));
+        // The button doubles in size at 2x, and its inset from the top-right corner
+        // doubles with it, so it stays pinned to the picture's corner.
+        assert_eq!((two.w, two.h), (2 * one.w, 2 * one.h));
+        assert_eq!(pic.x + pic.w - two.x, 2 * (pic.x + pic.w - one.x));
+        assert_eq!(two.y, 2 * one.y);
+    }
+
+    #[test]
+    fn table_geometry_scales_with_the_display() {
+        let f = fonts();
+        let r = Rope::from_str("| a | b |\n| - | - |\n| c | d |\n");
+        let images = ImageStore::new(None);
+        // Same font size both times, so only the scaled cell padding, borders, and
+        // column geometry move the grid width; the display scale flows in through the
+        // ctx. A wide wrap so the columns keep their natural (unshrunk) widths.
+        let build_at = |scale: Scale| {
+            let ctx = LayoutCtx::new(
+                &f,
+                &r,
+                1_000_000,
+                BODY,
+                (0, 0),
+                &images,
+                ImageUi::default(),
+                scale,
+            );
+            Layout::build_with_images(&ctx, LEFT, TOP)
+        };
+        let width_of = |l: &Layout| {
+            l.lines()
+                .iter()
+                .find_map(|v| v.table.as_ref().map(|t| t.width))
+                .expect("a table row")
+        };
+        let one = width_of(&build_at(Scale::ONE));
+        let two = width_of(&build_at(Scale::from_120(240)));
+        assert!(
+            two > one,
+            "table width scales with the display: {two} vs {one}"
+        );
+    }
+
+    #[test]
+    fn inline_code_pad_scales_with_the_display() {
+        let code = markdown::SpanKind::Text(markdown::Emphasis::Code);
+        let one = inline_code_pad(code, false, Scale::ONE);
+        assert!(one > 0);
+        assert_eq!(inline_code_pad(code, false, Scale::from_120(240)), 2 * one);
+        // A fenced-block code run draws no pill, so no pad at any scale.
+        assert_eq!(inline_code_pad(code, true, Scale::from_120(240)), 0);
     }
 
     /// A rope from a string literal, for the geometry tests.
@@ -3267,7 +3381,7 @@ mod tests {
         for r in oracle_docs() {
             for &w in ORACLE_WIDTHS {
                 let full = Layout::build(&f, &r, LEFT, TOP, w, BODY, NO_REVEAL);
-                let idx = LineIndex::build(&f, &r, w, BODY, &no_images);
+                let idx = LineIndex::build(&f, &r, w, BODY, &no_images, Scale::ONE);
                 assert_eq!(idx.len(), r.len_lines(), "one record per logical line");
                 assert_eq!(
                     idx.content_height(&RevealAdjust::default()),
@@ -3308,7 +3422,7 @@ mod tests {
         let r = rope("intro line\n![cat](cat.png)\ntrailing line\n");
         let w = 560;
         let img_line = 1;
-        let idx = LineIndex::build(&f, &r, w, BODY, &s);
+        let idx = LineIndex::build(&f, &r, w, BODY, &s, Scale::ONE);
         assert!(
             idx.reveal_extra(img_line) > 0,
             "revealing the source adds height"
@@ -3317,7 +3431,7 @@ mod tests {
         assert_eq!(idx.reveal_extra(2), 0);
 
         // Base height (nothing revealed) matches a full no-reveal build.
-        let base_ctx = LayoutCtx::for_index(&f, &r, w, BODY, &s);
+        let base_ctx = LayoutCtx::for_index(&f, &r, w, BODY, &s, Scale::ONE);
         let base = Layout::build_with_images(&base_ctx, LEFT, TOP);
         assert_eq!(
             idx.content_height(&RevealAdjust::default()),
@@ -3328,7 +3442,16 @@ mod tests {
         // that reveals the same line.
         let ls = r.line_to_byte(img_line);
         let le = r.line_to_byte(img_line + 1) - 1;
-        let revealed_ctx = LayoutCtx::new(&f, &r, w, BODY, (ls, le), &s, ImageUi::default());
+        let revealed_ctx = LayoutCtx::new(
+            &f,
+            &r,
+            w,
+            BODY,
+            (ls, le),
+            &s,
+            ImageUi::default(),
+            Scale::ONE,
+        );
         let revealed = Layout::build_with_images(&revealed_ctx, LEFT, TOP);
         let mut adj = RevealAdjust::default();
         adj.push(img_line, idx.reveal_extra(img_line));
@@ -3346,7 +3469,7 @@ mod tests {
             let n = r.len_lines();
             for &w in ORACLE_WIDTHS {
                 let full = Layout::build(&f, &r, LEFT, TOP, w, BODY, NO_REVEAL);
-                let idx = LineIndex::build(&f, &r, w, BODY, &no_images);
+                let idx = LineIndex::build(&f, &r, w, BODY, &no_images, Scale::ONE);
                 let full_fp = fingerprint(&full);
                 let bands: [(usize, usize); 5] = [
                     (0, n),
@@ -3357,7 +3480,7 @@ mod tests {
                 ];
                 for (bs, be) in bands {
                     let seed = TOP + idx.logical_top(bs, &RevealAdjust::default());
-                    let win_ctx = LayoutCtx::for_index(&f, &r, w, BODY, &no_images);
+                    let win_ctx = LayoutCtx::for_index(&f, &r, w, BODY, &no_images, Scale::ONE);
                     let win = Layout::build_window(&win_ctx, LEFT, seed, &idx, bs, be);
                     let expected: Vec<_> = full_fp
                         .iter()
@@ -3387,7 +3510,7 @@ mod tests {
             "# Title\n\nintro paragraph here\n\n- alpha\n- beta\n  - nested\n\n```\nlet x = 1;\n```\n\ntail line\nlast\n",
         );
         let mut rope = Rope::from_str(&text);
-        let mut index = LineIndex::build(&f, &rope, w, BODY, &no_images);
+        let mut index = LineIndex::build(&f, &rope, w, BODY, &no_images, Scale::ONE);
 
         let edits: &[(&str, &str)] = &[
             ("intro", "INTRO"),                                  // in-line replace
@@ -3404,9 +3527,9 @@ mod tests {
             let prev = rope.clone();
             text.replace_range(pos..pos + needle.len(), repl);
             rope = Rope::from_str(&text);
-            let update_ctx = LayoutCtx::for_index(&f, &rope, w, BODY, &no_images);
+            let update_ctx = LayoutCtx::for_index(&f, &rope, w, BODY, &no_images, Scale::ONE);
             index.update(&update_ctx, &prev);
-            let rebuilt = LineIndex::build(&f, &rope, w, BODY, &no_images);
+            let rebuilt = LineIndex::build(&f, &rope, w, BODY, &no_images, Scale::ONE);
             assert_eq!(
                 index.recs, rebuilt.recs,
                 "records after {needle:?} -> {repl:?}"
@@ -3427,8 +3550,8 @@ mod tests {
         let no_images = ImageStore::new(None);
         for r in oracle_docs() {
             for &w in ORACLE_WIDTHS {
-                let seq = LineIndex::build(&f, &r, w, BODY, &no_images);
-                let ctx = LayoutCtx::for_index(&f, &r, w, BODY, &no_images);
+                let seq = LineIndex::build(&f, &r, w, BODY, &no_images, Scale::ONE);
+                let ctx = LayoutCtx::for_index(&f, &r, w, BODY, &no_images, Scale::ONE);
                 for threads in [2, 3, 7, 32] {
                     let par = LineIndex::build_chunked(&ctx, threads);
                     assert_eq!(
@@ -5032,7 +5155,7 @@ mod tests {
         s: &ImageStore,
         ui: ImageUi,
     ) -> Layout {
-        let ctx = LayoutCtx::new(f, r, 1_000_000, BODY, active, s, ui);
+        let ctx = LayoutCtx::new(f, r, 1_000_000, BODY, active, s, ui, Scale::ONE);
         Layout::build_with_images(&ctx, LEFT, TOP)
     }
 
@@ -5181,7 +5304,7 @@ mod tests {
         let inside = ((rect.x + 5) as f32, (rect.y + 5) as f32);
         assert_eq!(sel.image_at(&f, inside.0, inside.1), Some(0));
         // The corner button is hit only when the image is selected.
-        let btn = image_button_rect(&rect);
+        let btn = image_button_rect(&rect, Scale::ONE);
         let bpt = ((btn.x + 1) as f32, (btn.y + 1) as f32);
         assert_eq!(sel.image_button_at(&f, bpt.0, bpt.1), Some(0));
         let idle = layout_img(&f, &r, (20, 20), &s, ImageUi::default());

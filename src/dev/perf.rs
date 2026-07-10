@@ -39,6 +39,7 @@ use crate::platform::error::{Error, Result};
 use crate::platform::freetype::Fonts;
 use crate::render::image::{Image, ImageStore};
 use crate::rope::Rope;
+use crate::scale::Scale;
 use crate::text::TextBuffer;
 use crate::theme::{FONT_SIZE, MARGIN};
 
@@ -163,7 +164,7 @@ fn measure() -> Result<Vec<Sample>> {
     // the window, not the document, so it should sit far below `layout_build` and
     // stay flat as documents grow. The index is warmed first (its build is the
     // per-edit cost, guarded separately below).
-    let index = LineIndex::build(&fonts, &rope, wrap, FONT_SIZE, &images);
+    let index = LineIndex::build(&fonts, &rope, wrap, FONT_SIZE, &images, Scale::ONE);
     let band = 30.min(index.len());
     let window_ctx = LayoutCtx::new(
         &fonts,
@@ -173,6 +174,7 @@ fn measure() -> Result<Vec<Sample>> {
         (0, 0),
         &images,
         ImageUi::default(),
+        Scale::ONE,
     );
     out.push(sample("layout_window", 500, || {
         Layout::build_window(&window_ctx, MARGIN, MARGIN, &index, 0, band)
@@ -185,7 +187,7 @@ fn measure() -> Result<Vec<Sample>> {
     // reuses the rest, so it stays flat as documents grow. (The clone per iteration
     // is measurement scaffolding, since `update` mutates in place.)
     let edited = edited_middle(&text);
-    let update_ctx = LayoutCtx::for_index(&fonts, &edited, wrap, FONT_SIZE, &images);
+    let update_ctx = LayoutCtx::for_index(&fonts, &edited, wrap, FONT_SIZE, &images, Scale::ONE);
     out.push(sample("index_update", 500, || {
         let mut idx = index.clone();
         idx.update(&update_ctx, &rope);
@@ -217,6 +219,7 @@ fn measure() -> Result<Vec<Sample>> {
         (0, 0),
         &image_store,
         ImageUi::default(),
+        Scale::ONE,
     );
     let image_layout = Layout::build_with_images(&image_ctx, MARGIN, MARGIN);
 
@@ -271,6 +274,7 @@ fn measure() -> Result<Vec<Sample>> {
         (0, 0),
         &image_store,
         ImageUi::default(),
+        Scale::ONE,
     );
     out.push(sample("layout_reflow_image", 200, || {
         Layout::build_with_images(&reflow_ctx, MARGIN, MARGIN).text_height()
@@ -302,6 +306,8 @@ fn params(scroll_y: i32, selection: Option<(usize, usize)>) -> PaintParams<'stat
         width: WIDTH,
         height: HEIGHT,
         scroll_y,
+        scale: Scale::ONE,
+        body_size: FONT_SIZE,
         selection,
         table_hover: None,
         cursor: 0,
@@ -576,7 +582,7 @@ pub fn run_lab(args: &[String]) -> Result<()> {
         // Windowed layout + incremental index: the per-cursor-move and per-keystroke
         // costs that replace a full `layout` rebuild. A warm index, a viewport band,
         // and a one-character edit (at a char boundary near the middle) set them up.
-        let index = LineIndex::build(&fonts, &rope, wrap, FONT_SIZE, &images);
+        let index = LineIndex::build(&fonts, &rope, wrap, FONT_SIZE, &images, Scale::ONE);
         let band = 30.min(index.len());
         let edited = edited_middle(&text);
         let window_ctx = LayoutCtx::new(
@@ -587,8 +593,10 @@ pub fn run_lab(args: &[String]) -> Result<()> {
             (0, 0),
             &images,
             ImageUi::default(),
+            Scale::ONE,
         );
-        let update_ctx = LayoutCtx::for_index(&fonts, &edited, wrap, FONT_SIZE, &images);
+        let update_ctx =
+            LayoutCtx::for_index(&fonts, &edited, wrap, FONT_SIZE, &images, Scale::ONE);
 
         let cpu_before = sys::cpu_time();
 
@@ -1008,7 +1016,7 @@ pub fn run_load_bench(args: &[String]) -> Result<()> {
     report_stage("scan images", scan_ns, n);
 
     let (_index_seq, index_seq_ns) =
-        timed(|| LineIndex::build(&fonts, &rope, wrap, FONT_SIZE, &images));
+        timed(|| LineIndex::build(&fonts, &rope, wrap, FONT_SIZE, &images, Scale::ONE));
     report_stage("index (1 core)", index_seq_ns, n);
 
     // An optional positional arg after the path overrides the worker count, so the
@@ -1020,8 +1028,9 @@ pub fn run_load_bench(args: &[String]) -> Result<()> {
                 .map(|p| p.get())
                 .unwrap_or(1)
         });
-    let (index, index_ns) =
-        timed(|| LineIndex::build_parallel(&fonts, &rope, wrap, FONT_SIZE, &images, threads));
+    let (index, index_ns) = timed(|| {
+        LineIndex::build_parallel(&fonts, &rope, wrap, FONT_SIZE, &images, Scale::ONE, threads)
+    });
     report_stage(&format!("index ({threads} cores)"), index_ns, n);
 
     let band = 60.min(index.len());
@@ -1033,6 +1042,7 @@ pub fn run_load_bench(args: &[String]) -> Result<()> {
         (0, 0),
         &images,
         ImageUi::default(),
+        Scale::ONE,
     );
     let (window, window_ns) =
         timed(|| Layout::build_window(&window_ctx, MARGIN, MARGIN, &index, 0, band));
@@ -1085,7 +1095,8 @@ pub fn run_mem_report(args: &[String]) -> Result<()> {
     let threads = std::thread::available_parallelism()
         .map(|p| p.get())
         .unwrap_or(1);
-    let index = LineIndex::build_parallel(&fonts, &rope, wrap, FONT_SIZE, &images, threads);
+    let index =
+        LineIndex::build_parallel(&fonts, &rope, wrap, FONT_SIZE, &images, Scale::ONE, threads);
 
     let peak = sys::peak_rss_bytes();
     let rope_heap = rope.heap_bytes();

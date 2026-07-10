@@ -12,6 +12,7 @@ use crate::platform::protocol::wp_cursor_shape_device_v1;
 use crate::platform::scroll;
 use crate::render::image::ImageStore;
 use crate::rope::Rope;
+use crate::scale::Scale;
 use crate::store;
 use crate::text::TextBuffer;
 use crate::theme::{FONT_SIZE, MARGIN};
@@ -101,15 +102,17 @@ fn load(path: &Path) -> Result<(String, FileFormat)> {
 }
 
 /// The inputs the laid-out geometry depends on, used to memoize it: content
-/// version, surface width, body font size, the active range's logical line span
-/// (the marker reveal depends only on which lines the range touches, not the
-/// exact byte offsets), and the selected / raw-pinned image (by line-start
-/// offset). A scroll, idle redraw, or cursor move within one line leaves all of
-/// these unchanged and reuses the cached layout.
+/// version, surface width, body font size, the display scale (as its 120ths
+/// factor, so a DPI change reflows even at an unchanged column width and body
+/// size), the active range's logical line span (the marker reveal depends only on
+/// which lines the range touches, not the exact byte offsets), and the selected /
+/// raw-pinned image (by line-start offset). A scroll, idle redraw, or cursor move
+/// within one line leaves all of these unchanged and reuses the cached layout.
 type LayoutKey = (
     u64,
     i32,
     i32,
+    u32,
     u32,
     usize,
     usize,
@@ -118,9 +121,10 @@ type LayoutKey = (
 );
 
 /// The inputs the line-metrics index depends on: content version, column x and
-/// width, and body font size. Reveal and scroll leave these unchanged, so a cursor
-/// move or a scroll reuses the index and only the visible window rebuilds.
-type IndexKey = (u64, i32, i32, u32);
+/// width, body font size, and the display scale (its 120ths factor). Reveal and
+/// scroll leave these unchanged, so a cursor move or a scroll reuses the index and
+/// only the visible window rebuilds.
+type IndexKey = (u64, i32, i32, u32, u32);
 
 /// Cap on worker threads for a parallel index build. Bounds the transient memory
 /// of the per-worker font sets (each worker opens its own FreeType faces).
@@ -142,8 +146,10 @@ pub(crate) enum Focus {
 /// thin divider line drawn down its middle.
 pub(crate) const SPLITTER: i32 = 6;
 
-/// The adjustable column layout. The sidebar has a pixel width; the two content
-/// panes split the remaining width by a ratio. Splitters drag these values.
+/// The adjustable column layout. The sidebar has a logical pixel width; the two
+/// content panes split the remaining width by a ratio. Splitters drag these
+/// values. `tree_width` is logical (the persisted, scale-free unit); [`Self::columns`]
+/// scales it to device pixels.
 pub(crate) struct PaneLayout {
     pub(crate) tree_width: i32,
     /// Pane A's share of the content area (right of the tree), clamped 0.1..0.9.
@@ -163,10 +169,14 @@ pub(crate) struct Columns {
 }
 
 impl PaneLayout {
-    /// Lay the columns out across `width`×`height`. Editor A always takes what is
+    /// Lay the columns out across the device `width`×`height` at display `scale`.
+    /// The logical sidebar width and splitter thickness are scaled to device pixels
+    /// here, so the persisted layout stays scale-free. Editor A always takes what is
     /// left after an optional sidebar and an optional second pane; each column is
     /// full height, so content stays in its column by construction (no clip).
-    pub(crate) fn columns(&self, width: i32, height: i32) -> Columns {
+    pub(crate) fn columns(&self, width: i32, height: i32, scale: Scale) -> Columns {
+        let splitter = scale.px(SPLITTER);
+        let tree_width = scale.px(self.tree_width);
         let mut x = 0;
         let mut tree = None;
         let mut splitters = [None, None];
@@ -174,21 +184,21 @@ impl PaneLayout {
             tree = Some(Rect {
                 x,
                 y: 0,
-                w: self.tree_width,
+                w: tree_width,
                 h: height,
             });
-            x += self.tree_width;
+            x += tree_width;
             splitters[0] = Some(Rect {
                 x,
                 y: 0,
-                w: SPLITTER,
+                w: splitter,
                 h: height,
             });
-            x += SPLITTER;
+            x += splitter;
         }
         let mut editors = [None, None];
         if self.second_open {
-            let content = (width - x - SPLITTER).max(0);
+            let content = (width - x - splitter).max(0);
             let a_w = ((content as f32 * self.split_ratio) as i32).clamp(0, content);
             editors[0] = Some(Rect {
                 x,
@@ -200,10 +210,10 @@ impl PaneLayout {
             splitters[1] = Some(Rect {
                 x,
                 y: 0,
-                w: SPLITTER,
+                w: splitter,
                 h: height,
             });
-            x += SPLITTER;
+            x += splitter;
             editors[1] = Some(Rect {
                 x,
                 y: 0,
@@ -271,6 +281,11 @@ pub(crate) struct EditorPane {
     /// Pooled inline-markup scratch for [`Self::link_under_pointer`], so hit-testing
     /// a hovered line's links reuses its buffers instead of reallocating per event.
     link_scratch: markdown::InlineScratch,
+    /// The display scale and the device-pixel body font size this pane lays out at,
+    /// set by [`State`] and refreshed on a DPI change. At [`Scale::ONE`] the body is
+    /// [`FONT_SIZE`] and every geometry constant is its authored value.
+    scale: Scale,
+    body_size: u32,
 }
 
 impl EditorPane {
@@ -299,7 +314,17 @@ impl EditorPane {
             autoscroll: 0,
             autoscroll_at: None,
             link_scratch: markdown::InlineScratch::default(),
+            scale: Scale::ONE,
+            body_size: FONT_SIZE,
         }
+    }
+
+    /// Adopt a new display scale and device-pixel body size (a DPI change), so the
+    /// next layout re-measures at the new size. The memoization keys carry both, so
+    /// simply setting them invalidates the cached index and window.
+    pub(crate) fn set_scale(&mut self, scale: Scale, body_size: u32) {
+        self.scale = scale;
+        self.body_size = body_size;
     }
 
     /// Load `path` into a fresh pane, resolving inline images against its
@@ -376,16 +401,25 @@ impl EditorPane {
     /// any revealed image sources. The index is where the O(document) measuring
     /// lives now, paid once per edit or resize rather than per keystroke.
     pub(crate) fn ensure_index(&mut self, fonts: &Fonts, rect: Rect) {
-        let key = (self.text.version(), rect.x, rect.w, FONT_SIZE);
+        let margin = self.scale.px(MARGIN);
+        let key = (
+            self.text.version(),
+            rect.x,
+            rect.w,
+            self.body_size,
+            self.scale.factor_120(),
+        );
         if self.index_key != Some(key) {
-            let wrap_width = rect.w - 2 * MARGIN;
+            let wrap_width = rect.w - 2 * margin;
             self.scan_images();
-            // When only the content changed (same column and font), re-measure just
-            // the edited region against the previous rope; otherwise (first build,
+            // When only the content changed (same column, font, and scale), re-measure
+            // just the edited region against the previous rope; otherwise (first build,
             // or a resize) rebuild in full.
             let geometry_same = matches!(
                 self.index_key,
-                Some((_, x, w, fsize)) if x == rect.x && w == rect.w && fsize == FONT_SIZE
+                Some((_, x, w, fsize, f120))
+                    if x == rect.x && w == rect.w && fsize == self.body_size
+                        && f120 == self.scale.factor_120()
             );
             let incremental =
                 geometry_same && self.line_index.is_some() && self.prev_rope.is_some();
@@ -396,8 +430,9 @@ impl EditorPane {
                     fonts,
                     self.text.rope(),
                     wrap_width,
-                    FONT_SIZE,
+                    self.body_size,
                     &self.images,
+                    self.scale,
                 );
                 index.update(&ctx, &prev);
                 self.line_index = Some(index);
@@ -416,8 +451,9 @@ impl EditorPane {
                     fonts,
                     self.text.rope(),
                     wrap_width,
-                    FONT_SIZE,
+                    self.body_size,
                     &self.images,
+                    self.scale,
                     threads,
                 ));
             }
@@ -426,7 +462,7 @@ impl EditorPane {
         }
         let adjust = self.reveal_adjust();
         if let Some(index) = self.line_index.as_ref() {
-            self.content_height = index.content_height(&adjust) + 2 * MARGIN;
+            self.content_height = index.content_height(&adjust) + 2 * margin;
         }
     }
 
@@ -443,10 +479,11 @@ impl EditorPane {
             fonts,
             self.text.rope(),
             wrap_width,
-            FONT_SIZE,
+            self.body_size,
             active,
             &self.images,
             self.image_ui(),
+            self.scale,
         )
     }
 
@@ -465,7 +502,8 @@ impl EditorPane {
             self.text.version(),
             rect.x,
             rect.w,
-            FONT_SIZE,
+            self.body_size,
+            self.scale.factor_120(),
             active_lines.0,
             active_lines.1,
             self.selected_image,
@@ -492,12 +530,13 @@ impl EditorPane {
         }
         let start = vis_top.saturating_sub(over);
         let end = (vis_bot + over + 1).min(n).max(start);
-        let wrap_width = rect.w - 2 * MARGIN;
+        let margin = self.scale.px(MARGIN);
+        let wrap_width = rect.w - 2 * margin;
         let layout = {
             let ctx = self.layout_ctx(fonts, active, wrap_width);
             let index = self.line_index.as_ref().expect("index built above");
-            let seed = rect.y + MARGIN + index.logical_top(start, &adjust);
-            Layout::build_window(&ctx, rect.x + MARGIN, seed, index, start, end)
+            let seed = rect.y + margin + index.logical_top(start, &adjust);
+            Layout::build_window(&ctx, rect.x + margin, seed, index, start, end)
         };
         self.layout_cache = Some(layout);
         self.layout_band = (start, end);
@@ -526,12 +565,13 @@ impl EditorPane {
         let n = index.len();
         let start = cursor_line.saturating_sub(span);
         let end = (cursor_line + span + 1).min(n).max(start);
-        let seed = rect.y + MARGIN + index.logical_top(start, &adjust);
-        let wrap_width = rect.w - 2 * MARGIN;
+        let margin = self.scale.px(MARGIN);
+        let seed = rect.y + margin + index.logical_top(start, &adjust);
+        let wrap_width = rect.w - 2 * margin;
         let ctx = self.layout_ctx(fonts, active, wrap_width);
         Some(Layout::build_window(
             &ctx,
-            rect.x + MARGIN,
+            rect.x + margin,
             seed,
             index,
             start,
@@ -577,7 +617,7 @@ impl EditorPane {
             caret_h,
             rect.h,
             self.content_height,
-            MARGIN,
+            self.scale.px(MARGIN),
         );
         let moved = sy != self.scroll_y;
         self.scroll_y = sy;
@@ -651,7 +691,7 @@ impl EditorPane {
     /// How many visual lines make up a Page Up/Down jump in this column: its
     /// height in body line-heights, less one row of overlap, at least one.
     pub(crate) fn page_lines(&self, fonts: &Fonts, rect: Rect) -> usize {
-        let line_height = fonts.metrics(FONT_SIZE).line_height.max(1);
+        let line_height = fonts.metrics(self.body_size).line_height.max(1);
         (rect.h / line_height - 1).max(1) as usize
     }
 
@@ -667,10 +707,11 @@ impl EditorPane {
         }
         let rope = self.text.rope();
         let adjust = self.reveal_adjust();
+        let margin = self.scale.px(MARGIN);
         self.find
             .matches()
             .iter()
-            .map(|&(start, _)| MARGIN + index.logical_top(rope.byte_to_line(start), &adjust))
+            .map(|&(start, _)| margin + index.logical_top(rope.byte_to_line(start), &adjust))
             .collect()
     }
 
@@ -951,7 +992,7 @@ mod tests {
             tree_visible: true,
             second_open: true,
         };
-        let cols = panes.columns(1000, 700);
+        let cols = panes.columns(1000, 700, Scale::ONE);
         let tree = cols.tree.expect("tree shown");
         assert_eq!((tree.x, tree.w, tree.h), (0, 200, 700));
         assert_eq!(cols.splitters[0].expect("tree splitter").x, 200);
@@ -973,7 +1014,7 @@ mod tests {
             tree_visible: false,
             second_open: false,
         };
-        let cols = panes.columns(1000, 700);
+        let cols = panes.columns(1000, 700, Scale::ONE);
         assert!(cols.tree.is_none());
         assert!(cols.splitters[0].is_none() && cols.splitters[1].is_none());
         let a = cols.editors[0].expect("editor A");

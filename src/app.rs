@@ -37,16 +37,18 @@ use crate::paint::{build_display_list, build_find_paint, push_splitter, push_tre
 use crate::pane::{restore_editor, Columns, EditorPane, Focus, PaneLayout, TreePane};
 use crate::platform::conn::{Connection, Fill};
 use crate::platform::error::{Error, Result};
-use crate::platform::freetype::Fonts;
+use crate::platform::freetype::{FontConfig, Fonts};
 use crate::platform::geom::Rect;
 use crate::platform::protocol::{
     self, wl_buffer, wl_callback, wl_compositor, wl_data_device_manager, wl_data_offer, wl_display,
-    wl_registry, wl_seat, wl_surface, xdg_surface, xdg_toplevel, xdg_wm_base,
+    wl_output, wl_registry, wl_seat, wl_surface, wp_fractional_scale_manager_v1,
+    wp_fractional_scale_v1, wp_viewporter, xdg_surface, xdg_toplevel, xdg_wm_base,
 };
 use crate::platform::scroll;
 use crate::platform::wire::{Arg, Message, Reader};
 use crate::platform::xkb::Xkb;
 use crate::render::display::DisplayList;
+use crate::scale::Scale;
 use crate::store;
 use crate::theme::FONT_SIZE;
 use crate::tree;
@@ -59,6 +61,93 @@ const MAX_DIMENSION: u32 = 16384;
 /// First object id in Wayland's server-allocated range. Client-created ids stay
 /// below this; the free list only ever recycles client ids.
 const SERVER_ID_BASE: u32 = 0xff00_0000;
+
+/// A compositor scale of 1.0, in the fractional-scale protocol's 120ths unit. The
+/// scale is unknown until the compositor reports it, so the window opens at unity.
+const SCALE_120_UNITY: u32 = 120;
+
+/// The sane range a resolved device-pixel body font size is clamped to, guarding a
+/// hostile scale or a bogus `BNKNOTES_FONT_SIZE` from opening an unusable face.
+const FONT_SIZE_RANGE: std::ops::RangeInclusive<u32> = 6..=72;
+
+/// The device-pixel body font size at compositor scale `scale_120` (120ths). The
+/// logical body [`FONT_SIZE`] is scaled by the display, so text keeps its physical
+/// size as DPI changes. `BNKNOTES_FONT_SIZE` pins an explicit pixel height and opts
+/// out of scaling (the escape hatch).
+fn config_font_px(scale_120: u32) -> u32 {
+    if let Some(px) = std::env::var("BNKNOTES_FONT_SIZE")
+        .ok()
+        .and_then(|v| v.trim().parse::<u32>().ok())
+        .filter(|&px| px > 0)
+    {
+        return px.clamp(*FONT_SIZE_RANGE.start(), *FONT_SIZE_RANGE.end());
+    }
+    Scale::from_120(scale_120)
+        .font_px(FONT_SIZE)
+        .clamp(*FONT_SIZE_RANGE.start(), *FONT_SIZE_RANGE.end())
+}
+
+/// Compositor scale tracking and the objects that deliver it.
+///
+/// Two mechanisms, in priority order. The fractional path is primary: a
+/// `wp_fractional_scale_v1` reports `preferred_scale` in 120ths and a `wp_viewport`
+/// maps the device-pixel buffer down to the logical window size, so a 1.25 or 1.5
+/// display renders pixel-exact. The integer path is the fallback for compositors
+/// with no fractional-scale global: each `wl_output`'s `scale` event, the surface's
+/// scale being the max over the outputs it spans (`wl_surface.enter`/`leave`), and
+/// `wl_surface.set_buffer_scale`. `viewport != 0` means the fractional path is live.
+struct Scaling {
+    /// Effective scale as 120ths (120 = 1.0); drives the font pixels and buffer size.
+    factor_120: u32,
+    /// Logical window size (surface-local px) from the last xdg configure. The
+    /// device buffer is this scaled up; the viewport (or buffer scale) maps back.
+    logical: (u32, u32),
+    /// Whether the surface's geometry + viewport/buffer-scale state has been resent
+    /// since `factor_120` or `logical` last changed. Cleared on change, set on sync.
+    synced: bool,
+    fractional_manager: Option<u32>,
+    viewporter: Option<u32>,
+    /// Per-surface objects the managers mint (0 when unavailable).
+    fractional_scale: u32,
+    viewport: u32,
+    /// Integer fallback: each bound `wl_output`'s scale, and the ids the surface
+    /// currently spans. Unused once the fractional path is live.
+    outputs: Vec<(u32, i32)>,
+    entered: Vec<u32>,
+}
+
+impl Scaling {
+    fn new(logical: (u32, u32)) -> Self {
+        Scaling {
+            factor_120: SCALE_120_UNITY,
+            logical,
+            synced: false,
+            fractional_manager: None,
+            viewporter: None,
+            fractional_scale: 0,
+            viewport: 0,
+            outputs: Vec::new(),
+            entered: Vec::new(),
+        }
+    }
+
+    /// Whether the fractional path is live (a viewport was created for the surface).
+    fn is_fractional(&self) -> bool {
+        self.viewport != 0
+    }
+
+    /// The integer scale the surface spans: the max scale over the outputs it is
+    /// on, at least 1. Used only on the fallback path.
+    fn integer_scale(&self) -> i32 {
+        self.entered
+            .iter()
+            .filter_map(|id| self.outputs.iter().find(|(oid, _)| oid == id))
+            .map(|(_, scale)| *scale)
+            .max()
+            .unwrap_or(1)
+            .max(1)
+    }
+}
 
 pub fn run() -> Result<()> {
     // An optional path to open; everything after it is ignored for now.
@@ -98,9 +187,20 @@ struct State {
     /// The toplevel title last sent, so it is only re-set when it changes.
     title: String,
 
-    /// Current surface size in pixels.
+    /// Current surface size in device pixels (the buffer size). The logical window
+    /// the compositor sees lives in `scaling.logical`; at scale 1.0 the two match.
     width: u32,
     height: u32,
+    /// Compositor scale tracking and the objects that deliver it.
+    scaling: Scaling,
+    /// Device-pixel body font size, derived from the scale (or pinned by
+    /// `BNKNOTES_FONT_SIZE`). The fonts are opened at this size and every heading
+    /// scales off it; [`FONT_SIZE`] at scale 1.0.
+    body_size: u32,
+    /// The font paths and line-height scale, retained so a DPI change can reopen the
+    /// font set at the new device body size without rebuilding the whole config.
+    font_config: FontConfig,
+    line_height_scale: f32,
 
     // Object ids. Globals are Option (discovered via the registry); ids we
     // create default to 0 (never valid) until assigned.
@@ -238,9 +338,13 @@ impl State {
         // config yet). Open every size the styles use so headings render larger
         // than body text without re-opening mid-frame.
         let config = Config::default();
+        // The window opens at scale 1.0 (the compositor reports the real scale
+        // after the first configure), so the body size starts at the logical
+        // FONT_SIZE unless BNKNOTES_FONT_SIZE pins it.
+        let body_size = config_font_px(SCALE_120_UNITY);
         let fonts = Fonts::with_config(
             &config.fonts,
-            &markdown::all_sizes(FONT_SIZE),
+            &markdown::all_sizes(body_size),
             config.line_height_scale,
         )?;
         // The saved layout: window/column sizes, tree root and open folders, and
@@ -297,6 +401,10 @@ impl State {
             title: String::new(),
             width: session.window.0,
             height: session.window.1,
+            scaling: Scaling::new(session.window),
+            body_size,
+            font_config: config.fonts,
+            line_height_scale: config.line_height_scale,
             registry: 0,
             compositor: None,
             wm_base: None,
@@ -365,7 +473,78 @@ impl State {
 
     /// The current column layout for this window size.
     fn columns(&self) -> Columns {
-        self.panes.columns(self.width as i32, self.height as i32)
+        self.panes
+            .columns(self.width as i32, self.height as i32, self.scale())
+    }
+
+    /// The current display scale, derived from the compositor's reported factor.
+    fn scale(&self) -> Scale {
+        Scale::from_120(self.scaling.factor_120)
+    }
+
+    /// A logical (surface-local) length in device pixels at the current scale.
+    fn to_device(&self, logical: u32) -> u32 {
+        self.scale().px(logical as i32).max(0) as u32
+    }
+
+    /// The logical window size scaled to the device buffer size, clamped so a bogus
+    /// configure cannot blow up the buffer arithmetic.
+    fn device_size(&self, logical_w: u32, logical_h: u32) -> (u32, u32) {
+        (
+            self.to_device(logical_w).clamp(1, MAX_DIMENSION),
+            self.to_device(logical_h).clamp(1, MAX_DIMENSION),
+        )
+    }
+
+    /// Adopt a new compositor scale (in 120ths): reopen the fonts at the size it
+    /// calls for, re-derive the device buffer size from the logical window, and
+    /// mark the surface state unsynced so the next frame resends it. A no-op if the
+    /// scale is unchanged.
+    fn set_scale_120(&mut self, factor_120: u32) {
+        let factor_120 = factor_120.max(1);
+        if factor_120 == self.scaling.factor_120 {
+            return;
+        }
+        self.scaling.factor_120 = factor_120;
+        self.scaling.synced = false; // geometry + viewport/buffer-scale must be resent
+        self.apply_font_size(config_font_px(factor_120));
+        let (lw, lh) = self.scaling.logical;
+        let (dw, dh) = self.device_size(lw, lh);
+        self.resize_to(dw, dh);
+        // Force the next frame even if the device size happened to land the same, so
+        // the resent scale state (and rescaled glyphs) reach the screen.
+        self.dirty = true;
+    }
+
+    /// Reopen the fonts at device-pixel `size` (keeping the working fonts on a
+    /// font-open failure, so a DPI change never blanks the window), then push the
+    /// current scale and effective body size to both panes so their cached layouts
+    /// invalidate and re-measure at the new size.
+    fn apply_font_size(&mut self, size: u32) {
+        if size != self.body_size {
+            if let Ok(fonts) = Fonts::with_config(
+                &self.font_config,
+                &markdown::all_sizes(size),
+                self.line_height_scale,
+            ) {
+                self.fonts = fonts;
+                self.body_size = size;
+            }
+        }
+        let (scale, body) = (self.scale(), self.body_size);
+        for ed in &mut self.editors {
+            ed.set_scale(scale, body);
+        }
+    }
+
+    /// On the integer-scale fallback, recompute the surface scale as the max over
+    /// the outputs it currently spans and adopt it. A no-op on the fractional path.
+    fn refresh_integer_scale(&mut self) {
+        if self.scaling.is_fractional() {
+            return;
+        }
+        let factor_120 = self.scaling.integer_scale() as u32 * 120;
+        self.set_scale_120(factor_120);
     }
 
     /// Ensure the focused editor's layout is current, then keep its caret on
@@ -436,6 +615,27 @@ impl State {
         );
         self.refresh_title();
 
+        // Fractional scaling: a per-surface fractional-scale object delivers the
+        // preferred scale, and a viewport maps the device-pixel buffer onto the
+        // logical window size. They come as a pair; without both, the integer
+        // fallback (wl_output scale + set_buffer_scale) is used instead.
+        if let (Some(fmgr), Some(vp)) = (self.scaling.fractional_manager, self.scaling.viewporter) {
+            let fractional = self.alloc_id();
+            self.conn.request(
+                fmgr,
+                wp_fractional_scale_manager_v1::GET_FRACTIONAL_SCALE,
+                &[Arg::NewId(fractional), Arg::Object(self.surface)],
+            );
+            self.scaling.fractional_scale = fractional;
+            let viewport = self.alloc_id();
+            self.conn.request(
+                vp,
+                wp_viewporter::GET_VIEWPORT,
+                &[Arg::NewId(viewport), Arg::Object(self.surface)],
+            );
+            self.scaling.viewport = viewport;
+        }
+
         // The data device drives the clipboard; skip it if the compositor has no
         // wl_data_device_manager (editing still works, just no copy/paste).
         if let (Some(manager), Some(seat)) = (self.data_device_manager, self.seat) {
@@ -494,7 +694,9 @@ impl State {
             scroll_y: self.editors[i].scroll_y,
         };
         store::Session {
-            window: (self.width, self.height),
+            // The persisted window is the logical size (scale-free); the device
+            // buffer size lives in width/height.
+            window: self.scaling.logical,
             tree_width: self.panes.tree_width.max(0) as u32,
             split_ratio: self.panes.split_ratio,
             tree_visible: self.panes.tree_visible,
@@ -562,7 +764,16 @@ impl State {
         let mut list: DisplayList = Vec::new();
         if let Some(rect) = cols.tree {
             let focused = self.focus == Focus::Tree;
-            push_tree(&mut list, &self.fonts, &mut self.tree, rect, focused);
+            let (scale, body_size) = (self.scale(), self.body_size);
+            push_tree(
+                &mut list,
+                &self.fonts,
+                &mut self.tree,
+                rect,
+                focused,
+                scale,
+                body_size,
+            );
         }
         for i in 0..self.editors.len() {
             let Some(rect) = cols.editors[i] else {
@@ -593,6 +804,8 @@ impl State {
             let params = PaintParams {
                 width: rect.w as usize,
                 height: rect.h as usize,
+                scale: self.scale(),
+                body_size: self.body_size,
                 scroll_y: ed.scroll_y,
                 selection: ed.text.selection(),
                 cursor: ed.text.cursor(),
@@ -612,8 +825,9 @@ impl State {
                 ));
             }
         }
+        let scale = self.scale();
         for s in cols.splitters.into_iter().flatten() {
-            push_splitter(&mut list, s);
+            push_splitter(&mut list, s, scale);
         }
         Rc::new(list)
     }
@@ -669,11 +883,58 @@ impl State {
             // Defer the ack to the frame that commits the matching-size buffer
             // (see `pending_configure`); keep only the latest serial.
             self.pending_configure = Some(r.u32()?);
-            if let Some((w, h)) = self.pending_size.take() {
-                self.resize_to(w, h);
+            if let Some((lw, lh)) = self.pending_size.take() {
+                // The configure size is logical (surface-local); the buffer is device
+                // pixels. Record the logical size (for the viewport destination) and
+                // resize the buffer to the scaled device size.
+                self.scaling.logical = (lw, lh);
+                self.scaling.synced = false;
+                let (dw, dh) = self.device_size(lw, lh);
+                self.resize_to(dw, dh);
             }
             self.configured = true;
             self.dirty = true;
+            return Ok(());
+        }
+
+        // wp_fractional_scale_v1.preferred_scale: the compositor's scale as 120ths.
+        // This is the primary scale source; adopting it reopens the fonts and
+        // resizes the buffer to exact device resolution.
+        if self.scaling.fractional_scale != 0
+            && msg.object == self.scaling.fractional_scale
+            && msg.opcode == wp_fractional_scale_v1::EV_PREFERRED_SCALE
+        {
+            let scale_120 = r.u32()?;
+            self.set_scale_120(scale_120);
+            return Ok(());
+        }
+
+        // wl_surface.enter/leave and wl_output.scale drive the integer fallback
+        // (used only when the fractional path is absent).
+        if msg.object == self.surface
+            && (msg.opcode == wl_surface::EV_ENTER || msg.opcode == wl_surface::EV_LEAVE)
+        {
+            let output = r.u32()?;
+            if msg.opcode == wl_surface::EV_ENTER {
+                if !self.scaling.entered.contains(&output) {
+                    self.scaling.entered.push(output);
+                }
+            } else {
+                self.scaling.entered.retain(|&o| o != output);
+            }
+            self.refresh_integer_scale();
+            return Ok(());
+        }
+        if msg.opcode == wl_output::EV_SCALE
+            && self.scaling.outputs.iter().any(|(id, _)| *id == msg.object)
+        {
+            let factor = r.u32()? as i32;
+            for out in &mut self.scaling.outputs {
+                if out.0 == msg.object {
+                    out.1 = factor.max(1);
+                }
+            }
+            self.refresh_integer_scale();
             return Ok(());
         }
 
@@ -808,6 +1069,26 @@ impl State {
             protocol::IFACE_DRM_SYNCOBJ => {
                 let id = self.bind_capped(name, interface, version, protocol::VERSION_DRM_SYNCOBJ);
                 self.presentation.syncobj_manager = Some(id);
+            }
+            // Display scaling. The fractional-scale manager and viewporter are the
+            // primary path; each bound wl_output feeds the integer fallback (its
+            // scale defaults to 1 until a `scale` event refines it).
+            protocol::IFACE_OUTPUT => {
+                let id = self.bind_capped(name, interface, version, protocol::VERSION_OUTPUT);
+                self.scaling.outputs.push((id, 1));
+            }
+            protocol::IFACE_FRACTIONAL_SCALE_MANAGER => {
+                let id = self.bind_capped(
+                    name,
+                    interface,
+                    version,
+                    protocol::VERSION_FRACTIONAL_SCALE_MANAGER,
+                );
+                self.scaling.fractional_manager = Some(id);
+            }
+            protocol::IFACE_VIEWPORTER => {
+                let id = self.bind_capped(name, interface, version, protocol::VERSION_VIEWPORTER);
+                self.scaling.viewporter = Some(id);
             }
             _ => {}
         }

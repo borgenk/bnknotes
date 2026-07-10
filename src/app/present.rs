@@ -9,7 +9,7 @@ use crate::platform::error::{Error, Result};
 use crate::platform::ffi;
 use crate::platform::protocol::{
     self, wl_buffer, wl_display, wl_surface, wp_linux_drm_syncobj_manager_v1,
-    wp_linux_drm_syncobj_surface_v1, xdg_surface, zwp_linux_buffer_params_v1,
+    wp_linux_drm_syncobj_surface_v1, wp_viewport, xdg_surface, zwp_linux_buffer_params_v1,
     zwp_linux_dmabuf_feedback_v1, zwp_linux_dmabuf_v1,
 };
 use crate::platform::wire::{Arg, Reader};
@@ -369,24 +369,43 @@ impl State {
         self.dirty = true;
     }
 
-    /// Declare the window geometry, then ack configure `serial`. The geometry is
-    /// the whole surface (no client-side decorations or shadows), and being
-    /// double-buffered surface state it is what the compositor anchors a resize's
-    /// fixed edge to; sending it in the same commit as the ack and the matching
-    /// buffer gives the compositor one atomic, consistent size for the frame, so
-    /// the anchored edge does not drift. Caller commits after this.
+    /// Declare the surface's scale state, then ack configure `serial`. Sending the
+    /// geometry with the ack and the matching buffer gives the compositor one
+    /// atomic, consistent size for the frame, so an anchored (left/top) resize edge
+    /// does not drift. Caller commits after this.
     pub(super) fn ack_configure(&mut self, serial: u32) {
-        let (w, h) = (self.width as i32, self.height as i32);
-        self.conn.request(
-            self.xdg_surface,
-            xdg_surface::SET_WINDOW_GEOMETRY,
-            &[Arg::Int(0), Arg::Int(0), Arg::Int(w), Arg::Int(h)],
-        );
+        self.declare_surface_scale();
         self.conn.request(
             self.xdg_surface,
             xdg_surface::ACK_CONFIGURE,
             &[Arg::Uint(serial)],
         );
+    }
+
+    /// (Re)declare the surface's logical geometry and how the device-pixel buffer
+    /// maps onto it: a viewport destination on the fractional path, or an integer
+    /// buffer scale on the fallback. The geometry is the whole logical surface (no
+    /// client-side decorations), the double-buffered state the compositor anchors a
+    /// resize's fixed edge to. Idempotent surface state; marks the scale synced.
+    pub(super) fn declare_surface_scale(&mut self) {
+        let (lw, lh) = (self.scaling.logical.0 as i32, self.scaling.logical.1 as i32);
+        self.conn.request(
+            self.xdg_surface,
+            xdg_surface::SET_WINDOW_GEOMETRY,
+            &[Arg::Int(0), Arg::Int(0), Arg::Int(lw), Arg::Int(lh)],
+        );
+        if self.scaling.is_fractional() {
+            self.conn.request(
+                self.scaling.viewport,
+                wp_viewport::SET_DESTINATION,
+                &[Arg::Int(lw), Arg::Int(lh)],
+            );
+        } else {
+            let n = (self.scaling.factor_120 / 120).max(1) as i32;
+            self.conn
+                .request(self.surface, wl_surface::SET_BUFFER_SCALE, &[Arg::Int(n)]);
+        }
+        self.scaling.synced = true;
     }
 
     /// Build the current frame and present it on the GPU. Returns false if both
@@ -439,6 +458,11 @@ impl State {
         }
         if let Some(serial) = ack {
             self.ack_configure(serial);
+        }
+        // A scale change can arrive without a configure (a monitor move), so make
+        // sure the geometry + viewport/buffer-scale ride this commit too.
+        if !self.scaling.synced {
+            self.declare_surface_scale();
         }
 
         // Render, returning the render-done fence under explicit sync (`None`

@@ -18,6 +18,7 @@ mod platform;
 mod regex;
 mod render;
 mod rope;
+mod scale;
 mod store;
 mod syntax;
 mod table;

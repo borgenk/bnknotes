@@ -15,7 +15,7 @@ use crate::platform::protocol::{
 use crate::platform::scroll;
 use crate::platform::wire::{Arg, Reader};
 use crate::platform::xkb::KeyAction;
-use crate::theme::{FONT_SIZE, TREE_PAD};
+use crate::theme::TREE_PAD;
 
 /// What the Tab key inserts: spaces (a "soft tab"), not a literal `'\t'`. This
 /// keeps the buffer free of tab characters and spares the renderer any tab-stop
@@ -509,8 +509,12 @@ impl State {
             wl_pointer::EV_ENTER => {
                 let serial = r.u32()?;
                 let _surface = r.u32()?;
-                self.pointer_x = r.fixed()?;
-                self.pointer_y = r.fixed()?;
+                // The compositor reports pointer positions in logical (surface-local)
+                // pixels; scale them to the device space the layout and column rects
+                // live in, so a click on a HiDPI display lands where it looks.
+                let scale = self.scale();
+                self.pointer_x = scale.scale_f32(r.fixed()?);
+                self.pointer_y = scale.scale_f32(r.fixed()?);
                 self.pointer_serial = serial;
                 // The compositor resets the cursor on enter, so force a re-set by
                 // invalidating the remembered shape, then pick one for the position.
@@ -519,8 +523,9 @@ impl State {
             }
             wl_pointer::EV_MOTION => {
                 let _time = r.u32()?;
-                self.pointer_x = r.fixed()?;
-                self.pointer_y = r.fixed()?;
+                let scale = self.scale();
+                self.pointer_x = scale.scale_f32(r.fixed()?);
+                self.pointer_y = scale.scale_f32(r.fixed()?);
                 let (px, py) = (self.pointer_x, self.pointer_y);
                 if let Some(s) = self.drag_splitter {
                     self.drag_splitter_to(s, px);
@@ -569,7 +574,9 @@ impl State {
                 let axis = r.u32()?;
                 let value = r.fixed()?;
                 if axis == wl_pointer::AXIS_VERTICAL_SCROLL {
-                    let delta = (value * SCROLL_FACTOR).round() as i32;
+                    // The scroll step is authored in logical pixels; scale it so a
+                    // wheel notch moves the same physical distance at any DPI.
+                    let delta = self.scale().scale_f32(value * SCROLL_FACTOR).round() as i32;
                     let (px, py) = (self.pointer_x, self.pointer_y);
                     // Scroll whichever pane the pointer is over, not just the focused one.
                     match self.hit_test(px, py) {
@@ -620,17 +627,24 @@ impl State {
     /// resizes the sidebar, splitter 1 the A/B content split. Clamped to keep
     /// every column usable.
     pub(super) fn drag_splitter_to(&mut self, s: usize, px: f32) {
+        // The pointer, the window size, and the splitter are all device pixels here;
+        // the sidebar width is persisted logical, so its edge converts device -> logical
+        // on the way in and the min-width floor scales the other way.
         let x = px as i32;
         let w = self.width as i32;
+        let scale = self.scale();
+        let splitter = scale.px(SPLITTER);
         if s == 0 {
-            self.panes.tree_width = x.clamp(120, (w - 2 * SPLITTER - 120).max(120));
+            let min = scale.px(120);
+            let device_edge = x.clamp(min, (w - 2 * splitter - min).max(min));
+            self.panes.tree_width = scale.to_logical(device_edge);
         } else {
             let base = if self.panes.tree_visible {
-                self.panes.tree_width + SPLITTER
+                scale.px(self.panes.tree_width) + splitter
             } else {
                 0
             };
-            let content = (w - base - SPLITTER).max(1) as f32;
+            let content = (w - base - splitter).max(1) as f32;
             let a = (x - base) as f32 / content;
             self.panes.split_ratio = a.clamp(0.1, 0.9);
         }
@@ -652,8 +666,8 @@ impl State {
 
     /// The tree row index at window y `py` within the tree column, if any.
     pub(super) fn tree_row_at(&self, rect: Rect, py: f32) -> Option<usize> {
-        let row_h = self.fonts.metrics(FONT_SIZE).line_height.max(1);
-        let y = py as i32 - rect.y + self.tree.scroll_y - TREE_PAD;
+        let row_h = self.fonts.metrics(self.body_size).line_height.max(1);
+        let y = py as i32 - rect.y + self.tree.scroll_y - self.scale().px(TREE_PAD);
         if y < 0 {
             return None;
         }
@@ -696,16 +710,17 @@ impl State {
 
     /// Scroll the tree so its selected row is on screen.
     pub(super) fn reveal_tree_selection(&mut self) {
-        let row_h = self.fonts.metrics(FONT_SIZE).line_height.max(1);
+        let row_h = self.fonts.metrics(self.body_size).line_height.max(1);
         let rect = self.tree_rect();
-        let top = TREE_PAD + self.tree.selected as i32 * row_h;
+        let tree_pad = self.scale().px(TREE_PAD);
+        let top = tree_pad + self.tree.selected as i32 * row_h;
         self.tree.scroll_y = scroll::reveal(
             self.tree.scroll_y,
             top,
             row_h,
             rect.h,
             self.tree.content_height,
-            TREE_PAD,
+            tree_pad,
         );
     }
 

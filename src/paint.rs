@@ -12,11 +12,12 @@ use crate::platform::grapheme;
 use crate::platform::scroll;
 use crate::platform::shape;
 use crate::render::display::{self, DisplayList, DrawCmd};
+use crate::scale::Scale;
 use crate::theme::{
     BACKGROUND, BULLET, CARET_COLOR, CARET_WIDTH, CODE_BG, CODE_COLOR, CODE_COMMENT_COLOR,
     CODE_KEYWORD_COLOR, CODE_MARKER_COLOR, CODE_NUMBER_COLOR, CODE_PAD_X, CODE_PAD_Y, CODE_RADIUS,
-    CODE_STRING_COLOR, FIND_BG, FIND_ERROR_COLOR, FIND_MATCH_COLOR, FIND_TICK_COLOR, FONT_SIZE,
-    FOREGROUND, HEADING_COLORS, IMAGE_BORDER_COLOR, IMAGE_BORDER_THICKNESS, IMAGE_BUTTON_BG,
+    CODE_STRING_COLOR, FIND_BG, FIND_ERROR_COLOR, FIND_MATCH_COLOR, FIND_TICK_COLOR, FOREGROUND,
+    HEADING_COLORS, IMAGE_BORDER_COLOR, IMAGE_BORDER_THICKNESS, IMAGE_BUTTON_BG,
     IMAGE_BUTTON_RADIUS, LINK_COLOR, MARGIN, MARKER_COLOR, QUOTE_BAR_COLOR, QUOTE_BAR_WIDTH,
     RULE_COLOR, RULE_THICKNESS, SELECTION_COLOR, SPLITTER_COLOR, TABLE_BORDER_COLOR,
     TABLE_HEADER_BG, TICK_HEIGHT, TICK_WIDTH, TREE_BG, TREE_DIR_COLOR, TREE_HOVER_BG, TREE_INDENT,
@@ -31,6 +32,12 @@ pub(crate) struct PaintParams<'a> {
     pub width: usize,
     pub height: usize,
     pub scroll_y: i32,
+    /// The display scale, so the painter's pixel constants (margin, caret, rule,
+    /// tick strip) land at the right device size. Identity at [`Scale::ONE`].
+    pub scale: Scale,
+    /// Device-pixel body font size, for the find bar and other chrome sized off the
+    /// body ([`crate::theme::FONT_SIZE`] at scale 1.0).
+    pub body_size: u32,
     pub selection: Option<(usize, usize)>,
     pub cursor: usize,
     pub caret_visible: bool,
@@ -128,16 +135,17 @@ pub(crate) fn build_find_paint<'a>(
 
 /// Draw a splitter grab bar: its gap cleared to the background with a thin
 /// divider line down the center. Drawn last, over any content that overhangs.
-pub(crate) fn push_splitter(list: &mut DisplayList, rect: Rect) {
+pub(crate) fn push_splitter(list: &mut DisplayList, rect: Rect, scale: Scale) {
     list.push(DrawCmd::Fill {
         rect,
         color: BACKGROUND,
     });
+    let divider = scale.px(1).max(1);
     list.push(DrawCmd::Fill {
         rect: Rect {
-            x: rect.x + rect.w / 2,
+            x: rect.x + (rect.w - divider) / 2,
             y: rect.y,
-            w: 1,
+            w: divider,
             h: rect.h,
         },
         color: SPLITTER_COLOR,
@@ -155,23 +163,27 @@ pub(crate) fn push_tree(
     tree: &mut TreePane,
     rect: Rect,
     focused: bool,
+    scale: Scale,
+    body_size: u32,
 ) {
     list.push(DrawCmd::Fill {
         rect,
         color: TREE_BG,
     });
-    let m = fonts.metrics(FONT_SIZE);
+    let m = fonts.metrics(body_size);
     let row_h = m.line_height.max(1);
+    let tree_pad = scale.px(TREE_PAD);
+    let tree_indent = scale.px(TREE_INDENT);
     let rows = tree.tree.rows();
-    tree.content_height = rows.len() as i32 * row_h + 2 * TREE_PAD;
+    tree.content_height = rows.len() as i32 * row_h + 2 * tree_pad;
     tree.scroll_y = scroll::clamp(tree.scroll_y, tree.content_height, rect.h);
     let face = FaceKey::Prose {
-        size: FONT_SIZE,
+        size: body_size,
         style: FontStyle::Regular,
     };
-    let text_right = rect.x + rect.w - TREE_PAD;
+    let text_right = rect.x + rect.w - tree_pad;
     for (i, row) in rows.iter().enumerate() {
-        let top = rect.y + TREE_PAD + i as i32 * row_h - tree.scroll_y;
+        let top = rect.y + tree_pad + i as i32 * row_h - tree.scroll_y;
         if top + row_h <= rect.y || top >= rect.y + rect.h {
             continue;
         }
@@ -195,7 +207,7 @@ pub(crate) fn push_tree(
                 color,
             });
         }
-        let x = rect.x + TREE_PAD + row.depth as i32 * TREE_INDENT;
+        let x = rect.x + tree_pad + row.depth as i32 * tree_indent;
         let baseline = top + m.ascent;
         let (marker, color) = if row.is_dir {
             (if row.expanded { "▾ " } else { "▸ " }, TREE_DIR_COLOR)
@@ -264,6 +276,10 @@ struct Painter<'a> {
     /// images hang off this so a pane's content sits in its own column; the
     /// background clears from the column's outer edge, `MARGIN` to its left.
     left: i32,
+    /// The display scale, so each pixel constant scales to device pixels.
+    scale: Scale,
+    /// Device-pixel body font size, for chrome sized off the body.
+    body_size: u32,
 }
 
 impl<'a> Painter<'a> {
@@ -285,6 +301,8 @@ impl<'a> Painter<'a> {
             view_h: p.height as i32,
             width: p.width as i32,
             left: layout.left(),
+            scale: p.scale,
+            body_size: p.body_size,
         }
     }
 
@@ -321,7 +339,7 @@ impl<'a> Painter<'a> {
     fn background(&mut self) {
         self.list.push(DrawCmd::Fill {
             rect: Rect {
-                x: self.left - MARGIN,
+                x: self.left - self.scale.px(MARGIN),
                 y: 0,
                 w: self.width,
                 h: self.view_h,
@@ -340,7 +358,7 @@ impl<'a> Painter<'a> {
     /// the whole panel reads as one softly rounded block.
     fn code_block_panels(&mut self) {
         let lines = self.layout.lines();
-        let panel_w = (self.width - 2 * MARGIN).max(0);
+        let panel_w = (self.width - 2 * self.scale.px(MARGIN)).max(0);
         for (i, line) in lines.iter().enumerate() {
             if !line.code_block {
                 continue;
@@ -365,7 +383,7 @@ impl<'a> Painter<'a> {
             self.list.push(DrawCmd::RoundRect {
                 rect,
                 color: CODE_BG,
-                radius: CODE_RADIUS,
+                radius: self.scale.px(CODE_RADIUS),
                 corners,
             });
         }
@@ -375,18 +393,20 @@ impl<'a> Painter<'a> {
     /// selection over inline code shows through (the glyphs still draw on top in the
     /// text loop). Block code is excluded here; its full-width panel above covers it.
     fn inline_code_panels(&mut self) {
+        let pad_x = self.scale.px(CODE_PAD_X);
+        let pad_y = self.scale.px(CODE_PAD_Y);
         for rect in self.layout.code_rects(self.fonts, self.rope) {
             let panel = Rect {
-                x: rect.x - CODE_PAD_X,
-                y: rect.y - CODE_PAD_Y,
-                w: rect.w + 2 * CODE_PAD_X,
-                h: rect.h + 2 * CODE_PAD_Y,
+                x: rect.x - pad_x,
+                y: rect.y - pad_y,
+                w: rect.w + 2 * pad_x,
+                h: rect.h + 2 * pad_y,
             };
             if let Some(rect) = self.screen(panel) {
                 self.list.push(DrawCmd::RoundRect {
                     rect,
                     color: CODE_BG,
-                    radius: CODE_RADIUS,
+                    radius: self.scale.px(CODE_RADIUS),
                     corners: display::RoundedCorners::Both,
                 });
             }
@@ -472,7 +492,7 @@ impl<'a> Painter<'a> {
                     // and a corner toggle button: a rounded panel with a centered
                     // `</>` "source" glyph, the affordance to reveal its markdown.
                     if img.selected {
-                        push_image_chrome(&mut self.list, fonts, &pic);
+                        push_image_chrome(&mut self.list, fonts, &pic, self.scale, self.body_size);
                     }
                 }
                 continue;
@@ -498,7 +518,7 @@ impl<'a> Painter<'a> {
                     rect: Rect {
                         x: left,
                         y: baseline - m.ascent,
-                        w: QUOTE_BAR_WIDTH,
+                        w: self.scale.px(QUOTE_BAR_WIDTH),
                         h: m.line_height,
                     },
                     color: QUOTE_BAR_COLOR,
@@ -509,12 +529,13 @@ impl<'a> Painter<'a> {
             // the line.
             if line.rule {
                 let mid = baseline - m.ascent + m.line_height / 2;
+                let thickness = self.scale.px(RULE_THICKNESS);
                 self.list.push(DrawCmd::Fill {
                     rect: Rect {
                         x: left,
-                        y: mid - RULE_THICKNESS / 2,
-                        w: (self.width - 2 * MARGIN).max(0),
-                        h: RULE_THICKNESS,
+                        y: mid - thickness / 2,
+                        w: (self.width - 2 * self.scale.px(MARGIN)).max(0),
+                        h: thickness,
                     },
                     color: RULE_COLOR,
                 });
@@ -613,11 +634,11 @@ impl<'a> Painter<'a> {
                 // pill pad in from the pen, and the pen clears the pad after them, so
                 // the panel (drawn from the same geometry) frames the code without
                 // painting over the spaces around it.
-                let pad = inline_code_pad(run.kind, line.code_block);
+                let pad = inline_code_pad(run.kind, line.code_block, self.scale);
                 // A revealed backtick delimiter is nudged in against the code so it
                 // hugs the glyphs inside the pill; the nudge is draw-only, so the pen
                 // still advances by the run's true width (subtract the shift back out).
-                let shift = backtick_reveal_shift(rope, runs, i);
+                let shift = backtick_reveal_shift(rope, runs, i, self.scale);
                 let run_x = pen + pad + shift;
                 let run_end = self.push_text(fk, run_x, baseline, color, slice, m);
                 pen = run_end + pad - shift;
@@ -669,12 +690,13 @@ impl<'a> Painter<'a> {
                 color: TABLE_HEADER_BG,
             });
         }
+        let border = self.scale.px(TABLE_BORDER);
         for &bx in &t.borders {
             self.list.push(DrawCmd::Fill {
                 rect: Rect {
                     x: row_x + bx,
                     y: box_top,
-                    w: TABLE_BORDER,
+                    w: border,
                     h: t.height,
                 },
                 color: TABLE_BORDER_COLOR,
@@ -688,7 +710,7 @@ impl<'a> Painter<'a> {
                     x: row_x,
                     y: box_top,
                     w: t.width,
-                    h: TABLE_BORDER,
+                    h: border,
                 },
                 color: TABLE_BORDER_COLOR,
             });
@@ -696,18 +718,19 @@ impl<'a> Painter<'a> {
         self.list.push(DrawCmd::Fill {
             rect: Rect {
                 x: row_x,
-                y: box_top + t.height - TABLE_BORDER,
+                y: box_top + t.height - border,
                 w: t.width,
-                h: TABLE_BORDER,
+                h: border,
             },
             color: TABLE_BORDER_COLOR,
         });
-        let max_lines = row_max_lines(t.height, m.line_height);
+        let max_lines = row_max_lines(t.height, m.line_height, self.scale);
+        let cell_pad_y = self.scale.px(TABLE_CELL_PAD_Y);
         for (col, cell) in t.columns.iter().zip(&t.cells) {
             let n_lines = cell.lines.len().max(1);
             for (k, cl) in cell.lines.iter().enumerate() {
                 let baseline =
-                    box_top + TABLE_CELL_PAD_Y + cell_line_top(k, n_lines, max_lines, m) + m.ascent;
+                    box_top + cell_pad_y + cell_line_top(k, n_lines, max_lines, m) + m.ascent;
                 // Align the wrapped line within the column's content width.
                 let tx = aligned_x(*col, cl.width);
                 self.push_cell_line(row_x + tx, baseline, size, t.header, cl, m);
@@ -745,8 +768,8 @@ impl<'a> Painter<'a> {
             // pen clears the pad after them, so the tint panel frames the code without
             // covering the text around it, the same as the body loop. A revealed
             // backtick is nudged in against the code (draw-only, advance unchanged).
-            let pad = inline_code_pad(run.kind, false);
-            let shift = backtick_reveal_shift(self.rope, &cl.runs, i);
+            let pad = inline_code_pad(run.kind, false, self.scale);
+            let shift = backtick_reveal_shift(self.rope, &cl.runs, i, self.scale);
             let run_x = pen + pad + shift;
             let run_end = self.push_text(
                 fk,
@@ -790,14 +813,14 @@ impl<'a> Painter<'a> {
         self.list.push(DrawCmd::RoundRect {
             rect,
             color: TABLE_HEADER_BG,
-            radius: CODE_RADIUS,
+            radius: self.scale.px(CODE_RADIUS),
             corners: display::RoundedCorners::Both,
         });
         let face = FaceKey::Prose {
-            size: FONT_SIZE,
+            size: self.body_size,
             style: FontStyle::Regular,
         };
-        let m = self.fonts.metrics(FONT_SIZE);
+        let m = self.fonts.metrics(self.body_size);
         let plus_w = shape::text_advance(self.fonts.face_for(face), "+").round() as i32;
         let x = rect.x + (rect.w - plus_w) / 2;
         let baseline = rect.y + (rect.h + m.ascent - m.descent) / 2;
@@ -811,7 +834,7 @@ impl<'a> Painter<'a> {
             rect: Rect {
                 x: cx,
                 y: cy - self.scroll_y,
-                w: CARET_WIDTH,
+                w: self.scale.px(CARET_WIDTH),
                 h: ch,
             },
             color: CARET_COLOR,
@@ -820,12 +843,19 @@ impl<'a> Painter<'a> {
 
     /// The right-edge match tick strip, floating over the content.
     fn find_ticks(&mut self, find: &FindPaint) {
-        push_find_ticks(&mut self.list, find, self.width, self.view_h);
+        push_find_ticks(&mut self.list, find, self.width, self.view_h, self.scale);
     }
 
     /// The find bar panel, floating top-right over everything else.
     fn find_bar(&mut self, find: &FindPaint) {
-        push_find_bar(&mut self.list, self.fonts, find, self.width);
+        push_find_bar(
+            &mut self.list,
+            self.fonts,
+            find,
+            self.width,
+            self.scale,
+            self.body_size,
+        );
     }
 }
 
@@ -834,17 +864,25 @@ impl<'a> Painter<'a> {
 /// a glance and survives scrolling. Ticks are deduplicated per two-pixel row,
 /// which bounds the strip to O(viewport) commands however many matches exist;
 /// the current match's tick is wider and bright.
-fn push_find_ticks(list: &mut DisplayList, find: &FindPaint, width: i32, view_h: i32) {
+fn push_find_ticks(
+    list: &mut DisplayList,
+    find: &FindPaint,
+    width: i32,
+    view_h: i32,
+    scale: Scale,
+) {
     if find.state.matches().is_empty() || view_h <= 0 {
         return;
     }
+    let tick_h = scale.px(TICK_HEIGHT);
+    let tick_w = scale.px(TICK_WIDTH);
     let content_h = find.doc_height.max(view_h) as i64;
     let mut occupied = vec![false; (view_h / 2 + 1) as usize];
     for i in 0..find.state.matches().len() {
         // Each match's content-space top comes from the line index, so an offscreen
         // match still maps to its true position rather than the window's edge.
         let top = find.tick_tops.get(i).copied().unwrap_or(0) as i64;
-        let y = (top * (view_h - TICK_HEIGHT) as i64 / content_h) as i32;
+        let y = (top * (view_h - tick_h) as i64 / content_h) as i32;
         let bucket = (y / 2).clamp(0, view_h / 2) as usize;
         let current = i == find.state.current();
         if occupied[bucket] && !current {
@@ -852,16 +890,16 @@ fn push_find_ticks(list: &mut DisplayList, find: &FindPaint, width: i32, view_h:
         }
         occupied[bucket] = true;
         let (w, color) = if current {
-            (TICK_WIDTH + 3, CARET_COLOR)
+            (tick_w + scale.px(3), CARET_COLOR)
         } else {
-            (TICK_WIDTH, FIND_TICK_COLOR)
+            (tick_w, FIND_TICK_COLOR)
         };
         list.push(DrawCmd::Fill {
             rect: Rect {
-                x: width - w - 1,
+                x: width - w - scale.px(1),
                 y,
                 w,
-                h: TICK_HEIGHT,
+                h: tick_h,
             },
             color,
         });
@@ -900,8 +938,17 @@ fn visible_byte_range(
 /// steady caret after it, and a match counter. Drawn from plain display-list
 /// commands, so damage tracking and clipped repaints treat it like any other
 /// content.
-fn push_find_bar(list: &mut DisplayList, fonts: &Fonts, find: &FindPaint, width: i32) {
-    let size = FONT_SIZE;
+fn push_find_bar(
+    list: &mut DisplayList,
+    fonts: &Fonts,
+    find: &FindPaint,
+    width: i32,
+    scale: Scale,
+    body_size: u32,
+) {
+    let size = body_size;
+    let caret_w = scale.px(CARET_WIDTH);
+    let margin = scale.px(MARGIN);
     let key = FaceKey::Prose {
         size,
         style: FontStyle::Regular,
@@ -962,11 +1009,11 @@ fn push_find_bar(list: &mut DisplayList, fonts: &Fonts, find: &FindPaint, width:
     } else {
         0
     };
-    let field_w = query_w.max(replace_row_w) + CARET_WIDTH + 2;
+    let field_w = query_w.max(replace_row_w) + caret_w + 2;
     let w = (field_w + pad + tail_w + 2 * pad).max(6 * size as i32);
     let h = rows * row_h + (rows + 1) * (pad / 2);
-    let x = width - w - MARGIN;
-    let y = MARGIN / 2;
+    let x = width - w - margin;
+    let y = margin / 2;
     list.push(DrawCmd::RoundRect {
         rect: Rect { x, y, w, h },
         color: FIND_BG,
@@ -981,7 +1028,7 @@ fn push_find_bar(list: &mut DisplayList, fonts: &Fonts, find: &FindPaint, width:
             rect: Rect {
                 x: pen + 1,
                 y: baseline - m.ascent,
-                w: CARET_WIDTH,
+                w: caret_w,
                 h: row_h,
             },
             color: CARET_COLOR,
@@ -1175,8 +1222,14 @@ fn stroke_check_arm(list: &mut DisplayList, a: (f32, f32), b: (f32, f32), t: i32
 
 /// Append the selection chrome for a selected image at picture rect `pic` (screen
 /// space): a four-edge accent border and the corner `</>` toggle button.
-fn push_image_chrome(list: &mut DisplayList, fonts: &Fonts, pic: &Rect) {
-    let t = IMAGE_BORDER_THICKNESS;
+fn push_image_chrome(
+    list: &mut DisplayList,
+    fonts: &Fonts,
+    pic: &Rect,
+    scale: Scale,
+    body_size: u32,
+) {
+    let t = scale.px(IMAGE_BORDER_THICKNESS);
     for rect in [
         Rect {
             x: pic.x,
@@ -1209,19 +1262,19 @@ fn push_image_chrome(list: &mut DisplayList, fonts: &Fonts, pic: &Rect) {
         });
     }
 
-    let btn = image_button_rect(pic);
+    let btn = image_button_rect(pic, scale);
     list.push(DrawCmd::RoundRect {
         rect: btn,
         color: IMAGE_BUTTON_BG,
-        radius: IMAGE_BUTTON_RADIUS,
+        radius: scale.px(IMAGE_BUTTON_RADIUS),
         corners: display::RoundedCorners::Both,
     });
     // Center the glyph in both axes from the code-face metrics.
-    let fk = FaceKey::Code { size: FONT_SIZE };
+    let fk = FaceKey::Code { size: body_size };
     let face = fonts.face_for(fk);
     let glyph = "</>";
     let advance = shape::text_advance(face, glyph).round() as i32;
-    let m = fonts.metrics(FONT_SIZE);
+    let m = fonts.metrics(body_size);
     let gx = btn.x + (btn.w - advance) / 2;
     let gbaseline = btn.y + (btn.h - (m.ascent + m.descent)) / 2 + m.ascent;
     let gend = (gx as f32 + shape::text_advance(face, glyph)).round() as i32;
@@ -1239,6 +1292,7 @@ fn push_image_chrome(list: &mut DisplayList, fonts: &Fonts, pic: &Rect) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::theme::FONT_SIZE;
 
     /// The tick strip's per-match tops and document height, matching the values
     /// the app derives from its line index: each match's line baseline, and the
@@ -1263,6 +1317,8 @@ mod tests {
             width,
             height,
             scroll_y: 0,
+            scale: Scale::ONE,
+            body_size: FONT_SIZE,
             selection: None,
             cursor: 0,
             caret_visible: false,
@@ -1383,6 +1439,8 @@ mod tests {
             width: w,
             height: h,
             scroll_y: 0,
+            scale: Scale::ONE,
+            body_size: FONT_SIZE,
             // The app mirrors the current match into the selection.
             selection: Some((8, 11)),
             cursor: 11,
@@ -1438,6 +1496,8 @@ mod tests {
             width: w,
             height: h,
             scroll_y: 0,
+            scale: Scale::ONE,
+            body_size: FONT_SIZE,
             selection: Some((0, 3)),
             cursor: 3,
             caret_visible: false,

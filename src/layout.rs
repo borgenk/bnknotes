@@ -1002,7 +1002,9 @@ impl Layout {
     }
 
     /// The highlight rectangles covering the byte range `[start, end)`, one per
-    /// visual line it touches, each sized to that line's metrics.
+    /// visual line it touches. Each fills the full line box but centered on the
+    /// glyph box, splitting the leading above and below the text, so stacked lines
+    /// meet with no gap while a single line's highlight stays balanced around it.
     pub fn selection_rects(
         &self,
         fonts: &Fonts,
@@ -1068,9 +1070,12 @@ impl Layout {
             if newline_selected {
                 w += NEWLINE_PAD;
             }
+            // The fill is the full line box centered on the glyph box: start a
+            // leading pad above the text so the surplus splits above and below,
+            // and stacked lines meet with no gap.
             rects.push(Rect {
                 x: x0.round() as i32,
-                y: line.baseline - m.ascent,
+                y: line.baseline - m.ascent - leading_pad(m),
                 w: w.max(1),
                 h: m.line_height,
             });
@@ -1407,7 +1412,6 @@ impl Layout {
         let box_top = line.baseline - m.ascent;
         let n_lines = cell.lines.len().max(1);
         let max_lines = row_max_lines(t.height, m.line_height);
-        let block_pad = cell_block_pad(n_lines, max_lines, m.line_height);
         let (k0, adv0, _) = self.cell_offset_x(fonts, rope, line.size, t.header, cell, start);
         let (k1, adv1, _) = self.cell_offset_x(fonts, rope, line.size, t.header, cell, end);
         let column = t.columns.get(idx).copied();
@@ -1422,7 +1426,11 @@ impl Layout {
                 } else {
                     cl.width
                 };
-            let y = box_top + TABLE_CELL_PAD_Y + block_pad + k as i32 * m.line_height;
+            // Fill the line box centered on the glyph box, matching prose: the
+            // cell's glyph box is already centered in its slot, so this fills the
+            // whole slot and stays balanced around the text.
+            let y = box_top + TABLE_CELL_PAD_Y + cell_line_top(k, n_lines, max_lines, m)
+                - leading_pad(m);
             out.push(Rect {
                 x: left,
                 y,
@@ -2795,8 +2803,14 @@ fn cell_block_pad(n_lines: usize, max_lines: usize, line_height: i32) -> i32 {
 /// instead of all falling below and leaving the text riding high. Shared by the
 /// painter, the caret, and the click hit-test so the three stay in agreement.
 pub(crate) fn cell_line_top(k: usize, n_lines: usize, max_lines: usize, m: Metrics) -> i32 {
-    let slot_pad = (m.line_height - (m.ascent + m.descent)) / 2;
-    cell_block_pad(n_lines, max_lines, m.line_height) + k as i32 * m.line_height + slot_pad
+    cell_block_pad(n_lines, max_lines, m.line_height) + k as i32 * m.line_height + leading_pad(m)
+}
+
+/// Half the leading a taller line box adds around the glyph box: the slack above
+/// (and below) ascent + descent once the surplus is split evenly. Centering a
+/// full-line-box fill on the text means starting it this far above the glyph box.
+pub(crate) fn leading_pad(m: Metrics) -> i32 {
+    (m.line_height - (m.ascent + m.descent)) / 2
 }
 
 /// The count of the tallest cell's wrapped lines in a laid-out row, recovered from
@@ -3063,6 +3077,18 @@ mod tests {
 
     fn fonts() -> Fonts {
         Fonts::new(&markdown::all_sizes(BODY)).expect("a default font")
+    }
+
+    /// Fonts at a chosen line-height scale, so a test can exercise the leading the
+    /// editor's 1.5 spacing adds below the glyph box. Plain `fonts` runs at scale
+    /// 1.0, where line_height equals ascent + descent and the surplus is invisible.
+    fn fonts_scaled(scale: f32) -> Fonts {
+        Fonts::with_config(
+            &crate::platform::freetype::FontConfig::default(),
+            &markdown::all_sizes(BODY),
+            scale,
+        )
+        .expect("a default font")
     }
 
     fn h1_size() -> u32 {
@@ -3514,6 +3540,32 @@ mod tests {
         assert!(rects[0].w > 0);
         assert_eq!(rects[0].h, m.ascent + m.descent);
         assert_eq!(rects[0].y, TOP);
+    }
+
+    #[test]
+    fn selection_fills_the_line_box_centered_on_the_glyph_box() {
+        // At the editor's 1.5 spacing the line box is taller than the glyph box.
+        // The highlight fills the full line box, so stacked lines meet with no gap,
+        // but centers it on the text (leading split above and below) so a single
+        // line's highlight is not bottom-heavy.
+        let f = fonts_scaled(1.5);
+        let m = f.metrics(BODY);
+        let pad = leading_pad(m);
+        assert!(pad > 0, "1.5 spacing leaves leading around the glyph box");
+        let r = rope("ab\ncd");
+        let l = layout(&f, &r);
+        let rects = l.selection_rects(&f, &r, 0, 5);
+        assert_eq!(rects.len(), 2, "one rect per line");
+        // The glyph-box top (the caret top) sits one leading pad below the fill top.
+        let (_, caret_top, _) = l.caret(&f, &r, 0);
+        assert_eq!(rects[0].h, m.line_height, "fills the full line box");
+        assert_eq!(rects[0].y, caret_top - pad, "centered on the glyph box");
+        // Stacked lines meet exactly: no gap, no overlap.
+        assert_eq!(
+            rects[0].y + rects[0].h,
+            rects[1].y,
+            "consecutive line highlights are contiguous"
+        );
     }
 
     #[test]
@@ -5474,5 +5526,27 @@ mod tests {
             rects[0].h < t.height,
             "a text-line height, not the whole box"
         );
+    }
+
+    #[test]
+    fn a_table_cell_selection_fills_the_slot_centered_on_the_text() {
+        // In a cell the glyph box is already centered in its line slot, so the
+        // centered fill covers the whole slot (line-box height) and stays balanced
+        // around the text, the same fill prose gets.
+        let f = fonts_scaled(1.5);
+        let m = f.metrics(BODY);
+        let pad = leading_pad(m);
+        let r = rope("| hello | b |\n| - | - |\n| c | d |\n");
+        let l = layout(&f, &r);
+        let (_, t) = table_rows(&l)[0]; // the header row
+        let cell0 = &t.cells[0];
+        let start = cell0.start;
+        let end = (cell0.start + 3).min(cell0.end);
+        let rects = l.selection_rects(&f, &r, start, end);
+        assert_eq!(rects.len(), 1, "one precise rect inside the cell");
+        let (_, caret_top, _) = l.caret(&f, &r, start);
+        assert_eq!(rects[0].h, m.line_height, "fills the cell line slot");
+        assert_eq!(rects[0].y, caret_top - pad, "centered on the glyph box");
+        assert!(rects[0].w < t.width, "still narrower than the whole row");
     }
 }

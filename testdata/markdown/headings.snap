@@ -1,0 +1,9 @@
+H1@54    | ~mark"# " t"Heading one"
+H2@48    | ~mark"## " t"Heading two"
+H3@38    | ~mark"### " t"Heading three"
+H4@35    | ~mark"#### " t"Heading four"
+H5       | ~mark"##### " t"Heading five"
+H6@29    | ~mark"###### " t"Heading six"
+P        |
+P        | t"A paragraph of ordinary body text under the headings."
+P        |

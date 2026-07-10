@@ -1,0 +1,10 @@
+P        | t"Text above the rule."
+P        |
+HR       | ~mark"---"
+P        |
+P        | t"Text between rules."
+P        |
+HR       | ~mark"***"
+P        |
+P        | t"Text below the second rule."
+P        |

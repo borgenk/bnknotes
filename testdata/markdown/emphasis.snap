@@ -1,0 +1,8 @@
+P        | t"Plain text with " ~mark"**" b"bold" ~mark"**" t", " ~mark"*" i"italic" ~mark"*" t", and " ~mark"***" bi"bold italic" ~mark"***" t" words."
+P        |
+P        | t"Inline " ~mark"`" code"code span" ~mark"`" t" and " ~mark"~~" s"struck through" ~mark"~~" t" text."
+P        |
+P        | t"A " ~mark"[" link"link to somewhere" ~mark"](https://example.com)" t" inside a sentence."
+P        |
+P        | t"Mixed: " ~mark"**" b"bold with " ~mark"*" bi"nested italic" ~mark"*" b" inside" ~mark"**" t" it."
+P        |

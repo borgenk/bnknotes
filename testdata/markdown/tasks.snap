@@ -1,0 +1,10 @@
+TASK[ ]  | mark"- [ ] " t"an unchecked task"
+TASK[x]  | mark"- [x] " t"a checked task"
+TASK[ ]  | mark"- [ ] " t"another open item"
+P        |
+P        | t"Mixed list:"
+P        |
+UL       | mark"- " t"a plain bullet"
+TASK[ ]  | mark"- [ ] " t"a task in the same list"
+TASK[x]  | mark"- [x] " t"a done task"
+P        |

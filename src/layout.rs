@@ -1993,7 +1993,7 @@ fn lay_line(
 /// An `active` range that reveals nothing: `MAX <= le` is always false, so every
 /// line lays out with its markers collapsed and no image source shown. This is the
 /// base geometry the [`LineIndex`] measures, reveal-independent by construction.
-const NO_REVEAL: (usize, usize) = (usize::MAX, usize::MAX);
+pub(crate) const NO_REVEAL: (usize, usize) = (usize::MAX, usize::MAX);
 
 /// Below this line count, [`LineIndex::build_parallel`] just builds sequentially:
 /// the per-worker font open and thread hand-off cost more than the work saved.

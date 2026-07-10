@@ -8,5 +8,7 @@
 
 pub(crate) mod alloc;
 pub(crate) mod corpus;
+#[cfg(test)]
+mod golden;
 pub(crate) mod perf;
 pub(crate) mod sys;

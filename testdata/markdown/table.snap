@@ -1,0 +1,4 @@
+TABLE.head | L"Name" | R"Count" | C"Note" |
+TABLE.body | L"alpha" | R"1" | C"first" |
+TABLE.body | L"beta" | R"22" | C"second" |
+P        |

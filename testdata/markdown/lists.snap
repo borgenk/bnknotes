@@ -1,0 +1,13 @@
+UL       | mark"- " t"first bullet"
+UL       | mark"- " t"second bullet"
+UL       | mark"- " t"third bullet"
+P        |
+P        | mark"1. " t"first ordered"
+P        | mark"2. " t"second ordered"
+P        | mark"3. " t"third ordered"
+P        |
+UL       | mark"- " t"outer bullet"
+UL       | mark"  - " t"nested bullet"
+UL       | mark"  - " t"another nested"
+UL       | mark"- " t"back to outer"
+P        |

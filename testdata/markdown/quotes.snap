@@ -1,0 +1,8 @@
+QUOTE    | mark"> " t"a single quoted line"
+P        |
+QUOTE    | mark"> " t"a quote"
+QUOTE    | mark"> " t"spanning two lines"
+P        |
+QUOTE    | mark"> " t"outer quote"
+QUOTE    | mark">" t"> nested deeper"
+P        |

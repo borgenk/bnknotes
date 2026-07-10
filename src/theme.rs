@@ -88,9 +88,30 @@ pub(crate) const CARET_WIDTH: i32 = 2;
 
 /// File-tree sidebar and splitter colors and metrics.
 pub(crate) const TREE_BG: u32 = 0x0016_1a1f;
-pub(crate) const TREE_DIR_COLOR: u32 = 0x008c_a0b3;
+/// The disclosure chevron beside a folder. Folder and file names share
+/// [`FOREGROUND`]; only this marker is tinted, so it reads as chrome.
+pub(crate) const TREE_MARKER_COLOR: u32 = 0x008c_a0b3;
 pub(crate) const TREE_HOVER_BG: u32 = 0x0028_2c34;
 pub(crate) const SPLITTER_COLOR: u32 = 0x003f_444b;
-/// Inset for tree rows from the column edges, and the per-depth indent step.
-pub(crate) const TREE_PAD: i32 = 6;
+/// Padding inside the sidebar column: the gap above the first row and below the
+/// last, and the margin the row highlight leaves at the left and right edges.
+pub(crate) const TREE_PAD: i32 = 8;
+/// Horizontal padding inside a row highlight, from its edge to the chevron.
+pub(crate) const TREE_ROW_PAD: i32 = 8;
+/// Vertical padding added above and below each row's text, so items get more
+/// breathing room and a taller hit area than the bare line height.
+pub(crate) const TREE_ROW_VPAD: i32 = 3;
+/// Corner radius of a row's selection/hover highlight.
+pub(crate) const TREE_ROW_RADIUS: i32 = 5;
+/// Vertical inset of the highlight within its row, so background shows above and
+/// below it and the highlight reads as a pill.
+pub(crate) const TREE_ROW_INSET_Y: i32 = 2;
+/// Width reserved for a folder's chevron plus the gap to the name, so file and
+/// folder names align in one column whether or not a chevron is drawn. Wider
+/// than the chevron itself, so the label sits a little clear of the icon.
+pub(crate) const TREE_MARKER_W: i32 = 18;
+/// Largest a chevron's box grows to; capped below the reserved column so a gap to
+/// the label always remains, even at large font sizes.
+pub(crate) const TREE_CHEVRON_MAX: i32 = 15;
+/// Per-depth indent step for nested rows.
 pub(crate) const TREE_INDENT: i32 = 14;

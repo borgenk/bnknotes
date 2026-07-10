@@ -939,11 +939,12 @@ pub(crate) struct TreePane {
     pub(crate) tree: tree::Tree,
     pub(crate) scroll_y: i32,
     pub(crate) content_height: i32,
-    /// The row the pointer last hovered (mouse highlight).
+    /// The row the pointer last hovered (mouse highlight), or `None` when the
+    /// pointer is off the tree.
     pub(crate) hovered: Option<usize>,
-    /// The keyboard-selected row, moved by Up/Down and acted on by Enter while
-    /// the tree holds focus.
-    pub(crate) selected: usize,
+    /// The active row: the last one clicked or opened, and the target of Up/Down
+    /// and Enter. `None` until the user picks one, so nothing is marked at launch.
+    pub(crate) selected: Option<usize>,
 }
 
 /// Build an editor pane from a saved path, restoring its caret and scroll.

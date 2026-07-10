@@ -65,6 +65,11 @@ pub enum DrawCmd {
     /// checked box). The tick is intrinsic to the shape, so the command carries
     /// only its box and color; the GPU draws the smooth diagonals.
     CheckMark { rect: Rect, color: u32 },
+    /// A file-tree disclosure chevron, inked from a distance field over `rect`.
+    /// Points right when `down` is false (a collapsed folder) and down when true
+    /// (expanded). Like the check mark, the shape is intrinsic, so the command
+    /// carries only its box, color, and direction.
+    Chevron { rect: Rect, color: u32, down: bool },
     /// A run of text drawn from `x` along `baseline`. `bounds` is the run's screen
     /// rectangle padded for glyph ink that overhangs the advance box, so the
     /// damage diff and the clip test never clip a glyph's edge.
@@ -90,6 +95,7 @@ impl DrawCmd {
             DrawCmd::Fill { rect, .. }
             | DrawCmd::RoundRect { rect, .. }
             | DrawCmd::CheckMark { rect, .. }
+            | DrawCmd::Chevron { rect, .. }
             | DrawCmd::Image { rect, .. } => *rect,
             DrawCmd::Text { bounds, .. } => *bounds,
         }

@@ -30,6 +30,7 @@ pub const MODE_EMOJI: u32 = 2;
 pub const MODE_IMAGE: u32 = 3;
 pub const MODE_ROUND: u32 = 4;
 pub const MODE_CHECK: u32 = 5;
+pub const MODE_CHEVRON: u32 = 6;
 
 /// Atlases start here and double when full, up to [`ATLAS_MAX`]; growth wipes
 /// the atlas (sources are cached in `Fonts`, so re-inserting is cheap) and the
@@ -385,6 +386,13 @@ impl Batcher<'_> {
                 // carries the box size the shader's distance field needs.
                 let extra = [rect.w as f32, rect.h as f32, 0.0, 0.0];
                 self.quad(*rect, MODE_CHECK, *color, [0.0; 2], extra);
+            }
+            DrawCmd::Chevron { rect, color, down } => {
+                // Same intrinsic-shape path as the check mark: the box size in
+                // extra.xy feeds the distance field, and extra.z carries the
+                // facing (0 right for collapsed, 1 down for expanded).
+                let extra = [rect.w as f32, rect.h as f32, f32::from(*down), 0.0];
+                self.quad(*rect, MODE_CHEVRON, *color, [0.0; 2], extra);
             }
             DrawCmd::Text {
                 x,
@@ -833,6 +841,29 @@ mod tests {
         assert_eq!(v.extra, [20.0, 10.0, 4.0, 1.0], "w, h, r, corner mask");
         assert_eq!(v.uv, [0.0, 0.0], "uv is rect-local pixels");
         assert_eq!(f.vertices[4].uv, [20.0, 10.0]);
+    }
+
+    #[test]
+    fn chevron_emits_sdf_quad_with_facing_in_extra() {
+        let fonts = Fonts::new(&[16]).expect("default font");
+        let images = ImageStore::new(None);
+        let mut cache = GlyphCache::new();
+        let rect = Rect {
+            x: 4,
+            y: 6,
+            w: 12,
+            h: 12,
+        };
+        let list = vec![DrawCmd::Chevron {
+            rect,
+            color: 0x0011_2233,
+            down: true,
+        }];
+        let f = build_frame(&fonts, &[&images], &list, &mut cache, &|_| false);
+        assert_eq!(f.vertices.len(), 6);
+        let v = &f.vertices[0];
+        assert_eq!(v.mode, MODE_CHEVRON);
+        assert_eq!(v.extra, [12.0, 12.0, 1.0, 0.0], "w, h, down=1, unused");
     }
 
     #[test]

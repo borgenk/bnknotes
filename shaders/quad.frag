@@ -1,6 +1,6 @@
 // The one fragment shader. Modes (src/gpu.rs): 0 solid fill, 1 glyph coverage
 // from the R8 atlas, 2 emoji from the BGRA atlas, 3 an image texture,
-// 4 rounded-rect coverage, 5 a task check mark. Glyph and emoji reads are texelFetch at integer
+// 4 rounded-rect coverage, 5 a task check mark, 6 a disclosure chevron. Glyph and emoji reads are texelFetch at integer
 // coords so a 1:1 atlas quad reproduces its source texels exactly. An image is
 // an sRGB texture sampled with texture() and normalized UVs, so the GPU decodes
 // and scales its native-size texture to the display quad in linear space,
@@ -81,6 +81,26 @@ float check_coverage(vec2 p, vec2 size) {
     return clamp(half_w - d + 0.5, 0.0, 1.0);
 }
 
+// A disclosure chevron filling the box `size` (v_extra.xy): the two strokes of
+// Lucide's chevron, meeting at a point that faces right when `down` is false
+// (a collapsed folder) and down when true (an expanded one). Same anti-aliased
+// distance-to-segments as the check mark, so the wedge stays crisp at any size.
+float chevron_coverage(vec2 p, vec2 size, bool down) {
+    vec2 a, b, c;
+    if (down) {
+        a = vec2(0.25, 0.40) * size;
+        b = vec2(0.50, 0.63) * size;
+        c = vec2(0.75, 0.40) * size;
+    } else {
+        a = vec2(0.40, 0.25) * size;
+        b = vec2(0.63, 0.50) * size;
+        c = vec2(0.40, 0.75) * size;
+    }
+    float d = min(seg_dist(p, a, b), seg_dist(p, b, c));
+    float half_w = max(size.x * 0.07, 0.85);
+    return clamp(half_w - d + 0.5, 0.0, 1.0);
+}
+
 void main() {
     if (v_mode == 0u) {
         out_color = vec4(srgb_to_linear(v_color.rgb), v_color.a);
@@ -102,8 +122,11 @@ void main() {
     } else if (v_mode == 4u) {
         float cov = round_coverage(v_uv, v_extra.xy, v_extra.z, uint(v_extra.w));
         out_color = vec4(srgb_to_linear(v_color.rgb), v_color.a * cov);
-    } else {
+    } else if (v_mode == 5u) {
         float cov = check_coverage(v_uv, v_extra.xy);
+        out_color = vec4(srgb_to_linear(v_color.rgb), v_color.a * cov);
+    } else {
+        float cov = chevron_coverage(v_uv, v_extra.xy, v_extra.z > 0.5);
         out_color = vec4(srgb_to_linear(v_color.rgb), v_color.a * cov);
     }
 }

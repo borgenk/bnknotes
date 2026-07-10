@@ -369,12 +369,14 @@ impl State {
             scroll_y: 0,
             content_height: 0,
             hovered: None,
-            selected: 0,
+            selected: None,
         };
         let panes = PaneLayout {
             tree_width: session.tree_width as i32,
             split_ratio: session.split_ratio,
-            tree_visible: session.tree_visible,
+            // Opening a file from the CLI still shows the sidebar, so its folder
+            // (the file's parent) is there to browse, even if it was last hidden.
+            tree_visible: session.tree_visible || cli_file.is_some(),
             second_open: session.second_open,
         };
         let focus = initial_focus(
@@ -763,14 +765,12 @@ impl State {
         let cols = self.columns();
         let mut list: DisplayList = Vec::new();
         if let Some(rect) = cols.tree {
-            let focused = self.focus == Focus::Tree;
             let (scale, body_size) = (self.scale(), self.body_size);
             push_tree(
                 &mut list,
                 &self.fonts,
                 &mut self.tree,
                 rect,
-                focused,
                 scale,
                 body_size,
             );

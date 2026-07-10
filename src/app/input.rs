@@ -521,6 +521,13 @@ impl State {
                 self.cursor_shape = 0;
                 self.update_cursor_shape();
             }
+            wl_pointer::EV_LEAVE => {
+                // The pointer left the surface, so drop the mouse hover highlight;
+                // otherwise the last-hovered tree row stays lit with no pointer on it.
+                if self.tree.hovered.take().is_some() {
+                    self.dirty = true;
+                }
+            }
             wl_pointer::EV_MOTION => {
                 let _time = r.u32()?;
                 let scale = self.scale();
@@ -666,7 +673,7 @@ impl State {
 
     /// The tree row index at window y `py` within the tree column, if any.
     pub(super) fn tree_row_at(&self, rect: Rect, py: f32) -> Option<usize> {
-        let row_h = self.fonts.metrics(self.body_size).line_height.max(1);
+        let row_h = crate::paint::tree_row_height(self.fonts.metrics(self.body_size), self.scale());
         let y = py as i32 - rect.y + self.tree.scroll_y - self.scale().px(TREE_PAD);
         if y < 0 {
             return None;
@@ -708,12 +715,16 @@ impl State {
         })
     }
 
-    /// Scroll the tree so its selected row is on screen.
+    /// Scroll the tree so its active row is on screen. A no-op when nothing is
+    /// active.
     pub(super) fn reveal_tree_selection(&mut self) {
-        let row_h = self.fonts.metrics(self.body_size).line_height.max(1);
+        let Some(sel) = self.tree.selected else {
+            return;
+        };
+        let row_h = crate::paint::tree_row_height(self.fonts.metrics(self.body_size), self.scale());
         let rect = self.tree_rect();
         let tree_pad = self.scale().px(TREE_PAD);
-        let top = tree_pad + self.tree.selected as i32 * row_h;
+        let top = tree_pad + sel as i32 * row_h;
         self.tree.scroll_y = scroll::reveal(
             self.tree.scroll_y,
             top,
@@ -724,20 +735,21 @@ impl State {
         );
     }
 
-    /// Keyboard navigation while the tree holds focus: Up/Down move the selected
-    /// row, Left/Right collapse/expand a folder, Enter toggles a folder or opens
-    /// a file into the last-focused editor.
+    /// Keyboard navigation while the tree holds focus: Up/Down move the active
+    /// row (starting at the first when nothing is active), Left/Right
+    /// collapse/expand a folder, Enter toggles a folder or opens a file into the
+    /// last-focused editor.
     pub(super) fn tree_key(&mut self, action: KeyAction) {
         let n = self.tree.tree.rows().len();
         if n == 0 {
             return;
         }
         let last = n - 1;
-        let sel = self.tree.selected.min(last);
-        self.tree.selected = sel;
+        let sel = self.tree.selected.unwrap_or(0).min(last);
+        self.tree.selected = Some(sel);
         match action {
-            KeyAction::Up => self.tree.selected = sel.saturating_sub(1),
-            KeyAction::Down => self.tree.selected = (sel + 1).min(last),
+            KeyAction::Up => self.tree.selected = Some(sel.saturating_sub(1)),
+            KeyAction::Down => self.tree.selected = Some((sel + 1).min(last)),
             KeyAction::Left | KeyAction::Right | KeyAction::Enter => {
                 let row = &self.tree.tree.rows()[sel];
                 let (is_dir, expanded, path) = (row.is_dir, row.expanded, row.path.clone());
@@ -826,8 +838,8 @@ impl State {
         }
     }
 
-    /// A press in the tree: focus the sidebar, then toggle a folder's expansion
-    /// or open a file into the last-focused editor.
+    /// A press in the tree: focus the sidebar, mark the clicked row active, then
+    /// toggle a folder's expansion or open a file into the last-focused editor.
     pub(super) fn tree_press(&mut self, rect: Rect, py: f32) {
         self.focus = Focus::Tree;
         let Some(idx) = self.tree_row_at(rect, py) else {
@@ -837,6 +849,7 @@ impl State {
         let Some(row) = self.tree.tree.rows().get(idx) else {
             return;
         };
+        self.tree.selected = Some(idx);
         let path = row.path.clone();
         if row.is_dir {
             self.tree.tree.toggle(&path);

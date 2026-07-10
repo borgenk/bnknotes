@@ -20,8 +20,9 @@ use crate::theme::{
     HEADING_COLORS, IMAGE_BORDER_COLOR, IMAGE_BORDER_THICKNESS, IMAGE_BUTTON_BG,
     IMAGE_BUTTON_RADIUS, LINK_COLOR, MARGIN, MARKER_COLOR, QUOTE_BAR_COLOR, QUOTE_BAR_WIDTH,
     RULE_COLOR, RULE_THICKNESS, SELECTION_COLOR, SPLITTER_COLOR, TABLE_BORDER_COLOR,
-    TABLE_HEADER_BG, TICK_HEIGHT, TICK_WIDTH, TREE_BG, TREE_DIR_COLOR, TREE_HOVER_BG, TREE_INDENT,
-    TREE_PAD,
+    TABLE_HEADER_BG, TICK_HEIGHT, TICK_WIDTH, TREE_BG, TREE_CHEVRON_MAX, TREE_HOVER_BG,
+    TREE_INDENT, TREE_MARKER_COLOR, TREE_MARKER_W, TREE_PAD, TREE_ROW_INSET_Y, TREE_ROW_PAD,
+    TREE_ROW_RADIUS, TREE_ROW_VPAD,
 };
 
 /// The per-frame inputs [`build_display_list`] needs beyond the layout itself:
@@ -152,8 +153,15 @@ pub(crate) fn push_splitter(list: &mut DisplayList, rect: Rect, scale: Scale) {
     });
 }
 
+/// The pixel height of one tree row: the font's line height plus vertical
+/// padding above and below, so items get breathing room and a taller hit area.
+/// Shared by the painter and the pointer/scroll hit-testing so they agree.
+pub(crate) fn tree_row_height(m: Metrics, scale: Scale) -> i32 {
+    (m.line_height + 2 * scale.px(TREE_ROW_VPAD)).max(1)
+}
+
 /// Draw the file-tree sidebar into its column `rect`: a darker background, then
-/// each visible row (a folder marker plus the name), indented by depth and
+/// each visible row (a folder chevron plus the name), indented by depth and
 /// offset by the tree's own scroll. Updates `content_height` for scroll
 /// clamping. Rows do not wrap; a long name that overhangs is covered by the
 /// editor's own background, which is drawn after this.
@@ -162,7 +170,6 @@ pub(crate) fn push_tree(
     fonts: &Fonts,
     tree: &mut TreePane,
     rect: Rect,
-    focused: bool,
     scale: Scale,
     body_size: u32,
 ) {
@@ -171,8 +178,14 @@ pub(crate) fn push_tree(
         color: TREE_BG,
     });
     let m = fonts.metrics(body_size);
-    let row_h = m.line_height.max(1);
+    let row_h = tree_row_height(m, scale);
+    // Baseline that centers the glyph ink (ascent + descent) in the row, so the
+    // label sits in the middle of its pill rather than riding the line's top.
+    let text_offset = (row_h - (m.ascent + m.descent)) / 2 + m.ascent;
     let tree_pad = scale.px(TREE_PAD);
+    let row_pad = scale.px(TREE_ROW_PAD);
+    let inset_y = scale.px(TREE_ROW_INSET_Y);
+    let marker_w = scale.px(TREE_MARKER_W);
     let tree_indent = scale.px(TREE_INDENT);
     let rows = tree.tree.rows();
     tree.content_height = rows.len() as i32 * row_h + 2 * tree_pad;
@@ -181,41 +194,56 @@ pub(crate) fn push_tree(
         size: body_size,
         style: FontStyle::Regular,
     };
-    let text_right = rect.x + rect.w - tree_pad;
+    let text_right = rect.x + rect.w - tree_pad - row_pad;
     for (i, row) in rows.iter().enumerate() {
         let top = rect.y + tree_pad + i as i32 * row_h - tree.scroll_y;
         if top + row_h <= rect.y || top >= rect.y + rect.h {
             continue;
         }
-        // The keyboard-selected row (while the tree is focused) reads as a
-        // selection; a mouse-hovered row gets a subtler tint.
-        let highlight = if focused && tree.selected == i {
-            Some(SELECTION_COLOR)
-        } else if tree.hovered == Some(i) {
-            Some(TREE_HOVER_BG)
-        } else {
-            None
-        };
-        if let Some(color) = highlight {
-            list.push(DrawCmd::Fill {
+        // The active row (last clicked or opened) and the mouse-hovered row both
+        // read as the same soft gray pill, inset from the column edges and within
+        // the row so background frames it on every side.
+        if tree.selected == Some(i) || tree.hovered == Some(i) {
+            list.push(DrawCmd::RoundRect {
                 rect: Rect {
-                    x: rect.x,
-                    y: top,
-                    w: rect.w,
-                    h: row_h,
+                    x: rect.x + tree_pad,
+                    y: top + inset_y,
+                    w: (rect.w - 2 * tree_pad).max(0),
+                    h: (row_h - 2 * inset_y).max(0),
                 },
-                color,
+                color: TREE_HOVER_BG,
+                radius: scale.px(TREE_ROW_RADIUS),
+                corners: display::RoundedCorners::Both,
             });
         }
-        let x = rect.x + tree_pad + row.depth as i32 * tree_indent;
-        let baseline = top + m.ascent;
-        let (marker, color) = if row.is_dir {
-            (if row.expanded { "▾ " } else { "▸ " }, TREE_DIR_COLOR)
-        } else {
-            ("", FOREGROUND)
-        };
-        let label = format!("{marker}{}", row.name);
-        list.push(text_cmd(face, x, baseline, text_right, color, label, m));
+        // Names share one column, `marker_w` in from the row start, whether or not
+        // a chevron is drawn, so files and folders align. A folder's chevron is a
+        // vector shape (an anti-aliased distance field, like the task check mark),
+        // left-aligned in that column and centered vertically on the label, tinted;
+        // both folder and file names are drawn in the foreground.
+        let content_x = rect.x + tree_pad + row_pad + row.depth as i32 * tree_indent;
+        if row.is_dir {
+            let chev = (row_h * 9 / 16).clamp(scale.px(8), scale.px(TREE_CHEVRON_MAX));
+            list.push(DrawCmd::Chevron {
+                rect: Rect {
+                    x: content_x,
+                    y: top + (row_h - chev) / 2,
+                    w: chev,
+                    h: chev,
+                },
+                color: TREE_MARKER_COLOR,
+                down: row.expanded,
+            });
+        }
+        list.push(text_cmd(
+            face,
+            content_x + marker_w,
+            top + text_offset,
+            text_right,
+            FOREGROUND,
+            row.name.clone(),
+            m,
+        ));
     }
 }
 
@@ -1616,5 +1644,144 @@ mod tests {
                 .any(|c| matches!(c, DrawCmd::Text { text, .. } if text == "+")),
             "the add button's + reaches the list"
         );
+    }
+
+    /// A throwaway directory removed on drop, for driving the real [`push_tree`].
+    struct TreeDir(std::path::PathBuf);
+
+    impl TreeDir {
+        fn new(tag: &str) -> Self {
+            let dir = std::env::temp_dir()
+                .join(format!("bnknotes_paint_tree_{}_{tag}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(dir.join("folder")).expect("mkdir folder");
+            std::fs::write(dir.join("note.md"), b"n").expect("write note");
+            Self(dir)
+        }
+    }
+
+    impl Drop for TreeDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn tree_rows_paint_chevron_column_names_and_inset_highlight() {
+        let fx = TreeDir::new("rows");
+        let fonts = Fonts::new(&markdown::all_sizes(FONT_SIZE)).expect("a default font");
+        let mut tree = TreePane {
+            tree: crate::tree::Tree::new(fx.0.clone(), std::collections::BTreeSet::new()),
+            scroll_y: 0,
+            content_height: 0,
+            hovered: None,
+            selected: Some(0),
+        };
+        let rect = Rect {
+            x: 0,
+            y: 0,
+            w: 200,
+            h: 400,
+        };
+        let mut list = DisplayList::new();
+        // Row 0 (the folder) is active, so it draws its highlight.
+        push_tree(&mut list, &fonts, &mut tree, rect, Scale::ONE, FONT_SIZE);
+
+        // The active pill is a rounded rect in the hover gray, inset from both
+        // column edges so background frames it left and right.
+        let pill = list
+            .iter()
+            .find_map(|c| match c {
+                DrawCmd::RoundRect { rect, color, .. } if *color == TREE_HOVER_BG => Some(*rect),
+                _ => None,
+            })
+            .expect("the active row's highlight");
+        assert_eq!(pill.x, TREE_PAD, "highlight inset from the left edge");
+        assert_eq!(
+            pill.w,
+            rect.w - 2 * TREE_PAD,
+            "highlight inset from both edges"
+        );
+
+        // The folder draws one chevron (a vector shape, marker-colored, pointing
+        // right while collapsed); the file draws none, so there is exactly one.
+        let chevrons: Vec<(bool, i32)> = list
+            .iter()
+            .filter_map(|c| match c {
+                DrawCmd::Chevron { rect, color, down } if *color == TREE_MARKER_COLOR => {
+                    Some((*down, rect.x))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(chevrons.len(), 1, "one chevron, for the folder only");
+        assert!(!chevrons[0].0, "a collapsed folder points right, not down");
+        // Left-aligned at the row's content start, ahead of the name column.
+        assert_eq!(
+            chevrons[0].1,
+            TREE_PAD + TREE_ROW_PAD,
+            "the chevron sits at the row's content start"
+        );
+
+        // Both names are foreground and aligned in the column past the chevron slot.
+        let names: Vec<(&str, i32)> = list
+            .iter()
+            .filter_map(|c| match c {
+                DrawCmd::Text { text, color, x, .. } if *color == FOREGROUND => {
+                    Some((text.as_str(), *x))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            names,
+            [
+                ("folder", TREE_PAD + TREE_ROW_PAD + TREE_MARKER_W),
+                ("note", TREE_PAD + TREE_ROW_PAD + TREE_MARKER_W),
+            ],
+            "folder and file names share the foreground color and one column"
+        );
+    }
+
+    #[test]
+    fn tree_active_and_hover_share_the_gray_highlight() {
+        let fx = TreeDir::new("hover");
+        let fonts = Fonts::new(&markdown::all_sizes(FONT_SIZE)).expect("a default font");
+        let rect = Rect {
+            x: 0,
+            y: 0,
+            w: 200,
+            h: 400,
+        };
+        let gray_pill_tops = |selected, hovered| {
+            let mut tree = TreePane {
+                tree: crate::tree::Tree::new(fx.0.clone(), std::collections::BTreeSet::new()),
+                scroll_y: 0,
+                content_height: 0,
+                hovered,
+                selected,
+            };
+            let mut list = DisplayList::new();
+            push_tree(&mut list, &fonts, &mut tree, rect, Scale::ONE, FONT_SIZE);
+            list.iter()
+                .filter_map(|c| match c {
+                    DrawCmd::RoundRect { rect, color, .. } if *color == TREE_HOVER_BG => {
+                        Some(rect.y)
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+
+        // Nothing active or hovered draws no highlight.
+        assert!(gray_pill_tops(None, None).is_empty());
+        // The active row alone draws one gray pill (regardless of focus).
+        assert_eq!(gray_pill_tops(Some(0), None).len(), 1, "active only");
+        // Hover alone draws one gray pill, on the hovered row.
+        assert_eq!(gray_pill_tops(None, Some(1)).len(), 1, "hover only");
+        // Active and hover on different rows draw two, both in the same gray.
+        let two = gray_pill_tops(Some(0), Some(1));
+        assert_eq!(two.len(), 2, "active and hover, distinct rows");
+        assert_ne!(two[0], two[1], "the two pills sit on different rows");
     }
 }

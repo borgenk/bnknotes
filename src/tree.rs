@@ -2,7 +2,9 @@
 //! set of expanded sub-directories, flattened on demand into the visible rows
 //! the pane renders and hit-tests. Directories are read lazily (only expanded
 //! ones are walked) and each level is sorted directories-first, then
-//! case-insensitively by name. Pure filesystem + data; the pane owns the pixels.
+//! case-insensitively by name. Only Markdown files are listed, shown without
+//! their .md suffix; hidden entries (dotfiles and dot-folders like .git) are skipped.
+//! Pure filesystem + data; the pane owns the pixels.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -88,8 +90,10 @@ fn walk(dir: &Path, depth: usize, expanded: &BTreeSet<PathBuf>, out: &mut Vec<Ro
 }
 
 /// Read one directory into `(path, name, is_dir)`, folders first, then
-/// case-insensitively by name. An unreadable directory (permissions, a race)
-/// yields nothing rather than failing, so one bad folder cannot blank the tree.
+/// case-insensitively by name. Only folders and Markdown files are kept; a file's
+/// name drops the .md suffix, while its path keeps it. Hidden entries are skipped.
+/// An unreadable directory (permissions, a race) yields nothing rather than
+/// failing, so one bad folder cannot blank the tree.
 fn read_dir_sorted(dir: &Path) -> Vec<(PathBuf, String, bool)> {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return Vec::new();
@@ -97,9 +101,21 @@ fn read_dir_sorted(dir: &Path) -> Vec<(PathBuf, String, bool)> {
     let mut items: Vec<(PathBuf, String, bool)> = entries
         .flatten()
         .filter_map(|e| {
-            let name = e.file_name().to_str()?.to_string();
+            let raw = e.file_name();
+            let raw = raw.to_str()?;
+            if raw.starts_with('.') {
+                return None;
+            }
+            let path = e.path();
             let is_dir = e.file_type().map(|t| t.is_dir()).unwrap_or(false);
-            Some((e.path(), name, is_dir))
+            if is_dir {
+                Some((path, raw.to_string(), true))
+            } else if is_markdown(&path) {
+                let name = path.file_stem().and_then(|s| s.to_str())?.to_string();
+                Some((path, name, false))
+            } else {
+                None
+            }
         })
         .collect();
     // Directories (is_dir = true) sort ahead of files, then by lowercased name.
@@ -108,6 +124,14 @@ fn read_dir_sorted(dir: &Path) -> Vec<(PathBuf, String, bool)> {
             .then_with(|| a.1.to_lowercase().cmp(&b.1.to_lowercase()))
     });
     items
+}
+
+/// Whether the tree lists this file: a Markdown document, matched on the .md
+/// extension case-insensitively.
+fn is_markdown(path: &Path) -> bool {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| e.eq_ignore_ascii_case("md"))
 }
 
 #[cfg(test)]
@@ -124,7 +148,10 @@ mod tests {
             let _ = std::fs::remove_dir_all(&dir);
             std::fs::create_dir_all(dir.join("zeta")).expect("mkdir zeta");
             std::fs::create_dir_all(dir.join("alpha/nested")).expect("mkdir alpha/nested");
+            std::fs::create_dir_all(dir.join(".git")).expect("mkdir .git");
             std::fs::write(dir.join("readme.md"), b"r").expect("write readme");
+            std::fs::write(dir.join("notes.txt"), b"n").expect("write notes");
+            std::fs::write(dir.join(".secret.md"), b"s").expect("write secret");
             std::fs::write(dir.join("alpha/a.md"), b"a").expect("write a");
             std::fs::write(dir.join("alpha/nested/deep.md"), b"d").expect("write deep");
             Self(dir)
@@ -142,8 +169,32 @@ mod tests {
         let fx = Fixture::new("sort");
         let tree = Tree::new(fx.0.clone(), BTreeSet::new());
         let names: Vec<&str> = tree.rows().iter().map(|r| r.name.as_str()).collect();
-        // Folders (alpha, zeta) before the file (readme.md); collapsed, so no children.
-        assert_eq!(names, ["alpha", "zeta", "readme.md"]);
+        // Folders (alpha, zeta) before the file (readme, .md dropped); collapsed,
+        // so no children. The non-Markdown and hidden entries are absent.
+        assert_eq!(names, ["alpha", "zeta", "readme"]);
+    }
+
+    #[test]
+    fn hides_non_markdown_and_dotfiles() {
+        let fx = Fixture::new("filter");
+        // A Markdown file's row keeps the full path but shows without the suffix.
+        std::fs::write(fx.0.join("Loud.MD"), b"u").expect("write Loud");
+        let tree = Tree::new(fx.0.clone(), BTreeSet::new());
+        let rows: Vec<(&str, &std::path::Path)> = tree
+            .rows()
+            .iter()
+            .map(|r| (r.name.as_str(), r.path.as_path()))
+            .collect();
+        // notes.txt, .secret.md, and .git are all gone; Loud.MD matches case-insensitively.
+        assert_eq!(
+            rows,
+            [
+                ("alpha", fx.0.join("alpha").as_path()),
+                ("zeta", fx.0.join("zeta").as_path()),
+                ("Loud", fx.0.join("Loud.MD").as_path()),
+                ("readme", fx.0.join("readme.md").as_path()),
+            ]
+        );
     }
 
     #[test]
@@ -161,9 +212,9 @@ mod tests {
             [
                 ("alpha", 0, true),
                 ("nested", 1, false),
-                ("a.md", 1, false),
+                ("a", 1, false),
                 ("zeta", 0, false),
-                ("readme.md", 0, false),
+                ("readme", 0, false),
             ]
         );
     }
@@ -187,10 +238,7 @@ mod tests {
             .into_iter()
             .collect();
         let tree = Tree::new(fx.0.clone(), expanded);
-        let deep = tree
-            .rows()
-            .iter()
-            .any(|r| r.name == "deep.md" && r.depth == 2);
+        let deep = tree.rows().iter().any(|r| r.name == "deep" && r.depth == 2);
         assert!(
             deep,
             "restored expansion should reveal the deeply nested file"

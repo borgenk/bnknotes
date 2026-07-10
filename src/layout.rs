@@ -41,11 +41,11 @@
 //!
 //! A list or quote item also hangs its wrapped continuations under the text: each
 //! visual line past the first is inset by the marker's width (`VisualLine::indent`)
-//! so the column aligns. Once the cursor leaves the line the raw marker gives way
-//! to a [`Gutter`] decoration, a bullet point `•` for a list, a drawn checkbox
-//! for a task item, or a bar for a quote, always the same width as the source
-//! marker so the text never shifts; on the cursor's own line the raw, editable
-//! marker shows instead.
+//! so the column aligns. The raw marker gives way to a [`Gutter`] decoration,
+//! always the same width as the source marker so the text never shifts: a bullet
+//! point `•` for a list and a drawn checkbox for a task item stand in on every
+//! line, the cursor's own included, while a quote's bar yields to its editable
+//! `>` on the cursor's own line.
 //!
 //! Fenced code blocks are the one construct whose classification crosses line
 //! boundaries: a ``` line opens a block and a later ``` closes it, and every line
@@ -160,10 +160,9 @@ pub struct VisualLine {
     /// heading's scale.
     pub heading: Option<u8>,
     /// `Some(checked)` when this line belongs to a task-list item, on every
-    /// visual line the item wraps into. A checked item's text renders dim and
-    /// struck through; the checkbox itself is the first line's
-    /// [`Gutter::Checkbox`]. `None` off task items (and on an over-nested one,
-    /// which renders as plain body text).
+    /// visual line the item wraps into. A checked item's text renders dim; the
+    /// checkbox itself is the first line's [`Gutter::Checkbox`]. `None` off task
+    /// items (and on an over-nested one, which renders as plain body text).
     pub task: Option<bool>,
     /// True to draw a horizontal rule for this line: a thematic break (`---`)
     /// whose cursor has left, so its raw markers are collapsed. While the cursor is
@@ -896,7 +895,8 @@ impl Layout {
     /// a list line up in a column (the source `x` renders wider than a space in the
     /// proportional face). The painter draws the box here and [`Self::checkbox_at`]
     /// hit-tests clicks against it, so the two always agree. `None` for any other
-    /// line, including a revealed task line, which shows its raw editable marker.
+    /// line (a task item's box shows on every line it occupies, the cursor's own
+    /// line included).
     pub(crate) fn checkbox_rect(
         &self,
         fonts: &Fonts,
@@ -940,10 +940,10 @@ impl Layout {
     }
 
     /// The logical-line start of the task item whose drawn checkbox contains
-    /// content-space `(x, y)`, or `None`. Only a non-revealed task line draws a
-    /// checkbox (the cursor's own line shows its raw marker, where clicks
-    /// edit), so a hit here always means "toggle", never "place the caret".
-    /// The target is padded a little past the drawn box for clickability.
+    /// content-space `(x, y)`, or `None`. The box is drawn on every task line,
+    /// the cursor's own included, so a hit inside it always means "toggle" while
+    /// a click elsewhere on the line still places the caret. The target is padded
+    /// a little past the drawn box for clickability.
     pub fn checkbox_at(&self, fonts: &Fonts, rope: &Rope, x: f32, y: f32) -> Option<usize> {
         let line = self.line_for_y(fonts, y);
         let rect = self.checkbox_rect(fonts, rope, line)?;
@@ -1938,11 +1938,11 @@ fn lay_line(
         // the bar only once the cursor leaves.
         let gutter = match style {
             markdown::LineStyle::Bullet if k == 0 => Gutter::Bullet,
-            // A task item draws its checkbox only once the cursor leaves: on the line
-            // itself the raw `- [ ]` is the editable source, and a click there edits.
-            markdown::LineStyle::Task { checked } if k == 0 && !revealed => {
-                Gutter::Checkbox { checked }
-            }
+            // A task item shows its checkbox even on the cursor's own line, the way
+            // a bullet keeps its dot, so the box never flips back to a raw `- [ ]`
+            // while you edit the label. A click on the box toggles it; a click
+            // elsewhere on the line places the caret.
+            markdown::LineStyle::Task { checked } if k == 0 => Gutter::Checkbox { checked },
             markdown::LineStyle::Quote if !revealed => Gutter::QuoteBar { marker: k == 0 },
             _ => Gutter::None,
         };
@@ -4508,7 +4508,7 @@ mod tests {
     // --- Task lists ---------------------------------------------------------
 
     #[test]
-    fn a_task_line_draws_a_checkbox_off_line_and_raw_marker_on_it() {
+    fn a_task_line_draws_its_checkbox_even_on_the_cursors_own_line() {
         let f = fonts();
         let src = "- [ ] todo\nx";
         let r = rope(src);
@@ -4517,18 +4517,16 @@ mod tests {
         assert_eq!(
             away.lines()[0].gutter,
             Gutter::Checkbox { checked: false },
-            "the checkbox stands in once the cursor leaves"
+            "the checkbox stands in with the cursor away"
         );
         assert!(
             away.run_slice(&away.lines()[0])[0].visible,
             "the marker run persists (width-matched under the drawn box)"
         );
+        // The box stays put with the cursor on the line: it never flips back to a
+        // raw `- [ ]`, mirroring how a bullet keeps its dot while editing.
         let on = Layout::build(&f, &r, LEFT, TOP, 1_000_000, BODY, (0, 0));
-        assert_eq!(
-            on.lines()[0].gutter,
-            Gutter::None,
-            "the raw `- [ ]` shows while editing"
-        );
+        assert_eq!(on.lines()[0].gutter, Gutter::Checkbox { checked: false });
         assert!(on.run_slice(&on.lines()[0])[0].visible);
     }
 
@@ -4572,7 +4570,7 @@ mod tests {
         assert_eq!(
             lines[1].task,
             Some(true),
-            "the continuation still dims and strikes"
+            "the continuation still dims with the item"
         );
         let marker_w =
             shape::text_advance(f.face(BODY, FontStyle::Regular), "- [x] ").round() as i32;
@@ -4634,10 +4632,11 @@ mod tests {
             rect.y >= line.baseline - m.ascent && rect.y + rect.h <= line.baseline + m.descent,
             "vertically inside the line's box"
         );
-        // With the cursor on the task line the raw marker shows: no drawn box.
+        // The box shows on the cursor's own line too, at the same geometry
+        // (reveal never moves it).
         let task_start = 4;
         let on = Layout::build(&f, &r, LEFT, TOP, 1_000_000, BODY, (task_start, task_start));
-        assert!(on.checkbox_rect(&f, &r, &on.lines()[1]).is_none());
+        assert_eq!(on.checkbox_rect(&f, &r, &on.lines()[1]), Some(rect));
     }
 
     #[test]
@@ -4662,9 +4661,10 @@ mod tests {
             None,
             "another line is not the checkbox"
         );
-        // On the revealed line the raw marker shows and clicks edit, not toggle.
+        // On the cursor's own line the box still hit-tests, so a click there
+        // toggles it rather than only placing the caret.
         let on = Layout::build(&f, &r, LEFT, TOP, 1_000_000, BODY, (0, 0));
-        assert_eq!(on.checkbox_at(&f, &r, cx, cy), None);
+        assert_eq!(on.checkbox_at(&f, &r, cx, cy), Some(0));
     }
 
     #[test]

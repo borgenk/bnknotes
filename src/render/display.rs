@@ -61,6 +61,10 @@ pub enum DrawCmd {
         radius: i32,
         corners: RoundedCorners,
     },
+    /// A task item's check mark, inked from a distance field over `rect` (the
+    /// checked box). The tick is intrinsic to the shape, so the command carries
+    /// only its box and color; the GPU draws the smooth diagonals.
+    CheckMark { rect: Rect, color: u32 },
     /// A run of text drawn from `x` along `baseline`. `bounds` is the run's screen
     /// rectangle padded for glyph ink that overhangs the advance box, so the
     /// damage diff and the clip test never clip a glyph's edge.
@@ -85,6 +89,7 @@ impl DrawCmd {
         match self {
             DrawCmd::Fill { rect, .. }
             | DrawCmd::RoundRect { rect, .. }
+            | DrawCmd::CheckMark { rect, .. }
             | DrawCmd::Image { rect, .. } => *rect,
             DrawCmd::Text { bounds, .. } => *bounds,
         }

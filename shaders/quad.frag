@@ -1,6 +1,6 @@
 // The one fragment shader. Modes (src/gpu.rs): 0 solid fill, 1 glyph coverage
 // from the R8 atlas, 2 emoji from the BGRA atlas, 3 an image texture,
-// 4 rounded-rect coverage. Glyph and emoji reads are texelFetch at integer
+// 4 rounded-rect coverage, 5 a task check mark. Glyph and emoji reads are texelFetch at integer
 // coords so a 1:1 atlas quad reproduces its source texels exactly. An image is
 // an sRGB texture sampled with texture() and normalized UVs, so the GPU decodes
 // and scales its native-size texture to the display quad in linear space,
@@ -59,6 +59,28 @@ float round_coverage(vec2 p, vec2 size, float r, uint mask) {
     return clamp(r - length(p - c) + 0.5, 0.0, 1.0);
 }
 
+// Distance from point p to the segment ab.
+float seg_dist(vec2 p, vec2 a, vec2 b) {
+    vec2 pa = p - a;
+    vec2 ba = b - a;
+    float h = clamp(dot(pa, ba) / dot(ba, ba), 0.0, 1.0);
+    return length(pa - ba * h);
+}
+
+// A check mark filling the box `size` (v_extra.xy): a two-segment tick in the
+// box's normalized coordinates, inked by the anti-aliased distance to it. The
+// stroke half-width scales with the box (with a floor so it never sub-pixels
+// away) and coverage fades over the one-pixel band at that width, so the
+// diagonals read smooth at any size instead of the staircase a fill leaves.
+float check_coverage(vec2 p, vec2 size) {
+    vec2 a = vec2(0.22, 0.52) * size;
+    vec2 b = vec2(0.42, 0.71) * size;
+    vec2 c = vec2(0.80, 0.30) * size;
+    float d = min(seg_dist(p, a, b), seg_dist(p, b, c));
+    float half_w = max(size.x * 0.065, 0.75);
+    return clamp(half_w - d + 0.5, 0.0, 1.0);
+}
+
 void main() {
     if (v_mode == 0u) {
         out_color = vec4(srgb_to_linear(v_color.rgb), v_color.a);
@@ -77,8 +99,11 @@ void main() {
         // Image: the sRGB texture is decoded and scaled to the quad in linear
         // space by the sampler, so its result is already linear.
         out_color = texture(image_tex, v_uv);
-    } else {
+    } else if (v_mode == 4u) {
         float cov = round_coverage(v_uv, v_extra.xy, v_extra.z, uint(v_extra.w));
+        out_color = vec4(srgb_to_linear(v_color.rgb), v_color.a * cov);
+    } else {
+        float cov = check_coverage(v_uv, v_extra.xy);
         out_color = vec4(srgb_to_linear(v_color.rgb), v_color.a * cov);
     }
 }

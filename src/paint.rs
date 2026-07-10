@@ -543,8 +543,9 @@ impl<'a> Painter<'a> {
             // Content is inset by the line's hanging indent (0 unless this is a
             // wrapped list/quote continuation).
             let heading = line.heading.is_some();
-            // A completed task's text reads dim and struck through, over the whole
-            // item (wrapped continuations included), so done items scan as done.
+            // A completed task's text reads dim, over the whole item (wrapped
+            // continuations included), so done items scan as done while the
+            // checkbox carries the crossed-off signal.
             let done = line.task == Some(true);
             let mut pen = left + line.indent;
             let runs = layout.run_slice(line);
@@ -646,9 +647,9 @@ impl<'a> Painter<'a> {
                 // width: a link is underlined and struck text gets a line through its
                 // middle, both in the run's own color. Thickness scales with the
                 // line's size so it stays proportionate on larger headings. A done
-                // task strikes through all of its text instead.
+                // task only dims its text (the color above), so its label stays
+                // legible rather than crossed out.
                 let deco = match run.kind {
-                    markdown::SpanKind::Text(_) if done => Some(baseline - m.ascent / 3),
                     markdown::SpanKind::Text(markdown::Emphasis::Link) => {
                         Some(baseline + m.descent / 3)
                     }
@@ -1149,9 +1150,9 @@ fn push_find_bar(
 
 /// Append a task item's checkbox at `rect` (screen space, from
 /// [`Layout::checkbox_rect`]): unchecked is an outlined rounded square (an
-/// inset background fill hollows the border), checked fills with the accent
-/// and carries a check mark. Built entirely from fills, since the prose face
-/// has no checkbox glyphs to lean on.
+/// inset background fill hollows the border), checked fills with the accent and
+/// carries a check mark drawn from a distance field. The prose face has no
+/// checkbox glyphs to lean on, so the box is built from fills.
 fn push_checkbox(list: &mut DisplayList, rect: Rect, checked: bool) {
     let radius = (rect.w / 4).max(2);
     list.push(DrawCmd::RoundRect {
@@ -1161,7 +1162,10 @@ fn push_checkbox(list: &mut DisplayList, rect: Rect, checked: bool) {
         corners: display::RoundedCorners::Both,
     });
     if checked {
-        push_check_mark(list, rect);
+        list.push(DrawCmd::CheckMark {
+            rect,
+            color: BACKGROUND,
+        });
     } else {
         let t = (rect.w / 8).max(1);
         list.push(DrawCmd::RoundRect {
@@ -1173,48 +1177,6 @@ fn push_checkbox(list: &mut DisplayList, rect: Rect, checked: bool) {
             },
             color: BACKGROUND,
             radius: (radius - t).max(1),
-            corners: display::RoundedCorners::Both,
-        });
-    }
-}
-
-/// Append a check mark inside the checked box `b`: a short arm down to a low vertex
-/// then a longer arm up to the right, in the background color over the accent fill.
-/// The three points are fractions of the box so the tick sits centered. Each arm is
-/// drawn as overlapping round dots (anti-aliased [`DrawCmd::RoundRect`] circles),
-/// so its diagonal edges are smooth rather than the staircase a square fill leaves.
-fn push_check_mark(list: &mut DisplayList, b: Rect) {
-    let t = (b.w as f32 / 4.5).round().max(2.0) as i32;
-    let bw = b.w as f32;
-    let bh = b.h as f32;
-    let p = |fx: f32, fy: f32| (b.x as f32 + bw * fx, b.y as f32 + bh * fy);
-    let left = p(0.24, 0.52);
-    let vertex = p(0.46, 0.72);
-    let right = p(0.80, 0.28);
-    stroke_check_arm(list, left, vertex, t);
-    stroke_check_arm(list, vertex, right, t);
-}
-
-/// Draw a thickness-`t` stroke from `a` to `b` as a run of overlapping round dots
-/// (radius `t/2`), stepped about a pixel apart so the union reads as one smooth,
-/// anti-aliased line. Shared by the check mark's two arms.
-fn stroke_check_arm(list: &mut DisplayList, a: (f32, f32), b: (f32, f32), t: i32) {
-    let (dx, dy) = (b.0 - a.0, b.1 - a.1);
-    let steps = dx.hypot(dy).ceil().max(1.0) as i32;
-    let radius = (t / 2).max(1);
-    for i in 0..=steps {
-        let f = i as f32 / steps as f32;
-        let cx = (a.0 + dx * f).round() as i32;
-        let cy = (a.1 + dy * f).round() as i32;
-        list.push(DrawCmd::RoundRect {
-            rect: Rect {
-                x: cx - t / 2,
-                y: cy - t / 2,
-                w: t,
-                h: t,
-            },
-            color: BACKGROUND,
-            radius,
             corners: display::RoundedCorners::Both,
         });
     }
@@ -1361,14 +1323,15 @@ mod tests {
                 && rect.y >= accent.y
                 && rect.y + rect.h <= accent.y + accent.h
         };
-        // The check mark: overlapping background-color round dots inside the box.
-        let dots = list
+        // The check mark: one distance-field command in the background color,
+        // inked inside the checked box.
+        let checks = list
             .iter()
             .filter(|c| {
-                matches!(c, DrawCmd::RoundRect { rect, color, .. } if *color == BACKGROUND && inside(rect))
+                matches!(c, DrawCmd::CheckMark { rect, color } if *color == BACKGROUND && inside(rect))
             })
             .count();
-        assert!(dots >= 5, "a stroke of check dots, got {dots}");
+        assert_eq!(checks, 1, "one check mark inside the checked box");
         // The unchecked box is hollowed by a background inset (outside the checked box).
         assert!(
             list.iter().any(|c| {
@@ -1388,8 +1351,8 @@ mod tests {
             !texts.iter().any(|t| t.contains('[')),
             "no raw checkbox glyphs on rendered lines: {texts:?}"
         );
-        // The done item's text dims to the marker color and gains a strike
-        // fill spanning its drawn width; the open item's text stays foreground.
+        // The done item's text dims to the marker color; the open item's text
+        // stays foreground.
         let text_color = |needle: &str| {
             list.iter().find_map(|c| match c {
                 DrawCmd::Text { text, color, .. } if text == needle => Some(*color),
@@ -1398,6 +1361,8 @@ mod tests {
         };
         assert_eq!(text_color("open"), Some(FOREGROUND));
         assert_eq!(text_color("done"), Some(MARKER_COLOR), "done text is dim");
+        // A done task is only dimmed, never crossed out: no strike fill runs
+        // through its label.
         let done_run = list
             .iter()
             .find_map(|c| match c {
@@ -1409,14 +1374,14 @@ mod tests {
             .expect("the done run");
         let m = fonts.metrics(FONT_SIZE);
         assert!(
-            list.iter().any(|c| {
+            !list.iter().any(|c| {
                 matches!(c, DrawCmd::Fill { rect, color }
                     if *color == MARKER_COLOR
                         && rect.x == done_run.0
                         && rect.y > done_run.1 - m.ascent
                         && rect.y < done_run.1)
             }),
-            "the done text is struck through"
+            "a done task is not struck through, only dimmed"
         );
     }
 

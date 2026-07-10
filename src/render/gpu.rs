@@ -29,6 +29,7 @@ pub const MODE_GLYPH: u32 = 1;
 pub const MODE_EMOJI: u32 = 2;
 pub const MODE_IMAGE: u32 = 3;
 pub const MODE_ROUND: u32 = 4;
+pub const MODE_CHECK: u32 = 5;
 
 /// Atlases start here and double when full, up to [`ATLAS_MAX`]; growth wipes
 /// the atlas (sources are cached in `Fonts`, so re-inserting is cheap) and the
@@ -378,6 +379,13 @@ impl Batcher<'_> {
                 radius,
                 corners,
             } => self.round_rect(*rect, *color, *radius, *corners),
+            DrawCmd::CheckMark { rect, color } => {
+                // The tick is intrinsic to the mode: uv carries the pixel
+                // position within the box (like the rounded-rect mode) and extra
+                // carries the box size the shader's distance field needs.
+                let extra = [rect.w as f32, rect.h as f32, 0.0, 0.0];
+                self.quad(*rect, MODE_CHECK, *color, [0.0; 2], extra);
+            }
             DrawCmd::Text {
                 x,
                 baseline,

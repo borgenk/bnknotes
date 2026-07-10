@@ -781,6 +781,12 @@ impl Fonts {
             metrics.line_height = metrics.line_height.max(target);
             // Fallback faces draw only scalars the primary lacks and never route
             // emoji clusters themselves, so they carry no emoji font.
+            //
+            // They open at the primary `size` and their glyphs rasterize at the
+            // font's own natural proportions: we deliberately do NOT scale a fallback
+            // face down to the primary's em. Nerd Font's non-"Mono" cut draws icons
+            // wider than a monospace column, so an icon glyph (a git-branch mark, a
+            // Powerline separator) comes out big and crisp.
             let fallback = config
                 .fallback
                 .iter()

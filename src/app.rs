@@ -180,6 +180,20 @@ enum TabHover {
     },
 }
 
+/// An in-progress tab drag-to-reorder. Records which pane and which tab (by its
+/// current index, which the reorder keeps up to date), the pointer x at press and
+/// the grab offset within the tab (so the floating tab stays under the cursor), and
+/// whether the pointer has crossed the click threshold yet: a press that never
+/// does is a plain tab click, not a drag.
+#[derive(Clone, Copy)]
+struct TabDrag {
+    pane: usize,
+    tab: usize,
+    grab_x: f32,
+    grab_dx: i32,
+    moved: bool,
+}
+
 impl TabHover {
     /// The hovered tab index in pane `g` (its body highlight), if any.
     fn tab_in(self, g: usize) -> Option<usize> {
@@ -227,6 +241,8 @@ struct State {
     hovered_tab: Option<TabHover>,
     /// While a splitter is dragged, which one: 0 = tree|A edge, 1 = A|B edge.
     drag_splitter: Option<usize>,
+    /// While a tab is dragged to reorder it: which pane and tab, and the grab state.
+    drag_tab: Option<TabDrag>,
     /// The toplevel title last sent, so it is only re-set when it changes.
     title: String,
 
@@ -451,6 +467,7 @@ impl State {
             },
             hovered_tab: None,
             drag_splitter: None,
+            drag_tab: None,
             title: String::new(),
             width: session.window.0,
             height: session.window.1,
@@ -914,6 +931,14 @@ impl State {
                     hovered: self.hovered_tab.and_then(|h| h.tab_in(g)),
                     close_hover: self.hovered_tab.and_then(|h| h.close_in(g)),
                     new_hover: self.hovered_tab == Some(TabHover::New { pane: g }),
+                    // A tab reorder in progress lifts its tab to follow the pointer,
+                    // but only once the press has grown into an actual drag.
+                    drag: self.drag_tab.filter(|d| d.pane == g && d.moved).map(|d| {
+                        crate::paint::TabDragView {
+                            tab: d.tab,
+                            left: (self.pointer_x - d.grab_dx as f32).round() as i32,
+                        }
+                    }),
                 })
             };
             let dividers: Vec<Rect> = splitter_rects.into_iter().flatten().collect();

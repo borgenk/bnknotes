@@ -1105,13 +1105,55 @@ impl PaneGroup {
     /// tab stays put where it can; closing it falls to the neighbor that slides
     /// into its place.
     pub(crate) fn close(&mut self, i: usize) {
+        self.detach(i);
+    }
+
+    /// Remove tab `i` and hand back its document, so it can be re-homed in another
+    /// pane (a tab dragged across the split). The active tab shifts the same way
+    /// [`Self::close`] moves it. An out-of-range index yields `None`.
+    pub(crate) fn detach(&mut self, i: usize) -> Option<EditorPane> {
         if i >= self.docs.len() {
-            return;
+            return None;
         }
-        self.docs.remove(i);
+        let doc = self.docs.remove(i);
         if i < self.active || self.active >= self.docs.len() {
             self.active = self.active.saturating_sub(1);
         }
+        Some(doc)
+    }
+
+    /// Insert `doc` as a tab at index `i` (clamped to the end), adopt it under the
+    /// group's scale, make it active, and return the index it landed at. Receives a
+    /// tab dragged in from the other pane.
+    pub(crate) fn insert_tab(&mut self, i: usize, mut doc: EditorPane) -> usize {
+        doc.set_scale(self.scale, self.body_size);
+        let i = i.min(self.docs.len());
+        self.docs.insert(i, doc);
+        self.active = i;
+        i
+    }
+
+    /// Move the tab at `from` to index `to`, sliding the tabs in between over to
+    /// fill the gap. The same document stays active across the move, whichever slot
+    /// it lands in. Out-of-range or no-op moves are ignored.
+    pub(crate) fn move_tab(&mut self, from: usize, to: usize) {
+        if from >= self.docs.len() || to >= self.docs.len() || from == to {
+            return;
+        }
+        let doc = self.docs.remove(from);
+        self.docs.insert(to, doc);
+        self.active = if self.active == from {
+            to
+        } else {
+            let mut a = self.active;
+            if a > from {
+                a -= 1;
+            }
+            if a >= to {
+                a += 1;
+            }
+            a
+        };
     }
 
     /// Adopt a new display scale and body size (a DPI change), fanning it out to
@@ -1306,6 +1348,91 @@ mod tests {
             heading_marker_hidden(&pane, heading_start),
             "a live drag collapses the heading marker again"
         );
+    }
+
+    /// A group of `n` tabs, each stamped with a distinct `scroll_y` so a test can
+    /// track where a given document lands after a reorder.
+    fn marked_group(n: i32) -> PaneGroup {
+        let mut g = PaneGroup::empty();
+        for i in 0..n {
+            g.new_tab(Scale::ONE, FONT_SIZE);
+            g.active_doc_mut().scroll_y = i;
+        }
+        g
+    }
+
+    fn order(g: &PaneGroup) -> Vec<i32> {
+        g.docs.iter().map(|d| d.scroll_y).collect()
+    }
+
+    #[test]
+    fn move_tab_reorders_and_carries_the_active_document() {
+        // Documents 0..4; make document 1 (the second) active, then drag the first
+        // tab to the third slot. The middle tabs slide left, and the active follows
+        // its document to the slot it now occupies.
+        let mut g = marked_group(4);
+        g.activate(1);
+        g.move_tab(0, 2);
+        assert_eq!(order(&g), vec![1, 2, 0, 3]);
+        assert_eq!(g.active_index(), 0);
+    }
+
+    #[test]
+    fn move_tab_follows_the_dragged_tab_when_it_is_active() {
+        // Dragging the active tab itself: it stays active in its new slot.
+        let mut g = marked_group(4);
+        g.activate(0);
+        g.move_tab(0, 3);
+        assert_eq!(order(&g), vec![1, 2, 3, 0]);
+        assert_eq!(g.active_index(), 3);
+    }
+
+    #[test]
+    fn detach_and_insert_carry_a_tab_across_panes() {
+        // Pane A holds tabs 0,1,2 with the middle one active; pane B holds two tabs
+        // marked apart (10, 11) with the second active.
+        let mut a = marked_group(3);
+        a.activate(1);
+        let mut b = marked_group(2);
+        b.docs[0].scroll_y = 10;
+        b.docs[1].scroll_y = 11;
+
+        // Drag A's active tab out: it leaves A, whose active falls to the neighbor
+        // that slid into its place.
+        let doc = a.detach(1).expect("a tab to detach");
+        assert_eq!(doc.scroll_y, 1);
+        assert_eq!(order(&a), vec![0, 2]);
+        assert_eq!(a.active_index(), 1);
+
+        // Drop it at the front of B: B now owns it and makes it active.
+        let landed = b.insert_tab(0, doc);
+        assert_eq!(landed, 0);
+        assert_eq!(order(&b), vec![1, 10, 11]);
+        assert_eq!(b.active_index(), 0);
+
+        // An out-of-range detach is a no-op that hands back nothing.
+        assert!(a.detach(9).is_none());
+        assert_eq!(order(&a), vec![0, 2]);
+    }
+
+    #[test]
+    fn insert_tab_clamps_past_the_end() {
+        let mut b = marked_group(2);
+        let doc = EditorPane::empty();
+        let landed = b.insert_tab(99, doc);
+        assert_eq!(landed, 2);
+        assert_eq!(b.active_index(), 2);
+    }
+
+    #[test]
+    fn move_tab_ignores_out_of_range_and_no_op_moves() {
+        let mut g = marked_group(3);
+        g.activate(2);
+        g.move_tab(1, 1); // no-op
+        g.move_tab(0, 9); // out of range
+        g.move_tab(9, 0); // out of range
+        assert_eq!(order(&g), vec![0, 1, 2]);
+        assert_eq!(g.active_index(), 2);
     }
 
     #[test]

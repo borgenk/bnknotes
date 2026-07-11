@@ -2,7 +2,7 @@ use std::os::fd::AsRawFd;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-use super::{State, TabHover};
+use super::{State, TabDrag, TabHover};
 use crate::find;
 use crate::pane::{Columns, EditorPane, Focus, Hit, SPLITTER};
 use crate::platform::error::{Error, Result};
@@ -15,7 +15,7 @@ use crate::platform::protocol::{
 use crate::platform::scroll;
 use crate::platform::wire::{Arg, Reader};
 use crate::platform::xkb::KeyAction;
-use crate::theme::TREE_PAD;
+use crate::theme::{TAB_DRAG_THRESHOLD, TREE_PAD};
 
 /// What the Tab key inserts: spaces (a "soft tab"), not a literal `'\t'`. This
 /// keeps the buffer free of tab characters and spares the renderer any tab-stop
@@ -553,6 +553,8 @@ impl State {
                 let (px, py) = (self.pointer_x, self.pointer_y);
                 if let Some(s) = self.drag_splitter {
                     self.drag_splitter_to(s, px);
+                } else if self.drag_tab.is_some() {
+                    self.drag_tab_to(px);
                 } else {
                     let i = self.active_editor();
                     if matches!(self.focus, Focus::Editor(_)) && self.editors[i].selecting {
@@ -583,6 +585,15 @@ impl State {
                         // A splitter drag just ended: persist the new column sizes.
                         if self.drag_splitter.take().is_some() {
                             self.save_session();
+                        }
+                        // A tab reorder just ended: persist the new order and let the
+                        // lifted tab settle back into its slot. A press that never
+                        // grew into a drag was a plain click, already handled.
+                        if let Some(drag) = self.drag_tab.take() {
+                            if drag.moved {
+                                self.save_session();
+                                self.dirty = true;
+                            }
                         }
                         let i = self.active_editor();
                         let was_selecting = self.editors[i].selecting;
@@ -916,7 +927,7 @@ impl State {
                 self.focus_pane(i);
                 self.editor_press(i, rect, px, py);
             }
-            Hit::Tab(g, i) => self.select_tab(g, i),
+            Hit::Tab(g, i) => self.press_tab(g, i, px),
             Hit::TabClose(g, i) => self.close_tab(g, i),
             Hit::NewTab(g) => self.new_tab_in(g),
             // The empty part of a pane's tab strip still focuses that pane.
@@ -930,6 +941,82 @@ impl State {
         self.editors[g].activate(i);
         self.focus_pane(g);
         self.save_session();
+    }
+
+    /// A press on tab `i` of pane `g`: select it, and arm a reorder drag anchored at
+    /// pointer x `px`. The drag only starts moving tabs once the pointer crosses the
+    /// click threshold, so a plain click still just selects.
+    fn press_tab(&mut self, g: usize, i: usize, px: f32) {
+        self.select_tab(g, i);
+        let grab_dx = self
+            .tab_strip_rects(g)
+            .and_then(|(_, tabs)| tabs.get(i).map(|t| (px - t.rect.x as f32) as i32))
+            .unwrap_or(0);
+        self.drag_tab = Some(TabDrag {
+            pane: g,
+            tab: i,
+            grab_x: px,
+            grab_dx,
+            moved: false,
+        });
+    }
+
+    /// Continue a tab drag as the pointer reaches x `px`: once past the click
+    /// threshold, put the dragged tab where the pointer points. Within its own pane
+    /// that is a reorder; over the other pane's strip the tab crosses the split,
+    /// leaving its old pane and re-homing in the one under the pointer. The frame
+    /// keeps repainting so the lifted tab tracks the cursor.
+    fn drag_tab_to(&mut self, px: f32) {
+        let Some(mut drag) = self.drag_tab else {
+            return;
+        };
+        if !drag.moved {
+            if (px - drag.grab_x).abs() < self.scale().px(TAB_DRAG_THRESHOLD) as f32 {
+                return;
+            }
+            drag.moved = true;
+        }
+        let over = self.tab_target_pane(px).unwrap_or(drag.pane);
+        if over != drag.pane {
+            // Cross the split: detach from the source pane and insert where the
+            // pointer sits in the target's strip, which then owns and focuses it.
+            let idx = self
+                .tab_strip_rects(over)
+                .map(|(_, tabs)| crate::paint::tab_drop_index(&tabs, None, px))
+                .unwrap_or(0);
+            if let Some(doc) = self.editors[drag.pane].detach(drag.tab) {
+                drag.tab = self.editors[over].insert_tab(idx, doc);
+                drag.pane = over;
+                self.focus_pane(over);
+            }
+        } else if let Some((_, tabs)) = self.tab_strip_rects(drag.pane) {
+            let target = crate::paint::tab_drop_index(&tabs, Some(drag.tab), px);
+            if target != drag.tab {
+                self.editors[drag.pane].move_tab(drag.tab, target);
+                drag.tab = target;
+            }
+        }
+        self.drag_tab = Some(drag);
+        self.dirty = true;
+    }
+
+    /// Which pane's tab strip the pointer x `px` sits over, if any. Only panes that
+    /// are actually shown have a strip, so this is `None` over the tree, a splitter,
+    /// or a closed second pane, which is exactly when a tab has nowhere to cross to.
+    fn tab_target_pane(&self, px: f32) -> Option<usize> {
+        let strips = self.columns().tab_strips;
+        (0..strips.len())
+            .find(|&g| strips[g].is_some_and(|s| px >= s.x as f32 && px < (s.x + s.w) as f32))
+    }
+
+    /// Pane `g`'s tab strip rect and its per-tab geometry, measured the same way the
+    /// painter lays them out, so a drag reorders against exactly what is drawn.
+    fn tab_strip_rects(&self, g: usize) -> Option<(Rect, Vec<crate::paint::TabHit>)> {
+        let strip = self.columns().tab_strips[g]?;
+        let labels = self.editors[g].tab_names();
+        let tabs =
+            crate::paint::tab_rects(strip, &labels, &self.fonts, self.body_size, self.scale());
+        Some((strip, tabs))
     }
 
     /// Open a fresh blank tab in pane `g` and focus it (the new-tab button).

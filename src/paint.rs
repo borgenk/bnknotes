@@ -278,6 +278,16 @@ pub(crate) struct TabStrip<'a> {
     pub hovered: Option<usize>,
     pub close_hover: Option<usize>,
     pub new_hover: bool,
+    /// The tab being dragged to reorder, if any: it lifts out of the run (leaving a
+    /// gap) and follows the pointer.
+    pub drag: Option<TabDragView>,
+}
+
+/// A tab lifted for a drag-reorder: which tab (its index in the current order) and
+/// the left edge it floats at, in device pixels before clamping into the strip.
+pub(crate) struct TabDragView {
+    pub tab: usize,
+    pub left: i32,
 }
 
 /// The side of a tab's square close-glyph box.
@@ -370,6 +380,27 @@ pub(crate) fn tab_rects(
         x += tab_w;
     }
     out
+}
+
+/// Where a dragged tab should sit in this strip given pointer x `px`: the count of
+/// tabs whose horizontal midpoint the pointer has passed. Comparing against the
+/// neighbors' midpoints (not the dragged tab's own slot) keeps a reorder from
+/// oscillating when tabs differ in width. `dragged` is the dragged tab's own index
+/// when it lives in this strip (its slot is skipped, so the result indexes the run
+/// with it removed, exactly where it reinserts); pass `None` when dropping a tab in
+/// from the other pane, where every tab counts.
+pub(crate) fn tab_drop_index(tabs: &[TabHit], dragged: Option<usize>, px: f32) -> usize {
+    let mut target = 0;
+    for (k, t) in tabs.iter().enumerate() {
+        if dragged == Some(k) {
+            continue;
+        }
+        let mid = t.rect.x as f32 + t.rect.w as f32 / 2.0;
+        if px > mid {
+            target += 1;
+        }
+    }
+    target
 }
 
 /// The shared drawing context for the top bar's helpers: the fonts, display
@@ -502,33 +533,28 @@ fn push_glyph_button(list: &mut DisplayList, ctx: &BarCtx, box_: Rect, glyph: &s
 /// Draw one pane's tabs and its new-tab button (see [`push_top_bar`]).
 fn push_tab_strip(list: &mut DisplayList, ctx: &BarCtx, strip: &TabStrip) {
     let scale = ctx.scale;
-    let m = ctx.metrics();
     let tabs = tab_rects(strip.rect, strip.labels, ctx.fonts, ctx.body_size, scale);
-    let radius = scale.px(TAB_RADIUS);
     let vpad = scale.px(TAB_VPAD);
     let divider = scale.px(1).max(1);
-    let pad = scale.px(TAB_PAD_X);
+    let dragged = strip.drag.as_ref().map(|d| d.tab);
     let is_active = |i: usize| i == strip.active;
     for (i, tab) in tabs.iter().enumerate() {
+        // The dragged tab lifts out of the run and is drawn floating below, leaving
+        // a gap here.
+        if dragged == Some(i) {
+            continue;
+        }
         let active = is_active(i);
         let hovered = strip.hovered == Some(i);
-        if active {
-            list.push(DrawCmd::RoundRect {
-                rect: tab.rect,
-                color: TAB_ACTIVE_BG,
-                radius,
-                corners: display::RoundedCorners::Top,
-            });
-        } else if hovered {
-            list.push(DrawCmd::RoundRect {
-                rect: tab.rect,
-                color: TAB_HOVER_BG,
-                radius,
-                corners: display::RoundedCorners::Top,
-            });
-        } else if i + 1 < tabs.len() && !is_active(i + 1) && strip.hovered != Some(i + 1) {
-            // A hairline between two resting tabs, but never touching the active or
-            // hovered tab (those stand on their own fill).
+        // A hairline between two resting tabs, but never touching the active or
+        // hovered tab, nor the gap a lifted tab left behind.
+        if !active
+            && !hovered
+            && i + 1 < tabs.len()
+            && dragged != Some(i + 1)
+            && !is_active(i + 1)
+            && strip.hovered != Some(i + 1)
+        {
             list.push(DrawCmd::Fill {
                 rect: Rect {
                     x: tab.rect.x + tab.rect.w - divider,
@@ -539,46 +565,101 @@ fn push_tab_strip(list: &mut DisplayList, ctx: &BarCtx, strip: &TabStrip) {
                 color: SPLITTER_COLOR,
             });
         }
-        let color = if active {
-            TAB_ACTIVE_TEXT
-        } else {
-            TAB_INACTIVE_TEXT
-        };
-        let baseline = tab.rect.y + (tab.rect.h - (m.ascent + m.descent)) / 2 + m.ascent;
-        list.push(text_cmd(
-            ctx.regular(),
-            tab.rect.x + pad,
-            baseline,
-            tab.close.x - scale.px(TAB_CLOSE_GAP),
-            color,
-            tab.label.clone(),
-            m,
-        ));
-        // The close glyph shows on the active or hovered tab (with a button
-        // highlight when the pointer is on it); a resting unsaved tab shows a dot
-        // in its place instead.
         let dirty = strip.dirty.get(i).copied().unwrap_or(false);
-        if active || hovered {
-            push_glyph_button(list, ctx, tab.close, "×", strip.close_hover == Some(i));
-        } else if dirty {
-            let dot = scale.px(7);
-            list.push(DrawCmd::RoundRect {
-                rect: Rect {
-                    x: tab.close.x + (tab.close.w - dot) / 2,
-                    y: tab.close.y + (tab.close.h - dot) / 2,
-                    w: dot,
-                    h: dot,
-                },
-                color: TAB_DIRTY_COLOR,
-                radius: dot / 2,
-                corners: display::RoundedCorners::Both,
-            });
-        }
+        push_tab_body(
+            list,
+            ctx,
+            tab,
+            active,
+            hovered,
+            strip.close_hover == Some(i),
+            dirty,
+        );
     }
     // The new-tab (+) button at the end of the strip, drawn when it fits.
     let plus = new_tab_button_rect(strip.rect, &tabs, scale);
     if plus.x + plus.w <= strip.rect.x + strip.rect.w {
         push_glyph_button(list, ctx, plus, "+", strip.new_hover);
+    }
+    // The floating dragged tab, drawn last so it rides over its neighbors and the
+    // + button. It follows the pointer, clamped to stay within the strip.
+    if let Some(d) = &strip.drag {
+        if let Some(tab) = tabs.get(d.tab) {
+            let max_left = (strip.rect.x + strip.rect.w - tab.rect.w).max(strip.rect.x);
+            let left = d.left.clamp(strip.rect.x, max_left);
+            let dx = left - tab.rect.x;
+            let floated = TabHit {
+                rect: Rect {
+                    x: tab.rect.x + dx,
+                    ..tab.rect
+                },
+                close: Rect {
+                    x: tab.close.x + dx,
+                    ..tab.close
+                },
+                label: tab.label.clone(),
+            };
+            let dirty = strip.dirty.get(d.tab).copied().unwrap_or(false);
+            push_tab_body(list, ctx, &floated, true, false, false, dirty);
+        }
+    }
+}
+
+/// Draw one tab's contents: its active or hover background, the label, and either
+/// the close glyph (active or hovered tab) or the unsaved dot (a resting modified
+/// tab). The inter-tab hairline is the strip's business, not a tab's, so it stays
+/// out of here.
+fn push_tab_body(
+    list: &mut DisplayList,
+    ctx: &BarCtx,
+    tab: &TabHit,
+    active: bool,
+    hovered: bool,
+    close_hover: bool,
+    dirty: bool,
+) {
+    let scale = ctx.scale;
+    let m = ctx.metrics();
+    let radius = scale.px(TAB_RADIUS);
+    let pad = scale.px(TAB_PAD_X);
+    if active || hovered {
+        list.push(DrawCmd::RoundRect {
+            rect: tab.rect,
+            color: if active { TAB_ACTIVE_BG } else { TAB_HOVER_BG },
+            radius,
+            corners: display::RoundedCorners::Top,
+        });
+    }
+    let color = if active {
+        TAB_ACTIVE_TEXT
+    } else {
+        TAB_INACTIVE_TEXT
+    };
+    let baseline = tab.rect.y + (tab.rect.h - (m.ascent + m.descent)) / 2 + m.ascent;
+    list.push(text_cmd(
+        ctx.regular(),
+        tab.rect.x + pad,
+        baseline,
+        tab.close.x - scale.px(TAB_CLOSE_GAP),
+        color,
+        tab.label.clone(),
+        m,
+    ));
+    if active || hovered {
+        push_glyph_button(list, ctx, tab.close, "×", close_hover);
+    } else if dirty {
+        let dot = scale.px(7);
+        list.push(DrawCmd::RoundRect {
+            rect: Rect {
+                x: tab.close.x + (tab.close.w - dot) / 2,
+                y: tab.close.y + (tab.close.h - dot) / 2,
+                w: dot,
+                h: dot,
+            },
+            color: TAB_DIRTY_COLOR,
+            radius: dot / 2,
+            corners: display::RoundedCorners::Both,
+        });
     }
 }
 
@@ -1661,6 +1742,46 @@ mod tests {
         }
     }
 
+    /// A tab occupying `[x, x + w)` on the strip, with the close box irrelevant to
+    /// the drop math.
+    fn tab_at(x: i32, w: i32) -> TabHit {
+        TabHit {
+            rect: Rect { x, y: 0, w, h: 30 },
+            close: Rect {
+                x: x + w,
+                y: 0,
+                w: 0,
+                h: 0,
+            },
+            label: String::new(),
+        }
+    }
+
+    #[test]
+    fn tab_drop_index_tracks_the_neighbors_the_pointer_has_passed() {
+        // Three tabs of unequal width: [0,100), [100,150), [150,300); midpoints at
+        // 50, 125, 225.
+        let tabs = vec![tab_at(0, 100), tab_at(100, 50), tab_at(150, 150)];
+
+        // Dragging the first tab. It stays at 0 while left of tab 1's midpoint,
+        // slides past tab 1 beyond 125, then past tab 2 beyond 225.
+        assert_eq!(tab_drop_index(&tabs, Some(0), 40.0), 0);
+        assert_eq!(tab_drop_index(&tabs, Some(0), 130.0), 1);
+        assert_eq!(tab_drop_index(&tabs, Some(0), 260.0), 2);
+
+        // Dragging the last tab back toward the front: the dragged tab's own slot is
+        // skipped, so only tabs 0 and 1 count.
+        assert_eq!(tab_drop_index(&tabs, Some(2), 260.0), 2);
+        assert_eq!(tab_drop_index(&tabs, Some(2), 110.0), 1);
+        assert_eq!(tab_drop_index(&tabs, Some(2), 30.0), 0);
+
+        // Dropping a tab in from the other pane: none of these tabs is the dragged
+        // one, so every midpoint the pointer passed counts toward the insert slot.
+        assert_eq!(tab_drop_index(&tabs, None, 30.0), 0);
+        assert_eq!(tab_drop_index(&tabs, None, 130.0), 2);
+        assert_eq!(tab_drop_index(&tabs, None, 260.0), 3);
+    }
+
     #[test]
     fn top_bar_draws_vault_label_and_tabs_with_the_active_one_highlighted() {
         let fonts = Fonts::new(&markdown::all_sizes(FONT_SIZE)).expect("a default font");
@@ -1695,6 +1816,7 @@ mod tests {
                 hovered: None,
                 close_hover: None,
                 new_hover: false,
+                drag: None,
             }),
             None,
         ];

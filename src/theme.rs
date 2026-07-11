@@ -122,6 +122,9 @@ pub(crate) const TAB_NEW_W: i32 = 24;
 /// A tab's minimum and maximum width; a longer label truncates with an ellipsis.
 pub(crate) const TAB_MIN_W: i32 = 90;
 pub(crate) const TAB_MAX_W: i32 = 220;
+/// How far the pointer must travel from a tab press before it counts as a drag to
+/// reorder rather than a plain click that selects the tab.
+pub(crate) const TAB_DRAG_THRESHOLD: i32 = 5;
 /// Left padding of the vault label inside its region.
 pub(crate) const VAULT_PAD_X: i32 = 14;
 

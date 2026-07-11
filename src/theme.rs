@@ -101,16 +101,21 @@ pub(crate) const TAB_HOVER_BG: u32 = 0x0028_2c34;
 /// The unsaved-changes dot shown on a tab that is neither active nor hovered.
 pub(crate) const TAB_DIRTY_COLOR: u32 = 0x008c_a0b3;
 /// Corner radius of a tab's fill (rounded at the top, square where it meets the
-/// pane), and the accent underline marking the active tab.
+/// pane).
 pub(crate) const TAB_RADIUS: i32 = 6;
-pub(crate) const TAB_ACCENT_COLOR: u32 = 0x005c_9cf6;
-pub(crate) const TAB_ACCENT_THICKNESS: i32 = 2;
+/// The rounded button that lights up behind a tab's close glyph or the new-tab
+/// (+) button under the pointer, and its corner radius.
+pub(crate) const TAB_BUTTON_HOVER_BG: u32 = 0x0039_3f47;
+pub(crate) const TAB_BUTTON_RADIUS: i32 = 4;
 /// Vertical padding above and below a tab label; with the body line height it
 /// sets the bar height. Horizontal padding inside a tab, and the gap between the
 /// label and its close glyph.
 pub(crate) const TAB_VPAD: i32 = 7;
 pub(crate) const TAB_PAD_X: i32 = 12;
 pub(crate) const TAB_CLOSE_GAP: i32 = 6;
+/// The square side of a tab's close-glyph button and of the new-tab (+) button.
+pub(crate) const TAB_CLOSE_W: i32 = 18;
+pub(crate) const TAB_NEW_W: i32 = 24;
 /// A tab's minimum and maximum width; a longer label truncates with an ellipsis.
 pub(crate) const TAB_MIN_W: i32 = 90;
 pub(crate) const TAB_MAX_W: i32 = 220;

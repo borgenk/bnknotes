@@ -20,11 +20,11 @@ use crate::theme::{
     HEADING_COLORS, IMAGE_BORDER_COLOR, IMAGE_BORDER_THICKNESS, IMAGE_BUTTON_BG,
     IMAGE_BUTTON_RADIUS, LINK_COLOR, MARGIN, MARKER_COLOR, QUOTE_BAR_COLOR, QUOTE_BAR_WIDTH,
     RULE_COLOR, RULE_THICKNESS, SELECTION_COLOR, SPLITTER_COLOR, TABLE_BORDER_COLOR,
-    TABLE_HEADER_BG, TAB_ACCENT_COLOR, TAB_ACCENT_THICKNESS, TAB_ACTIVE_BG, TAB_ACTIVE_TEXT,
-    TAB_CLOSE_GAP, TAB_DIRTY_COLOR, TAB_HOVER_BG, TAB_INACTIVE_TEXT, TAB_MAX_W, TAB_MIN_W,
-    TAB_PAD_X, TAB_RADIUS, TAB_VPAD, TICK_HEIGHT, TICK_WIDTH, TOP_BAR_BG, TREE_BG,
-    TREE_CHEVRON_MAX, TREE_HOVER_BG, TREE_INDENT, TREE_MARKER_COLOR, TREE_MARKER_W, TREE_PAD,
-    TREE_ROW_INSET_Y, TREE_ROW_PAD, TREE_ROW_RADIUS, TREE_ROW_VPAD, VAULT_PAD_X,
+    TABLE_HEADER_BG, TAB_ACTIVE_BG, TAB_ACTIVE_TEXT, TAB_BUTTON_HOVER_BG, TAB_BUTTON_RADIUS,
+    TAB_CLOSE_GAP, TAB_CLOSE_W, TAB_DIRTY_COLOR, TAB_HOVER_BG, TAB_INACTIVE_TEXT, TAB_MAX_W,
+    TAB_MIN_W, TAB_NEW_W, TAB_PAD_X, TAB_RADIUS, TAB_VPAD, TICK_HEIGHT, TICK_WIDTH, TOP_BAR_BG,
+    TREE_BG, TREE_CHEVRON_MAX, TREE_HOVER_BG, TREE_INDENT, TREE_MARKER_COLOR, TREE_MARKER_W,
+    TREE_PAD, TREE_ROW_INSET_Y, TREE_ROW_PAD, TREE_ROW_RADIUS, TREE_ROW_VPAD, VAULT_PAD_X,
 };
 
 /// The per-frame inputs [`build_display_list`] needs beyond the layout itself:
@@ -266,18 +266,36 @@ pub(crate) struct TabHit {
 }
 
 /// The paint inputs for one pane's tab strip: where it sits and its tabs' labels,
-/// unsaved flags, active index, and the hovered tab (if the pointer is over one).
+/// unsaved flags, active index, and what the pointer is over: a tab body
+/// (`hovered`), a tab's close glyph (`close_hover`), or the new-tab button
+/// (`new_hover`).
 pub(crate) struct TabStrip<'a> {
     pub rect: Rect,
     pub labels: &'a [String],
     pub dirty: &'a [bool],
     pub active: usize,
     pub hovered: Option<usize>,
+    pub close_hover: Option<usize>,
+    pub new_hover: bool,
 }
 
 /// The side of a tab's square close-glyph box.
 fn tab_close_side(scale: Scale) -> i32 {
-    scale.px(16)
+    scale.px(TAB_CLOSE_W)
+}
+
+/// The new-tab (+) button's box: a square just past the last tab (or at the strip
+/// start when the pane is empty). Shared by the painter and the hit-testing.
+pub(crate) fn new_tab_button_rect(strip: Rect, tabs: &[TabHit], scale: Scale) -> Rect {
+    let gap = scale.px(TAB_CLOSE_GAP);
+    let side = scale.px(TAB_NEW_W);
+    let x = tabs.last().map(|t| t.rect.x + t.rect.w).unwrap_or(strip.x) + gap;
+    Rect {
+        x,
+        y: strip.y + (strip.h - side) / 2,
+        w: side,
+        h: side,
+    }
 }
 
 /// Truncate `label` with a trailing ellipsis until it fits `max_w` pixels in
@@ -353,26 +371,56 @@ pub(crate) fn tab_rects(
     out
 }
 
-/// Draw the top bar: fill the strip and a bottom divider, the vault label above
-/// the sidebar, and each pane's tab strip above its column. The active tab is
-/// filled with the pane background and reaches the strip bottom, covering the
-/// divider so it reads as joined to its pane; inactive tabs stay muted, with a
-/// soft highlight under the hovered one.
+/// The shared drawing context for the top bar's helpers: the fonts, display
+/// scale, and body size everything in the bar is measured and drawn at. Bundled
+/// so the helpers thread one context instead of three parallel arguments.
+pub(crate) struct BarCtx<'a> {
+    fonts: &'a Fonts,
+    scale: Scale,
+    body_size: u32,
+}
+
+impl<'a> BarCtx<'a> {
+    pub(crate) fn new(fonts: &'a Fonts, scale: Scale, body_size: u32) -> Self {
+        Self {
+            fonts,
+            scale,
+            body_size,
+        }
+    }
+
+    fn metrics(&self) -> Metrics {
+        self.fonts.metrics(self.body_size)
+    }
+
+    fn regular(&self) -> FaceKey {
+        FaceKey::Prose {
+            size: self.body_size,
+            style: FontStyle::Regular,
+        }
+    }
+}
+
+/// Draw the top bar: fill the strip and a bottom divider, continue the column
+/// dividers up through it, the (optional) vault label above the sidebar, and each
+/// pane's tab strip above its column. The active tab is filled with the pane
+/// background and reaches the strip bottom, covering the divider so it reads as
+/// joined to its pane; inactive tabs stay muted, with a soft highlight under the
+/// hovered one.
 pub(crate) fn push_top_bar(
     list: &mut DisplayList,
-    fonts: &Fonts,
+    ctx: &BarCtx,
     bar: Rect,
     vault: Option<(Rect, &str)>,
     strips: [Option<TabStrip>; 2],
-    scale: Scale,
-    body_size: u32,
+    dividers: &[Rect],
 ) {
-    let m = fonts.metrics(body_size);
+    let m = ctx.metrics();
     list.push(DrawCmd::Fill {
         rect: bar,
         color: TOP_BAR_BG,
     });
-    let divider = scale.px(1).max(1);
+    let divider = ctx.scale.px(1).max(1);
     list.push(DrawCmd::Fill {
         rect: Rect {
             x: bar.x,
@@ -382,18 +430,31 @@ pub(crate) fn push_top_bar(
         },
         color: SPLITTER_COLOR,
     });
+    // The column splitters' divider lines continue up through the bar, so the bar
+    // reads as segmented into each pane's strip.
+    for d in dividers {
+        list.push(DrawCmd::Fill {
+            rect: Rect {
+                x: d.x + (d.w - divider) / 2,
+                y: bar.y,
+                w: divider,
+                h: bar.h,
+            },
+            color: SPLITTER_COLOR,
+        });
+    }
     if let Some((vrect, name)) = vault {
-        let x = vrect.x + scale.px(VAULT_PAD_X);
-        let right = vrect.x + vrect.w - scale.px(VAULT_PAD_X);
+        let x = vrect.x + ctx.scale.px(VAULT_PAD_X);
+        let right = vrect.x + vrect.w - ctx.scale.px(VAULT_PAD_X);
         let baseline = vrect.y + (vrect.h - (m.ascent + m.descent)) / 2 + m.ascent;
         let fitted = fit_label(
-            fonts.face(body_size, FontStyle::Bold),
+            ctx.fonts.face(ctx.body_size, FontStyle::Bold),
             name,
             (right - x).max(0),
         );
         list.push(text_cmd(
             FaceKey::Prose {
-                size: body_size,
+                size: ctx.body_size,
                 style: FontStyle::Bold,
             },
             x,
@@ -405,57 +466,68 @@ pub(crate) fn push_top_bar(
         ));
     }
     for strip in strips.into_iter().flatten() {
-        push_tab_strip(list, fonts, &strip, m, scale, body_size);
+        push_tab_strip(list, ctx, &strip);
     }
 }
 
-/// Draw one pane's tabs (see [`push_top_bar`]).
-fn push_tab_strip(
-    list: &mut DisplayList,
-    fonts: &Fonts,
-    strip: &TabStrip,
-    m: Metrics,
-    scale: Scale,
-    body_size: u32,
-) {
-    let tabs = tab_rects(strip.rect, strip.labels, fonts, body_size, scale);
+/// A small rounded button that lights up under the pointer, with `glyph` centered
+/// in it (the tab close × and the new-tab +). Drawn highlighted only when hovered.
+fn push_glyph_button(list: &mut DisplayList, ctx: &BarCtx, box_: Rect, glyph: &str, hovered: bool) {
+    if hovered {
+        list.push(DrawCmd::RoundRect {
+            rect: box_,
+            color: TAB_BUTTON_HOVER_BG,
+            radius: ctx.scale.px(TAB_BUTTON_RADIUS),
+            corners: display::RoundedCorners::Both,
+        });
+    }
+    let m = ctx.metrics();
+    let gw = shape::text_advance(ctx.fonts.face(ctx.body_size, FontStyle::Regular), glyph) as i32;
+    list.push(text_cmd(
+        ctx.regular(),
+        box_.x + (box_.w - gw) / 2,
+        box_.y + (box_.h - (m.ascent + m.descent)) / 2 + m.ascent,
+        box_.x + box_.w,
+        if hovered {
+            TAB_ACTIVE_TEXT
+        } else {
+            TAB_INACTIVE_TEXT
+        },
+        glyph.to_string(),
+        m,
+    ));
+}
+
+/// Draw one pane's tabs and its new-tab button (see [`push_top_bar`]).
+fn push_tab_strip(list: &mut DisplayList, ctx: &BarCtx, strip: &TabStrip) {
+    let scale = ctx.scale;
+    let m = ctx.metrics();
+    let tabs = tab_rects(strip.rect, strip.labels, ctx.fonts, ctx.body_size, scale);
     let radius = scale.px(TAB_RADIUS);
     let vpad = scale.px(TAB_VPAD);
     let divider = scale.px(1).max(1);
     let pad = scale.px(TAB_PAD_X);
-    let face = FaceKey::Prose {
-        size: body_size,
-        style: FontStyle::Regular,
-    };
+    let is_active = |i: usize| i == strip.active;
     for (i, tab) in tabs.iter().enumerate() {
-        let is_active = i == strip.active;
-        let is_hovered = strip.hovered == Some(i);
-        if is_active {
+        let active = is_active(i);
+        let hovered = strip.hovered == Some(i);
+        if active {
             list.push(DrawCmd::RoundRect {
                 rect: tab.rect,
                 color: TAB_ACTIVE_BG,
                 radius,
                 corners: display::RoundedCorners::Top,
             });
-            let t = scale.px(TAB_ACCENT_THICKNESS);
-            list.push(DrawCmd::Fill {
-                rect: Rect {
-                    x: tab.rect.x,
-                    y: tab.rect.y + tab.rect.h - t,
-                    w: tab.rect.w,
-                    h: t,
-                },
-                color: TAB_ACCENT_COLOR,
-            });
-        } else if is_hovered {
+        } else if hovered {
             list.push(DrawCmd::RoundRect {
                 rect: tab.rect,
                 color: TAB_HOVER_BG,
                 radius,
                 corners: display::RoundedCorners::Top,
             });
-        } else if i + 1 < tabs.len() {
-            // A hairline between adjacent resting tabs.
+        } else if i + 1 < tabs.len() && !is_active(i + 1) && strip.hovered != Some(i + 1) {
+            // A hairline between two resting tabs, but never touching the active or
+            // hovered tab (those stand on their own fill).
             list.push(DrawCmd::Fill {
                 rect: Rect {
                     x: tab.rect.x + tab.rect.w - divider,
@@ -466,14 +538,14 @@ fn push_tab_strip(
                 color: SPLITTER_COLOR,
             });
         }
-        let color = if is_active {
+        let color = if active {
             TAB_ACTIVE_TEXT
         } else {
             TAB_INACTIVE_TEXT
         };
         let baseline = tab.rect.y + (tab.rect.h - (m.ascent + m.descent)) / 2 + m.ascent;
         list.push(text_cmd(
-            face,
+            ctx.regular(),
             tab.rect.x + pad,
             baseline,
             tab.close.x - scale.px(TAB_CLOSE_GAP),
@@ -481,21 +553,12 @@ fn push_tab_strip(
             tab.label.clone(),
             m,
         ));
-        // The close glyph shows on the active or hovered tab; a resting unsaved tab
-        // shows a dot in its place instead.
+        // The close glyph shows on the active or hovered tab (with a button
+        // highlight when the pointer is on it); a resting unsaved tab shows a dot
+        // in its place instead.
         let dirty = strip.dirty.get(i).copied().unwrap_or(false);
-        if is_active || is_hovered {
-            let glyph = "×";
-            let gw = shape::text_advance(fonts.face(body_size, FontStyle::Regular), glyph) as i32;
-            list.push(text_cmd(
-                face,
-                tab.close.x + (tab.close.w - gw) / 2,
-                tab.close.y + (tab.close.h - (m.ascent + m.descent)) / 2 + m.ascent,
-                tab.close.x + tab.close.w,
-                TAB_INACTIVE_TEXT,
-                glyph.to_string(),
-                m,
-            ));
+        if active || hovered {
+            push_glyph_button(list, ctx, tab.close, "×", strip.close_hover == Some(i));
         } else if dirty {
             let dot = scale.px(7);
             list.push(DrawCmd::RoundRect {
@@ -510,6 +573,11 @@ fn push_tab_strip(
                 corners: display::RoundedCorners::Both,
             });
         }
+    }
+    // The new-tab (+) button at the end of the strip, drawn when it fits.
+    let plus = new_tab_button_rect(strip.rect, &tabs, scale);
+    if plus.x + plus.w <= strip.rect.x + strip.rect.w {
+        push_glyph_button(list, ctx, plus, "+", strip.new_hover);
     }
 }
 
@@ -1615,18 +1683,27 @@ mod tests {
                 dirty: &dirty,
                 active: 1,
                 hovered: None,
+                close_hover: None,
+                new_hover: false,
             }),
             None,
         ];
+        // A splitter divider between the vault region and pane A.
+        let dividers = [Rect {
+            x: 200,
+            y: top,
+            w: 6,
+            h: 100,
+        }];
         let mut list: DisplayList = Vec::new();
+        let ctx = BarCtx::new(&fonts, Scale::ONE, FONT_SIZE);
         push_top_bar(
             &mut list,
-            &fonts,
+            &ctx,
             bar,
             Some((vrect, "Notes")),
             strips,
-            Scale::ONE,
-            FONT_SIZE,
+            &dividers,
         );
 
         let has_text = |s: &str| {
@@ -1654,6 +1731,8 @@ mod tests {
             has_round(TAB_DIRTY_COLOR),
             "dirty dot on the resting unsaved tab"
         );
+        // The new-tab button sits at the end of the strip.
+        assert!(has_text("+"), "new-tab button");
     }
 
     #[test]

@@ -2,7 +2,7 @@ use std::os::fd::AsRawFd;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-use super::State;
+use super::{State, TabHover};
 use crate::find;
 use crate::pane::{Columns, EditorPane, Focus, Hit, SPLITTER};
 use crate::platform::error::{Error, Result};
@@ -57,6 +57,15 @@ impl KeyRepeat {
             at: None,
         }
     }
+}
+
+/// Whether this action produces text, so pressing it in an empty pane should open
+/// a tab to receive it. Navigation and shortcuts leave an empty pane empty.
+fn opens_a_tab(action: &KeyAction) -> bool {
+    matches!(
+        action,
+        KeyAction::Char(_) | KeyAction::Enter | KeyAction::Tab | KeyAction::Paste
+    )
 }
 
 /// Apply one pure-editor key action to the focused pane, returning whether it
@@ -311,6 +320,13 @@ impl State {
         // Keyboard input goes to the focused editor; `rect` is its column, for
         // the motion methods that need the viewport.
         let i = self.active_editor();
+        // Typing into an empty pane opens a fresh tab to receive the text, so a
+        // just-launched blank pane becomes editable on the first keystroke.
+        if !self.editors[i].has_tabs() && opens_a_tab(&action) {
+            let (scale, body) = (self.scale(), self.body_size);
+            self.editors[i].new_tab(scale, body);
+            self.dirty = true;
+        }
         let rect = self.editor_rect(i);
         if !matches!(action, KeyAction::Copy)
             && (self.editors[i].selected_image.is_some() || self.editors[i].raw_image.is_some())
@@ -657,6 +673,9 @@ impl State {
                     return Hit::Tab(g, i);
                 }
             }
+            if crate::paint::new_tab_button_rect(strip, &tabs, self.scale()).contains(px, py) {
+                return Hit::NewTab(g);
+            }
             return Hit::TabStrip(g);
         }
         Hit::None
@@ -703,12 +722,23 @@ impl State {
         }
     }
 
-    /// Update the hovered tab from the pointer, repainting if it changed (the tab
-    /// shows a soft highlight and its close glyph while hovered).
+    /// Update what the pointer is over in a tab strip, repainting if it changed (a
+    /// hovered tab shows a highlight, its close glyph and the new-tab button light
+    /// up under the pointer).
     pub(super) fn update_tab_hover(&mut self) {
         let (px, py) = (self.pointer_x, self.pointer_y);
         let hovered = match self.hit_test(px, py) {
-            Hit::Tab(g, i) | Hit::TabClose(g, i) => Some((g, i)),
+            Hit::Tab(pane, tab) => Some(TabHover::Tab {
+                pane,
+                tab,
+                close: false,
+            }),
+            Hit::TabClose(pane, tab) => Some(TabHover::Tab {
+                pane,
+                tab,
+                close: true,
+            }),
+            Hit::NewTab(pane) => Some(TabHover::New { pane }),
             _ => None,
         };
         if hovered != self.hovered_tab {
@@ -860,7 +890,7 @@ impl State {
             Hit::Splitter(_) => SHAPE_EW_RESIZE,
             Hit::Tree(_) => SHAPE_DEFAULT,
             Hit::Editor(i, rect) => self.editors[i].cursor_shape_at(&self.fonts, rect, px, py),
-            Hit::Tab(..) | Hit::TabClose(..) => SHAPE_POINTER,
+            Hit::Tab(..) | Hit::TabClose(..) | Hit::NewTab(_) => SHAPE_POINTER,
             Hit::TabStrip(_) | Hit::None => SHAPE_DEFAULT,
         };
         if shape != self.cursor_shape {
@@ -883,6 +913,7 @@ impl State {
             }
             Hit::Tab(g, i) => self.select_tab(g, i),
             Hit::TabClose(g, i) => self.close_tab(g, i),
+            Hit::NewTab(g) => self.new_tab_in(g),
             // The empty part of a pane's tab strip still focuses that pane.
             Hit::TabStrip(g) => self.focus_pane(g),
             Hit::None => {}
@@ -892,6 +923,14 @@ impl State {
     /// Switch pane `g` to tab `i` and focus that pane.
     fn select_tab(&mut self, g: usize, i: usize) {
         self.editors[g].activate(i);
+        self.focus_pane(g);
+        self.save_session();
+    }
+
+    /// Open a fresh blank tab in pane `g` and focus it (the new-tab button).
+    fn new_tab_in(&mut self, g: usize) {
+        let (scale, body) = (self.scale(), self.body_size);
+        self.editors[g].new_tab(scale, body);
         self.focus_pane(g);
         self.save_session();
     }

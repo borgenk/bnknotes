@@ -35,7 +35,7 @@ use crate::file;
 use crate::markdown;
 use crate::paint::{
     build_display_list, build_find_paint, push_splitter, push_top_bar, push_tree, top_bar_height,
-    PaintParams, TabStrip,
+    BarCtx, PaintParams, TabStrip,
 };
 use crate::pane::{restore_group, Columns, Focus, PaneGroup, PaneLayout, TreePane};
 use crate::platform::conn::{Connection, Fill};
@@ -166,6 +166,42 @@ pub fn gpu_probe() -> Result<()> {
     State::new(None)?.probe_dmabuf()
 }
 
+/// What the pointer is hovering in a pane's tab strip, so the painter can light
+/// the right element: a tab body, that tab's close glyph, or the new-tab button.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TabHover {
+    Tab {
+        pane: usize,
+        tab: usize,
+        close: bool,
+    },
+    New {
+        pane: usize,
+    },
+}
+
+impl TabHover {
+    /// The hovered tab index in pane `g` (its body highlight), if any.
+    fn tab_in(self, g: usize) -> Option<usize> {
+        match self {
+            TabHover::Tab { pane, tab, .. } if pane == g => Some(tab),
+            _ => None,
+        }
+    }
+
+    /// The tab whose close glyph is hovered in pane `g`, if any.
+    fn close_in(self, g: usize) -> Option<usize> {
+        match self {
+            TabHover::Tab {
+                pane,
+                tab,
+                close: true,
+            } if pane == g => Some(tab),
+            _ => None,
+        }
+    }
+}
+
 struct State {
     conn: Connection,
     /// The font opened at every size the styles need (body and heading sizes),
@@ -186,9 +222,9 @@ struct State {
     /// The editor last given focus, so a file opened from the tree (which takes
     /// focus itself) lands in the content pane the user was last editing.
     last_editor: usize,
-    /// The tab the pointer is over (pane, tab index), for the tab-strip hover
-    /// highlight; `None` when the pointer is off every strip.
-    hovered_tab: Option<(usize, usize)>,
+    /// What the pointer is over in a tab strip (a tab, its close glyph, or the
+    /// new-tab button), for the hover highlights; `None` when off every strip.
+    hovered_tab: Option<TabHover>,
     /// While a splitter is dragged, which one: 0 = tree|A edge, 1 = A|B edge.
     drag_splitter: Option<usize>,
     /// The toplevel title last sent, so it is only re-set when it changes.
@@ -798,6 +834,10 @@ impl State {
             let Some(rect) = cols.editors[i] else {
                 continue;
             };
+            // An empty pane (no tabs open) paints no content and no caret.
+            if !self.editors[i].has_tabs() {
+                continue;
+            }
             self.editors[i].ensure_layout(&self.fonts, rect);
             let ch = self.editors[i].content_height;
             self.editors[i].scroll_y = scroll::clamp(self.editors[i].scroll_y, ch, rect.h);
@@ -815,7 +855,7 @@ impl State {
                 && py < (rect.y + rect.h) as f32;
             let table_hover = if over && !ed.selecting && self.drag_splitter.is_none() {
                 ed.layout_cache.as_ref().and_then(|l| {
-                    l.table_button_at(&self.fonts, ed.text.rope(), px, ed.content_y(rect, py))
+                    l.table_button_at(&self.fonts, ed.text.rope(), px, ed.content_y(py))
                 })
             } else {
                 None
@@ -845,11 +885,16 @@ impl State {
             }
         }
         let scale = self.scale();
+        // The column splitters, kept (Copy) so the top bar can continue their
+        // divider lines up through the reserved strip.
+        let splitter_rects = cols.splitters;
         for s in cols.splitters.into_iter().flatten() {
             push_splitter(&mut list, s, scale);
         }
-        // The top bar: the vault label above the sidebar, a tab strip above each
-        // pane. Drawn last; it occupies the reserved strip above every column.
+        // The top bar: a tab strip above each pane, segmented by the continued
+        // column dividers. Drawn last; it occupies the reserved strip above every
+        // column. The vault label is left off for now (a later step brings the
+        // dropdown), so `None` is passed for it.
         let top = self.top_bar_h();
         if top > 0 {
             let bar = Rect {
@@ -858,13 +903,6 @@ impl State {
                 w: self.width as i32,
                 h: top,
             };
-            let vault_name = self
-                .tree
-                .tree
-                .root()
-                .file_name()
-                .map(|n| n.to_string_lossy().into_owned())
-                .unwrap_or_else(|| "bnknotes".to_string());
             let labels = [self.editors[0].tab_names(), self.editors[1].tab_names()];
             let dirty = [self.editors[0].tab_dirty(), self.editors[1].tab_dirty()];
             let strip = |g: usize| {
@@ -873,19 +911,14 @@ impl State {
                     labels: &labels[g],
                     dirty: &dirty[g],
                     active: self.editors[g].active_index(),
-                    hovered: self.hovered_tab.and_then(|(hg, i)| (hg == g).then_some(i)),
+                    hovered: self.hovered_tab.and_then(|h| h.tab_in(g)),
+                    close_hover: self.hovered_tab.and_then(|h| h.close_in(g)),
+                    new_hover: self.hovered_tab == Some(TabHover::New { pane: g }),
                 })
             };
-            let vault = cols.vault.map(|r| (r, vault_name.as_str()));
-            push_top_bar(
-                &mut list,
-                &self.fonts,
-                bar,
-                vault,
-                [strip(0), strip(1)],
-                scale,
-                self.body_size,
-            );
+            let dividers: Vec<Rect> = splitter_rects.into_iter().flatten().collect();
+            let ctx = BarCtx::new(&self.fonts, scale, self.body_size);
+            push_top_bar(&mut list, &ctx, bar, None, [strip(0), strip(1)], &dividers);
         }
         Rc::new(list)
     }
@@ -1182,9 +1215,12 @@ impl State {
     /// The toplevel title: the focused editor's file name (or just the app name
     /// for an unnamed buffer), with a leading dot when it has unsaved changes.
     fn window_title(&self) -> String {
-        let ed = &self.editors[self.active_editor()];
-        let modified = if ed.text.is_modified() { "• " } else { "" };
-        match ed.path.as_ref().and_then(|p| p.file_name()) {
+        let pane = &self.editors[self.active_editor()];
+        if !pane.has_tabs() {
+            return "bnknotes".to_string();
+        }
+        let modified = if pane.text.is_modified() { "• " } else { "" };
+        match pane.path.as_ref().and_then(|p| p.file_name()) {
             Some(name) => format!("{modified}{} - bnknotes", name.to_string_lossy()),
             None => format!("{modified}bnknotes"),
         }

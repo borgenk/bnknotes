@@ -169,9 +169,6 @@ pub(crate) struct Columns {
     pub(crate) editors: [Option<Rect>; 2],
     /// Grab bars: `[0]` between tree and A, `[1]` between A and B.
     pub(crate) splitters: [Option<Rect>; 2],
-    /// The vault-label region of the top bar (above the sidebar), `None` when the
-    /// sidebar is hidden.
-    pub(crate) vault: Option<Rect>,
     /// Each pane's tab-strip region of the top bar, spanning that editor column.
     pub(crate) tab_strips: [Option<Rect>; 2],
 }
@@ -239,7 +236,7 @@ impl PaneLayout {
                 h: body,
             });
         }
-        // The bar regions take each column's x-span at the top strip's height.
+        // Each pane's tab strip takes its column's x-span at the top strip's height.
         let strip = |col: Option<Rect>| {
             col.map(|c| Rect {
                 x: c.x,
@@ -248,13 +245,11 @@ impl PaneLayout {
                 h: top,
             })
         };
-        let vault = strip(tree);
         let tab_strips = [strip(editors[0]), strip(editors[1])];
         Columns {
             tree,
             editors,
             splitters,
-            vault,
             tab_strips,
         }
     }
@@ -271,8 +266,10 @@ pub(crate) enum Hit {
     Tab(usize, usize),
     /// The close box of a tab in pane `group`'s strip: close it.
     TabClose(usize, usize),
-    /// Empty area of pane `group`'s tab strip (reserved, e.g. a future new-tab
-    /// button); consumes the click without acting.
+    /// The new-tab (+) button at the end of pane `group`'s strip: open a blank tab.
+    NewTab(usize),
+    /// Empty area of pane `group`'s tab strip; consumes the click by focusing the
+    /// pane without acting on a tab.
     TabStrip(usize),
     None,
 }
@@ -660,10 +657,13 @@ impl EditorPane {
         let Some(win) = self.cursor_window(fonts, rect) else {
             return false;
         };
+        // The caret comes from a window built at absolute positions (the column top
+        // baked in), but scroll::reveal works in content space against the pane's
+        // scroll and content height, so drop the column top first.
         let (_, caret_top, caret_h) = win.caret(fonts, self.text.rope(), cursor);
         let sy = scroll::reveal(
             self.scroll_y,
-            caret_top,
+            caret_top - rect.y,
             caret_h,
             rect.h,
             self.content_height,
@@ -773,10 +773,14 @@ impl EditorPane {
         self.layout_band.0 <= line && line < self.layout_band.1
     }
 
-    /// Content-space y for a window y inside this pane's column (the column top
-    /// and this pane's scroll offset removed).
-    pub(crate) fn content_y(&self, rect: Rect, py: f32) -> f32 {
-        py - rect.y as f32 + self.scroll_y as f32
+    /// The layout-space y for a window y inside this pane's column. The windowed
+    /// layout is built at absolute positions (the column top and margin baked into
+    /// its baselines by the seed), with the pane's scroll applied only at paint, so
+    /// a hit-test recovers the layout frame by adding the scroll back. This mirrors
+    /// the x side, where the raw window x is passed straight through (the column
+    /// left is baked into the layout too); only y is scrolled.
+    pub(crate) fn content_y(&self, py: f32) -> f32 {
+        py + self.scroll_y as f32
     }
 
     /// Ensure the windowed layout covers `rect`, then return it (with the buffer
@@ -787,7 +791,7 @@ impl EditorPane {
     /// it.
     fn layout_at(&mut self, fonts: &Fonts, rect: Rect, py: f32) -> Option<(&Layout, &Rope, f32)> {
         self.ensure_layout(fonts, rect);
-        let y = self.content_y(rect, py);
+        let y = self.content_y(py);
         let layout = self.layout_cache.as_ref()?;
         Some((layout, self.text.rope(), y))
     }
@@ -983,15 +987,21 @@ impl EditorPane {
     }
 }
 
-/// One content pane as a stack of open documents with one active. A pane always
-/// holds at least one document, so it always has something to show; closing the
-/// last tab leaves a fresh blank one. The group forwards to its active document
-/// (via [`Deref`]), so a pane's active tab is simply "the pane" to every caller
-/// that edits, scrolls, or hit-tests it; only tab management (open, close,
-/// switch) and the DPI fan-out are group-level.
+/// One content pane as a stack of open documents with one active. A pane may hold
+/// no documents at all (nothing open), in which case it shows an empty column and
+/// a bare tab strip with just the new-tab button. The group forwards to its active
+/// document (via [`Deref`]), so a pane's active tab is simply "the pane" to every
+/// caller that edits, scrolls, or hit-tests it; only tab management (open, close,
+/// switch) and the DPI fan-out are group-level. So the deref stays total even with
+/// no tabs, an empty pane forwards to a scratch `placeholder` document; it is never
+/// drawn (an empty pane paints no content), so editing it is a harmless no-op until
+/// the first keystroke materializes a real tab.
 pub(crate) struct PaneGroup {
     docs: Vec<EditorPane>,
     active: usize,
+    /// The document an empty pane's deref targets, so the `pane.field` sites stay
+    /// panic-free with no tabs open. Never painted.
+    placeholder: EditorPane,
     /// The display scale and body size the group lays out at, so a tab opened
     /// after a DPI change is stamped with the current scale rather than the unity
     /// default a fresh [`EditorPane`] carries.
@@ -1000,26 +1010,36 @@ pub(crate) struct PaneGroup {
 }
 
 impl PaneGroup {
-    /// A pane with a single empty document.
+    /// A pane with nothing open (no tabs).
     pub(crate) fn empty() -> Self {
         Self {
-            docs: vec![EditorPane::empty()],
+            docs: Vec::new(),
             active: 0,
+            placeholder: EditorPane::empty(),
             scale: Scale::ONE,
             body_size: FONT_SIZE,
         }
     }
 
-    /// The active tab index.
+    /// The active tab index (0 and meaningless when the pane has no tabs).
     pub(crate) fn active_index(&self) -> usize {
         self.active
     }
 
-    /// The active document. Most callers reach it implicitly through [`Deref`];
-    /// this explicit borrow is for the few sites that mutate one field while
-    /// reading another, which a deref cannot split into disjoint borrows.
+    /// Whether the pane has any open tab. An empty pane paints no content and no
+    /// caret, and its title falls back to the app name.
+    pub(crate) fn has_tabs(&self) -> bool {
+        !self.docs.is_empty()
+    }
+
+    /// The active document, or the placeholder when the pane is empty. Most callers
+    /// reach it implicitly through [`Deref`]; this explicit borrow is for the few
+    /// sites that mutate one field while reading another, which a deref cannot split
+    /// into disjoint borrows.
     pub(crate) fn active_doc_mut(&mut self) -> &mut EditorPane {
-        &mut self.docs[self.active]
+        self.docs
+            .get_mut(self.active)
+            .unwrap_or(&mut self.placeholder)
     }
 
     /// Each tab's label, in order, for the tab strip.
@@ -1039,6 +1059,15 @@ impl PaneGroup {
         }
     }
 
+    /// Open a fresh blank tab and focus it, stamped with the group's scale. Backs
+    /// the new-tab button and the first keystroke into an empty pane.
+    pub(crate) fn new_tab(&mut self, scale: Scale, body_size: u32) {
+        let mut doc = EditorPane::empty();
+        doc.set_scale(scale, body_size);
+        self.docs.push(doc);
+        self.active = self.docs.len() - 1;
+    }
+
     /// Open `path`: focus an existing tab holding it, replace a blank scratch tab
     /// in place, or stack a new tab and focus it. The new document adopts the
     /// group's current scale so it renders crisp immediately at any DPI.
@@ -1053,7 +1082,8 @@ impl PaneGroup {
         }
         let mut doc = EditorPane::open(path)?;
         doc.set_scale(self.scale, self.body_size);
-        if self.docs[self.active].is_blank() {
+        // Replace a lone blank scratch tab (a just-opened new tab); otherwise stack.
+        if self.docs.get(self.active).is_some_and(EditorPane::is_blank) {
             self.docs[self.active] = doc;
         } else {
             self.docs.push(doc);
@@ -1062,31 +1092,29 @@ impl PaneGroup {
         Ok(())
     }
 
-    /// Close tab `i`. Closing the last tab leaves one fresh blank tab, so a pane is
-    /// never empty. The active tab stays put where it can; closing it falls to the
-    /// neighbor that slides into its place.
+    /// Close tab `i`. Closing the last tab empties the pane (no tabs). The active
+    /// tab stays put where it can; closing it falls to the neighbor that slides
+    /// into its place.
     pub(crate) fn close(&mut self, i: usize) {
         if i >= self.docs.len() {
             return;
         }
         self.docs.remove(i);
-        if self.docs.is_empty() {
-            self.docs.push(EditorPane::empty());
-            self.docs[0].set_scale(self.scale, self.body_size);
-            self.active = 0;
-        } else if i < self.active || self.active >= self.docs.len() {
+        if i < self.active || self.active >= self.docs.len() {
             self.active = self.active.saturating_sub(1);
         }
     }
 
     /// Adopt a new display scale and body size (a DPI change), fanning it out to
-    /// every tab so an inactive tab re-measures correctly when next shown.
+    /// every tab (and the placeholder) so an inactive tab re-measures correctly
+    /// when next shown.
     pub(crate) fn set_scale(&mut self, scale: Scale, body_size: u32) {
         self.scale = scale;
         self.body_size = body_size;
         for doc in &mut self.docs {
             doc.set_scale(scale, body_size);
         }
+        self.placeholder.set_scale(scale, body_size);
     }
 
     /// The persisted form of this pane: each tab's file, caret, and scroll, plus
@@ -1111,13 +1139,15 @@ impl Deref for PaneGroup {
     type Target = EditorPane;
 
     fn deref(&self) -> &EditorPane {
-        &self.docs[self.active]
+        self.docs.get(self.active).unwrap_or(&self.placeholder)
     }
 }
 
 impl DerefMut for PaneGroup {
     fn deref_mut(&mut self) -> &mut EditorPane {
-        &mut self.docs[self.active]
+        self.docs
+            .get_mut(self.active)
+            .unwrap_or(&mut self.placeholder)
     }
 }
 
@@ -1136,8 +1166,8 @@ pub(crate) struct TreePane {
 }
 
 /// Build a pane from its saved tabs, restoring each file's caret and scroll and
-/// the active tab. An empty tab list (a never-opened pane) yields one blank tab.
-/// The active index is clamped into the restored tabs.
+/// the active tab. An empty tab list (a never-opened pane) yields an empty pane
+/// with no tabs. The active index is clamped into the restored tabs.
 pub(crate) fn restore_group(tabs: &[store::PaneSession], active: usize) -> PaneGroup {
     if tabs.is_empty() {
         return PaneGroup::empty();
@@ -1147,6 +1177,7 @@ pub(crate) fn restore_group(tabs: &[store::PaneSession], active: usize) -> PaneG
     PaneGroup {
         docs,
         active,
+        placeholder: EditorPane::empty(),
         scale: Scale::ONE,
         body_size: FONT_SIZE,
     }
@@ -1227,17 +1258,18 @@ mod tests {
         let a = cols.editors[0].expect("editor A");
         let b = cols.editors[1].expect("editor B");
         assert_eq!((a.y, a.h), (30, 670));
-        // The vault region sits above the sidebar; each strip above its pane.
-        let vault = cols.vault.expect("vault region");
-        assert_eq!((vault.x, vault.y, vault.w, vault.h), (0, 0, 200, 30));
+        // Each pane's tab strip sits above its column at the bar height.
         let strip_a = cols.tab_strips[0].expect("strip A");
         let strip_b = cols.tab_strips[1].expect("strip B");
-        assert_eq!((strip_a.x, strip_a.w, strip_a.h), (a.x, a.w, 30));
+        assert_eq!(
+            (strip_a.x, strip_a.y, strip_a.w, strip_a.h),
+            (a.x, 0, a.w, 30)
+        );
         assert_eq!((strip_b.x, strip_b.w, strip_b.h), (b.x, b.w, 30));
     }
 
     #[test]
-    fn hidden_sidebar_drops_the_vault_region() {
+    fn hidden_sidebar_fills_the_strip_full_width() {
         let panes = PaneLayout {
             tree_width: 200,
             split_ratio: 0.5,
@@ -1245,14 +1277,13 @@ mod tests {
             second_open: false,
         };
         let cols = panes.columns(1000, 700, 30, Scale::ONE);
-        assert!(cols.vault.is_none());
         let strip_a = cols.tab_strips[0].expect("strip A");
         assert_eq!((strip_a.x, strip_a.w), (0, 1000));
         assert!(cols.tab_strips[1].is_none());
     }
 
     #[test]
-    fn open_or_focus_replaces_a_blank_tab_then_stacks_and_dedups() {
+    fn open_replaces_a_blank_new_tab_then_stacks_and_dedups() {
         let dir = std::env::temp_dir().join(format!("bnknotes_group_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("mkdir");
@@ -1262,7 +1293,8 @@ mod tests {
         std::fs::write(&b, b"beta").expect("write b");
 
         let mut group = PaneGroup::empty();
-        // The first open replaces the blank scratch tab in place.
+        // An empty pane has no tabs; opening a file gives it its first tab.
+        assert!(!group.has_tabs());
         group.open_or_focus(&a).expect("open a");
         assert_eq!(group.tab_names(), vec!["a".to_string()]);
         assert_eq!(group.active_index(), 0);
@@ -1274,16 +1306,25 @@ mod tests {
         group.open_or_focus(&a).expect("reopen a");
         assert_eq!(group.tab_names().len(), 2);
         assert_eq!(group.active_index(), 0);
+        // A fresh blank tab (the new-tab button) is replaced in place by an open.
+        group.new_tab(Scale::ONE, FONT_SIZE);
+        assert_eq!(group.tab_names(), vec!["a", "b", "untitled"]);
+        let c = dir.join("c.md");
+        std::fs::write(&c, b"gamma").expect("write c");
+        group.open_or_focus(&c).expect("open c");
+        assert_eq!(group.tab_names(), vec!["a", "b", "c"]);
 
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
-    fn closing_the_last_tab_leaves_one_blank_tab() {
+    fn closing_the_last_tab_empties_the_pane() {
         let mut group = PaneGroup::empty();
+        group.new_tab(Scale::ONE, FONT_SIZE);
+        assert!(group.has_tabs());
         group.close(0);
-        assert_eq!(group.tab_names(), vec!["untitled".to_string()]);
-        assert_eq!(group.active_index(), 0);
+        assert!(!group.has_tabs());
+        assert!(group.tab_names().is_empty());
     }
 
     #[test]
@@ -1342,6 +1383,37 @@ mod tests {
         let a = cols.editors[0].expect("editor A");
         assert_eq!((a.x, a.w), (0, 1000));
         assert!(cols.editors[1].is_none());
+    }
+
+    #[test]
+    fn hit_test_is_invariant_to_the_column_top_offset() {
+        // A click over a given content position must land on the same byte offset
+        // whether or not the column starts below a top bar. The layout bakes the
+        // column top into its baselines, so the hit-test must not double-count it.
+        let fonts = Fonts::new(&markdown::all_sizes(FONT_SIZE)).expect("a default font");
+        let text = "a normal paragraph line of prose\n# A tall heading here\nfinal line after it\n";
+        let pane_at = |top: i32| {
+            let mut pane = EditorPane::empty();
+            pane.text = TextBuffer::from_text(text.to_string());
+            pane.set_scale(Scale::ONE, FONT_SIZE);
+            (
+                pane,
+                Rect {
+                    x: 0,
+                    y: top,
+                    w: 600,
+                    h: 400,
+                },
+            )
+        };
+        let (mut flush, r_flush) = pane_at(0);
+        let (mut barred, r_barred) = pane_at(40);
+        for dy in [4.0, 24.0, 48.0, 80.0, 120.0] {
+            let a = flush.pointer_offset(&fonts, r_flush, 120.0, dy);
+            // The barred column and the pointer both shift down by the bar height.
+            let b = barred.pointer_offset(&fonts, r_barred, 120.0, dy + 40.0);
+            assert_eq!(a, b, "hit at content y {dy} must ignore the column top");
+        }
     }
 
     #[test]

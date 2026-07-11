@@ -69,7 +69,10 @@ pub(crate) const HEADING_COLORS: [u32; 6] = [
 /// the left of the (indented) quote text.
 pub(crate) const QUOTE_BAR_COLOR: u32 = 0x003f_444b;
 pub(crate) const QUOTE_BAR_WIDTH: i32 = 3;
-pub(crate) const BULLET: &str = "•";
+/// A gutter decoration (a list disc, a task checkbox) sits this fraction of the
+/// text ascent short of the first character, so it reads as inset from the words
+/// rather than crowding them. Shared by the bullet and the checkbox.
+pub(crate) const DECOR_TEXT_GAP: f32 = 0.4;
 /// A thematic break (`---`) renders as a thin horizontal line across the content
 /// width once the cursor leaves it, in a muted line tone.
 pub(crate) const RULE_COLOR: u32 = 0x003f_444b;

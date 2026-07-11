@@ -14,17 +14,18 @@ use crate::platform::shape;
 use crate::render::display::{self, DisplayList, DrawCmd};
 use crate::scale::Scale;
 use crate::theme::{
-    BACKGROUND, BULLET, CARET_COLOR, CARET_WIDTH, CODE_BG, CODE_COLOR, CODE_COMMENT_COLOR,
+    BACKGROUND, CARET_COLOR, CARET_WIDTH, CODE_BG, CODE_COLOR, CODE_COMMENT_COLOR,
     CODE_KEYWORD_COLOR, CODE_MARKER_COLOR, CODE_NUMBER_COLOR, CODE_PAD_X, CODE_PAD_Y, CODE_RADIUS,
-    CODE_STRING_COLOR, FIND_BG, FIND_ERROR_COLOR, FIND_MATCH_COLOR, FIND_TICK_COLOR, FOREGROUND,
-    HEADING_COLORS, IMAGE_BORDER_COLOR, IMAGE_BORDER_THICKNESS, IMAGE_BUTTON_BG,
-    IMAGE_BUTTON_RADIUS, LINK_COLOR, MARGIN, MARKER_COLOR, QUOTE_BAR_COLOR, QUOTE_BAR_WIDTH,
-    RULE_COLOR, RULE_THICKNESS, SELECTION_COLOR, SPLITTER_COLOR, TABLE_BORDER_COLOR,
-    TABLE_HEADER_BG, TAB_ACTIVE_BG, TAB_ACTIVE_TEXT, TAB_BUTTON_HOVER_BG, TAB_BUTTON_RADIUS,
-    TAB_CLOSE_GAP, TAB_CLOSE_W, TAB_DIRTY_COLOR, TAB_HOVER_BG, TAB_INACTIVE_TEXT, TAB_MAX_W,
-    TAB_MIN_W, TAB_NEW_W, TAB_PAD_X, TAB_RADIUS, TAB_VPAD, TICK_HEIGHT, TICK_WIDTH, TOP_BAR_BG,
-    TREE_BG, TREE_CHEVRON_MAX, TREE_HOVER_BG, TREE_INDENT, TREE_MARKER_COLOR, TREE_MARKER_W,
-    TREE_PAD, TREE_ROW_INSET_Y, TREE_ROW_PAD, TREE_ROW_RADIUS, TREE_ROW_VPAD, VAULT_PAD_X,
+    CODE_STRING_COLOR, DECOR_TEXT_GAP, FIND_BG, FIND_ERROR_COLOR, FIND_MATCH_COLOR,
+    FIND_TICK_COLOR, FOREGROUND, HEADING_COLORS, IMAGE_BORDER_COLOR, IMAGE_BORDER_THICKNESS,
+    IMAGE_BUTTON_BG, IMAGE_BUTTON_RADIUS, LINK_COLOR, MARGIN, MARKER_COLOR, QUOTE_BAR_COLOR,
+    QUOTE_BAR_WIDTH, RULE_COLOR, RULE_THICKNESS, SELECTION_COLOR, SPLITTER_COLOR,
+    TABLE_BORDER_COLOR, TABLE_HEADER_BG, TAB_ACTIVE_BG, TAB_ACTIVE_TEXT, TAB_BUTTON_HOVER_BG,
+    TAB_BUTTON_RADIUS, TAB_CLOSE_GAP, TAB_CLOSE_W, TAB_DIRTY_COLOR, TAB_HOVER_BG,
+    TAB_INACTIVE_TEXT, TAB_MAX_W, TAB_MIN_W, TAB_NEW_W, TAB_PAD_X, TAB_RADIUS, TAB_VPAD,
+    TICK_HEIGHT, TICK_WIDTH, TOP_BAR_BG, TREE_BG, TREE_CHEVRON_MAX, TREE_HOVER_BG, TREE_INDENT,
+    TREE_MARKER_COLOR, TREE_MARKER_W, TREE_PAD, TREE_ROW_INSET_Y, TREE_ROW_PAD, TREE_ROW_RADIUS,
+    TREE_ROW_VPAD, VAULT_PAD_X,
 };
 
 /// The per-frame inputs [`build_display_list`] needs beyond the layout itself:
@@ -922,29 +923,38 @@ impl<'a> Painter<'a> {
                 let face = fonts.face_for(fk);
                 let slice = rope.byte_slice(run.start..run.end);
                 // The block marker (the first run on a list/quote line) gives way to
-                // its gutter decoration: a bullet glyph for a list, nothing for a
+                // its gutter decoration: a filled disc for a list, nothing for a
                 // quote (the bar above replaces it). Either keeps the source width,
                 // so text never shifts.
                 if i == 0 && matches!(run.kind, markdown::SpanKind::Marker) {
                     let advance = shape::text_advance(face, &slice).round() as i32;
                     match line.gutter {
                         Gutter::Bullet => {
-                            // Place the marker's leading indentation first, so a
-                            // nested item's dot sits at its depth, then the dot in
-                            // place of the dash. The dot stands in for the `- `
-                            // marker, so it takes the muted marker color
-                            // (MARKER_COLOR), not the body FG.
-                            let indent = slice.len() - slice.trim_start().len();
-                            let dot_x =
-                                pen + shape::text_advance(face, &slice[..indent]).round() as i32;
-                            self.push_text(
-                                fk,
-                                dot_x,
-                                baseline,
-                                MARKER_COLOR,
-                                BULLET.to_string(),
-                                m,
-                            );
+                            // A filled disc stands in for the source marker
+                            // ("- ", "* ", "+ "), in the muted marker color
+                            // (MARKER_COLOR), not the body FG. Right-anchor it a
+                            // gap short of where the text begins, the inset the
+                            // checkbox also uses, so the disc hangs in the item's
+                            // gutter with breathing room before the words and
+                            // sits centered on the ascent band. The pen still
+                            // advances by the full source marker, so revealing it
+                            // never shifts the text.
+                            let text_x = pen + advance;
+                            let d = (m.ascent * 2 / 5).max(4);
+                            let gap = (m.ascent as f32 * DECOR_TEXT_GAP).max(4.0);
+                            let x = ((text_x as f32 - gap).round() as i32 - d).max(left);
+                            let cy = baseline - m.ascent / 2;
+                            self.list.push(DrawCmd::RoundRect {
+                                rect: Rect {
+                                    x,
+                                    y: cy - d / 2,
+                                    w: d,
+                                    h: d,
+                                },
+                                color: MARKER_COLOR,
+                                radius: d / 2,
+                                corners: display::RoundedCorners::Both,
+                            });
                             pen += advance;
                             continue;
                         }
@@ -1828,6 +1838,57 @@ mod tests {
                         && rect.y < done_run.1)
             }),
             "a done task is not struck through, only dimmed"
+        );
+    }
+
+    #[test]
+    fn a_list_bullet_renders_as_a_disc_in_the_marker_color() {
+        let fonts = Fonts::new(&markdown::all_sizes(FONT_SIZE)).expect("a default font");
+        let src = "- item\nx";
+        let rope = Rope::from_str(src);
+        let (w, h) = (600usize, 200usize);
+        let wrap = w as i32 - 2 * MARGIN;
+        let off = src.len() - 1;
+        let layout = Layout::build(&fonts, &rope, MARGIN, MARGIN, wrap, FONT_SIZE, (off, off));
+        let list = build_display_list(&fonts, &layout, &rope, &paint_params(w, h));
+
+        // The dash gives way to a filled disc: a square rounded rect whose radius
+        // is half its side, in the muted marker color, sitting left of the text.
+        let disc = list
+            .iter()
+            .find_map(|c| match c {
+                DrawCmd::RoundRect {
+                    rect,
+                    color,
+                    radius,
+                    ..
+                } if *color == MARKER_COLOR => Some((*rect, *radius)),
+                _ => None,
+            })
+            .expect("a bullet line draws a disc");
+        let (rect, radius) = disc;
+        assert_eq!(rect.w, rect.h, "a square");
+        assert_eq!(radius, rect.w / 2, "radius is half the side, so a disc");
+        assert!(rect.w >= 4, "a visible dot");
+        // The disc hangs a clear gap short of the item's text, not crowding it.
+        let text_x = list
+            .iter()
+            .find_map(|c| match c {
+                DrawCmd::Text { text, x, .. } if text == "item" => Some(*x),
+                _ => None,
+            })
+            .expect("the item text");
+        assert!(
+            rect.x + rect.w <= text_x - 3,
+            "the disc sits a gap short of the text (disc ends at {}, text at {text_x})",
+            rect.x + rect.w
+        );
+        // The raw dash is substituted, not drawn.
+        assert!(
+            !list
+                .iter()
+                .any(|c| matches!(c, DrawCmd::Text { text, .. } if text.contains('-'))),
+            "no raw dash glyph on the bullet line"
         );
     }
 

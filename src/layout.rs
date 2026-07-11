@@ -353,7 +353,7 @@ pub enum Gutter {
     /// No decoration: body and heading lines, ordered items (their number stays
     /// put), and any list or quote line the cursor is currently on.
     None,
-    /// Paint a bullet point `•` in place of a `-`/`+`/`*` marker's glyph.
+    /// Paint a filled disc in place of a `-`/`+`/`*` marker's glyph.
     Bullet,
     /// Draw a checkbox (built from fills, no glyph dependency) in place of a
     /// task item's `- [ ]`/`- [x]` marker, once the cursor leaves the line; on
@@ -922,11 +922,13 @@ impl Layout {
         let pre = shape::text_advance(face, marker.get(..indent + 2)?);
         let tail_w = shape::text_advance(face, "[ ] ");
         let m = fonts.metrics(line.size);
-        let side = m.ascent.max(10);
+        // A touch taller than the ascent, so the box reads at a comfortable
+        // weight beside the text rather than shrinking into it.
+        let side = (m.ascent * 13 / 12).max(11);
         // The text begins at `pre + tail_w`. Right-anchor the box a gap short of it,
         // so it sits inset from both the list indent and the words rather than
         // crowding the text; clamp so it never runs off the marker's left.
-        let gap = (m.ascent as f32 / 3.0).max(3.0);
+        let gap = (m.ascent as f32 * crate::theme::DECOR_TEXT_GAP).max(4.0);
         let box_left = (pre + tail_w - gap - side as f32).max(0.0);
         let x = self.left + line.indent + box_left.round() as i32;
         // Centered on the middle of the ascent band, where the glyphs' bulk sits.
@@ -4628,9 +4630,16 @@ mod tests {
         );
         assert!(rect.w >= 8 && rect.h == rect.w, "a sensible square");
         let m = f.metrics(BODY);
+        // Centered on the ascent band (being a touch taller than the ascent, it
+        // may sit a hair above the cap line) and never dipping past the descender.
+        let mid = line.baseline - m.ascent / 2;
         assert!(
-            rect.y >= line.baseline - m.ascent && rect.y + rect.h <= line.baseline + m.descent,
-            "vertically inside the line's box"
+            (rect.y + rect.h / 2 - mid).abs() <= 1,
+            "vertically centered on the ascent band"
+        );
+        assert!(
+            rect.y + rect.h <= line.baseline + m.descent,
+            "stays above the descender"
         );
         // The box shows on the cursor's own line too, at the same geometry
         // (reveal never moves it).

@@ -4,7 +4,7 @@ use std::time::{Duration, Instant};
 
 use crate::file::{self, FileFormat};
 use crate::find::FindState;
-use crate::layout::{ImageUi, Layout, LayoutCtx, LineIndex, RevealAdjust};
+use crate::layout::{ImageUi, Layout, LayoutCtx, LineIndex, RevealAdjust, NO_REVEAL};
 use crate::markdown;
 use crate::platform::error::{Error, Result};
 use crate::platform::freetype::Fonts;
@@ -299,7 +299,6 @@ pub(crate) struct EditorPane {
     pub(crate) layout_band: (usize, usize),
     pub(crate) goal_x: Option<f32>,
     pub(crate) selecting: bool,
-    pub(crate) frozen_reveal: Option<(usize, usize)>,
     pub(crate) clicks: ClickChain,
     /// Drag auto-scroll step: pixels per tick (negative up, positive down), 0 when
     /// disarmed. Armed while a selection drag holds the pointer in a column's edge
@@ -338,7 +337,6 @@ impl EditorPane {
             layout_band: (0, 0),
             goal_x: None,
             selecting: false,
-            frozen_reveal: None,
             clicks: ClickChain::new(),
             autoscroll: 0,
             autoscroll_at: None,
@@ -388,15 +386,16 @@ impl EditorPane {
         self.path.is_none() && self.text.rope().len() == 0
     }
 
-    /// The active range for live-preview marker reveal: the live selection (or
-    /// the bare cursor), pinned to `frozen_reveal` while a drag extends a
-    /// selection so the markdown under the pointer does not flip rendered/raw.
+    /// The active range for live-preview marker reveal: the live selection, or the
+    /// bare cursor when there is none. A drag in progress reveals nothing
+    /// ([`NO_REVEAL`]): the whole document stays rendered while selecting, and the
+    /// markers under the selection reveal only once the button is released.
     pub(crate) fn reveal_range(&self) -> (usize, usize) {
-        let cursor = self.text.cursor();
-        match (self.selecting, self.frozen_reveal) {
-            (true, Some(range)) => range,
-            _ => self.text.selection().unwrap_or((cursor, cursor)),
+        if self.selecting {
+            return NO_REVEAL;
         }
+        let cursor = self.text.cursor();
+        self.text.selection().unwrap_or((cursor, cursor))
     }
 
     /// The per-image UI state (selected border, pinned raw source) for the layout.
@@ -430,11 +429,16 @@ impl EditorPane {
         };
         let rope = self.text.rope();
         let (lo, hi) = self.reveal_range();
-        let l0 = rope.byte_to_line(lo);
-        adjust.push(l0, index.reveal_extra(l0));
-        let l1 = rope.byte_to_line(hi);
-        if l1 != l0 {
-            adjust.push(l1, index.reveal_extra(l1));
+        // A drag suppresses selection-driven reveal (NO_REVEAL touches no line), so
+        // no image source expands while selecting; a corner-pinned source below
+        // still does.
+        if (lo, hi) != NO_REVEAL {
+            let l0 = rope.byte_to_line(lo);
+            adjust.push(l0, index.reveal_extra(l0));
+            let l1 = rope.byte_to_line(hi);
+            if l1 != l0 {
+                adjust.push(l1, index.reveal_extra(l1));
+            }
         }
         if let Some(raw) = self.raw_image {
             let lr = rope.byte_to_line(raw);
@@ -541,7 +545,13 @@ impl EditorPane {
     /// out. A scroll or cursor move that stays within the band reuses the cache.
     pub(crate) fn ensure_window(&mut self, fonts: &Fonts, rect: Rect) {
         let active = self.reveal_range();
-        let active_lines = {
+        // Reveal depends only on which lines the active range touches, so the key
+        // is coarsened to lines. NO_REVEAL is kept verbatim: mapping it through
+        // byte_to_line would clamp to the last line and could collide with a real
+        // cursor there, so a drag starting on that line would not un-reveal it.
+        let active_lines = if active == NO_REVEAL {
+            NO_REVEAL
+        } else {
             let rope = self.text.rope();
             (rope.byte_to_line(active.0), rope.byte_to_line(active.1))
         };
@@ -882,7 +892,6 @@ impl EditorPane {
             let cursor = self.text.cursor();
             self.text.set_cursor(cursor, false);
             self.selecting = false;
-            self.frozen_reveal = None;
             return true;
         }
         false
@@ -1220,6 +1229,84 @@ fn smart_home_target(line: &str, start: usize, end: usize, cursor: usize) -> usi
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_drag_suppresses_reveal_until_release() {
+        let mut ed = EditorPane::empty();
+        ed.text.insert_str("# Title\nbody");
+        // A settled selection over the heading is its own reveal range, so the
+        // heading shows its markers.
+        ed.text.set_cursor(0, false);
+        ed.text.set_cursor(7, true);
+        assert_eq!(ed.reveal_range(), (0, 7));
+        // While the drag is live, nothing reveals: the whole document stays
+        // rendered, headings included.
+        ed.selecting = true;
+        assert_eq!(ed.reveal_range(), NO_REVEAL);
+        // Releasing lets the reveal catch up to the settled selection.
+        ed.selecting = false;
+        assert_eq!(ed.reveal_range(), (0, 7));
+    }
+
+    #[test]
+    fn reveal_follows_the_bare_cursor_when_not_selecting() {
+        let mut ed = EditorPane::empty();
+        ed.text.insert_str("# Title");
+        ed.text.set_cursor(3, false);
+        assert_eq!(ed.reveal_range(), (3, 3));
+    }
+
+    /// Whether the heading logical line starting at `heading_start` has its `#`
+    /// marker collapsed in the pane's freshly built layout.
+    fn heading_marker_hidden(pane: &EditorPane, heading_start: usize) -> bool {
+        let layout = pane.layout_cache.as_ref().expect("a built layout");
+        let line = layout
+            .lines()
+            .iter()
+            .find(|l| l.start == heading_start)
+            .expect("the heading's visual line");
+        let run = layout.run_slice(line).first().expect("a marker run");
+        assert!(
+            matches!(run.kind, markdown::SpanKind::Marker),
+            "the first run is the heading marker"
+        );
+        !run.visible
+    }
+
+    #[test]
+    fn a_drag_beginning_on_the_last_line_still_un_reveals_it() {
+        // A heading on the final line: with the cursor there it reveals its `#`.
+        // Starting a drag from it must collapse the marker again, though NO_REVEAL
+        // and a last-line cursor both fold to the last line index, so the layout
+        // cache key must keep them apart.
+        let fonts = Fonts::new(&markdown::all_sizes(FONT_SIZE)).expect("a default font");
+        let text = "body line\n# Heading";
+        let heading_start = text.find("# Heading").expect("heading present");
+        let rect = Rect {
+            x: 0,
+            y: 0,
+            w: 600,
+            h: 400,
+        };
+        let mut pane = EditorPane::empty();
+        pane.text = TextBuffer::from_text(text.to_string());
+        pane.set_scale(Scale::ONE, FONT_SIZE);
+
+        pane.text.set_cursor(heading_start + 2, false);
+        pane.ensure_layout(&fonts, rect);
+        assert!(
+            !heading_marker_hidden(&pane, heading_start),
+            "cursor on the heading reveals its '#'"
+        );
+
+        // A drag now begins on that same line; the reveal must switch off.
+        pane.selecting = true;
+        pane.ensure_layout(&fonts, rect);
+        assert!(
+            heading_marker_hidden(&pane, heading_start),
+            "a live drag collapses the heading marker again"
+        );
+    }
 
     #[test]
     fn columns_lay_out_tree_and_two_editors_with_splitters() {

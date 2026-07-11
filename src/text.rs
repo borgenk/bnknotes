@@ -776,6 +776,36 @@ impl TextBuffer {
         self.set_selection(start, end);
     }
 
+    /// Pull the low end of a mouse-driven selection back over a heading's
+    /// collapsed `#` marker, so selecting a heading from the start of its visible
+    /// text takes the marker with it. Hit-testing lands a click on a heading's
+    /// text start (the marker is zero-width when collapsed), so without this a
+    /// drag from there would select the words but not the `#`. A no-op unless a
+    /// selection's low end sits exactly at a heading line's first content byte.
+    pub fn include_heading_marker(&mut self) {
+        let Some(anchor) = self.anchor else {
+            return;
+        };
+        if anchor == self.cursor {
+            return;
+        }
+        let lo = anchor.min(self.cursor);
+        let line = self.text.byte_to_line(lo);
+        let (ls, le) = self.text.line_content_range(line);
+        if lo == ls {
+            return;
+        }
+        let (style, marker_len) = markdown::classify(&self.text.byte_slice(ls..le));
+        if !matches!(style, markdown::LineStyle::Heading(_)) || lo != ls + marker_len {
+            return;
+        }
+        if self.cursor < anchor {
+            self.cursor = ls;
+        } else {
+            self.anchor = Some(ls);
+        }
+    }
+
     /// Set the selection to the half-open range `[start, end)` with the cursor at
     /// `end`. A collapsed range (`start == end`) leaves a bare cursor, no
     /// selection. Breaks the coalescing group, like any cursor move.
@@ -1934,6 +1964,77 @@ mod tests {
         let mut empty = TextBuffer::new();
         empty.select_all();
         assert_eq!(empty.selection(), None);
+    }
+
+    #[test]
+    fn selecting_a_heading_from_its_text_start_takes_the_marker() {
+        // "# Title\nbody": "Title" is bytes 2..7, the content starting past "# ".
+        let mut b = TextBuffer::new();
+        b.insert_str("# Title\nbody");
+        // Drag rightward from the heading's text start (anchor at 2, the content
+        // byte a far-left click lands on).
+        b.set_cursor(2, false);
+        b.set_cursor(7, true);
+        assert_eq!(b.selection(), Some((2, 7)));
+        b.include_heading_marker();
+        assert_eq!(b.selection(), Some((0, 7)));
+        assert_eq!(b.selected_text().as_deref(), Some("# Title"));
+    }
+
+    #[test]
+    fn selecting_a_heading_leftward_to_its_start_takes_the_marker() {
+        let mut b = TextBuffer::new();
+        b.insert_str("# Title\nbody");
+        // Drag leftward: anchor past the text, cursor lands on the text start.
+        b.set_cursor(7, false);
+        b.set_cursor(2, true);
+        assert_eq!(b.selection(), Some((2, 7)));
+        b.include_heading_marker();
+        assert_eq!(b.selection(), Some((0, 7)));
+        // The cursor (the low end here) moved onto the line start.
+        assert_eq!(b.cursor, 0);
+    }
+
+    #[test]
+    fn deeper_heading_levels_include_their_full_marker() {
+        // "## Head": marker is "## " (3 bytes), content starts at 3.
+        let mut b = TextBuffer::new();
+        b.insert_str("## Head");
+        b.set_cursor(3, false);
+        b.set_cursor(7, true);
+        b.include_heading_marker();
+        assert_eq!(b.selection(), Some((0, 7)));
+        assert_eq!(b.selected_text().as_deref(), Some("## Head"));
+    }
+
+    #[test]
+    fn selecting_a_heading_from_mid_text_keeps_the_marker_out() {
+        let mut b = TextBuffer::new();
+        b.insert_str("# Title");
+        // Low end at byte 4, inside "Title": the drag did not start at the text
+        // start, so the marker stays unselected.
+        b.set_cursor(4, false);
+        b.set_cursor(7, true);
+        b.include_heading_marker();
+        assert_eq!(b.selection(), Some((4, 7)));
+    }
+
+    #[test]
+    fn marker_inclusion_leaves_body_and_empty_selections_alone() {
+        // A body line has no marker to pull in.
+        let mut b = TextBuffer::new();
+        b.insert_str("plain line");
+        b.set_cursor(0, false);
+        b.set_cursor(5, true);
+        b.include_heading_marker();
+        assert_eq!(b.selection(), Some((0, 5)));
+        // A bare cursor (no selection) is untouched.
+        let mut c = TextBuffer::new();
+        c.insert_str("# Title");
+        c.set_cursor(2, false);
+        c.include_heading_marker();
+        assert_eq!(c.selection(), None);
+        assert_eq!(c.cursor, 2);
     }
 
     #[test]

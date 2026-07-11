@@ -585,10 +585,15 @@ impl State {
                             self.save_session();
                         }
                         let i = self.active_editor();
+                        let was_selecting = self.editors[i].selecting;
                         self.editors[i].selecting = false;
                         self.editors[i].disarm_autoscroll();
-                        // Drag over: let the reveal catch up to the final selection.
-                        if self.editors[i].frozen_reveal.take().is_some() {
+                        if was_selecting {
+                            // Selecting a heading from its text start takes the `#`
+                            // marker with it.
+                            self.editors[i].text.include_heading_marker();
+                            // The drag is over: reveal catches up to the settled
+                            // selection (suppressed while selecting).
                             self.dirty = true;
                         }
                     }
@@ -1027,10 +1032,6 @@ impl State {
             1 => {
                 self.editors[i].place_cursor_at(&self.fonts, rect, px, py, shift);
                 self.editors[i].selecting = true;
-                // Pin marker reveal to the press point for the whole drag.
-                let c = self.editors[i].text.cursor();
-                let reveal = self.editors[i].text.selection().unwrap_or((c, c));
-                self.editors[i].frozen_reveal = Some(reveal);
                 // Show the moved caret on the next frame, not the next blink wake.
                 self.dirty = true;
             }

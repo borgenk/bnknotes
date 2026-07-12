@@ -399,6 +399,14 @@ fn resolve_vault(
     }
 }
 
+/// Make a CLI path argument absolute so a relative one (notably ".") roots the
+/// vault at a real directory with a proper name, rather than at the literal
+/// argument. A path that cannot be resolved (a not-yet-created file) is returned
+/// unchanged, so opening a new file still works.
+fn absolute_arg(path: &Path) -> PathBuf {
+    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
 /// The configured vault that holds `file`, if any: the vault whose root is an
 /// ancestor of the file, choosing the deepest when several nest, so a note opened
 /// deep in a vault still resolves its embeds against the whole vault root.
@@ -451,8 +459,11 @@ impl State {
         // falls back to the first-run default without failing.
         let session = store::load();
 
+        // A CLI path is made absolute up front, so `bnknotes .` roots at the real
+        // current directory (named after its folder) instead of the literal ".".
+        let arg = path.as_deref().map(absolute_arg);
         let (root, cli_file) = resolve_vault(
-            path.as_deref(),
+            arg.as_deref(),
             session.active_vault.as_deref(),
             &config.vaults,
         );
@@ -1570,6 +1581,23 @@ mod tests {
         let (root, file) = resolve_vault(None, Some(&stale), &vs);
         assert_eq!(root, Path::new("/home/user/notes"));
         assert_eq!(file, None);
+    }
+
+    #[test]
+    fn absolute_arg_resolves_an_existing_directory_to_an_absolute_named_path() {
+        // A real directory canonicalizes to an absolute path that still has a final
+        // component, so a vault rooted there gets a name (not "." or "").
+        let abs = absolute_arg(&std::env::temp_dir());
+        assert!(abs.is_absolute());
+        assert!(abs.file_name().is_some());
+    }
+
+    #[test]
+    fn absolute_arg_passes_through_an_unresolvable_path() {
+        // A not-yet-created file cannot be canonicalized, so it is left as given and
+        // opening a new file still works.
+        let p = Path::new("/no/such/path/here.md");
+        assert_eq!(absolute_arg(p), p);
     }
 
     #[test]

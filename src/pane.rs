@@ -1202,7 +1202,9 @@ impl EditorPane {
     }
 
     /// The destination of the openable link under a window position, if its line
-    /// is rendered (markup collapsed) and the scheme is one the browser opens.
+    /// is rendered (markup collapsed) and the scheme is one the browser opens. An
+    /// inline `[text](dest)` and a bare URL both resolve here, since a bare URL is
+    /// just the link whose text is its own destination.
     pub(crate) fn link_under_pointer(
         &mut self,
         fonts: &Fonts,
@@ -1210,6 +1212,15 @@ impl EditorPane {
         px: f32,
         py: f32,
     ) -> Option<String> {
+        // A fenced code block is not parsed as inline markdown, so nothing in it is a
+        // link however much it looks like one: a `curl https://…` renders as code and
+        // must stay code when clicked.
+        if self
+            .layout_at(fonts, rect, py)
+            .is_some_and(|(layout, _, y)| layout.code_block_at(fonts, y))
+        {
+            return None;
+        }
         let off = self.pointer_offset(fonts, rect, px, py);
         let (a0, a1) = self.reveal_range();
         let rope = self.text.rope();
@@ -1743,6 +1754,98 @@ mod tests {
             !heading_marker_hidden(&pane, heading_start),
             "a live drag keeps the heading marker revealed"
         );
+    }
+
+    /// A pane holding `text`, with the cursor parked at the very start so no line
+    /// under test is the revealed (active) one.
+    fn pane_of(text: &str) -> EditorPane {
+        let mut pane = EditorPane::empty();
+        pane.text = TextBuffer::from_text(text.to_string());
+        pane.set_scale(Scale::ONE, FONT_SIZE);
+        pane.text.set_cursor(0, false);
+        pane
+    }
+
+    /// The link the pointer finds over the first character of `needle` in `text`,
+    /// driving the real layout so the hit-test, the reveal rule, and the code-block
+    /// rule all run. `text` is laid under a spacer line that the cursor parks on, so
+    /// no line under test is the revealed one (that rule has its own case below).
+    fn link_over(text: &str, needle: &str) -> Option<String> {
+        let fonts = Fonts::new(&markdown::all_sizes(FONT_SIZE)).expect("a default font");
+        let rect = Rect {
+            x: 0,
+            y: 0,
+            w: 800,
+            h: 600,
+        };
+        let doc = format!("spacer\n{text}");
+        let mut pane = pane_of(&doc);
+        let at = doc.find(needle).expect("needle not in text");
+        pane.ensure_layout(&fonts, rect);
+        let layout = pane.layout_cache.as_ref().expect("a built layout");
+        // The caret of the needle's first byte is the pixel the pointer hovers.
+        let (x, y, h) = layout.caret(&fonts, pane.text.rope(), at);
+        // Nudge into the middle of the glyph's box, so the hit lands on it and not on
+        // the boundary with the character before.
+        let (px, py) = (x as f32 + 1.0, (y + h / 2) as f32);
+        pane.link_under_pointer(&fonts, rect, px, py)
+    }
+
+    #[test]
+    fn a_bare_url_follows_on_a_click() {
+        // Typed straight into the prose, with no markup at all.
+        assert_eq!(
+            link_over("see https://example.com/a now", "https"),
+            Some("https://example.com/a".into())
+        );
+        // The whole URL is clickable, not just its first character.
+        assert_eq!(
+            link_over("see https://example.com/a now", "example"),
+            Some("https://example.com/a".into())
+        );
+        // An inline link still resolves to its destination, not its text.
+        assert_eq!(
+            link_over("see [docs](https://example.com/d) now", "docs"),
+            Some("https://example.com/d".into())
+        );
+        // Ordinary prose is not a link, so a click there just places the caret.
+        assert_eq!(link_over("see https://example.com/a now", "now"), None);
+    }
+
+    #[test]
+    fn a_url_in_a_fenced_code_block_is_code_not_a_link() {
+        // The block is not parsed as inline markdown, so the URL renders as plain
+        // code; following it would mean the pointer offering a link the painter never
+        // drew. The same URL outside the fence is still a link.
+        let text = "```sh\ncurl https://example.com/a\n```\nsee https://example.com/b\n";
+        assert_eq!(link_over(text, "https://example.com/a"), None);
+        assert_eq!(
+            link_over(text, "https://example.com/b"),
+            Some("https://example.com/b".into())
+        );
+    }
+
+    #[test]
+    fn a_url_on_the_cursors_own_line_stays_editable() {
+        // The active line shows its raw source and belongs to the keyboard: clicking
+        // a URL there places the caret rather than launching a browser, which is what
+        // lets a URL be edited at all.
+        let fonts = Fonts::new(&markdown::all_sizes(FONT_SIZE)).expect("a default font");
+        let rect = Rect {
+            x: 0,
+            y: 0,
+            w: 800,
+            h: 600,
+        };
+        let text = "see https://example.com/a now";
+        let at = text.find("https").expect("url present");
+        let mut pane = pane_of(text);
+        pane.text.set_cursor(at, false);
+        pane.ensure_layout(&fonts, rect);
+        let layout = pane.layout_cache.as_ref().expect("a built layout");
+        let (x, y, h) = layout.caret(&fonts, pane.text.rope(), at);
+        let (px, py) = (x as f32 + 1.0, (y + h / 2) as f32);
+        assert_eq!(pane.link_under_pointer(&fonts, rect, px, py), None);
     }
 
     /// Whether the fenced-block delimiter line starting at `fence_start` shows its

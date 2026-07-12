@@ -892,6 +892,13 @@ impl Layout {
         line.rule.then_some((line.start, line.end))
     }
 
+    /// Whether the visual line at content-space `y` sits in a fenced code block. Its
+    /// text is not parsed as inline markdown, so a URL there is code, not a link, and
+    /// the editor must neither offer to follow it nor point a hand at it.
+    pub fn code_block_at(&self, fonts: &Fonts, y: f32) -> bool {
+        self.line_for_y(fonts, y).code_block
+    }
+
     /// The drawn checkbox's rectangle in content space for a task line whose
     /// gutter is [`Gutter::Checkbox`]: a square sized to the line's metrics, inset
     /// within the marker region a gap short of the text so it crowds neither the

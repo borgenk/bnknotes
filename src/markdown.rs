@@ -21,6 +21,8 @@
 //! emphasis, strikethrough, and inline links. Indented *headings* and quotes are
 //! still not recognized; only list items nest.
 
+use std::ops::Range;
+
 /// The block style of one logical line. A closed set, extended as more markup
 /// lands.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -337,6 +339,11 @@ pub fn all_sizes(base: u32) -> Vec<u32> {
 //   2. Inline links (`[text](dest)`): the `[`, `]`, and `(dest)` are markers; the
 //      text styles as a link. The whole link is inert for emphasis, so a `*` or
 //      `_` inside the text or the URL stays literal.
+//   2b. Bare URLs: a `https://…` typed straight into the prose is a link with no
+//      markup, so it has no markers and nothing to collapse, but it styles and
+//      follows like one. It is inert for emphasis too, which keeps an `_` in a path
+//      literal. Detection is [`crate::platform::link`], shared with the browser so
+//      only a URL we would actually open is ever decorated.
 //   3. Emphasis and strikethrough (`*`/`_`, `**`/`__`, `***`/`___`, `~~`): runs
 //      outside code and links are paired opener-to-closer with a stack (innermost
 //      first) to mark italic, bold, both, or struck. Whether a run can open or
@@ -428,6 +435,7 @@ const F_INERT: u16 = F_IN_CODE | F_IN_LINK;
 pub struct InlineScratch {
     flags: Vec<u16>,
     links: Vec<LinkSpan>,
+    bare: Vec<Range<usize>>,
     delims: Vec<Delim>,
     pairs: Vec<(usize, usize)>,
     open_stack: Vec<usize>,
@@ -461,10 +469,11 @@ pub fn inline_spans_append(content: &str, scratch: &mut InlineScratch, out: &mut
     // emphasis, strikethrough, or link, so every byte resolves to `Regular` and the
     // whole thing coalesces to a single plain run. Pushing it directly skips the
     // dozen per-line mask allocations below, and this is the shape of ordinary
-    // prose, most lines of most documents.
+    // prose, most lines of most documents. Every scheme a bare URL can carry holds a
+    // `:`, so that byte is what keeps one off this path.
     if !bytes
         .iter()
-        .any(|&b| matches!(b, b'`' | b'*' | b'_' | b'~' | b'['))
+        .any(|&b| matches!(b, b'`' | b'*' | b'_' | b'~' | b'[' | b':'))
     {
         out.push(Span {
             start: 0,
@@ -479,6 +488,7 @@ pub fn inline_spans_append(content: &str, scratch: &mut InlineScratch, out: &mut
     let InlineScratch {
         flags,
         links,
+        bare,
         delims,
         pairs,
         open_stack,
@@ -506,6 +516,17 @@ pub fn inline_spans_append(content: &str, scratch: &mut InlineScratch, out: &mut
         }
         for f in &mut flags[l.open..=l.rp] {
             *f |= F_IN_LINK;
+        }
+    }
+
+    // Then a URL typed straight into the prose. It carries no markup, so it has no
+    // markers and nothing collapses: the whole span is link text, and it goes inert so
+    // an `_` in a path stays literal. Runs after the links because that is what makes
+    // a URL sitting in a link's own `(dest)` already inert here.
+    bare_urls_into(content, flags, bare);
+    for r in &*bare {
+        for f in &mut flags[r.start..r.end] {
+            *f |= F_LINK_TEXT | F_IN_LINK;
         }
     }
 
@@ -810,42 +831,72 @@ fn link_spans_into(bytes: &[u8], flags: &[u16], out: &mut Vec<LinkSpan>) {
     }
 }
 
+/// Collect the bare URLs of `content` into `out`: the ones written with no markup at
+/// all, which style and follow as links anyway (see [`crate::platform::link`]).
+///
+/// `flags` must already carry the code and link masks, because a URL is only bare
+/// when nothing else already claims it: the one in a link's own `(dest)`, the one a
+/// link uses as its text, and the one inside a code span are all `F_INERT` by now and
+/// drop out here.
+fn bare_urls_into(content: &str, flags: &[u16], out: &mut Vec<Range<usize>>) {
+    out.clear();
+    out.extend(
+        crate::platform::link::urls(content)
+            .filter(|r| flags[r.start..r.end].iter().all(|f| f & F_INERT == 0)),
+    );
+}
+
 /// One inline link `[text](dest)` located in a line, as byte ranges into that
 /// line. See [`links`].
+/// One link located in a line, as byte ranges into that line. Either an inline
+/// `[text](dest)` or a bare URL, which is simply the link whose text *is* its
+/// destination, so a caller follows both without telling them apart. See [`links`].
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Link {
-    /// Byte range of the link text, between `[` and `]`.
+    /// Byte range of the link text: between `[` and `]`, or the URL itself.
     pub text: (usize, usize),
     /// Byte range of the destination URL, with any `<...>` wrapper and `"title"`
     /// suffix already removed, so it is ready to hand to a browser.
     pub dest: (usize, usize),
 }
 
-/// The inline links in `content`, each with its text range and a cleaned
-/// destination, as byte ranges into `content`. The renderer reaches links through
-/// [`inline_spans`]; this is the structured view the editor uses to follow the link
-/// the pointer clicks. A `[x](y)` inside a code span is skipped, matching the
-/// renderer.
+/// The links in `content`, each with its text range and a cleaned destination, as
+/// byte ranges into `content`. The renderer reaches links through [`inline_spans`];
+/// this is the structured view the editor uses to follow the link the pointer clicks.
+/// A `[x](y)` inside a code span is skipped, matching the renderer.
 ///
-/// Threads the caller's pooled [`InlineScratch`] so the "code makes links inert"
-/// masking runs through the same code-mask + link-span layers the renderer uses
-/// (layers 1-2 of [`inline_spans_append`]) instead of a parallel per-call
-/// allocation. Only `flags` and `links` are touched; the returned `Vec` is fresh.
+/// Threads the caller's pooled [`InlineScratch`] so the masking that makes code and
+/// markup inert runs through the same layers the renderer uses (layers 1-2b of
+/// [`inline_spans_append`]) instead of a parallel per-call allocation, which is what
+/// keeps the two views agreeing on what a link is. Only `flags`, `links`, and `bare`
+/// are touched; the returned `Vec` is fresh.
 pub fn links(content: &str, scratch: &mut InlineScratch) -> Vec<Link> {
     let bytes = content.as_bytes();
-    let InlineScratch { flags, links, .. } = scratch;
+    let InlineScratch {
+        flags, links, bare, ..
+    } = scratch;
     flags.clear();
     flags.resize(bytes.len(), 0);
     code_masks_into(content, flags);
     links.clear();
     link_spans_into(bytes, flags, links);
-    links
-        .iter()
-        .map(|l| Link {
-            text: (l.open + 1, l.rb),
-            dest: path_of_dest(content, l.rb + 2, l.rp),
-        })
-        .collect()
+    // Only `F_IN_LINK` matters here: it is what tells the bare-URL pass that a URL in a
+    // link's `(dest)`, or standing as its text, is already spoken for.
+    for l in &*links {
+        for f in &mut flags[l.open..=l.rp] {
+            *f |= F_IN_LINK;
+        }
+    }
+    bare_urls_into(content, flags, bare);
+    let inline = links.iter().map(|l| Link {
+        text: (l.open + 1, l.rb),
+        dest: path_of_dest(content, l.rb + 2, l.rp),
+    });
+    let plain = bare.iter().map(|r| Link {
+        text: (r.start, r.end),
+        dest: (r.start, r.end),
+    });
+    inline.chain(plain).collect()
 }
 
 // --- Block images -----------------------------------------------------------
@@ -1832,6 +1883,134 @@ mod tests {
         assert!(link_list("[a]").is_empty(), "no destination");
         assert!(link_list("[a] (b)").is_empty(), "gap before the dest");
         assert!(link_list("[](b)").is_empty(), "empty text");
+    }
+
+    // --- Bare URLs --------------------------------------------------------
+
+    #[test]
+    fn a_bare_url_styles_as_link_text_with_no_markers() {
+        // Nothing is markup, so nothing collapses: the URL is one Link run, and the
+        // prose around it is untouched.
+        assert_eq!(
+            spans("see https://x.com/a now"),
+            vec![
+                (0, 4, SpanKind::Text(Emphasis::Regular)),
+                (4, 19, SpanKind::Text(Emphasis::Link)),
+                (19, 23, SpanKind::Text(Emphasis::Regular)),
+            ]
+        );
+        assert_eq!(
+            spans("https://x.com"),
+            vec![(0, 13, SpanKind::Text(Emphasis::Link))]
+        );
+    }
+
+    #[test]
+    fn a_bare_url_is_a_link_whose_text_is_its_destination() {
+        // The editor follows it through the same `Link` an inline one produces, so
+        // the click path never has to tell the two apart.
+        assert_eq!(
+            link_list("see https://x.com/a now"),
+            vec![("https://x.com/a", "https://x.com/a")]
+        );
+        assert_eq!(
+            link_list("mail me at mailto:a@b.com"),
+            vec![("mailto:a@b.com", "mailto:a@b.com")]
+        );
+    }
+
+    #[test]
+    fn a_bare_url_is_inert_for_emphasis() {
+        // The `_`s in the path pair into italics if the URL is not inert, which would
+        // both mis-style it and (worse) cut the link short of its real end.
+        assert_eq!(
+            spans("https://x.com/a_b_c"),
+            vec![(0, 19, SpanKind::Text(Emphasis::Link))]
+        );
+        assert_eq!(
+            link_list("https://x.com/a_b_c"),
+            vec![("https://x.com/a_b_c", "https://x.com/a_b_c")]
+        );
+    }
+
+    #[test]
+    fn a_url_already_inside_markup_is_not_claimed_a_second_time() {
+        // In an inline link the URL is the `(dest)`, already a marker; detecting it
+        // again would style the collapsed markup as link text and report the link
+        // twice. Same for a URL standing as the link's own text, and for one quoted
+        // inside a code span.
+        assert_eq!(
+            spans("[docs](https://x.com)"),
+            vec![
+                (0, 1, SpanKind::Marker),
+                (1, 5, SpanKind::Text(Emphasis::Link)),
+                (5, 21, SpanKind::Marker),
+            ]
+        );
+        assert_eq!(
+            link_list("[docs](https://x.com)"),
+            vec![("docs", "https://x.com")]
+        );
+        assert_eq!(
+            link_list("[https://x.com](https://y.com)"),
+            vec![("https://x.com", "https://y.com")]
+        );
+        assert_eq!(
+            spans("`https://x.com`"),
+            vec![
+                (0, 1, SpanKind::Marker),
+                (1, 14, SpanKind::Text(Emphasis::Code)),
+                (14, 15, SpanKind::Marker),
+            ]
+        );
+        assert!(link_list("`https://x.com`").is_empty(), "inside code");
+    }
+
+    #[test]
+    fn prose_that_only_looks_like_a_url_stays_prose() {
+        // The fast path is keyed on `:`, so a colon in ordinary prose reaches the full
+        // scan and must still come out as one plain run. A scheme we refuse to open is
+        // never decorated, and neither is a bare host.
+        for line in [
+            "Note: this is a note",
+            "javascript:alert(1)",
+            "ftp://example.com/a",
+            "see example.com/a",
+            "https:// alone",
+        ] {
+            assert_eq!(
+                spans(line),
+                vec![(0, line.len(), SpanKind::Text(Emphasis::Regular))],
+                "{line:?}"
+            );
+            assert!(link_list(line).is_empty(), "{line:?}");
+        }
+    }
+
+    #[test]
+    fn a_url_gives_trailing_punctuation_back_to_the_sentence() {
+        // The extent rules live in `platform::link`; this pins that a line actually
+        // gets them, so the sentence's period never renders underlined.
+        assert_eq!(
+            spans("go to https://x.com/a."),
+            vec![
+                (0, 6, SpanKind::Text(Emphasis::Regular)),
+                (6, 21, SpanKind::Text(Emphasis::Link)),
+                (21, 22, SpanKind::Text(Emphasis::Regular)),
+            ]
+        );
+    }
+
+    #[test]
+    fn several_bare_urls_and_an_inline_link_coexist() {
+        assert_eq!(
+            link_list("[a](http://x) then https://y.com and https://z.com"),
+            vec![
+                ("a", "http://x"),
+                ("https://y.com", "https://y.com"),
+                ("https://z.com", "https://z.com"),
+            ]
+        );
     }
 
     // --- Strikethrough ----------------------------------------------------

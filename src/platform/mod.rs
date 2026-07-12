@@ -1,5 +1,5 @@
-//! The portable platform layer: the parts of bnknotes that are not about editing
-//! notes at all, but about talking to the machine.
+//! The portable platform layer: the parts that are not about what the app does at
+//! all, but about talking to the machine.
 //!
 //! - **Wayland**: the wire codec (`wire`), the connection (`conn`), the
 //!   protocol constants (`protocol`), and dmabuf feedback (`dmabuf`).
@@ -9,7 +9,7 @@
 //!   segmentation (`grapheme`), and ARGB pixel math (`pixel`).
 //! - **Foundation**: the syscall FFI surface (`ffi`), the minimal error type
 //!   (`error`), branchless byte scanning (`bytes`), scroll math (`scroll`), and
-//!   opening a URL in the browser (`browser`).
+//!   finding a URL in text (`link`) so it can be opened in the browser (`browser`).
 //!
 //! This layer is self-contained enough to lift out whole. It is a clean leaf: a
 //! module here may depend only on other `platform` modules and `std`, never on
@@ -26,6 +26,7 @@ pub(crate) mod ffi;
 pub(crate) mod freetype;
 pub(crate) mod geom;
 pub(crate) mod grapheme;
+pub(crate) mod link;
 pub(crate) mod pixel;
 pub(crate) mod protocol;
 pub(crate) mod scroll;

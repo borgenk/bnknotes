@@ -1,6 +1,6 @@
 //! On-disk session state: a small binary blob at `~/.config/bnknotes/state.bin`
 //! remembering the pane layout across restarts, so reopening bnknotes restores
-//! the file tree's root and expanded folders, the column widths, and each
+//! the active vault and its expanded folders, the column widths, and each
 //! content pane's open file with its cursor and scroll.
 //!
 //! The format is a 4-byte magic (`BNKN`), a version byte, little-endian
@@ -18,7 +18,7 @@
 //!   tree_visible   u8
 //!   second_open    u8    (is content pane B open)
 //!   focus          u8    (0 = tree, 1 = pane A, 2 = pane B)
-//!   tree_root      opt string (absolute path, u8 tag + u16 len + utf-8)
+//!   active_vault   opt string (absolute path, u8 tag + u16 len + utf-8)
 //!   expanded count u32; per: u16 len + utf-8 path
 //!   per pane (2):  tab count u32; per tab: opt string path, u64 cursor byte
 //!                  offset, i32 scroll_y; then active tab index u32
@@ -88,7 +88,9 @@ pub struct Session {
     pub tree_visible: bool,
     pub second_open: bool,
     pub focus: Focus,
-    pub tree_root: Option<PathBuf>,
+    /// The active vault's root directory: the file tree roots here and every note
+    /// reference resolves against it. `None` before a first vault is chosen.
+    pub active_vault: Option<PathBuf>,
     pub expanded: Vec<PathBuf>,
     pub panes: [PaneGroupSession; 2],
 }
@@ -105,7 +107,7 @@ impl Default for Session {
             tree_visible: true,
             second_open: true,
             focus: Focus::PaneA,
-            tree_root: None,
+            active_vault: None,
             expanded: Vec::new(),
             panes: [PaneGroupSession::default(), PaneGroupSession::default()],
         }
@@ -195,7 +197,7 @@ fn encode(s: &Session) -> Result<Vec<u8>> {
     out.push(u8::from(s.tree_visible));
     out.push(u8::from(s.second_open));
     out.push(s.focus.tag());
-    write_opt_path(&mut out, s.tree_root.as_deref())?;
+    write_opt_path(&mut out, s.active_vault.as_deref())?;
 
     let expanded = u32::try_from(s.expanded.len())
         .map_err(|_| Error::msg("too many expanded folders to persist"))?;
@@ -234,7 +236,7 @@ fn decode(data: &[u8]) -> Result<Session> {
     let tree_visible = r.u8()? != 0;
     let second_open = r.u8()? != 0;
     let focus = Focus::from_tag(r.u8()?)?;
-    let tree_root = r.opt_path()?;
+    let active_vault = r.opt_path()?;
 
     let expanded_count = r.u32()? as usize;
     let mut expanded = Vec::with_capacity(expanded_count.min(4096));
@@ -250,7 +252,7 @@ fn decode(data: &[u8]) -> Result<Session> {
         tree_visible,
         second_open,
         focus,
-        tree_root,
+        active_vault,
         expanded,
         panes,
     })
@@ -395,7 +397,7 @@ mod tests {
             tree_visible: true,
             second_open: false,
             focus: Focus::PaneB,
-            tree_root: Some(PathBuf::from("/home/user/notes")),
+            active_vault: Some(PathBuf::from("/home/user/notes")),
             expanded: vec![
                 PathBuf::from("/home/user/notes"),
                 PathBuf::from("/home/user/notes/journal"),
@@ -478,7 +480,7 @@ mod tests {
     #[test]
     fn unicode_paths_round_trip() {
         let s = Session {
-            tree_root: Some(PathBuf::from("/home/user/notità/日本語")),
+            active_vault: Some(PathBuf::from("/home/user/notità/日本語")),
             panes: [
                 PaneGroupSession {
                     tabs: vec![PaneSession {
@@ -492,7 +494,7 @@ mod tests {
             ..Session::default()
         };
         let loaded = decode(&encode(&s).expect("encode")).expect("decode");
-        assert_eq!(loaded.tree_root, s.tree_root);
+        assert_eq!(loaded.active_vault, s.active_vault);
         assert_eq!(loaded.panes[0].tabs[0].path, s.panes[0].tabs[0].path);
     }
 

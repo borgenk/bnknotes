@@ -7,7 +7,53 @@
 //! the concrete font paths are this app's choice, so they live here rather than
 //! in the portable `platform/freetype.rs`, which stays free of app-specific fonts.
 
+use std::ffi::OsStr;
+use std::path::{Path, PathBuf};
+
 use crate::platform::freetype::{FontConfig, FontFamily};
+
+/// A notes vault: a root directory the editor roots its file tree and every note
+/// reference (images, wikilink embeds) against. Its name is the last component of
+/// the path.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Vault {
+    pub path: PathBuf,
+}
+
+/// The display name for a vault root shown in the top bar: the final path
+/// component, or the whole path when it has none (a filesystem root). Takes a
+/// path so the app can name the active vault straight from the file tree's root.
+pub fn vault_name(path: &Path) -> &str {
+    path.file_name()
+        .and_then(|s| s.to_str())
+        .or_else(|| path.to_str())
+        .unwrap_or("vault")
+}
+
+/// Expand a leading `~/` (or a bare `~`) to the user's home directory; any other
+/// path passes through unchanged. Keeps configured vault paths short and stays
+/// ready for a future config-file loader that reads them as text.
+pub fn expand_tilde(path: &str) -> PathBuf {
+    expand_tilde_in(
+        path,
+        std::env::var_os("HOME")
+            .filter(|s| !s.is_empty())
+            .as_deref(),
+    )
+}
+
+/// The pure core of [`expand_tilde`], taking the home directory explicitly so it
+/// can be tested with and without one, rather than mutating the process HOME.
+fn expand_tilde_in(path: &str, home: Option<&OsStr>) -> PathBuf {
+    match home {
+        Some(h) if path == "~" => PathBuf::from(h),
+        Some(h) => match path.strip_prefix("~/") {
+            Some(rest) => Path::new(h).join(rest),
+            None => PathBuf::from(path),
+        },
+        None => PathBuf::from(path),
+    }
+}
 
 /// The editor's configurable settings, the seam a config-file loader fills in.
 #[derive(Clone, Debug)]
@@ -30,6 +76,10 @@ pub struct Config {
     pub line_height_scale: f32,
     /// Caret motion: whether the caret eases toward its target and how it feels.
     pub caret: CaretConfig,
+    /// The configured vaults, in priority order. The first is the default active
+    /// vault when the session has no valid remembered one; the active vault roots
+    /// the file tree and every note reference.
+    pub vaults: Vec<Vault>,
 }
 
 /// Caret motion settings: one master toggle plus the knobs that shape the motion.
@@ -85,6 +135,11 @@ impl Default for Config {
             code_glyph_coverage_gamma: 1.0,
             line_height_scale: 1.5,
             caret: CaretConfig::default(),
+            // One vault to start, the notes folder in the user's home. A future
+            // loader replaces this list from an on-disk config.
+            vaults: vec![Vault {
+                path: expand_tilde("~/notes"),
+            }],
         }
     }
 }
@@ -159,5 +214,75 @@ impl Default for FontConfig {
                 "/usr/share/fonts/noto/NotoSansMono-Regular.ttf".into(),
             ],
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn expand_tilde_joins_the_home_dir() {
+        let home = OsStr::new("/home/user");
+        assert_eq!(
+            expand_tilde_in("~/notes", Some(home)),
+            PathBuf::from("/home/user/notes")
+        );
+        assert_eq!(
+            expand_tilde_in("~/a/b/c", Some(home)),
+            PathBuf::from("/home/user/a/b/c")
+        );
+    }
+
+    #[test]
+    fn expand_tilde_handles_a_bare_tilde() {
+        assert_eq!(
+            expand_tilde_in("~", Some(OsStr::new("/home/user"))),
+            PathBuf::from("/home/user")
+        );
+    }
+
+    #[test]
+    fn expand_tilde_leaves_non_tilde_paths_alone() {
+        let home = Some(OsStr::new("/home/user"));
+        assert_eq!(
+            expand_tilde_in("/etc/notes", home),
+            PathBuf::from("/etc/notes")
+        );
+        assert_eq!(
+            expand_tilde_in("relative/dir", home),
+            PathBuf::from("relative/dir")
+        );
+        // A tilde mid-path is not a home marker, only a leading one is.
+        assert_eq!(expand_tilde_in("a/~/b", home), PathBuf::from("a/~/b"));
+    }
+
+    #[test]
+    fn expand_tilde_without_a_home_passes_through() {
+        assert_eq!(expand_tilde_in("~/notes", None), PathBuf::from("~/notes"));
+        assert_eq!(expand_tilde_in("~", None), PathBuf::from("~"));
+    }
+
+    #[test]
+    fn vault_name_is_the_last_path_component() {
+        assert_eq!(vault_name(Path::new("/home/user/notes")), "notes");
+    }
+
+    #[test]
+    fn vault_name_ignores_a_trailing_slash() {
+        // A trailing separator does not hide the final component.
+        assert_eq!(vault_name(Path::new("/home/user/work/")), "work");
+    }
+
+    #[test]
+    fn vault_name_falls_back_to_the_whole_path_at_a_root() {
+        assert_eq!(vault_name(Path::new("/")), "/");
+    }
+
+    #[test]
+    fn default_config_has_a_notes_vault() {
+        let config = Config::default();
+        assert_eq!(config.vaults.len(), 1);
+        assert_eq!(vault_name(&config.vaults[0].path), "notes");
     }
 }

@@ -30,7 +30,7 @@ use std::time::{Duration, Instant};
 use self::clipboard::{is_text_mime, ClipboardState, CLIPBOARD_MIMES};
 use self::input::KeyRepeat;
 use self::present::GpuPresentation;
-use crate::config::{CaretConfig, Config};
+use crate::config::{vault_name, CaretConfig, Config, Vault};
 use crate::file;
 use crate::markdown;
 use crate::paint::{
@@ -355,33 +355,59 @@ struct State {
     stats: bool,
 }
 
-/// Resolve the file-tree root and any file to open, from the CLI argument and the
-/// saved session root. Precedence: a directory argument roots there and opens no
-/// file; a file argument roots at its parent (or `cwd` if it has none) and opens
-/// the file; no argument uses the last session's root when it is still a
-/// directory, else `cwd`. Pure precedence, split out of `State::new` so it is
-/// testable without a live connection.
-fn resolve_root(
+/// Resolve the active vault root and any file to open, from the CLI argument, the
+/// saved session vault, and the configured vaults. Precedence, never falling back
+/// to the working directory: a directory argument is the vault and opens no file;
+/// a file argument opens the file, rooted at the configured vault that contains it,
+/// else the file's own parent; no argument restores the remembered session vault
+/// only when it is still one of the configured vaults, else the first configured
+/// vault (rooted there even when it does not yet exist). Requiring the remembered
+/// vault to be configured keeps a stale pre-vault root (an old working directory)
+/// from shadowing the configured default. Pure precedence, split out of
+/// `State::new` so it is testable without a live connection.
+fn resolve_vault(
     arg: Option<&Path>,
     session_root: Option<&Path>,
-    cwd: &Path,
+    vaults: &[Vault],
 ) -> (PathBuf, Option<PathBuf>) {
+    // The configured default, used when nothing else resolves. An empty list (only
+    // possible from a future misconfigured loader) degrades to the current dir.
+    let default = || {
+        vaults
+            .first()
+            .map(|v| v.path.clone())
+            .unwrap_or_else(|| PathBuf::from("."))
+    };
     match arg {
         Some(p) if p.is_dir() => (p.to_path_buf(), None),
-        Some(p) => (
-            p.parent()
-                .map(Path::to_path_buf)
-                .unwrap_or_else(|| cwd.to_path_buf()),
-            Some(p.to_path_buf()),
-        ),
+        Some(p) => {
+            let root = vault_containing(p, vaults).unwrap_or_else(|| {
+                p.parent()
+                    .filter(|parent| !parent.as_os_str().is_empty())
+                    .map(Path::to_path_buf)
+                    .unwrap_or_else(|| PathBuf::from("."))
+            });
+            (root, Some(p.to_path_buf()))
+        }
         None => (
             session_root
-                .filter(|r| r.is_dir())
+                .filter(|r| vaults.iter().any(|v| v.path.as_path() == *r))
                 .map(Path::to_path_buf)
-                .unwrap_or_else(|| cwd.to_path_buf()),
+                .unwrap_or_else(default),
             None,
         ),
     }
+}
+
+/// The configured vault that holds `file`, if any: the vault whose root is an
+/// ancestor of the file, choosing the deepest when several nest, so a note opened
+/// deep in a vault still resolves its embeds against the whole vault root.
+fn vault_containing(file: &Path, vaults: &[Vault]) -> Option<PathBuf> {
+    vaults
+        .iter()
+        .filter(|v| file.starts_with(&v.path))
+        .max_by_key(|v| v.path.components().count())
+        .map(|v| v.path.clone())
 }
 
 /// The region that holds focus at startup: a file argument focuses its editor
@@ -425,8 +451,11 @@ impl State {
         // falls back to the first-run default without failing.
         let session = store::load();
 
-        let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-        let (root, cli_file) = resolve_root(path.as_deref(), session.tree_root.as_deref(), &cwd);
+        let (root, cli_file) = resolve_vault(
+            path.as_deref(),
+            session.active_vault.as_deref(),
+            &config.vaults,
+        );
 
         // Editor A: a file argument opens as a single tab; otherwise restore the
         // session's pane A tabs. Editor B always restores from the session (one
@@ -802,7 +831,7 @@ impl State {
             tree_visible: self.panes.tree_visible,
             second_open: self.panes.second_open,
             focus,
-            tree_root: Some(self.tree.tree.root().to_path_buf()),
+            active_vault: Some(self.tree.tree.root().to_path_buf()),
             expanded: self.tree.tree.expanded_dirs(),
             panes: [self.editors[0].to_session(), self.editors[1].to_session()],
         }
@@ -935,10 +964,9 @@ impl State {
         for s in cols.splitters.into_iter().flatten() {
             push_splitter(&mut list, s, scale);
         }
-        // The top bar: a tab strip above each pane, segmented by the continued
-        // column dividers. Drawn last; it occupies the reserved strip above every
-        // column. The vault label is left off for now (a later step brings the
-        // dropdown), so `None` is passed for it.
+        // The top bar: the active vault's name above the sidebar and a tab strip
+        // above each pane, segmented by the continued column dividers. Drawn last;
+        // it occupies the reserved strip above every column.
         let top = self.top_bar_h();
         if top > 0 {
             let bar = Rect {
@@ -970,7 +998,19 @@ impl State {
             };
             let dividers: Vec<Rect> = splitter_rects.into_iter().flatten().collect();
             let ctx = BarCtx::new(&self.fonts, scale, self.body_size);
-            push_top_bar(&mut list, &ctx, bar, None, [strip(0), strip(1)], &dividers);
+            // The vault label sits above the sidebar, sharing the tree column's
+            // x-span; when the sidebar is hidden there is no vault region.
+            let name = vault_name(self.tree.tree.root());
+            let vault = cols.tree.map(|t| {
+                let region = Rect {
+                    x: t.x,
+                    y: 0,
+                    w: t.w,
+                    h: top,
+                };
+                (region, name)
+            });
+            push_top_bar(&mut list, &ctx, bar, vault, [strip(0), strip(1)], &dividers);
         }
         Rc::new(list)
     }
@@ -1463,43 +1503,80 @@ mod tests {
 
     // `Focus` is not `Debug`, so compare with `==` inside `assert!`.
 
+    fn vaults(paths: &[&str]) -> Vec<Vault> {
+        paths
+            .iter()
+            .map(|p| Vault {
+                path: PathBuf::from(p),
+            })
+            .collect()
+    }
+
     #[test]
-    fn resolve_root_prefers_a_directory_argument() {
+    fn resolve_vault_prefers_a_directory_argument() {
         let dir = std::env::temp_dir();
-        let (root, file) = resolve_root(Some(&dir), None, Path::new("/cwd"));
+        let vs = vaults(&["/vault"]);
+        let (root, file) = resolve_vault(Some(&dir), None, &vs);
         assert_eq!(root, dir);
         assert_eq!(file, None);
     }
 
     #[test]
-    fn resolve_root_roots_a_file_argument_at_its_parent() {
-        let dir = std::env::temp_dir();
-        let arg = dir.join("note.md");
-        let (root, opened) = resolve_root(Some(&arg), None, Path::new("/cwd"));
-        assert_eq!(root, dir);
-        assert_eq!(opened.as_deref(), Some(arg.as_path()));
+    fn resolve_vault_roots_a_file_argument_at_its_containing_vault() {
+        // A note deep inside a configured vault roots at the whole vault, not just
+        // the note's own folder, so its embeds resolve vault-wide.
+        let vs = vaults(&["/home/user/notes"]);
+        let arg = Path::new("/home/user/notes/journal/day.md");
+        let (root, opened) = resolve_vault(Some(arg), None, &vs);
+        assert_eq!(root, Path::new("/home/user/notes"));
+        assert_eq!(opened.as_deref(), Some(arg));
     }
 
     #[test]
-    fn resolve_root_uses_the_session_root_when_it_is_a_directory() {
-        let dir = std::env::temp_dir();
-        let (root, file) = resolve_root(None, Some(&dir), Path::new("/cwd"));
-        assert_eq!(root, dir);
+    fn resolve_vault_prefers_the_deepest_containing_vault() {
+        // Nested vaults: the note belongs to the innermost one that holds it.
+        let vs = vaults(&["/home/user/notes", "/home/user/notes/work"]);
+        let arg = Path::new("/home/user/notes/work/plan.md");
+        let (root, _) = resolve_vault(Some(arg), None, &vs);
+        assert_eq!(root, Path::new("/home/user/notes/work"));
+    }
+
+    #[test]
+    fn resolve_vault_roots_a_file_outside_any_vault_at_its_parent() {
+        let vs = vaults(&["/home/user/notes"]);
+        let arg = Path::new("/tmp/scratch/note.md");
+        let (root, opened) = resolve_vault(Some(arg), None, &vs);
+        assert_eq!(root, Path::new("/tmp/scratch"));
+        assert_eq!(opened.as_deref(), Some(arg));
+    }
+
+    #[test]
+    fn resolve_vault_restores_a_configured_session_vault() {
+        // The remembered vault is one of the configured ones (not the first), so it
+        // is restored rather than snapping back to the default.
+        let vs = vaults(&["/home/user/notes", "/home/user/other"]);
+        let (root, file) = resolve_vault(None, Some(Path::new("/home/user/other")), &vs);
+        assert_eq!(root, Path::new("/home/user/other"));
         assert_eq!(file, None);
     }
 
     #[test]
-    fn resolve_root_ignores_a_nonexistent_session_root() {
-        let bogus = Path::new("/does/not/exist/anywhere");
-        let (root, file) = resolve_root(None, Some(bogus), Path::new("/cwd"));
-        assert_eq!(root, Path::new("/cwd"));
+    fn resolve_vault_ignores_an_unconfigured_session_vault() {
+        // A stale pre-vault root (an old working directory, or `.`) is not a
+        // configured vault, so it is dropped for the configured default even though
+        // it exists on disk. This is the migration path off the cwd-based root.
+        let vs = vaults(&["/home/user/notes", "/home/user/other"]);
+        let stale = std::env::temp_dir();
+        let (root, file) = resolve_vault(None, Some(&stale), &vs);
+        assert_eq!(root, Path::new("/home/user/notes"));
         assert_eq!(file, None);
     }
 
     #[test]
-    fn resolve_root_with_no_argument_or_session_uses_cwd() {
-        let (root, file) = resolve_root(None, None, Path::new("/here"));
-        assert_eq!(root, Path::new("/here"));
+    fn resolve_vault_with_no_argument_or_session_uses_the_first_vault() {
+        let vs = vaults(&["/home/user/notes", "/home/user/other"]);
+        let (root, file) = resolve_vault(None, None, &vs);
+        assert_eq!(root, Path::new("/home/user/notes"));
         assert_eq!(file, None);
     }
 

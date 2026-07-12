@@ -438,10 +438,19 @@ impl State {
                     ..Default::default()
                 }],
                 0,
+                Some(root.as_path()),
             ),
-            None => restore_group(&session.panes[0].tabs, session.panes[0].active as usize),
+            None => restore_group(
+                &session.panes[0].tabs,
+                session.panes[0].active as usize,
+                Some(root.as_path()),
+            ),
         };
-        let editor_b = restore_group(&session.panes[1].tabs, session.panes[1].active as usize);
+        let editor_b = restore_group(
+            &session.panes[1].tabs,
+            session.panes[1].active as usize,
+            Some(root.as_path()),
+        );
 
         let expanded: BTreeSet<PathBuf> = session.expanded.iter().cloned().collect();
         let tree = TreePane {

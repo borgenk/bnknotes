@@ -190,11 +190,21 @@ pub struct ImageStore {
     /// The document's directory, that relative image paths resolve against.
     /// `None` for an unsaved buffer, where only absolute paths resolve.
     dir: Option<PathBuf>,
+    /// The vault root, the base for attachment lookups. A relative path
+    /// missing beside the note is looked for here and under its attachment folders,
+    /// so a bare embed name like `Pasted image ….png` resolves. `None` disables the
+    /// vault fallback (the buffer has no vault).
+    vault: Option<PathBuf>,
     /// Decoded images by raw path. A `None` value is a negative entry: the path
     /// was tried and could not be read or decoded.
     cache: HashMap<String, Option<Image>>,
     limits: Limits,
 }
+
+/// Attachment subfolders tried under the vault root when a relative embed name is
+/// not beside the note: the folder names notes apps commonly default to. The vault
+/// root itself is tried before these.
+const ATTACHMENT_DIRS: [&str; 3] = ["attachments", "assets", "@attachment"];
 
 impl ImageStore {
     /// An empty store resolving relative paths against `dir` (or only absolute
@@ -202,8 +212,21 @@ impl ImageStore {
     pub fn new(dir: Option<PathBuf>) -> Self {
         Self {
             dir,
+            vault: None,
             cache: HashMap::new(),
             limits: Limits::default(),
+        }
+    }
+
+    /// Point the store at the vault root, the base for attachment lookups,
+    /// so a relative embed name resolves against the vault and its attachment
+    /// folders as well as the note's directory. Clears the cache when the root
+    /// actually changes, since a name that failed to resolve before may now be
+    /// found (and vice versa).
+    pub fn set_vault(&mut self, vault: Option<PathBuf>) {
+        if self.vault != vault {
+            self.vault = vault;
+            self.cache.clear();
         }
     }
 
@@ -219,18 +242,42 @@ impl ImageStore {
     }
 
     fn load(&self, raw_path: &str) -> Option<Image> {
-        let bytes = std::fs::read(self.resolve(raw_path)).ok()?;
-        Image::decode(&bytes, self.limits).ok()
+        self.candidates(raw_path).into_iter().find_map(|cand| {
+            let bytes = std::fs::read(&cand).ok()?;
+            Image::decode(&bytes, self.limits).ok()
+        })
     }
 
-    /// Resolve `raw_path` to a filesystem path: an absolute path as-is, a relative
-    /// one against the document's directory (or as-is when the buffer is unsaved).
-    fn resolve(&self, raw_path: &str) -> PathBuf {
+    /// The filesystem paths to try for `raw_path`, in order. An absolute path is
+    /// used as-is. A relative path resolves first against the note's own directory,
+    /// then (when a vault is set) against the vault root and its attachment
+    /// subfolders, so a bare `Pasted image ….png` is found wherever the vault filed
+    /// it. Duplicate bases (a note that sits at the vault root) collapse to one try.
+    fn candidates(&self, raw_path: &str) -> Vec<PathBuf> {
         let path = Path::new(raw_path);
-        match &self.dir {
-            Some(dir) if path.is_relative() => dir.join(path),
-            _ => path.to_path_buf(),
+        if path.is_absolute() {
+            return vec![path.to_path_buf()];
         }
+        let mut bases: Vec<PathBuf> = Vec::new();
+        if let Some(dir) = &self.dir {
+            bases.push(dir.clone());
+        }
+        if let Some(vault) = &self.vault {
+            bases.push(vault.clone());
+            bases.extend(ATTACHMENT_DIRS.iter().map(|sub| vault.join(sub)));
+        }
+        if bases.is_empty() {
+            // Unsaved buffer with no vault: use the path as given.
+            return vec![path.to_path_buf()];
+        }
+        let mut out: Vec<PathBuf> = Vec::with_capacity(bases.len());
+        for base in bases {
+            let candidate = base.join(path);
+            if !out.contains(&candidate) {
+                out.push(candidate);
+            }
+        }
+        out
     }
 
     /// The decoded image for `raw_path`, if it decoded successfully.
@@ -248,12 +295,14 @@ impl ImageStore {
     /// not a re-encode of the decoded pixels, so no encoder is needed. `None` if the
     /// file can no longer be read or is not a recognized image.
     pub fn read_source(&self, raw_path: &str) -> Option<(Vec<u8>, &'static str)> {
-        let bytes = std::fs::read(self.resolve(raw_path)).ok()?;
-        let mime = match Format::sniff(&bytes)? {
-            Format::Png => "image/png",
-            Format::Jpeg => "image/jpeg",
-        };
-        Some((bytes, mime))
+        self.candidates(raw_path).into_iter().find_map(|cand| {
+            let bytes = std::fs::read(&cand).ok()?;
+            let mime = match Format::sniff(&bytes)? {
+                Format::Png => "image/png",
+                Format::Jpeg => "image/jpeg",
+            };
+            Some((bytes, mime))
+        })
     }
 
     /// A store pre-populated with already-decoded images, bypassing the filesystem:
@@ -262,6 +311,7 @@ impl ImageStore {
         let cache = items.into_iter().map(|(k, v)| (k, Some(v))).collect();
         Self {
             dir: None,
+            vault: None,
             cache,
             limits: Limits::default(),
         }
@@ -420,5 +470,54 @@ mod tests {
         store.ensure("note.txt");
         assert!(store.get("note.txt").is_none());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn store_resolves_a_bare_name_from_the_vault_root() {
+        let vault = temp_dir("vault-root");
+        let notes = vault.join("notes");
+        std::fs::create_dir_all(&notes).unwrap();
+        // The picture sits at the vault root, not beside the note (a paste filed at
+        // the default attachment location).
+        std::fs::write(vault.join("Pasted image 1.png"), TINY_PNG).unwrap();
+        let mut store = ImageStore::new(Some(notes));
+        store.set_vault(Some(vault.clone()));
+        store.ensure("Pasted image 1.png");
+        assert_eq!(store.dimensions("Pasted image 1.png"), Some((2, 2)));
+        let _ = std::fs::remove_dir_all(&vault);
+    }
+
+    #[test]
+    fn store_resolves_a_bare_name_from_a_vault_attachment_folder() {
+        let vault = temp_dir("vault-attach");
+        std::fs::create_dir_all(vault.join("attachments")).unwrap();
+        std::fs::create_dir_all(vault.join("@attachment")).unwrap();
+        std::fs::write(vault.join("attachments/cat.png"), TINY_PNG).unwrap();
+        std::fs::write(vault.join("@attachment/dog.png"), TINY_PNG).unwrap();
+        // Only the attachment folders hold these; the note's directory does not.
+        let mut store = ImageStore::new(Some(vault.join("notes")));
+        store.set_vault(Some(vault.clone()));
+        store.ensure("cat.png");
+        store.ensure("dog.png");
+        assert_eq!(store.dimensions("cat.png"), Some((2, 2)));
+        assert_eq!(store.dimensions("dog.png"), Some((2, 2)));
+        let _ = std::fs::remove_dir_all(&vault);
+    }
+
+    #[test]
+    fn setting_the_vault_reattempts_a_previously_missing_name() {
+        let vault = temp_dir("vault-late");
+        let notes = vault.join("notes");
+        std::fs::create_dir_all(&notes).unwrap();
+        std::fs::write(vault.join("cat.png"), TINY_PNG).unwrap();
+        let mut store = ImageStore::new(Some(notes));
+        // Without a vault the name is not beside the note: a negative entry.
+        store.ensure("cat.png");
+        assert!(store.get("cat.png").is_none());
+        // Learning the vault clears the negative cache; the name now resolves.
+        store.set_vault(Some(vault.clone()));
+        store.ensure("cat.png");
+        assert_eq!(store.dimensions("cat.png"), Some((2, 2)));
+        let _ = std::fs::remove_dir_all(&vault);
     }
 }

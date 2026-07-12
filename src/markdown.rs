@@ -861,17 +861,21 @@ pub struct ImageLink {
     pub path: (usize, usize),
 }
 
-/// If `line` is, ignoring surrounding whitespace, a single image `![alt](dest)`
-/// and nothing else, the byte ranges of its alt text and destination path. Such a
-/// line renders its picture in place once the cursor leaves it (the same
-/// live-preview reveal a heading uses for its `#`); an image mixed with other text
-/// on the line (an inline image) is not matched and stays source for now.
+/// If `line` is, ignoring surrounding whitespace, a single image and nothing else,
+/// the byte ranges of its alt text and destination path. Both the CommonMark form
+/// `![alt](dest)` and the wikilink embed `![[target]]` (see [`wikilink_image`]) are
+/// recognized. Such a line renders its picture in place once the cursor leaves it
+/// (the same live-preview reveal a heading uses for its `#`); an image mixed with
+/// other text on the line (an inline image) is not matched and stays source for now.
 ///
 /// `dest` may wrap its path in `<...>` (which lets the path hold spaces) and may
 /// carry a `"title"`/`'title'` after the path; both are stripped to leave the
 /// path. A path containing a literal `)` is not handled: the first `)` closes the
 /// link.
 pub fn standalone_image(line: &str) -> Option<ImageLink> {
+    if let Some(embed) = wikilink_image(line) {
+        return Some(embed);
+    }
     let open = line.find("![")?;
     // Only whitespace may precede the image, so this is a block on its own line.
     if !line[..open].trim().is_empty() {
@@ -894,6 +898,54 @@ pub fn standalone_image(line: &str) -> Option<ImageLink> {
         alt: (alt_start, alt_end),
         path: (path_start, path_end),
     })
+}
+
+/// If `line` is a single wikilink embed `![[target]]` (optionally `![[target|label]]`),
+/// ignoring surrounding whitespace, the byte ranges of its target and label. The
+/// target names a vault file that [`crate::render::image::ImageStore`] resolves by
+/// name against the note's directory, the vault root, and its attachment folders, so
+/// a bare `![[Pasted image 20250101.png]]` finds its picture wherever the vault filed
+/// it. A `|label` (a display width or caption) is kept as the alt range.
+///
+/// Recognition is blind to the target's kind: a note embed like `![[Some Note]]`
+/// matches here too, then fails to decode as an image and falls back to its source
+/// line, which is the right outcome until note transclusion exists.
+fn wikilink_image(line: &str) -> Option<ImageLink> {
+    let open = line.find("![[")?;
+    // Only whitespace may precede the embed, so this is a block on its own line.
+    if !line[..open].trim().is_empty() {
+        return None;
+    }
+    let inner_start = open + 3;
+    let inner_end = inner_start + line[inner_start..].find("]]")?;
+    // Only whitespace may follow the closing `]]`.
+    if !line[inner_end + 2..].trim().is_empty() {
+        return None;
+    }
+    // An optional `|label` (a display size or caption) trails the target.
+    let (path, alt) = match line[inner_start..inner_end].find('|') {
+        Some(off) => {
+            let bar = inner_start + off;
+            (
+                trim_range(line, inner_start, bar),
+                trim_range(line, bar + 1, inner_end),
+            )
+        }
+        None => (
+            trim_range(line, inner_start, inner_end),
+            (inner_end, inner_end),
+        ),
+    };
+    (path.0 < path.1).then_some(ImageLink { alt, path })
+}
+
+/// The subrange `line[start..end]` shrunk past any leading and trailing ASCII
+/// whitespace, as absolute byte offsets into `line`. An all-whitespace range
+/// collapses to empty at its trimmed start, never inverts.
+fn trim_range(line: &str, start: usize, end: usize) -> (usize, usize) {
+    let seg = &line[start..end];
+    let s = start + (seg.len() - seg.trim_start().len());
+    (s, s + seg.trim().len())
 }
 
 /// The path's byte range within a link destination `line[start..end]`, dropping
@@ -1857,6 +1909,44 @@ mod tests {
         assert!(img("![x]()").is_none(), "empty destination");
         assert!(img("plain text").is_none());
         assert!(img("[x](a.png)").is_none(), "a link, not an image");
+    }
+
+    #[test]
+    fn recognizes_a_wikilink_embed() {
+        // The target becomes the path; there is no separate alt.
+        assert_eq!(
+            img("![[Pasted image 20251219150959.png]]"),
+            Some(("", "Pasted image 20251219150959.png"))
+        );
+    }
+
+    #[test]
+    fn a_wikilink_label_after_the_pipe_is_the_alt() {
+        // A `|300` display-size suffix parses as the alt, path is the target.
+        assert_eq!(img("![[cat.png|300]]"), Some(("300", "cat.png")));
+        assert_eq!(
+            img("![[ cat.png | a caption ]]"),
+            Some(("a caption", "cat.png"))
+        );
+    }
+
+    #[test]
+    fn a_wikilink_embed_allows_surrounding_whitespace_only() {
+        assert_eq!(img("   ![[cat.png]]  "), Some(("", "cat.png")));
+        // Trailing prose makes it inline, left as source.
+        assert!(img("![[cat.png]] and text").is_none());
+        assert!(img("see ![[cat.png]]").is_none());
+    }
+
+    #[test]
+    fn rejects_malformed_wikilink_embeds() {
+        assert!(img("![[]]").is_none(), "empty target");
+        assert!(img("![[   ]]").is_none(), "whitespace-only target");
+        assert!(img("![[cat.png").is_none(), "unclosed");
+        assert!(
+            img("[[cat.png]]").is_none(),
+            "a link embed marker needs the !"
+        );
     }
 
     // --- Tables -------------------------------------------------------------

@@ -689,6 +689,13 @@ impl EditorPane {
         self.body_size = body_size;
     }
 
+    /// Point this pane's image store at the vault root, so a wikilink embed
+    /// `![[name]]` resolves its picture against the vault and its attachment folders
+    /// as well as the note's own directory.
+    pub(crate) fn set_vault_root(&mut self, root: Option<&Path>) {
+        self.images.set_vault(root.map(Path::to_path_buf));
+    }
+
     /// Load `path` into a fresh pane, resolving inline images against its
     /// directory. An unreadable file is an error the caller surfaces.
     pub(crate) fn open(path: &Path) -> Result<Self> {
@@ -1370,6 +1377,10 @@ pub(crate) struct PaneGroup {
     /// default a fresh [`EditorPane`] carries.
     scale: Scale,
     body_size: u32,
+    /// The vault root every tab resolves wikilink embeds against, stamped onto each
+    /// document as it opens so a `![[name]]` finds its picture. `None` outside a
+    /// vault (a bare file argument with no session root).
+    vault: Option<PathBuf>,
 }
 
 impl PaneGroup {
@@ -1381,6 +1392,7 @@ impl PaneGroup {
             placeholder: EditorPane::empty(),
             scale: Scale::ONE,
             body_size: FONT_SIZE,
+            vault: None,
         }
     }
 
@@ -1428,6 +1440,7 @@ impl PaneGroup {
     pub(crate) fn new_tab(&mut self, scale: Scale, body_size: u32) {
         let mut doc = EditorPane::empty();
         doc.set_scale(scale, body_size);
+        doc.set_vault_root(self.vault.as_deref());
         self.docs.push(doc);
         self.active = self.docs.len() - 1;
     }
@@ -1447,6 +1460,7 @@ impl PaneGroup {
         }
         let mut doc = EditorPane::open(path)?;
         doc.set_scale(self.scale, self.body_size);
+        doc.set_vault_root(self.vault.as_deref());
         // Replace a lone blank scratch tab (a just-opened new tab); otherwise stack.
         if self.docs.get(self.active).is_some_and(EditorPane::is_blank) {
             self.docs[self.active] = doc;
@@ -1578,11 +1592,20 @@ pub(crate) struct TreePane {
 /// Build a pane from its saved tabs, restoring each file's caret and scroll and
 /// the active tab. An empty tab list (a never-opened pane) yields an empty pane
 /// with no tabs. The active index is clamped into the restored tabs.
-pub(crate) fn restore_group(tabs: &[store::PaneSession], active: usize) -> PaneGroup {
+pub(crate) fn restore_group(
+    tabs: &[store::PaneSession],
+    active: usize,
+    vault: Option<&Path>,
+) -> PaneGroup {
     if tabs.is_empty() {
-        return PaneGroup::empty();
+        let mut group = PaneGroup::empty();
+        group.vault = vault.map(Path::to_path_buf);
+        return group;
     }
-    let docs: Vec<EditorPane> = tabs.iter().map(restore_doc).collect();
+    let mut docs: Vec<EditorPane> = tabs.iter().map(restore_doc).collect();
+    for doc in &mut docs {
+        doc.set_vault_root(vault);
+    }
     let active = active.min(docs.len() - 1);
     PaneGroup {
         docs,
@@ -1590,6 +1613,7 @@ pub(crate) fn restore_group(tabs: &[store::PaneSession], active: usize) -> PaneG
         placeholder: EditorPane::empty(),
         scale: Scale::ONE,
         body_size: FONT_SIZE,
+        vault: vault.map(Path::to_path_buf),
     }
 }
 

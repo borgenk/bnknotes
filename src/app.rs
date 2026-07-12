@@ -30,14 +30,14 @@ use std::time::{Duration, Instant};
 use self::clipboard::{is_text_mime, ClipboardState, CLIPBOARD_MIMES};
 use self::input::KeyRepeat;
 use self::present::GpuPresentation;
-use crate::config::Config;
+use crate::config::{CaretConfig, Config};
 use crate::file;
 use crate::markdown;
 use crate::paint::{
     build_display_list, build_find_paint, push_splitter, push_top_bar, push_tree, top_bar_height,
-    BarCtx, PaintParams, TabStrip,
+    BarCtx, CaretPaint, PaintParams, TabStrip,
 };
-use crate::pane::{restore_group, Columns, Focus, PaneGroup, PaneLayout, TreePane};
+use crate::pane::{restore_group, CaretAnim, Columns, Focus, PaneGroup, PaneLayout, TreePane};
 use crate::platform::conn::{Connection, Fill};
 use crate::platform::error::{Error, Result};
 use crate::platform::freetype::{FontConfig, Fonts};
@@ -53,7 +53,7 @@ use crate::platform::xkb::Xkb;
 use crate::render::display::DisplayList;
 use crate::scale::Scale;
 use crate::store;
-use crate::theme::FONT_SIZE;
+use crate::theme::{CARET_WIDTH, FONT_SIZE};
 use crate::tree;
 
 /// Upper bound on either surface dimension, applied to a compositor-supplied
@@ -224,6 +224,9 @@ struct State {
     /// Mask gamma for glyph coverage, read from the app config at startup and
     /// handed to the shader each frame (see [`crate::config::Config`]).
     glyph_gamma: f32,
+    /// Caret motion settings, read from the app config at startup. When animation is
+    /// off the caret snaps cell to cell; otherwise it eases toward its target.
+    caret_config: CaretConfig,
     xkb: Xkb,
     /// The two content panes (editor A and B) and the file-tree sidebar, laid
     /// out as adjustable columns below the top bar. Each pane is a stack of open
@@ -456,6 +459,7 @@ impl State {
             conn,
             fonts,
             glyph_gamma: config.glyph_coverage_gamma,
+            caret_config: config.caret,
             xkb: Xkb::new()?,
             editors: [editor_a, editor_b],
             tree,
@@ -811,6 +815,7 @@ impl State {
             self.fire_repeats()?;
             self.fire_autoscroll();
             self.fire_caret_blink();
+            self.fire_caret_anim();
             // Pace to the compositor's clock: only draw when no frame callback is
             // outstanding, so a burst of edits or held keys between refreshes
             // collapses into a single repaint instead of racing both buffers.
@@ -835,6 +840,7 @@ impl State {
     /// filename; splitters last so they cover the inter-column gaps.
     fn build_frame_list(&mut self) -> Rc<DisplayList> {
         let cols = self.columns();
+        let now = Instant::now();
         let mut list: DisplayList = Vec::new();
         if let Some(rect) = cols.tree {
             let (scale, body_size) = (self.scale(), self.body_size);
@@ -859,6 +865,9 @@ impl State {
             let ch = self.editors[i].content_height;
             self.editors[i].scroll_y = scroll::clamp(self.editors[i].scroll_y, ch, rect.h);
             let focused = self.focus == Focus::Editor(i);
+            // Tick this pane's caret animation and reduce it to a paint rectangle
+            // before borrowing the pane immutably for the rest of the frame.
+            let caret = self.build_caret(i, rect, focused, now);
             let ed = &self.editors[i];
             // Owned so it outlives the `FindPaint` that borrows it for this frame.
             let tick_tops = ed.find_tick_tops();
@@ -884,11 +893,7 @@ impl State {
                 body_size: self.body_size,
                 scroll_y: ed.scroll_y,
                 selection: ed.text.selection(),
-                cursor: ed.text.cursor(),
-                // The caret draws only on the focused pane's visible blink half, and
-                // only when the cursor's line is in the painted window; scrolled far
-                // from the cursor it is off screen and simply not drawn.
-                caret_visible: focused && self.caret_visible && ed.cursor_in_window(),
+                caret,
                 find: build_find_paint(&ed.find, &tick_tops, ed.content_height),
                 table_hover,
             };
@@ -948,6 +953,98 @@ impl State {
         Rc::new(list)
     }
 
+    /// Tick pane `i`'s caret animation and reduce it to the rectangle to draw this
+    /// frame, or `None` when no caret is drawn. The animation is ticked even when
+    /// the caret is hidden (unfocused or blinked off) so it still settles; when the
+    /// cursor has scrolled off the painted window it is snapped, so it never resumes
+    /// a stale smear on the way back. The returned rectangle is content space; the
+    /// painter shifts it by scroll.
+    fn build_caret(
+        &mut self,
+        i: usize,
+        rect: Rect,
+        focused: bool,
+        now: Instant,
+    ) -> Option<CaretPaint> {
+        let scale = self.scale();
+        let body_size = self.body_size;
+        let config = self.caret_config;
+        let visible = self.caret_visible;
+        let fonts = &self.fonts;
+        let ed = &mut self.editors[i];
+        if !ed.has_tabs() {
+            return None;
+        }
+        // Off-window: the cursor scrolled outside the painted band. Snap so a later
+        // scroll back does not smear from a stale position, and draw nothing.
+        if !ed.cursor_in_window() {
+            ed.request_caret_snap();
+            return None;
+        }
+        let cursor = ed.text.cursor();
+        let (cx, cy, ch) = ed
+            .layout_cache
+            .as_ref()?
+            .caret(fonts, ed.text.rope(), cursor);
+        let target = (cx as f32, cy as f32);
+        let key = (rect.x, rect.w, body_size, scale.factor_120());
+        let anim = ed.caret_anim_mut();
+        anim.update(target, ch as f32, key, &config, now);
+        // Hidden this frame (unfocused window or blinked-off half): the anim is still
+        // ticked above so it settles, but nothing is drawn.
+        if !(focused && visible) {
+            return None;
+        }
+        let caret_width = scale.px(CARET_WIDTH);
+        let paint_rect = anim.smear_rect(target, ch as f32, caret_width);
+        // A moving caret is a rounded smear; a settled one (and the whole
+        // animation-off path) is the plain bar, drawn as a sharp Fill.
+        let radius = if anim.in_flight() {
+            caret_width.min(paint_rect.w.min(paint_rect.h) / 2)
+        } else {
+            0
+        };
+        Some(CaretPaint {
+            rect: paint_rect,
+            radius,
+        })
+    }
+
+    /// The focused editor's caret animation when it is drawable this frame: the
+    /// window has keyboard focus, an editor pane with tabs holds focus, and the
+    /// cursor sits in its painted window. This is the caret whose in-flight motion
+    /// keeps the loop ticking; nothing else animates the caret.
+    fn drawable_caret_anim(&self) -> Option<&CaretAnim> {
+        if !self.focused {
+            return None;
+        }
+        let Focus::Editor(i) = self.focus else {
+            return None;
+        };
+        let ed = &self.editors[i];
+        (ed.has_tabs() && ed.cursor_in_window()).then(|| ed.caret_anim())
+    }
+
+    /// When the loop should next tick the caret while it eases, or `None` when it is
+    /// settled or not drawable.
+    fn caret_retry_at(&self) -> Option<Instant> {
+        self.drawable_caret_anim().and_then(CaretAnim::retry_at)
+    }
+
+    /// While the caret eases and no compositor frame is pending, a tick whose integer
+    /// rectangle did not change presents nothing and arms no frame callback, so the
+    /// loop would sleep mid-motion. When its short retry deadline passes, mark a
+    /// repaint so the next iteration ticks it again, until the rectangle moves (back
+    /// to callback pacing) or the caret settles.
+    fn fire_caret_anim(&mut self) {
+        if self.frame_callback != 0 {
+            return;
+        }
+        if self.caret_retry_at().is_some_and(|at| at <= Instant::now()) {
+            self.dirty = true;
+        }
+    }
+
     fn handle(&mut self, msg: Message) -> Result<()> {
         let mut r = Reader::new(&msg.body);
 
@@ -992,6 +1089,11 @@ impl State {
             && msg.opcode == wl_callback::EV_DONE
         {
             self.frame_callback = 0;
+            // Keep the animation going: if the caret is still easing, request the
+            // next frame now that the compositor is ready for it.
+            if self.drawable_caret_anim().is_some_and(CaretAnim::in_flight) {
+                self.dirty = true;
+            }
             return Ok(());
         }
 
@@ -1290,7 +1392,14 @@ impl State {
             .then_some(self.caret_blink_at)
             .flatten()
             .map(until);
-        [self.repeat_timeout(), autoscroll, caret]
+        // A caret still easing needs a follow-up tick, but only when no compositor
+        // frame is pending: while a callback is outstanding, the frame-done event
+        // paces the animation, so adding a deadline here would just wake early.
+        let caret_anim = (self.frame_callback == 0)
+            .then(|| self.caret_retry_at())
+            .flatten()
+            .map(until);
+        [self.repeat_timeout(), autoscroll, caret, caret_anim]
             .into_iter()
             .flatten()
             .min()

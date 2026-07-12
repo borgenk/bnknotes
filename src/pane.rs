@@ -2,6 +2,7 @@ use std::ops::{Deref, DerefMut};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+use crate::config::CaretConfig;
 use crate::file::{self, FileFormat};
 use crate::find::FindState;
 use crate::layout::{ImageUi, Layout, LayoutCtx, LineIndex, RevealAdjust, NO_REVEAL};
@@ -74,6 +75,177 @@ impl ClickChain {
         self.last = Some(now);
         self.last_pos = (px, py);
         (self.count, chained)
+    }
+}
+
+/// The decay step treats a stall longer than this as one bounded update, so a long
+/// idle never lets the caret leap most of the way in a single frame. The
+/// exponential step never overshoots regardless.
+const CARET_DT_CAP: Duration = Duration::from_millis(50);
+/// While the caret eases, the loop retries at least this often so a frame whose
+/// integer rectangle did not change (and so presented nothing and armed no
+/// compositor callback) still gets a follow-up tick.
+const CARET_RETRY: Duration = Duration::from_millis(16);
+/// Within half a device pixel of the target the caret snaps and settles, cutting
+/// the asymptotic tail so the loop can go idle.
+const CARET_SETTLE_PX: f32 = 0.5;
+
+/// Content-space geometry the caret target was computed under: column left and
+/// width, body font size, and the display scale (its 120ths factor). A change means
+/// the document reflowed (resize, DPI change, column move, show/hide a pane), so the
+/// caret snaps to its new target rather than smearing across the jump.
+type CaretGeomKey = (i32, i32, u32, u32);
+
+/// Euclidean distance between two content-space points.
+fn caret_distance(a: (f32, f32), b: (f32, f32)) -> f32 {
+    let dx = a.0 - b.0;
+    let dy = a.1 - b.1;
+    (dx * dx + dy * dy).sqrt()
+}
+
+/// The smooth-caret animation for one document: the rendered caret position that
+/// eases toward its live target, plus the bookkeeping the app loop reads to keep
+/// feeding it frames until it settles. Positions are content space (pre-scroll); the
+/// painter shifts by scroll at draw. Inert unless [`CaretConfig::animate`] is on, in
+/// which case every update snaps.
+///
+/// ```text
+///   settled ──new target──▶ in flight ──ease each frame──▶ within 0.5px ──▶ settled
+///     ▲                        │                                              │
+///     └───────── snap (disabled / reflow / requested / jump > cap) ◀──────────┘
+/// ```
+pub(crate) struct CaretAnim {
+    /// The rendered caret's content-space top-left, or `None` until the first update
+    /// seeds it from the live target.
+    pos: Option<(f32, f32)>,
+    /// The geometry the last target was laid out under, to detect a reflow.
+    key: Option<CaretGeomKey>,
+    /// When the last decay step ran, or `None` while settled, so a move after an idle
+    /// stretch starts its clock fresh instead of consuming one whole capped step.
+    last_tick: Option<Instant>,
+    /// Whether the caret is still easing toward its target. Drives frame requests.
+    in_flight: bool,
+    /// Force the next update to snap (a focus, tab, or file-open transition).
+    snap_next: bool,
+}
+
+impl CaretAnim {
+    fn new() -> Self {
+        Self {
+            pos: None,
+            key: None,
+            last_tick: None,
+            in_flight: false,
+            snap_next: false,
+        }
+    }
+
+    /// Advance the rendered caret one frame toward `target` (content-space top-left,
+    /// caret `height`) laid out under `key`, at `now`. Snaps (no smear) when
+    /// animation is off, on the first update, after a requested snap, when the
+    /// geometry reflowed, or when the jump exceeds the configured cap. Otherwise
+    /// eases with frame-rate-independent exponential decay and settles within half a
+    /// pixel.
+    pub(crate) fn update(
+        &mut self,
+        target: (f32, f32),
+        height: f32,
+        key: CaretGeomKey,
+        config: &CaretConfig,
+        now: Instant,
+    ) {
+        let reflowed = self.key != Some(key);
+        self.key = Some(key);
+        let snap = !config.animate
+            || self.snap_next
+            || self.pos.is_none()
+            || reflowed
+            || self
+                .pos
+                .is_some_and(|pos| caret_distance(pos, target) > config.max_jump_lines * height);
+        if snap {
+            self.pos = Some(target);
+            self.in_flight = false;
+            self.last_tick = None;
+            self.snap_next = false;
+            return;
+        }
+        let pos = self.pos.expect("pos is Some past the snap guard");
+        if pos == target {
+            self.in_flight = false;
+            self.last_tick = None;
+            return;
+        }
+        if !self.in_flight {
+            // A settled caret just got a new target: keep the old rendered position,
+            // start the clock, and draw the full smear this frame. The first decay
+            // step lands next frame, so a move after a long idle never consumes a
+            // whole capped step at once.
+            self.in_flight = true;
+            self.last_tick = Some(now);
+            return;
+        }
+        let dt = self
+            .last_tick
+            .map_or(CARET_DT_CAP, |t| now.saturating_duration_since(t))
+            .min(CARET_DT_CAP);
+        self.last_tick = Some(now);
+        let factor = 1.0 - (-config.rate * dt.as_secs_f32()).exp();
+        let next = (
+            pos.0 + (target.0 - pos.0) * factor,
+            pos.1 + (target.1 - pos.1) * factor,
+        );
+        if caret_distance(next, target) < CARET_SETTLE_PX {
+            self.pos = Some(target);
+            self.in_flight = false;
+            self.last_tick = None;
+        } else {
+            self.pos = Some(next);
+        }
+    }
+
+    /// Mark the next update to snap to its live target, and clear flight and timing
+    /// now so a hidden, off-window, or unfocused caret cannot keep scheduling
+    /// retries. Cheaper than computing layout geometry at the transition call site.
+    pub(crate) fn request_snap(&mut self) {
+        self.snap_next = true;
+        self.in_flight = false;
+        self.last_tick = None;
+    }
+
+    /// Whether the caret is still easing toward its target.
+    pub(crate) fn in_flight(&self) -> bool {
+        self.in_flight
+    }
+
+    /// When the loop should next tick this caret while it eases, so a quantized frame
+    /// that presented nothing still gets a follow-up. `None` once settled.
+    pub(crate) fn retry_at(&self) -> Option<Instant> {
+        self.in_flight
+            .then_some(self.last_tick)
+            .flatten()
+            .map(|t| t + CARET_RETRY)
+    }
+
+    /// The content-space rectangle to draw this frame: the outward-rounded bounding
+    /// box spanning the rendered position and `target`, each a caret bar of width
+    /// `caret_width` and the given `height`. Flooring the left/top and ceiling the
+    /// right/bottom never drops the target pixel and yields exactly the caret bar at
+    /// rest. Pre-scroll; the painter shifts it by scroll at draw.
+    pub(crate) fn smear_rect(&self, target: (f32, f32), height: f32, caret_width: i32) -> Rect {
+        let (px, py) = self.pos.unwrap_or(target);
+        let (tx, ty) = target;
+        let cw = caret_width as f32;
+        let left = px.min(tx).floor() as i32;
+        let top = py.min(ty).floor() as i32;
+        let right = (px.max(tx) + cw).ceil() as i32;
+        let bottom = (py.max(ty) + height).ceil() as i32;
+        Rect {
+            x: left,
+            y: top,
+            w: (right - left).max(0),
+            h: (bottom - top).max(0),
+        }
     }
 }
 
@@ -306,6 +478,9 @@ pub(crate) struct EditorPane {
     pub(crate) autoscroll: i32,
     /// When the next auto-scroll tick is due; `None` while disarmed.
     pub(crate) autoscroll_at: Option<Instant>,
+    /// The smooth-caret animation for this document: the rendered caret easing
+    /// toward the cursor's live position. Inert unless the config enables it.
+    caret_anim: CaretAnim,
     /// Pooled inline-markup scratch for [`Self::link_under_pointer`], so hit-testing
     /// a hovered line's links reuses its buffers instead of reallocating per event.
     link_scratch: markdown::InlineScratch,
@@ -340,6 +515,7 @@ impl EditorPane {
             clicks: ClickChain::new(),
             autoscroll: 0,
             autoscroll_at: None,
+            caret_anim: CaretAnim::new(),
             link_scratch: markdown::InlineScratch::default(),
             scale: Scale::ONE,
             body_size: FONT_SIZE,
@@ -783,6 +959,23 @@ impl EditorPane {
         self.layout_band.0 <= line && line < self.layout_band.1
     }
 
+    /// This document's caret animation, for the app loop to read its flight state
+    /// and retry deadline.
+    pub(crate) fn caret_anim(&self) -> &CaretAnim {
+        &self.caret_anim
+    }
+
+    /// This document's caret animation, for the frame builder to tick it.
+    pub(crate) fn caret_anim_mut(&mut self) -> &mut CaretAnim {
+        &mut self.caret_anim
+    }
+
+    /// Snap the caret to its live target on the next frame, so a focus, tab, or
+    /// file-open change never resumes a stale mid-flight smear.
+    pub(crate) fn request_caret_snap(&mut self) {
+        self.caret_anim.request_snap();
+    }
+
     /// The layout-space y for a window y inside this pane's column. The windowed
     /// layout is built at absolute positions (the column top and margin baked into
     /// its baselines by the seed), with the pane's scroll applied only at paint, so
@@ -1065,6 +1258,7 @@ impl PaneGroup {
     pub(crate) fn activate(&mut self, i: usize) {
         if i < self.docs.len() {
             self.active = i;
+            self.active_doc_mut().request_caret_snap();
         }
     }
 
@@ -1087,6 +1281,7 @@ impl PaneGroup {
             .position(|d| d.path.as_deref() == Some(path))
         {
             self.active = i;
+            self.active_doc_mut().request_caret_snap();
             return Ok(());
         }
         let mut doc = EditorPane::open(path)?;
@@ -1119,6 +1314,9 @@ impl PaneGroup {
         if i < self.active || self.active >= self.docs.len() {
             self.active = self.active.saturating_sub(1);
         }
+        // The tab that slid into focus is a different document; snap its caret so it
+        // does not resume a smear from wherever it last left off.
+        self.active_doc_mut().request_caret_snap();
         Some(doc)
     }
 
@@ -1718,5 +1916,287 @@ mod tests {
         pane.disarm_autoscroll();
         assert_eq!(pane.autoscroll, 0);
         assert_eq!(pane.autoscroll_due(due_at + AUTOSCROLL_INTERVAL), None);
+    }
+
+    // --- Caret animation --------------------------------------------------
+
+    /// A geometry key standing in for one column, body size, and scale; the tests
+    /// only care that it stays constant (a change would force a snap).
+    const CARET_KEY: CaretGeomKey = (0, 600, FONT_SIZE, 120);
+    /// The caret height the tests animate with.
+    const CARET_H: f32 = 20.0;
+
+    /// An animating config with the given jump cap (in caret heights). A large cap
+    /// takes the distance guard out of the way for the easing tests.
+    fn anim_cfg(max_jump_lines: f32) -> CaretConfig {
+        CaretConfig {
+            animate: true,
+            rate: 40.0,
+            max_jump_lines,
+        }
+    }
+
+    #[test]
+    fn caret_initializes_at_target() {
+        let mut a = CaretAnim::new();
+        a.update(
+            (100.0, 50.0),
+            CARET_H,
+            CARET_KEY,
+            &anim_cfg(1000.0),
+            Instant::now(),
+        );
+        // First update seeds the rendered position at the live target: settled, no
+        // smear from the default origin.
+        assert_eq!(a.pos, Some((100.0, 50.0)));
+        assert!(!a.in_flight());
+        let r = a.smear_rect((100.0, 50.0), CARET_H, 2);
+        assert_eq!(r.w, 2);
+        assert_eq!(r.h, 20);
+    }
+
+    #[test]
+    fn caret_converges_to_target() {
+        let cfg = anim_cfg(1000.0);
+        let mut a = CaretAnim::new();
+        let mut t = Instant::now();
+        a.update((0.0, 0.0), CARET_H, CARET_KEY, &cfg, t);
+        a.update((200.0, 0.0), CARET_H, CARET_KEY, &cfg, t); // flight starts, no step
+        for _ in 0..200 {
+            t += Duration::from_millis(16);
+            a.update((200.0, 0.0), CARET_H, CARET_KEY, &cfg, t);
+            if !a.in_flight() {
+                break;
+            }
+        }
+        assert_eq!(a.pos, Some((200.0, 0.0)));
+        assert!(!a.in_flight());
+    }
+
+    #[test]
+    fn caret_easing_is_frame_rate_independent() {
+        let cfg = anim_cfg(1000.0);
+        let t0 = Instant::now();
+        // One 32ms step.
+        let mut one = CaretAnim::new();
+        one.update((0.0, 0.0), CARET_H, CARET_KEY, &cfg, t0);
+        one.update((300.0, 0.0), CARET_H, CARET_KEY, &cfg, t0);
+        one.update(
+            (300.0, 0.0),
+            CARET_H,
+            CARET_KEY,
+            &cfg,
+            t0 + Duration::from_millis(32),
+        );
+        // Two 16ms steps.
+        let mut two = CaretAnim::new();
+        two.update((0.0, 0.0), CARET_H, CARET_KEY, &cfg, t0);
+        two.update((300.0, 0.0), CARET_H, CARET_KEY, &cfg, t0);
+        two.update(
+            (300.0, 0.0),
+            CARET_H,
+            CARET_KEY,
+            &cfg,
+            t0 + Duration::from_millis(16),
+        );
+        two.update(
+            (300.0, 0.0),
+            CARET_H,
+            CARET_KEY,
+            &cfg,
+            t0 + Duration::from_millis(32),
+        );
+        // Exponential decay composes over dt, so the same elapsed time lands in the
+        // same place however it is subdivided.
+        assert!((one.pos.unwrap().0 - two.pos.unwrap().0).abs() < 0.5);
+    }
+
+    #[test]
+    fn caret_settles_within_half_a_pixel() {
+        let cfg = anim_cfg(1000.0);
+        let t0 = Instant::now();
+        let mut a = CaretAnim::new();
+        a.update((0.0, 0.0), CARET_H, CARET_KEY, &cfg, t0);
+        // Sit just under a pixel from the target while in flight; the next step
+        // crosses the half-pixel threshold and snaps exactly, with no asymptotic
+        // tail.
+        a.pos = Some((99.7, 0.0));
+        a.in_flight = true;
+        a.last_tick = Some(t0);
+        a.update(
+            (100.0, 0.0),
+            CARET_H,
+            CARET_KEY,
+            &cfg,
+            t0 + Duration::from_millis(16),
+        );
+        assert_eq!(a.pos, Some((100.0, 0.0)));
+        assert!(!a.in_flight());
+    }
+
+    #[test]
+    fn caret_requested_snap_lands_at_target() {
+        let cfg = anim_cfg(1000.0);
+        let t0 = Instant::now();
+        let mut a = CaretAnim::new();
+        a.update((0.0, 0.0), CARET_H, CARET_KEY, &cfg, t0);
+        a.update((50.0, 0.0), CARET_H, CARET_KEY, &cfg, t0); // in flight
+        a.request_snap();
+        a.update((50.0, 0.0), CARET_H, CARET_KEY, &cfg, t0);
+        assert_eq!(a.pos, Some((50.0, 0.0)));
+        assert!(!a.in_flight());
+    }
+
+    #[test]
+    fn caret_jump_beyond_cap_snaps() {
+        let cfg = anim_cfg(6.0); // cap = 6 * 20px = 120px
+        let t0 = Instant::now();
+        let mut a = CaretAnim::new();
+        a.update((0.0, 0.0), CARET_H, CARET_KEY, &cfg, t0);
+        a.update((500.0, 0.0), CARET_H, CARET_KEY, &cfg, t0); // 500px > cap
+        assert_eq!(a.pos, Some((500.0, 0.0)));
+        assert!(!a.in_flight());
+    }
+
+    #[test]
+    fn caret_dt_is_capped_and_never_overshoots() {
+        let cfg = anim_cfg(1000.0);
+        let t0 = Instant::now();
+        // A capped (50ms) step.
+        let mut capped = CaretAnim::new();
+        capped.update((0.0, 0.0), CARET_H, CARET_KEY, &cfg, t0);
+        capped.update((400.0, 0.0), CARET_H, CARET_KEY, &cfg, t0);
+        capped.update(
+            (400.0, 0.0),
+            CARET_H,
+            CARET_KEY,
+            &cfg,
+            t0 + Duration::from_millis(50),
+        );
+        // A huge elapsed duration clamps to the same cap.
+        let mut huge = CaretAnim::new();
+        huge.update((0.0, 0.0), CARET_H, CARET_KEY, &cfg, t0);
+        huge.update((400.0, 0.0), CARET_H, CARET_KEY, &cfg, t0);
+        huge.update(
+            (400.0, 0.0),
+            CARET_H,
+            CARET_KEY,
+            &cfg,
+            t0 + Duration::from_secs(10),
+        );
+        assert!((capped.pos.unwrap().0 - huge.pos.unwrap().0).abs() < 1e-3);
+        // The exponential step approaches but never passes the target.
+        assert!(huge.pos.unwrap().0 < 400.0);
+    }
+
+    #[test]
+    fn caret_smear_spans_pos_to_target_and_is_the_bar_at_rest() {
+        let cfg = anim_cfg(1000.0);
+        let mut a = CaretAnim::new();
+        a.update((100.0, 40.0), CARET_H, CARET_KEY, &cfg, Instant::now());
+        // At rest the box is exactly the caret bar.
+        let rest = a.smear_rect((100.0, 40.0), CARET_H, 2);
+        assert_eq!(
+            rest,
+            Rect {
+                x: 100,
+                y: 40,
+                w: 2,
+                h: 20
+            }
+        );
+        // A rightward in-flight state spans pos.x to target.x + CARET_WIDTH.
+        a.pos = Some((100.0, 40.0));
+        let smear = a.smear_rect((150.0, 40.0), CARET_H, 2);
+        assert_eq!(smear.x, 100);
+        assert_eq!(smear.x + smear.w, 152);
+        assert_eq!(smear.y, 40);
+        assert_eq!(smear.h, 20);
+    }
+
+    #[test]
+    fn caret_disabled_is_the_plain_bar() {
+        let cfg = CaretConfig {
+            animate: false,
+            rate: 40.0,
+            max_jump_lines: 6.0,
+        };
+        let t0 = Instant::now();
+        let mut a = CaretAnim::new();
+        a.update((100.0, 40.0), CARET_H, CARET_KEY, &cfg, t0);
+        assert!(!a.in_flight());
+        // With animation off the paint rect is the same Fill bar as the pre-animation
+        // path (the caller draws radius zero because it never flies).
+        assert_eq!(
+            a.smear_rect((100.0, 40.0), CARET_H, 2),
+            Rect {
+                x: 100,
+                y: 40,
+                w: 2,
+                h: 20
+            }
+        );
+        // A move snaps immediately; it never eases.
+        a.update(
+            (300.0, 40.0),
+            CARET_H,
+            CARET_KEY,
+            &cfg,
+            t0 + Duration::from_millis(16),
+        );
+        assert_eq!(a.pos, Some((300.0, 40.0)));
+        assert!(!a.in_flight());
+    }
+
+    #[test]
+    fn caret_exposes_a_retry_only_while_in_flight() {
+        let cfg = anim_cfg(1000.0);
+        let t0 = Instant::now();
+        let mut a = CaretAnim::new();
+        a.update((0.0, 0.0), CARET_H, CARET_KEY, &cfg, t0);
+        assert!(a.retry_at().is_none()); // settled
+        a.update((80.0, 0.0), CARET_H, CARET_KEY, &cfg, t0); // in flight
+        assert!(a.retry_at().is_some_and(|at| at > t0));
+    }
+
+    #[test]
+    fn caret_move_after_idle_starts_the_clock_fresh() {
+        let cfg = anim_cfg(1000.0);
+        let t0 = Instant::now();
+        let mut a = CaretAnim::new();
+        a.update((0.0, 0.0), CARET_H, CARET_KEY, &cfg, t0);
+        // A move long after settling: the first frame keeps the old position and just
+        // starts the clock, so no animation time is consumed by the idle stretch.
+        let t1 = t0 + Duration::from_secs(100);
+        a.update((60.0, 0.0), CARET_H, CARET_KEY, &cfg, t1);
+        assert_eq!(a.pos, Some((0.0, 0.0)));
+        assert!(a.in_flight());
+        assert_eq!(a.last_tick, Some(t1));
+        // The next tick uses the real 16ms elapsed, not the 100s idle, so it eases
+        // instead of leaping most of the way.
+        a.update(
+            (60.0, 0.0),
+            CARET_H,
+            CARET_KEY,
+            &cfg,
+            t1 + Duration::from_millis(16),
+        );
+        let moved = a.pos.unwrap().0;
+        assert!(moved > 0.0 && moved < 40.0);
+    }
+
+    #[test]
+    fn caret_request_snap_clears_flight_immediately() {
+        let cfg = anim_cfg(1000.0);
+        let t0 = Instant::now();
+        let mut a = CaretAnim::new();
+        a.update((0.0, 0.0), CARET_H, CARET_KEY, &cfg, t0);
+        a.update((80.0, 0.0), CARET_H, CARET_KEY, &cfg, t0); // in flight
+        assert!(a.in_flight());
+        // A hidden or off-window caret requests a snap; flight and timing clear at
+        // once so it cannot keep scheduling retries.
+        a.request_snap();
+        assert!(!a.in_flight());
+        assert!(a.retry_at().is_none());
     }
 }

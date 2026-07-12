@@ -23,6 +23,38 @@ pub struct Config {
     /// grown to at least this many times its size (never below the font's own line
     /// height), and the extra space falls below the text. The default is 1.5.
     pub line_height_scale: f32,
+    /// Caret motion: whether the caret eases toward its target and how it feels.
+    pub caret: CaretConfig,
+}
+
+/// Caret motion settings: one master toggle plus the two knobs that actually change
+/// the feel. When [`Self::animate`] is off the caret snaps cell to cell as before.
+#[derive(Clone, Copy, Debug)]
+pub struct CaretConfig {
+    /// Whether the caret eases toward its target and stretches along the way.
+    pub animate: bool,
+    /// Exponential decay constant, 1/second. Higher is snappier and shortens the
+    /// smear; this is the single feel knob.
+    pub rate: f32,
+    /// Largest animated target distance in caret heights. A larger jump (jump to
+    /// end, a click across the document) settles immediately rather than drawing a
+    /// document-long streak.
+    pub max_jump_lines: f32,
+}
+
+impl Default for CaretConfig {
+    fn default() -> Self {
+        Self {
+            // On, to dogfood the smooth caret on real content.
+            animate: true,
+            // 30 to 50 reads as visible but not sluggish; 40 is a good start.
+            rate: 40.0,
+            // Wide enough that an Enter, Home/End, or a click across a full-width
+            // line still animates (a content column is tens of caret heights wide);
+            // only a document-spanning jump is farther than this and snaps.
+            max_jump_lines: 50.0,
+        }
+    }
 }
 
 impl Default for Config {
@@ -33,6 +65,7 @@ impl Default for Config {
             // above that also matches the browser's edge lightening.
             glyph_coverage_gamma: 2.0,
             line_height_scale: 1.5,
+            caret: CaretConfig::default(),
         }
     }
 }

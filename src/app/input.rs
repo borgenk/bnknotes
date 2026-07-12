@@ -4,7 +4,7 @@ use std::time::{Duration, Instant};
 
 use super::{State, TabDrag, TabHover};
 use crate::find;
-use crate::pane::{Columns, EditorPane, Focus, Hit, SPLITTER};
+use crate::pane::{CaretAnim, Columns, EditorPane, Focus, Hit, SPLITTER};
 use crate::platform::error::{Error, Result};
 use crate::platform::ffi;
 use crate::platform::freetype::Fonts;
@@ -237,8 +237,13 @@ impl State {
             }
             wl_keyboard::EV_ENTER => {
                 self.last_serial = r.u32()?;
-                // Regained keyboard focus: show the caret and resume its blink.
+                // Regained keyboard focus: show the caret and resume its blink. Snap
+                // the focused pane's caret so restored focus never resumes a stale,
+                // mid-flight smear.
                 self.focused = true;
+                if let Focus::Editor(i) = self.focus {
+                    self.editors[i].request_caret_snap();
+                }
                 self.bump_caret();
                 self.dirty = true;
             }
@@ -259,8 +264,14 @@ impl State {
     /// Move keyboard focus to editor pane `i`, remembering it as the last active
     /// editor, refreshing the title for its note, and marking a repaint.
     fn focus_pane(&mut self, i: usize) {
+        // Snap the caret only when focus actually crosses panes; a click within the
+        // already-focused pane is a navigation move that should still smear.
+        let crossed = self.focus != Focus::Editor(i);
         self.focus = Focus::Editor(i);
         self.last_editor = i;
+        if crossed {
+            self.editors[i].request_caret_snap();
+        }
         self.refresh_title();
         self.dirty = true;
     }
@@ -1171,6 +1182,14 @@ impl State {
             return;
         }
         let now = Instant::now();
+        // A caret still easing toward its target must not blink out mid-motion: hold
+        // it shown and defer the next toggle until it settles. Covers slow rates and
+        // a target that keeps moving while the user types.
+        if self.drawable_caret_anim().is_some_and(CaretAnim::in_flight) {
+            self.caret_visible = true;
+            self.caret_blink_at = Some(now + CARET_BLINK);
+            return;
+        }
         match self.caret_blink_at {
             None => self.caret_blink_at = Some(now + CARET_BLINK),
             Some(at) if at <= now => {

@@ -34,9 +34,10 @@ use crate::dev::sys;
 use crate::find::FindState;
 use crate::layout::{ImageUi, Layout, LayoutCtx, LineIndex};
 use crate::markdown;
-use crate::paint::{build_display_list, PaintParams};
+use crate::paint::{build_display_list, CaretPaint, PaintParams};
 use crate::platform::error::{Error, Result};
 use crate::platform::freetype::Fonts;
+use crate::platform::geom::Rect;
 use crate::render::image::{Image, ImageStore};
 use crate::rope::Rope;
 use crate::scale::Scale;
@@ -310,8 +311,17 @@ fn params(scroll_y: i32, selection: Option<(usize, usize)>) -> PaintParams<'stat
         body_size: FONT_SIZE,
         selection,
         table_hover: None,
-        cursor: 0,
-        caret_visible: true,
+        // A settled caret bar: one Fill command, matching the app's steady state so
+        // the batch benchmark counts the caret exactly as a live frame does.
+        caret: Some(CaretPaint {
+            rect: Rect {
+                x: MARGIN,
+                y: MARGIN,
+                w: 2,
+                h: FONT_SIZE as i32,
+            },
+            radius: 0,
+        }),
         find: None,
     }
 }

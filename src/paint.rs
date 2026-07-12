@@ -43,14 +43,26 @@ pub(crate) struct PaintParams<'a> {
     /// body ([`crate::theme::FONT_SIZE`] at scale 1.0).
     pub body_size: u32,
     pub selection: Option<(usize, usize)>,
-    pub cursor: usize,
-    pub caret_visible: bool,
+    /// The caret to draw this frame, already reduced to a content-space rectangle by
+    /// the caller's caret animation; `None` when the caret is hidden (unfocused,
+    /// blinked off, off-window, or an empty pane).
+    pub caret: Option<CaretPaint>,
     /// The find bar's paint state while it is open; `None` draws no bar and no
     /// match highlights.
     pub find: Option<FindPaint<'a>>,
     /// The table add-row / add-column strip under the pointer, drawn as a hover
     /// affordance; `None` when the pointer is not over one.
     pub table_hover: Option<crate::layout::TableButton>,
+}
+
+/// The caret reduced to what the painter draws: its content-space (pre-scroll)
+/// rectangle and a corner radius. A zero radius is the plain caret bar (drawn as a
+/// [`DrawCmd::Fill`], the pre-animation appearance); a positive radius is a smear
+/// mid-motion (a rounded rectangle). The animation lives on the pane, so the
+/// painter holds no caret state.
+pub(crate) struct CaretPaint {
+    pub rect: Rect,
+    pub radius: i32,
 }
 
 /// What the painter needs from an open find bar: the [`FindState`] itself,
@@ -692,8 +704,8 @@ pub(crate) fn build_display_list(
     if let Some(button) = p.table_hover {
         painter.table_button(button);
     }
-    if p.caret_visible {
-        painter.caret(p.cursor);
+    if let Some(caret) = &p.caret {
+        painter.caret(caret);
     }
     // The find bar and its match ticks float over everything else, so they go last.
     if let Some(find) = &p.find {
@@ -1281,18 +1293,27 @@ impl<'a> Painter<'a> {
         self.push_text(face, x, baseline, MARKER_COLOR, "+".to_string(), m);
     }
 
-    /// The caret, drawn only on the visible half of its blink cycle.
-    fn caret(&mut self, cursor: usize) {
-        let (cx, cy, ch) = self.layout.caret(self.fonts, self.rope, cursor);
-        self.list.push(DrawCmd::Fill {
-            rect: Rect {
-                x: cx,
-                y: cy - self.scroll_y,
-                w: self.scale.px(CARET_WIDTH),
-                h: ch,
-            },
-            color: CARET_COLOR,
-        });
+    /// The caret, from the pre-scroll rectangle its animation produced. A zero
+    /// radius is the plain bar (a `Fill`, the pre-animation appearance); a positive
+    /// radius is a smear mid-motion (a rounded rectangle). Culled when it scrolls
+    /// out of the viewport.
+    fn caret(&mut self, caret: &CaretPaint) {
+        let Some(rect) = self.screen(caret.rect) else {
+            return;
+        };
+        if caret.radius > 0 {
+            self.list.push(DrawCmd::RoundRect {
+                rect,
+                color: CARET_COLOR,
+                radius: caret.radius,
+                corners: display::RoundedCorners::Both,
+            });
+        } else {
+            self.list.push(DrawCmd::Fill {
+                rect,
+                color: CARET_COLOR,
+            });
+        }
     }
 
     /// The right-edge match tick strip, floating over the content.
@@ -1735,8 +1756,7 @@ mod tests {
             scale: Scale::ONE,
             body_size: FONT_SIZE,
             selection: None,
-            cursor: 0,
-            caret_visible: false,
+            caret: None,
             find: None,
             table_hover: None,
         }
@@ -2037,8 +2057,7 @@ mod tests {
             body_size: FONT_SIZE,
             // The app mirrors the current match into the selection.
             selection: Some((8, 11)),
-            cursor: 11,
-            caret_visible: false,
+            caret: None,
             find: build_find_paint(&bar, &tops, doc_h),
             table_hover: None,
         };
@@ -2093,8 +2112,7 @@ mod tests {
             scale: Scale::ONE,
             body_size: FONT_SIZE,
             selection: Some((0, 3)),
-            cursor: 3,
-            caret_visible: false,
+            caret: None,
             find: build_find_paint(&bar, &tops, doc_h),
             table_hover: None,
         };

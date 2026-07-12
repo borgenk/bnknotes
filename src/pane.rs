@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 use crate::config::CaretConfig;
 use crate::file::{self, FileFormat};
 use crate::find::FindState;
-use crate::layout::{ImageUi, Layout, LayoutCtx, LineIndex, RevealAdjust, NO_REVEAL};
+use crate::layout::{ImageUi, Layout, LayoutCtx, LineIndex, RevealAdjust};
 use crate::markdown;
 use crate::platform::error::{Error, Result};
 use crate::platform::freetype::Fonts;
@@ -435,8 +435,9 @@ fn load(path: &Path) -> Result<(String, FileFormat)> {
 /// version, surface width, body font size, the display scale (as its 120ths
 /// factor, so a DPI change reflows even at an unchanged column width and body
 /// size), the active range's logical line span (the marker reveal depends only on
-/// which lines the range touches, not the exact byte offsets), and the selected /
-/// raw-pinned image (by line-start offset). A scroll, idle redraw, or cursor move
+/// which lines the range touches, not the exact byte offsets), the selected /
+/// raw-pinned image (by line-start offset), and whether a drag is in progress
+/// (which holds image sources collapsed). A scroll, idle redraw, or cursor move
 /// within one line leaves all of these unchanged and reuses the cached layout.
 type LayoutKey = (
     u64,
@@ -448,6 +449,7 @@ type LayoutKey = (
     usize,
     Option<usize>,
     Option<usize>,
+    bool,
 );
 
 /// The inputs the line-metrics index depends on: content version, column x and
@@ -720,22 +722,24 @@ impl EditorPane {
     }
 
     /// The active range for live-preview marker reveal: the live selection, or the
-    /// bare cursor when there is none. A drag in progress reveals nothing
-    /// ([`NO_REVEAL`]): the whole document stays rendered while selecting, and the
-    /// markers under the selection reveal only once the button is released.
+    /// bare cursor when there is none. Markers reveal even mid-drag, so a selection
+    /// shows the raw source it grabs (the ``` of a fenced block, a heading's `#`)
+    /// as it sweeps over it, rather than dragging across blank collapsed glyphs.
+    /// Revealing a text marker never reflows the line, so this is safe under the
+    /// pointer; image sources, which would reflow, are held collapsed instead (see
+    /// [`Self::image_ui`] and [`Self::reveal_adjust`]).
     pub(crate) fn reveal_range(&self) -> (usize, usize) {
-        if self.selecting {
-            return NO_REVEAL;
-        }
         let cursor = self.text.cursor();
         self.text.selection().unwrap_or((cursor, cursor))
     }
 
-    /// The per-image UI state (selected border, pinned raw source) for the layout.
+    /// The per-image UI state (selected border, pinned raw source, drag-freeze) for
+    /// the layout.
     pub(crate) fn image_ui(&self) -> ImageUi {
         ImageUi {
             selected: self.selected_image,
             raw: self.raw_image,
+            dragging: self.selecting,
         }
     }
 
@@ -761,11 +765,12 @@ impl EditorPane {
             return adjust;
         };
         let rope = self.text.rope();
-        let (lo, hi) = self.reveal_range();
-        // A drag suppresses selection-driven reveal (NO_REVEAL touches no line), so
-        // no image source expands while selecting; a corner-pinned source below
-        // still does.
-        if (lo, hi) != NO_REVEAL {
+        // A drag holds every image source collapsed so the geometry under the
+        // pointer stays put (matching the window build's `image_ui.dragging`); only
+        // a corner-pinned source below still expands. Off a drag the reveal range's
+        // ends expand their image sources.
+        if !self.selecting {
+            let (lo, hi) = self.reveal_range();
             let l0 = rope.byte_to_line(lo);
             adjust.push(l0, index.reveal_extra(l0));
             let l1 = rope.byte_to_line(hi);
@@ -879,12 +884,10 @@ impl EditorPane {
     pub(crate) fn ensure_window(&mut self, fonts: &Fonts, rect: Rect) {
         let active = self.reveal_range();
         // Reveal depends only on which lines the active range touches, so the key
-        // is coarsened to lines. NO_REVEAL is kept verbatim: mapping it through
-        // byte_to_line would clamp to the last line and could collide with a real
-        // cursor there, so a drag starting on that line would not un-reveal it.
-        let active_lines = if active == NO_REVEAL {
-            NO_REVEAL
-        } else {
+        // is coarsened to lines. `selecting` rides the key because it holds image
+        // sources collapsed (`image_ui.dragging`), so releasing a drag over an image
+        // must rebuild to let that source expand.
+        let active_lines = {
             let rope = self.text.rope();
             (rope.byte_to_line(active.0), rope.byte_to_line(active.1))
         };
@@ -898,6 +901,7 @@ impl EditorPane {
             active_lines.1,
             self.selected_image,
             self.raw_image,
+            self.selecting,
         );
         let adjust = self.reveal_adjust();
         let (vis_top, vis_bot, over, n) = {
@@ -1628,7 +1632,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_drag_suppresses_reveal_until_release() {
+    fn reveal_follows_the_selection_through_a_drag() {
         let mut ed = EditorPane::empty();
         ed.text.insert_str("# Title\nbody");
         // A settled selection over the heading is its own reveal range, so the
@@ -1636,11 +1640,10 @@ mod tests {
         ed.text.set_cursor(0, false);
         ed.text.set_cursor(7, true);
         assert_eq!(ed.reveal_range(), (0, 7));
-        // While the drag is live, nothing reveals: the whole document stays
-        // rendered, headings included.
+        // A live drag still reveals the selection, so the source you are grabbing
+        // stays visible under the pointer rather than blanking out.
         ed.selecting = true;
-        assert_eq!(ed.reveal_range(), NO_REVEAL);
-        // Releasing lets the reveal catch up to the settled selection.
+        assert_eq!(ed.reveal_range(), (0, 7));
         ed.selecting = false;
         assert_eq!(ed.reveal_range(), (0, 7));
     }
@@ -1671,11 +1674,11 @@ mod tests {
     }
 
     #[test]
-    fn a_drag_beginning_on_the_last_line_still_un_reveals_it() {
-        // A heading on the final line: with the cursor there it reveals its `#`.
-        // Starting a drag from it must collapse the marker again, though NO_REVEAL
-        // and a last-line cursor both fold to the last line index, so the layout
-        // cache key must keep them apart.
+    fn a_drag_over_a_marker_keeps_it_revealed() {
+        // Dragging a selection across a heading keeps its `#` shown, so the source
+        // being grabbed stays visible under the pointer rather than blanking out.
+        // The heading is on the final line, where a last-line cursor and its
+        // selection both fold to the same line index, so the rebuild still lands.
         let fonts = Fonts::new(&markdown::all_sizes(FONT_SIZE)).expect("a default font");
         let text = "body line\n# Heading";
         let heading_start = text.find("# Heading").expect("heading present");
@@ -1696,12 +1699,56 @@ mod tests {
             "cursor on the heading reveals its '#'"
         );
 
-        // A drag now begins on that same line; the reveal must switch off.
+        // A drag now extends a selection across that line; the marker stays shown.
         pane.selecting = true;
+        pane.text.set_cursor(text.len(), true);
         pane.ensure_layout(&fonts, rect);
         assert!(
-            heading_marker_hidden(&pane, heading_start),
-            "a live drag collapses the heading marker again"
+            !heading_marker_hidden(&pane, heading_start),
+            "a live drag keeps the heading marker revealed"
+        );
+    }
+
+    /// Whether the fenced-block delimiter line starting at `fence_start` shows its
+    /// ``` backticks (any visible marker run) in the pane's built layout.
+    fn fence_backticks_shown(pane: &EditorPane, fence_start: usize) -> bool {
+        let layout = pane.layout_cache.as_ref().expect("a built layout");
+        let line = layout
+            .lines()
+            .iter()
+            .find(|l| l.start == fence_start)
+            .expect("the fence's visual line");
+        layout
+            .run_slice(line)
+            .iter()
+            .any(|r| matches!(r.kind, markdown::SpanKind::Marker) && r.visible)
+    }
+
+    #[test]
+    fn dragging_a_selection_over_a_fence_keeps_the_backticks_visible() {
+        // The reported bug: selecting the ``` of a fenced block used to blank the
+        // whole delimiter line for the length of the drag, so you dragged over
+        // nothing and the backticks only reappeared on release.
+        let fonts = Fonts::new(&markdown::all_sizes(FONT_SIZE)).expect("a default font");
+        let text = "```\ncode\n```\n";
+        let rect = Rect {
+            x: 0,
+            y: 0,
+            w: 600,
+            h: 400,
+        };
+        let mut pane = EditorPane::empty();
+        pane.text = TextBuffer::from_text(text.to_string());
+        pane.set_scale(Scale::ONE, FONT_SIZE);
+
+        // Anchor at the top and drag down across the opening fence.
+        pane.text.set_cursor(0, false);
+        pane.selecting = true;
+        pane.text.set_cursor(text.len(), true);
+        pane.ensure_layout(&fonts, rect);
+        assert!(
+            fence_backticks_shown(&pane, 0),
+            "the ``` stays visible while the drag sweeps over it"
         );
     }
 

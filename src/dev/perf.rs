@@ -245,14 +245,23 @@ fn measure() -> Result<Vec<Sample>> {
     // frame time is only observable via BNKNOTES_STATS on a live run.
     let mut glyph_cache = crate::render::gpu::GlyphCache::new();
     // Warm the atlases so the steady state (no uploads) is what is measured.
-    let _ =
-        crate::render::gpu::build_frame(&fonts, &[&images], &frame_list, &mut glyph_cache, &|_| {
-            true
-        });
+    let _ = crate::render::gpu::build_frame(
+        &fonts,
+        &[&images],
+        &frame_list,
+        &mut glyph_cache,
+        &|_| true,
+        1.0,
+    );
     out.push(sample("gpu_batch_frame", 500, || {
-        crate::render::gpu::build_frame(&fonts, &[&images], &frame_list, &mut glyph_cache, &|_| {
-            true
-        })
+        crate::render::gpu::build_frame(
+            &fonts,
+            &[&images],
+            &frame_list,
+            &mut glyph_cache,
+            &|_| true,
+            1.0,
+        )
         .vertices
         .len()
     }));
@@ -293,6 +302,7 @@ fn measure() -> Result<Vec<Sample>> {
             &image_list,
             &mut glyph_cache,
             &|_| false,
+            1.0,
         )
         .image_uploads
         .len()
@@ -587,7 +597,14 @@ pub fn run_lab(args: &[String]) -> Result<()> {
         let warm = Layout::build(&fonts, &rope, MARGIN, MARGIN, wrap, FONT_SIZE, (0, 0));
         let frame = build_display_list(&fonts, &warm, &rope, &params(0, None));
         let mut glyphs = crate::render::gpu::GlyphCache::new();
-        let _ = crate::render::gpu::build_frame(&fonts, &[&images], &frame, &mut glyphs, &|_| true);
+        let _ = crate::render::gpu::build_frame(
+            &fonts,
+            &[&images],
+            &frame,
+            &mut glyphs,
+            &|_| true,
+            1.0,
+        );
 
         // Windowed layout + incremental index: the per-cursor-move and per-keystroke
         // costs that replace a full `layout` rebuild. A warm index, a viewport band,

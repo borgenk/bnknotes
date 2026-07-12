@@ -293,8 +293,17 @@ pub fn font_size(style: LineStyle, base: u32) -> u32 {
     (base * tenths + 5) / 10
 }
 
+/// The pixel size a fenced code block renders at, a step below the body `base`
+/// (0.875x): monospace at the full body size reads noticeably larger than the
+/// surrounding prose, so the block sits a touch smaller. Rounded to the nearest
+/// pixel with the same integer-tenths style the heading scales use.
+pub fn code_size(base: u32) -> u32 {
+    (base * 7 + 4) / 8
+}
+
 /// Every distinct pixel size the styles use at body size `base`, so the font set
-/// can be opened up front. Body first, then each heading size not already seen.
+/// can be opened up front. Body first, then each heading size, then the code size,
+/// each added only if not already seen.
 pub fn all_sizes(base: u32) -> Vec<u32> {
     let mut sizes = vec![font_size(LineStyle::Body, base)];
     for level in 1..=6u8 {
@@ -302,6 +311,10 @@ pub fn all_sizes(base: u32) -> Vec<u32> {
         if !sizes.contains(&size) {
             sizes.push(size);
         }
+    }
+    let code = code_size(base);
+    if !sizes.contains(&code) {
+        sizes.push(code);
     }
     sizes
 }
@@ -1142,6 +1155,19 @@ mod tests {
         seen.sort_unstable();
         seen.dedup();
         assert_eq!(seen.len(), sizes.len(), "no duplicate sizes");
+    }
+
+    #[test]
+    fn code_size_is_a_step_below_body_and_is_opened() {
+        // 0.875x, rounded to the nearest pixel: 14 -> 12, 16 -> 14, 32 -> 28.
+        assert_eq!(code_size(14), 12);
+        assert_eq!(code_size(16), 14);
+        assert_eq!(code_size(32), 28);
+        assert!(code_size(32) < 32, "code sits below body");
+        assert!(
+            all_sizes(14).contains(&code_size(14)),
+            "the code face size is opened up front"
+        );
     }
 
     // --- Lists & blockquotes ----------------------------------------------

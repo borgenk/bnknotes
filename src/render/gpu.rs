@@ -322,6 +322,7 @@ pub fn build_frame(
     list: &[DrawCmd],
     cache: &mut GlyphCache,
     known_images: &dyn Fn(&ImageKey) -> bool,
+    code_glyph_gamma: f32,
 ) -> FrameData {
     loop {
         let glyphs_gen = cache.glyphs.generation;
@@ -334,6 +335,7 @@ pub fn build_frame(
             batches: Vec::new(),
             image_uploads: Vec::new(),
             known_images,
+            code_glyph_gamma,
         };
         for cmd in list {
             b.command(cmd);
@@ -366,6 +368,10 @@ struct Batcher<'a> {
     batches: Vec<Batch>,
     image_uploads: Vec<(ImageKey, Vec<u32>)>,
     known_images: &'a dyn Fn(&ImageKey) -> bool,
+    /// Per-glyph mask gamma for code runs, baked into the vertex `extra.x` so the
+    /// shader thins them less than the prose gamma it carries as a push constant.
+    /// Zero in the vertex means "use the push default"; a code run writes this.
+    code_glyph_gamma: f32,
 }
 
 impl Batcher<'_> {
@@ -501,22 +507,30 @@ impl Batcher<'_> {
     /// `shape::text_advance`, so the quads land where layout measured.
     fn text(&mut self, face_key: FaceKey, x: i32, baseline: i32, text: &str, color: u32) {
         let face = self.fonts.face_for(face_key);
+        // Code runs thin less than prose (their small stems read as faint under the
+        // prose gamma), so a code run overrides the push-constant gamma per glyph.
+        // Zero means "use the push default", the prose path.
+        let gamma = match face_key {
+            FaceKey::Code { .. } => self.code_glyph_gamma,
+            FaceKey::Prose { .. } => 0.0,
+        };
         let mut pen = x as f32;
         if text.is_ascii() {
             for ch in text.chars() {
-                pen = self.scalar(face, face_key, ch, pen, baseline, color);
+                pen = self.scalar(face, face_key, ch, pen, baseline, color, gamma);
             }
             return;
         }
         for (_, cluster) in grapheme::graphemes(text) {
             match self.packed_cluster(face, face_key, cluster) {
                 Some(packed) => {
-                    self.emit_glyph(&packed, pen, baseline, MODE_EMOJI, 0);
+                    // Emoji carry their own color and ignore the mask gamma.
+                    self.emit_glyph(&packed, pen, baseline, MODE_EMOJI, 0, 0.0);
                     pen += packed.advance;
                 }
                 None => {
                     for ch in cluster.chars() {
-                        pen = self.scalar(face, face_key, ch, pen, baseline, color);
+                        pen = self.scalar(face, face_key, ch, pen, baseline, color, gamma);
                     }
                 }
             }
@@ -527,6 +541,7 @@ impl Batcher<'_> {
     /// returning the advanced pen. Its placement is cached beside the atlas
     /// slot, so a steady-state frame emits the quad without re-rasterizing the
     /// glyph.
+    #[allow(clippy::too_many_arguments)]
     fn scalar(
         &mut self,
         face: &Face,
@@ -535,9 +550,10 @@ impl Batcher<'_> {
         pen: f32,
         baseline: i32,
         color: u32,
+        gamma: f32,
     ) -> f32 {
         let packed = self.packed_scalar(face, face_key, ch);
-        self.emit_glyph(&packed, pen, baseline, MODE_GLYPH, color);
+        self.emit_glyph(&packed, pen, baseline, MODE_GLYPH, color, gamma);
         pen + packed.advance
     }
 
@@ -612,7 +628,16 @@ impl Batcher<'_> {
 
     /// Emit a cached glyph's textured quad. An inkless or unplaced glyph (slot
     /// `None`) draws nothing; the caller advances the pen regardless.
-    fn emit_glyph(&mut self, packed: &PackedGlyph, pen: f32, baseline: i32, mode: u32, color: u32) {
+    #[allow(clippy::too_many_arguments)]
+    fn emit_glyph(
+        &mut self,
+        packed: &PackedGlyph,
+        pen: f32,
+        baseline: i32,
+        mode: u32,
+        color: u32,
+        gamma: f32,
+    ) {
         let Some(slot) = packed.slot else {
             return;
         };
@@ -622,7 +647,10 @@ impl Batcher<'_> {
             w: slot.w as i32,
             h: slot.h as i32,
         };
-        self.quad(rect, mode, color, [slot.x as f32, slot.y as f32], [0.0; 4]);
+        // extra.x carries the per-glyph mask gamma override (0 = use the push
+        // default); the shader reads it only for MODE_GLYPH.
+        let extra = [gamma, 0.0, 0.0, 0.0];
+        self.quad(rect, mode, color, [slot.x as f32, slot.y as f32], extra);
     }
 
     /// An image quad over its own texture, attaching the bitmap when the
@@ -725,7 +753,7 @@ mod tests {
             },
             color: 0x00ff_0000,
         }];
-        let f = build_frame(&fonts, &[&images], &list, &mut cache, &|_| false);
+        let f = build_frame(&fonts, &[&images], &list, &mut cache, &|_| false, 1.0);
         assert_eq!(f.vertices.len(), 6);
         assert_eq!(f.batches.len(), 1);
         assert_eq!(
@@ -740,6 +768,56 @@ mod tests {
         assert_eq!(f.vertices[0].pos, [1.0, 2.0]);
         assert_eq!(f.vertices[4].pos, [11.0, 22.0]);
         assert_eq!(f.vertices[0].color, [1.0, 0.0, 0.0, 1.0]);
+    }
+
+    #[test]
+    fn code_glyphs_carry_the_gamma_override_prose_does_not() {
+        // One size opens both the prose and code faces at 16.
+        let fonts = Fonts::new(&[16]).expect("default font");
+        let images = ImageStore::new(None);
+        let mut cache = GlyphCache::new();
+        let bounds = Rect {
+            x: 0,
+            y: 0,
+            w: 100,
+            h: 20,
+        };
+        let text = |face| DrawCmd::Text {
+            bounds,
+            x: 0,
+            baseline: 16,
+            face,
+            color: 0x00ff_ffff,
+            text: "xy".to_string(),
+        };
+        const CODE_GAMMA: f32 = 1.3;
+        let list = vec![
+            text(FaceKey::Prose {
+                size: 16,
+                style: crate::platform::freetype::FontStyle::Regular,
+            }),
+            text(FaceKey::Code { size: 16 }),
+        ];
+        let f = build_frame(
+            &fonts,
+            &[&images],
+            &list,
+            &mut cache,
+            &|_| false,
+            CODE_GAMMA,
+        );
+        // Every glyph vertex is MODE_GLYPH; prose ones carry a zero override (the
+        // shader then uses its push default), code ones carry the code gamma.
+        let glyphs: Vec<&Vertex> = f.vertices.iter().filter(|v| v.mode == MODE_GLYPH).collect();
+        assert!(!glyphs.is_empty(), "some glyph quads were emitted");
+        assert!(
+            glyphs.iter().any(|v| v.extra[0] == 0.0),
+            "prose glyphs defer to the push default (extra.x == 0)"
+        );
+        assert!(
+            glyphs.iter().any(|v| v.extra[0] == CODE_GAMMA),
+            "code glyphs carry the per-run gamma override"
+        );
     }
 
     #[test]
@@ -763,14 +841,14 @@ mod tests {
             color: 0x00ff_ffff,
             text: "abcabc".to_string(),
         }];
-        let f1 = build_frame(&fonts, &[&images], &list, &mut cache, &|_| false);
+        let f1 = build_frame(&fonts, &[&images], &list, &mut cache, &|_| false, 1.0);
         assert!(f1.glyph_upload.is_some(), "first frame uploads new glyphs");
         assert!(
             !f1.vertices.is_empty(),
             "glyph quads were emitted ({} vertices)",
             f1.vertices.len()
         );
-        let f2 = build_frame(&fonts, &[&images], &list, &mut cache, &|_| false);
+        let f2 = build_frame(&fonts, &[&images], &list, &mut cache, &|_| false, 1.0);
         assert!(f2.glyph_upload.is_none(), "steady state uploads nothing");
         assert_eq!(f1.vertices, f2.vertices, "same list, same geometry");
     }
@@ -807,7 +885,7 @@ mod tests {
                 text: "hi".to_string(),
             },
         ];
-        let f = build_frame(&fonts, &[&images], &list, &mut cache, &|_| false);
+        let f = build_frame(&fonts, &[&images], &list, &mut cache, &|_| false, 1.0);
         assert_eq!(
             f.batches.len(),
             1,
@@ -834,7 +912,7 @@ mod tests {
             radius: 4,
             corners: RoundedCorners::Top,
         }];
-        let f = build_frame(&fonts, &[&images], &list, &mut cache, &|_| false);
+        let f = build_frame(&fonts, &[&images], &list, &mut cache, &|_| false, 1.0);
         assert_eq!(f.vertices.len(), 6);
         let v = &f.vertices[0];
         assert_eq!(v.mode, MODE_ROUND);
@@ -859,7 +937,7 @@ mod tests {
             color: 0x0011_2233,
             down: true,
         }];
-        let f = build_frame(&fonts, &[&images], &list, &mut cache, &|_| false);
+        let f = build_frame(&fonts, &[&images], &list, &mut cache, &|_| false, 1.0);
         assert_eq!(f.vertices.len(), 6);
         let v = &f.vertices[0];
         assert_eq!(v.mode, MODE_CHEVRON);
@@ -882,7 +960,7 @@ mod tests {
             radius: 0,
             corners: RoundedCorners::Both,
         }];
-        let f = build_frame(&fonts, &[&images], &list, &mut cache, &|_| false);
+        let f = build_frame(&fonts, &[&images], &list, &mut cache, &|_| false, 1.0);
         assert!(f.vertices.iter().all(|v| v.mode == MODE_SOLID));
     }
 
@@ -916,7 +994,7 @@ mod tests {
             },
             fill,
         ];
-        let f = build_frame(&fonts, &[&images], &list, &mut cache, &|_| false);
+        let f = build_frame(&fonts, &[&images], &list, &mut cache, &|_| false, 1.0);
         assert_eq!(f.batches.len(), 3, "solid / image / solid: {:?}", f.batches);
         // The texture is uploaded at the image's native 2x2 size (the GPU scales
         // it to the 8x8 quad); the key is that native size, so a resize reuses it.
@@ -926,7 +1004,7 @@ mod tests {
         assert_eq!(f.image_uploads[0].0, key);
         assert_eq!(f.image_uploads[0].1.len(), 4, "2x2 native bitmap");
         // A renderer that already has the texture gets no upload.
-        let f2 = build_frame(&fonts, &[&images], &list, &mut cache, &|k| *k == key);
+        let f2 = build_frame(&fonts, &[&images], &list, &mut cache, &|k| *k == key, 1.0);
         assert!(f2.image_uploads.is_empty());
         assert_eq!(f2.batches.len(), 3, "batches still split around the image");
     }
@@ -945,7 +1023,7 @@ mod tests {
             },
             path: "nope.png".to_string(),
         }];
-        let f = build_frame(&fonts, &[&images], &list, &mut cache, &|_| false);
+        let f = build_frame(&fonts, &[&images], &list, &mut cache, &|_| false, 1.0);
         assert!(f.vertices.is_empty());
         assert!(f.batches.is_empty());
         assert!(f.image_uploads.is_empty());
@@ -972,7 +1050,7 @@ mod tests {
             color: 0x00ff_ffff,
             text: "😀".to_string(),
         }];
-        let f = build_frame(&fonts, &[&images], &list, &mut cache, &|_| false);
+        let f = build_frame(&fonts, &[&images], &list, &mut cache, &|_| false, 1.0);
         // With an emoji font installed the cluster takes MODE_EMOJI; without
         // one it renders as per-character glyphs. Either way it must not
         // crash, and with color output there must be an emoji upload.

@@ -619,8 +619,9 @@ impl State {
                             // Selecting a heading from its text start takes the `#`
                             // marker with it.
                             self.editors[i].text.include_heading_marker();
-                            // The drag is over: reveal catches up to the settled
-                            // selection (suppressed while selecting).
+                            // The drag is over: image sources under the selection
+                            // ends were held collapsed while dragging and can now
+                            // expand, so force a redraw.
                             self.dirty = true;
                         }
                     }

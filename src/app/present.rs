@@ -485,6 +485,7 @@ impl State {
                 &new_list,
                 &mut self.presentation.glyphs,
                 &known,
+                self.code_glyph_gamma,
             );
             match self.presentation.explicit_sync.as_ref() {
                 Some(es) => {

@@ -110,7 +110,10 @@ void main() {
         // gamma-space stacks beside it, so raising coverage to this power lowers
         // partial-coverage alpha back to a matching weight. Solid pixels
         // (coverage 1) are unchanged, so color fills keep full strength.
-        float cov = pow(texelFetch(glyph_atlas, ivec2(v_uv), 0).r, push.glyph_coverage_gamma);
+        // v_extra.x overrides the push default per glyph (0 = use the default),
+        // so a code run can thin less than the prose beside it.
+        float gamma = v_extra.x > 0.0 ? v_extra.x : push.glyph_coverage_gamma;
+        float cov = pow(texelFetch(glyph_atlas, ivec2(v_uv), 0).r, gamma);
         out_color = vec4(srgb_to_linear(v_color.rgb), v_color.a * cov);
     } else if (v_mode == 2u) {
         vec4 e = texelFetch(emoji_atlas, ivec2(v_uv), 0);

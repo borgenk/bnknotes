@@ -224,8 +224,11 @@ struct State {
     /// so each line can render at its own size.
     fonts: Fonts,
     /// Mask gamma for glyph coverage, read from the app config at startup and
-    /// handed to the shader each frame (see [`crate::config::Config`]).
+    /// handed to the shader each frame (see [`crate::config::Config`]). Prose uses
+    /// this; code uses [`Self::code_glyph_gamma`], baked per glyph at build time.
     glyph_gamma: f32,
+    /// The gentler mask gamma for code glyphs (see [`crate::config::Config`]).
+    code_glyph_gamma: f32,
     /// Caret motion settings, read from the app config at startup. When animation is
     /// off the caret snaps cell to cell; otherwise it eases toward its target.
     caret_config: CaretConfig,
@@ -467,6 +470,7 @@ impl State {
             conn,
             fonts,
             glyph_gamma: config.glyph_coverage_gamma,
+            code_glyph_gamma: config.code_glyph_coverage_gamma,
             caret_config: config.caret,
             xkb: Xkb::new()?,
             editors: [editor_a, editor_b],

@@ -341,6 +341,11 @@ impl TableRow {
 pub struct ImageUi {
     pub selected: Option<usize>,
     pub raw: Option<usize>,
+    /// A selection drag is in progress. Image sources then hold their collapsed
+    /// picture-only height even where the growing selection would reveal one, so
+    /// the document geometry (and the pointer-to-offset mapping) stays put while
+    /// dragging. Text markers still reveal, since revealing them never reflows.
+    pub dragging: bool,
 }
 
 /// The live-preview decoration of a visual line's left gutter, chosen once the
@@ -1747,7 +1752,7 @@ fn classify_line(
         code_block_spans_into(line, delimiter, fence.lang, &mut pool.spans);
         LineClass {
             style: markdown::LineStyle::Body,
-            size: ctx.body_size,
+            size: markdown::code_size(ctx.body_size),
             block_marker: 0,
             block_persists: false,
             revealed: !delimiter || on_line,
@@ -1762,7 +1767,7 @@ fn classify_line(
         code_block_spans_into(line, true, lang, &mut pool.spans);
         LineClass {
             style: markdown::LineStyle::Body,
-            size: ctx.body_size,
+            size: markdown::code_size(ctx.body_size),
             block_marker: 0,
             block_persists: false,
             revealed: on_line,
@@ -1864,8 +1869,10 @@ fn lay_line(
                     pad_y: ctx.scale.px(IMAGE_PAD_Y),
                     selected: ctx.image_ui.selected == Some(ls),
                 };
-                if on_line || ctx.image_ui.raw == Some(ls) {
-                    // Source revealed: emit it (fall through), then the widget.
+                if (on_line && !ctx.image_ui.dragging) || ctx.image_ui.raw == Some(ls) {
+                    // Source revealed: emit it (fall through), then the widget. A live
+                    // drag holds it collapsed so the geometry under the pointer is
+                    // stable, matching the index's `reveal_adjust`.
                     pending_image = Some(image);
                 } else {
                     // Picture only: one widget line, no source text.
@@ -4734,14 +4741,18 @@ mod tests {
 
     #[test]
     fn markdown_inside_a_fence_is_literal() {
-        // A '#' line that would be an H1 is plain code inside a fence: body size,
+        // A '#' line that would be an H1 is plain code inside a fence: code size,
         // a single code run, no heading marker.
         let f = fonts();
         let r = rope("```\n# not a heading\n```");
         let l = layout(&f, &r);
         let inner = &l.lines()[1];
         assert!(inner.code_block);
-        assert_eq!(inner.size, BODY, "no heading scaling inside a code block");
+        assert_eq!(
+            inner.size,
+            markdown::code_size(BODY),
+            "no heading scaling inside a code block"
+        );
         assert_eq!(l.run_slice(inner).len(), 1);
         assert_eq!(
             l.run_slice(inner)[0].kind,
@@ -5219,6 +5230,29 @@ mod tests {
     }
 
     #[test]
+    fn a_drag_holds_an_image_source_collapsed() {
+        let f = fonts();
+        let r = rope("![cat](cat.png)\nafter");
+        let s = store("cat.png", 80, 40);
+        // The selection covers the image line, but a drag is in progress: the source
+        // stays collapsed to the picture so the geometry under the pointer holds
+        // still. Text markers still reveal (a separate `active`-driven decision).
+        let ui = ImageUi {
+            dragging: true,
+            ..ImageUi::default()
+        };
+        let l = layout_img(&f, &r, (0, 15), &s, ui);
+        assert!(
+            l.lines()[0].image.is_some(),
+            "the image stays a picture-only row while dragging"
+        );
+        assert!(
+            l.run_slice(&l.lines()[0]).is_empty(),
+            "no source text expands under the drag"
+        );
+    }
+
+    #[test]
     fn the_button_pin_reveals_source_without_the_cursor() {
         let f = fonts();
         let r = rope("![cat](cat.png)\nafter");
@@ -5227,6 +5261,7 @@ mod tests {
         let ui = ImageUi {
             selected: Some(0),
             raw: Some(0),
+            dragging: false,
         };
         let l = layout_img(&f, &r, (20, 20), &s, ui);
         assert!(
@@ -5254,6 +5289,7 @@ mod tests {
             ImageUi {
                 selected: Some(0),
                 raw: None,
+                dragging: false,
             },
         );
         assert!(
@@ -5304,6 +5340,7 @@ mod tests {
             ImageUi {
                 selected: Some(0),
                 raw: None,
+                dragging: false,
             },
         );
         let rect = sel

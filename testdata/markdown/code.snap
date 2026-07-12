@@ -1,17 +1,17 @@
 P        | t"Here is a Rust fence:"
 P        |
-CODE     | ~mark"```rust"
-CODE     | c.kw"fn" c" main() {"
-CODE     | c"    " c.com"// greet the world"
-CODE     | c"    " c.kw"let" c" n = " c.num"42" c";"
-CODE     | c"    println!(" c.str"\"hello\"" c");"
-CODE     | c"}"
-CODE     | ~mark"```"
+CODE@28  | ~mark"```rust"
+CODE@28  | c.kw"fn" c" main() {"
+CODE@28  | c"    " c.com"// greet the world"
+CODE@28  | c"    " c.kw"let" c" n = " c.num"42" c";"
+CODE@28  | c"    println!(" c.str"\"hello\"" c");"
+CODE@28  | c"}"
+CODE@28  | ~mark"```"
 P        |
 P        | t"And a plain fence with no language:"
 P        |
-CODE     | ~mark"```"
-CODE     | c"just some"
-CODE     | c"preformatted text"
-CODE     | ~mark"```"
+CODE@28  | ~mark"```"
+CODE@28  | c"just some"
+CODE@28  | c"preformatted text"
+CODE@28  | ~mark"```"
 P        |

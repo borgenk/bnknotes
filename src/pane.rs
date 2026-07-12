@@ -591,7 +591,16 @@ impl PaneLayout {
 /// splitters (they sit in the gaps between columns).
 pub(crate) enum Hit {
     Splitter(usize),
+    /// A row of the sidebar's file tree, carrying the rows' viewport (the column
+    /// above the footer), which is what a row index and the scroll clamp measure
+    /// against.
     Tree(Rect),
+    /// The sidebar footer's folder-filter toggle: list, or hide, the folders with no
+    /// notes in them.
+    TreeFilter,
+    /// The rest of the sidebar footer; consumes the click so it cannot fall through
+    /// to a tree row scrolled beneath the strip.
+    TreeFooter,
     Editor(usize, Rect),
     /// A tab in pane `group`'s strip: switch to it.
     Tab(usize, usize),
@@ -1587,6 +1596,9 @@ pub(crate) struct TreePane {
     /// The active row: the last one clicked or opened, and the target of Up/Down
     /// and Enter. `None` until the user picks one, so nothing is marked at launch.
     pub(crate) selected: Option<usize>,
+    /// Whether the pointer is over the footer's folder-filter toggle, which lights
+    /// up under it.
+    pub(crate) filter_hovered: bool,
 }
 
 /// Build a pane from its saved tabs, restoring each file's caret and scroll and

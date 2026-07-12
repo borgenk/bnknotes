@@ -23,9 +23,9 @@ use crate::theme::{
     TABLE_BORDER_COLOR, TABLE_HEADER_BG, TAB_ACTIVE_BG, TAB_ACTIVE_TEXT, TAB_BUTTON_HOVER_BG,
     TAB_BUTTON_RADIUS, TAB_CLOSE_GAP, TAB_CLOSE_W, TAB_DIRTY_COLOR, TAB_HOVER_BG,
     TAB_INACTIVE_TEXT, TAB_MAX_W, TAB_MIN_W, TAB_NEW_W, TAB_PAD_X, TAB_RADIUS, TAB_VPAD,
-    TICK_HEIGHT, TICK_WIDTH, TOP_BAR_BG, TREE_BG, TREE_CHEVRON_MAX, TREE_HOVER_BG, TREE_INDENT,
-    TREE_MARKER_COLOR, TREE_MARKER_W, TREE_PAD, TREE_ROW_INSET_Y, TREE_ROW_PAD, TREE_ROW_RADIUS,
-    TREE_ROW_VPAD, VAULT_PAD_X,
+    TICK_HEIGHT, TICK_WIDTH, TOP_BAR_BG, TREE_BG, TREE_CHEVRON_MAX, TREE_FOOTER_GAP,
+    TREE_FOOTER_VPAD, TREE_HOVER_BG, TREE_INDENT, TREE_MARKER_COLOR, TREE_MARKER_W, TREE_PAD,
+    TREE_ROW_INSET_Y, TREE_ROW_PAD, TREE_ROW_RADIUS, TREE_ROW_VPAD, VAULT_PAD_X,
 };
 
 /// The per-frame inputs [`build_display_list`] needs beyond the layout itself:
@@ -175,11 +175,50 @@ pub(crate) fn tree_row_height(m: Metrics, scale: Scale) -> i32 {
     (m.line_height + 2 * scale.px(TREE_ROW_VPAD)).max(1)
 }
 
+/// The sidebar column split into the rows that scroll and the footer pinned to its
+/// bottom, with the folder-filter toggle's hit box inside the footer. Shared by the
+/// painter and the pointer hit-testing so a click lands where it looks.
+pub(crate) struct TreeColumn {
+    /// The rows' viewport: the column above the footer. Scroll is clamped to it.
+    pub rows: Rect,
+    pub footer: Rect,
+    /// The filter toggle (its checkbox and label) within the footer.
+    pub button: Rect,
+}
+
+/// Split the sidebar `column` into its rows viewport and its footer. The footer is
+/// one row tall plus its padding, and never taller than the column itself.
+pub(crate) fn tree_column(column: Rect, m: Metrics, scale: Scale) -> TreeColumn {
+    let vpad = scale.px(TREE_FOOTER_VPAD);
+    let h = (tree_row_height(m, scale) + 2 * vpad).min(column.h);
+    let pad = scale.px(TREE_PAD);
+    let footer = Rect {
+        x: column.x,
+        y: column.y + column.h - h,
+        w: column.w,
+        h,
+    };
+    TreeColumn {
+        rows: Rect {
+            h: (column.h - h).max(0),
+            ..column
+        },
+        footer,
+        button: Rect {
+            x: footer.x + pad,
+            y: footer.y + vpad,
+            w: (footer.w - 2 * pad).max(0),
+            h: (footer.h - 2 * vpad).max(0),
+        },
+    }
+}
+
 /// Draw the file-tree sidebar into its column `rect`: a darker background, then
 /// each visible row (a folder chevron plus the name), indented by depth and
-/// offset by the tree's own scroll. Updates `content_height` for scroll
-/// clamping. Rows do not wrap; a long name that overhangs is covered by the
-/// editor's own background, which is drawn after this.
+/// offset by the tree's own scroll, and finally the footer over the column's
+/// bottom. Updates `content_height` for scroll clamping. Rows do not wrap; a long
+/// name that overhangs is covered by the editor's own background, which is drawn
+/// after this.
 pub(crate) fn push_tree(
     list: &mut DisplayList,
     fonts: &Fonts,
@@ -193,6 +232,8 @@ pub(crate) fn push_tree(
         color: TREE_BG,
     });
     let m = fonts.metrics(body_size);
+    let col = tree_column(rect, m, scale);
+    let view = col.rows;
     let row_h = tree_row_height(m, scale);
     // Baseline that centers the glyph ink (ascent + descent) in the row, so the
     // label sits in the middle of its pill rather than riding the line's top.
@@ -204,15 +245,15 @@ pub(crate) fn push_tree(
     let tree_indent = scale.px(TREE_INDENT);
     let rows = tree.tree.rows();
     tree.content_height = rows.len() as i32 * row_h + 2 * tree_pad;
-    tree.scroll_y = scroll::clamp(tree.scroll_y, tree.content_height, rect.h);
+    tree.scroll_y = scroll::clamp(tree.scroll_y, tree.content_height, view.h);
     let face = FaceKey::Prose {
         size: body_size,
         style: FontStyle::Regular,
     };
     let text_right = rect.x + rect.w - tree_pad - row_pad;
     for (i, row) in rows.iter().enumerate() {
-        let top = rect.y + tree_pad + i as i32 * row_h - tree.scroll_y;
-        if top + row_h <= rect.y || top >= rect.y + rect.h {
+        let top = view.y + tree_pad + i as i32 * row_h - tree.scroll_y;
+        if top + row_h <= view.y || top >= view.y + view.h {
             continue;
         }
         // The active row (last clicked or opened) and the mouse-hovered row both
@@ -260,6 +301,78 @@ pub(crate) fn push_tree(
             m,
         ));
     }
+    push_tree_footer(list, fonts, &col, tree, scale, body_size);
+}
+
+/// The sidebar footer's toggle: whether the tree lists folders that hold no note
+/// anywhere beneath them. The label doubles as the button's only affordance, so it
+/// says what the checkbox means rather than naming the filter.
+const TREE_FILTER_LABEL: &str = "Show folders without notes";
+
+/// Draw the sidebar footer: a divider across its top, then the folder-filter
+/// toggle, a checkbox and label that brighten under the pointer. The strip is
+/// filled first, so a row scrolled beneath it is covered rather than showing
+/// through.
+fn push_tree_footer(
+    list: &mut DisplayList,
+    fonts: &Fonts,
+    col: &TreeColumn,
+    tree: &TreePane,
+    scale: Scale,
+    body_size: u32,
+) {
+    let m = fonts.metrics(body_size);
+    let hovered = tree.filter_hovered;
+    list.push(DrawCmd::Fill {
+        rect: col.footer,
+        color: TREE_BG,
+    });
+    let divider = scale.px(1).max(1);
+    list.push(DrawCmd::Fill {
+        rect: Rect {
+            h: divider,
+            ..col.footer
+        },
+        color: SPLITTER_COLOR,
+    });
+    // The pill under the pointer, the same soft gray a hovered row gets; the
+    // checkbox is hollowed against whichever of the two it sits on.
+    let behind = if hovered { TREE_HOVER_BG } else { TREE_BG };
+    if hovered {
+        list.push(DrawCmd::RoundRect {
+            rect: col.button,
+            color: TREE_HOVER_BG,
+            radius: scale.px(TREE_ROW_RADIUS),
+            corners: display::RoundedCorners::Both,
+        });
+    }
+    let side = (m.ascent * 13 / 12).max(scale.px(11));
+    let box_ = Rect {
+        x: col.button.x + scale.px(TREE_ROW_PAD),
+        y: col.button.y + (col.button.h - side) / 2,
+        w: side,
+        h: side,
+    };
+    push_checkbox(list, box_, tree.tree.show_empty_dirs(), behind);
+    let x = box_.x + box_.w + scale.px(TREE_FOOTER_GAP);
+    let right = col.button.x + col.button.w - scale.px(TREE_ROW_PAD);
+    let face = fonts.face(body_size, FontStyle::Regular);
+    list.push(text_cmd(
+        FaceKey::Prose {
+            size: body_size,
+            style: FontStyle::Regular,
+        },
+        x,
+        col.button.y + (col.button.h - (m.ascent + m.descent)) / 2 + m.ascent,
+        right,
+        if hovered {
+            FOREGROUND
+        } else {
+            TREE_MARKER_COLOR
+        },
+        fit_label(face, TREE_FILTER_LABEL, (right - x).max(0)),
+        m,
+    ));
 }
 
 /// The pixel height of the top bar: the body line height plus vertical padding
@@ -1062,7 +1175,7 @@ impl<'a> Painter<'a> {
                                     y: rect.y - scroll_y,
                                     ..rect
                                 };
-                                push_checkbox(&mut self.list, rect, checked);
+                                push_checkbox(&mut self.list, rect, checked, BACKGROUND);
                             }
                             pen += advance;
                             continue;
@@ -1622,12 +1735,14 @@ fn push_find_bar(
     }
 }
 
-/// Append a task item's checkbox at `rect` (screen space, from
-/// [`Layout::checkbox_rect`]): unchecked is an outlined rounded square (an
-/// inset background fill hollows the border), checked fills with the accent and
-/// carries a check mark drawn from a distance field. The prose face has no
-/// checkbox glyphs to lean on, so the box is built from fills.
-fn push_checkbox(list: &mut DisplayList, rect: Rect, checked: bool) {
+/// Append a checkbox at `rect` (screen space): unchecked is an outlined rounded
+/// square, checked fills with the accent and carries a check mark drawn from a
+/// distance field. The prose face has no checkbox glyphs to lean on, so the box is
+/// built from fills, and `behind` is the color it sits on: it inks the check mark
+/// and hollows the unchecked box's border. Drawn for a task item (over the editor,
+/// from [`Layout::checkbox_rect`]) and for the sidebar footer's filter toggle (over
+/// the tree, where the surface is darker).
+fn push_checkbox(list: &mut DisplayList, rect: Rect, checked: bool, behind: u32) {
     let radius = (rect.w / 4).max(2);
     list.push(DrawCmd::RoundRect {
         rect,
@@ -1638,7 +1753,7 @@ fn push_checkbox(list: &mut DisplayList, rect: Rect, checked: bool) {
     if checked {
         list.push(DrawCmd::CheckMark {
             rect,
-            color: BACKGROUND,
+            color: behind,
         });
     } else {
         let t = (rect.w / 8).max(1);
@@ -1649,7 +1764,7 @@ fn push_checkbox(list: &mut DisplayList, rect: Rect, checked: bool) {
                 w: rect.w - 2 * t,
                 h: rect.h - 2 * t,
             },
-            color: BACKGROUND,
+            color: behind,
             radius: (radius - t).max(1),
             corners: display::RoundedCorners::Both,
         });
@@ -2285,17 +2400,25 @@ mod tests {
         }
     }
 
+    /// A sidebar over `root` with nothing hovered and `selected` active, listing
+    /// every folder (the first-run filter).
+    fn tree_pane(root: &std::path::Path, selected: Option<usize>) -> TreePane {
+        TreePane {
+            tree: crate::tree::Tree::new(root.to_path_buf(), Default::default(), true),
+            scroll_y: 0,
+            content_height: 0,
+            hovered: None,
+            selected,
+            filter_hovered: false,
+        }
+    }
+
     #[test]
     fn tree_rows_paint_chevron_column_names_and_inset_highlight() {
         let fx = TreeDir::new("rows");
         let fonts = Fonts::new(&markdown::all_sizes(FONT_SIZE)).expect("a default font");
-        let mut tree = TreePane {
-            tree: crate::tree::Tree::new(fx.0.clone(), std::collections::BTreeSet::new()),
-            scroll_y: 0,
-            content_height: 0,
-            hovered: None,
-            selected: Some(0),
-        };
+        // Row 0 (the folder) is active, so it draws its highlight.
+        let mut tree = tree_pane(&fx.0, Some(0));
         let rect = Rect {
             x: 0,
             y: 0,
@@ -2303,7 +2426,6 @@ mod tests {
             h: 400,
         };
         let mut list = DisplayList::new();
-        // Row 0 (the folder) is active, so it draws its highlight.
         push_tree(&mut list, &fonts, &mut tree, rect, Scale::ONE, FONT_SIZE);
 
         // The active pill is a rounded rect in the hover gray, inset from both
@@ -2373,13 +2495,8 @@ mod tests {
             h: 400,
         };
         let gray_pill_tops = |selected, hovered| {
-            let mut tree = TreePane {
-                tree: crate::tree::Tree::new(fx.0.clone(), std::collections::BTreeSet::new()),
-                scroll_y: 0,
-                content_height: 0,
-                hovered,
-                selected,
-            };
+            let mut tree = tree_pane(&fx.0, selected);
+            tree.hovered = hovered;
             let mut list = DisplayList::new();
             push_tree(&mut list, &fonts, &mut tree, rect, Scale::ONE, FONT_SIZE);
             list.iter()
@@ -2402,5 +2519,150 @@ mod tests {
         let two = gray_pill_tops(Some(0), Some(1));
         assert_eq!(two.len(), 2, "active and hover, distinct rows");
         assert_ne!(two[0], two[1], "the two pills sit on different rows");
+    }
+
+    #[test]
+    fn the_footer_takes_its_row_off_the_bottom_of_the_column() {
+        let fonts = Fonts::new(&markdown::all_sizes(FONT_SIZE)).expect("a default font");
+        let m = fonts.metrics(FONT_SIZE);
+        let column = Rect {
+            x: 10,
+            y: 30,
+            w: 200,
+            h: 400,
+        };
+        let col = tree_column(column, m, Scale::ONE);
+        // The two parts tile the column, the footer pinned to its bottom.
+        assert_eq!(col.rows.y, column.y);
+        assert_eq!(col.rows.h + col.footer.h, column.h);
+        assert_eq!(col.footer.y, col.rows.y + col.rows.h);
+        assert_eq!(col.footer.y + col.footer.h, column.y + column.h);
+        // Its button is inset from the strip on every side, like a row's pill.
+        assert!(col.button.x > col.footer.x);
+        assert!(col.button.y > col.footer.y);
+        assert!(col.button.x + col.button.w < col.footer.x + col.footer.w);
+        assert!(col.button.y + col.button.h < col.footer.y + col.footer.h);
+        // A column too short for a footer gives it what there is and no rows, rather
+        // than a footer hanging off the bottom.
+        let squat = tree_column(Rect { h: 10, ..column }, m, Scale::ONE);
+        assert_eq!(squat.footer.h, 10);
+        assert_eq!(squat.rows.h, 0);
+    }
+
+    #[test]
+    fn the_footer_filter_draws_its_state_and_lights_up_when_hovered() {
+        let fx = TreeDir::new("footer");
+        let fonts = Fonts::new(&markdown::all_sizes(FONT_SIZE)).expect("a default font");
+        // Wide enough for the whole label, so the assertions below name it in full; a
+        // narrower sidebar ellipsizes it like any other row.
+        let rect = Rect {
+            x: 0,
+            y: 0,
+            w: 320,
+            h: 400,
+        };
+        let paint = |show_empty: bool, hovered: bool| {
+            let mut tree = tree_pane(&fx.0, None);
+            tree.tree.set_show_empty_dirs(show_empty);
+            tree.filter_hovered = hovered;
+            let mut list = DisplayList::new();
+            push_tree(&mut list, &fonts, &mut tree, rect, Scale::ONE, FONT_SIZE);
+            list
+        };
+        let col = tree_column(rect, fonts.metrics(FONT_SIZE), Scale::ONE);
+        let in_footer = |r: &Rect| r.y >= col.footer.y && r.y + r.h <= col.footer.y + col.footer.h;
+
+        // Listing the empty folders is the checked state: the box fills with the
+        // accent and carries a check mark.
+        let on = paint(true, false);
+        assert!(
+            on.iter().any(
+                |c| matches!(c, DrawCmd::RoundRect { rect, color, .. } if *color == LINK_COLOR && in_footer(rect))
+            ),
+            "the checked box fills with the accent"
+        );
+        assert!(
+            on.iter()
+                .any(|c| matches!(c, DrawCmd::CheckMark { rect, .. } if in_footer(rect))),
+            "the checked box carries a check mark"
+        );
+        // Hiding them unchecks it: an outlined box, hollowed against the sidebar's own
+        // background rather than the editor's.
+        let off = paint(false, false);
+        assert!(
+            off.iter()
+                .all(|c| !matches!(c, DrawCmd::CheckMark { rect, .. } if in_footer(rect))),
+            "the unchecked box has no check mark"
+        );
+        assert!(
+            off.iter().any(
+                |c| matches!(c, DrawCmd::RoundRect { rect, color, .. } if *color == TREE_BG && in_footer(rect))
+            ),
+            "the unchecked box is hollowed against the sidebar background"
+        );
+        // The label names what the checkbox means, and both it and the pill under it
+        // light up only while the pointer is on the toggle.
+        let label = |list: &DisplayList| {
+            list.iter().find_map(|c| match c {
+                DrawCmd::Text { text, color, .. } if text == TREE_FILTER_LABEL => Some(*color),
+                _ => None,
+            })
+        };
+        assert_eq!(label(&on), Some(TREE_MARKER_COLOR), "muted at rest");
+        let hot = paint(true, true);
+        assert_eq!(
+            label(&hot),
+            Some(FOREGROUND),
+            "brightened under the pointer"
+        );
+        assert!(
+            hot.iter().any(
+                |c| matches!(c, DrawCmd::RoundRect { rect, color, .. } if *color == TREE_HOVER_BG && *rect == col.button)
+            ),
+            "the toggle's pill fills its button box"
+        );
+        assert!(
+            on.iter()
+                .all(|c| !matches!(c, DrawCmd::RoundRect { color, .. } if *color == TREE_HOVER_BG)),
+            "no pill without the pointer"
+        );
+    }
+
+    #[test]
+    fn tree_rows_scroll_within_the_viewport_above_the_footer() {
+        let fx = TreeDir::new("scroll");
+        let fonts = Fonts::new(&markdown::all_sizes(FONT_SIZE)).expect("a default font");
+        let mut tree = tree_pane(&fx.0, None);
+        // A column too short for both rows, so the scroll has somewhere to go.
+        let m = fonts.metrics(FONT_SIZE);
+        let rect = Rect {
+            x: 0,
+            y: 0,
+            w: 200,
+            h: tree_row_height(m, Scale::ONE) * 2
+                + tree_column(
+                    Rect {
+                        x: 0,
+                        y: 0,
+                        w: 200,
+                        h: 400,
+                    },
+                    m,
+                    Scale::ONE,
+                )
+                .footer
+                .h,
+        };
+        tree.scroll_y = 10_000;
+        let mut list = DisplayList::new();
+        push_tree(&mut list, &fonts, &mut tree, rect, Scale::ONE, FONT_SIZE);
+        // The scroll clamps against the rows' viewport, not the whole column, so the
+        // last row cannot come to rest under the footer.
+        let view = tree_column(rect, m, Scale::ONE).rows;
+        assert_eq!(
+            tree.scroll_y,
+            (tree.content_height - view.h).max(0),
+            "clamped to the rows viewport"
+        );
     }
 }

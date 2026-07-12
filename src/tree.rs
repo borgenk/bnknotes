@@ -4,10 +4,15 @@
 //! ones are walked) and each level is sorted directories-first, then
 //! case-insensitively by name. Only Markdown files are listed, shown without
 //! their .md suffix; hidden entries (dotfiles and dot-folders like .git) are skipped.
-//! Pure filesystem + data; the pane owns the pixels.
+//! A folder holding no note anywhere beneath it can be hidden too, the sidebar
+//! footer's toggle. Pure filesystem + data; the pane owns the pixels.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
+
+/// How deep [`has_notes`] descends looking for a note. A vault nests a handful of
+/// levels; this only bounds the stack on a pathological tree.
+const MAX_SCAN_DEPTH: usize = 32;
 
 /// One visible row in the flattened tree: enough to draw it (name, indent,
 /// folder-vs-file, open-vs-closed) and to act on a click (its path).
@@ -21,21 +26,31 @@ pub struct Row {
 }
 
 /// A directory tree rooted at `root`, remembering which folders are open. The
-/// flattened `rows` are rebuilt whenever the expansion set changes; the pane
-/// reads them each frame.
+/// flattened `rows` are rebuilt whenever the expansion set or the folder filter
+/// changes; the pane reads them each frame.
 pub struct Tree {
     root: PathBuf,
     expanded: BTreeSet<PathBuf>,
+    show_empty_dirs: bool,
     rows: Vec<Row>,
 }
 
+/// What a walk of the tree keeps in hand at every level: which folders are open,
+/// and whether a folder with no note beneath it is listed at all.
+struct View<'a> {
+    expanded: &'a BTreeSet<PathBuf>,
+    show_empty_dirs: bool,
+}
+
 impl Tree {
-    /// Build a tree at `root` with `expanded` folders already open (as restored
-    /// from the session). Reads the visible folders immediately.
-    pub fn new(root: PathBuf, expanded: BTreeSet<PathBuf>) -> Self {
+    /// Build a tree at `root` with `expanded` folders already open and the folder
+    /// filter in `show_empty_dirs` (both as restored from the session). Reads the
+    /// visible folders immediately.
+    pub fn new(root: PathBuf, expanded: BTreeSet<PathBuf>, show_empty_dirs: bool) -> Self {
         let mut tree = Self {
             root,
             expanded,
+            show_empty_dirs,
             rows: Vec::new(),
         };
         tree.rebuild();
@@ -50,9 +65,28 @@ impl Tree {
         &self.rows
     }
 
+    /// The row showing `path`, if it is currently visible. Lets a caller hold on to
+    /// a row across a rebuild that shifts the indices under it.
+    pub fn index_of(&self, path: &Path) -> Option<usize> {
+        self.rows.iter().position(|r| r.path == path)
+    }
+
     /// The open folders, for persisting to the session file.
     pub fn expanded_dirs(&self) -> Vec<PathBuf> {
         self.expanded.iter().cloned().collect()
+    }
+
+    /// Whether folders with no note beneath them are listed.
+    pub fn show_empty_dirs(&self) -> bool {
+        self.show_empty_dirs
+    }
+
+    /// List (or hide) the folders that hold no note, and re-flatten.
+    pub fn set_show_empty_dirs(&mut self, show: bool) {
+        if self.show_empty_dirs != show {
+            self.show_empty_dirs = show;
+            self.rebuild();
+        }
     }
 
     /// Toggle a folder open/closed and re-flatten. A no-op on files.
@@ -65,17 +99,26 @@ impl Tree {
 
     /// Re-read the open folders from disk and re-flatten, picking up files that
     /// appeared or vanished since the last build.
-    pub fn rebuild(&mut self) {
+    fn rebuild(&mut self) {
+        let view = View {
+            expanded: &self.expanded,
+            show_empty_dirs: self.show_empty_dirs,
+        };
         let mut rows = Vec::new();
         // The root itself is not a row (it is the pane); its children are depth 0.
-        walk(&self.root, 0, &self.expanded, &mut rows);
+        walk(&self.root, 0, &view, &mut rows);
         self.rows = rows;
     }
 }
 
-fn walk(dir: &Path, depth: usize, expanded: &BTreeSet<PathBuf>, out: &mut Vec<Row>) {
+fn walk(dir: &Path, depth: usize, view: &View, out: &mut Vec<Row>) {
     for (path, name, is_dir) in read_dir_sorted(dir) {
-        let is_expanded = is_dir && expanded.contains(&path);
+        // A folder with no note beneath it is dropped whole when the filter is on,
+        // children and all, so its subtree cannot come back through an open folder.
+        if is_dir && !view.show_empty_dirs && !has_notes(&path, 0) {
+            continue;
+        }
+        let is_expanded = is_dir && view.expanded.contains(&path);
         out.push(Row {
             path: path.clone(),
             name,
@@ -84,9 +127,37 @@ fn walk(dir: &Path, depth: usize, expanded: &BTreeSet<PathBuf>, out: &mut Vec<Ro
             expanded: is_expanded,
         });
         if is_expanded {
-            walk(&path, depth + 1, expanded, out);
+            walk(&path, depth + 1, view, out);
         }
     }
+}
+
+/// Whether `dir` holds a note anywhere beneath it, so the tree lists it under the
+/// folder filter. A folder whose own notes sit in a sub-folder still counts, so the
+/// filter never hides the path to a note; the scan stops at the first one found.
+/// Hidden entries are skipped, as they are in the tree itself.
+fn has_notes(dir: &Path, depth: usize) -> bool {
+    if depth >= MAX_SCAN_DEPTH {
+        return false;
+    }
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return false;
+    };
+    for entry in entries.flatten() {
+        let raw = entry.file_name();
+        if raw.to_str().is_none_or(is_hidden) {
+            continue;
+        }
+        let path = entry.path();
+        if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+            if has_notes(&path, depth + 1) {
+                return true;
+            }
+        } else if is_markdown(&path) {
+            return true;
+        }
+    }
+    false
 }
 
 /// Read one directory into `(path, name, is_dir)`, folders first, then
@@ -103,7 +174,7 @@ fn read_dir_sorted(dir: &Path) -> Vec<(PathBuf, String, bool)> {
         .filter_map(|e| {
             let raw = e.file_name();
             let raw = raw.to_str()?;
-            if raw.starts_with('.') {
+            if is_hidden(raw) {
                 return None;
             }
             let path = e.path();
@@ -132,6 +203,11 @@ fn is_markdown(path: &Path) -> bool {
     path.extension()
         .and_then(|e| e.to_str())
         .is_some_and(|e| e.eq_ignore_ascii_case("md"))
+}
+
+/// A dotfile or dot-directory (.git): never listed, never scanned.
+fn is_hidden(name: &str) -> bool {
+    name.starts_with('.')
 }
 
 #[cfg(test)]
@@ -164,14 +240,23 @@ mod tests {
         }
     }
 
+    /// The tree as the app first shows it: every folder listed, none expanded.
+    fn tree_at(root: &Path) -> Tree {
+        Tree::new(root.to_path_buf(), BTreeSet::new(), true)
+    }
+
+    /// The names of the visible rows, in order.
+    fn names(tree: &Tree) -> Vec<&str> {
+        tree.rows().iter().map(|r| r.name.as_str()).collect()
+    }
+
     #[test]
     fn lists_folders_before_files_each_sorted() {
         let fx = Fixture::new("sort");
-        let tree = Tree::new(fx.0.clone(), BTreeSet::new());
-        let names: Vec<&str> = tree.rows().iter().map(|r| r.name.as_str()).collect();
+        let tree = tree_at(&fx.0);
         // Folders (alpha, zeta) before the file (readme, .md dropped); collapsed,
         // so no children. The non-Markdown and hidden entries are absent.
-        assert_eq!(names, ["alpha", "zeta", "readme"]);
+        assert_eq!(names(&tree), ["alpha", "zeta", "readme"]);
     }
 
     #[test]
@@ -179,7 +264,7 @@ mod tests {
         let fx = Fixture::new("filter");
         // A Markdown file's row keeps the full path but shows without the suffix.
         std::fs::write(fx.0.join("Loud.MD"), b"u").expect("write Loud");
-        let tree = Tree::new(fx.0.clone(), BTreeSet::new());
+        let tree = tree_at(&fx.0);
         let rows: Vec<(&str, &std::path::Path)> = tree
             .rows()
             .iter()
@@ -200,7 +285,7 @@ mod tests {
     #[test]
     fn expanding_a_folder_reveals_its_children_indented() {
         let fx = Fixture::new("expand");
-        let mut tree = Tree::new(fx.0.clone(), BTreeSet::new());
+        let mut tree = tree_at(&fx.0);
         tree.toggle(&fx.0.join("alpha"));
         let rows: Vec<(&str, usize, bool)> = tree
             .rows()
@@ -223,7 +308,7 @@ mod tests {
     fn toggle_collapses_and_persists_the_expanded_set() {
         let fx = Fixture::new("toggle");
         let alpha = fx.0.join("alpha");
-        let mut tree = Tree::new(fx.0.clone(), BTreeSet::new());
+        let mut tree = tree_at(&fx.0);
         tree.toggle(&alpha);
         assert_eq!(tree.expanded_dirs(), vec![alpha.clone()]);
         tree.toggle(&alpha);
@@ -237,11 +322,76 @@ mod tests {
         let expanded: BTreeSet<PathBuf> = [fx.0.join("alpha"), fx.0.join("alpha/nested")]
             .into_iter()
             .collect();
-        let tree = Tree::new(fx.0.clone(), expanded);
+        let tree = Tree::new(fx.0.clone(), expanded, true);
         let deep = tree.rows().iter().any(|r| r.name == "deep" && r.depth == 2);
         assert!(
             deep,
             "restored expansion should reveal the deeply nested file"
         );
+    }
+
+    #[test]
+    fn index_of_locates_a_visible_row() {
+        let fx = Fixture::new("index");
+        let tree = tree_at(&fx.0);
+        assert_eq!(tree.index_of(&fx.0.join("readme.md")), Some(2));
+        // A file inside a collapsed folder has no row.
+        assert_eq!(tree.index_of(&fx.0.join("alpha/a.md")), None);
+    }
+
+    #[test]
+    fn the_filter_hides_a_folder_with_no_notes() {
+        let fx = Fixture::new("empty");
+        // zeta holds nothing; a folder of non-notes is just as empty to the tree.
+        std::fs::create_dir_all(fx.0.join("assets")).expect("mkdir assets");
+        std::fs::write(fx.0.join("assets/pic.png"), b"p").expect("write pic");
+        let tree = Tree::new(fx.0.clone(), BTreeSet::new(), false);
+        assert_eq!(names(&tree), ["alpha", "readme"]);
+    }
+
+    #[test]
+    fn the_filter_keeps_a_folder_whose_notes_are_nested() {
+        let fx = Fixture::new("nested");
+        // outer holds no note itself, only a folder that (deeply) does; hiding it
+        // would hide the path to that note.
+        std::fs::create_dir_all(fx.0.join("outer/inner")).expect("mkdir outer/inner");
+        std::fs::write(fx.0.join("outer/inner/note.md"), b"n").expect("write note");
+        let expanded: BTreeSet<PathBuf> = [fx.0.join("outer")].into_iter().collect();
+        let tree = Tree::new(fx.0.clone(), expanded, false);
+        assert_eq!(names(&tree), ["alpha", "outer", "inner", "readme"]);
+    }
+
+    #[test]
+    fn the_filter_hides_an_empty_folder_nested_in_a_kept_one() {
+        let fx = Fixture::new("deep_empty");
+        // alpha stays (it has notes), but the drafts folder inside it has none.
+        std::fs::create_dir_all(fx.0.join("alpha/drafts")).expect("mkdir drafts");
+        let expanded: BTreeSet<PathBuf> = [fx.0.join("alpha")].into_iter().collect();
+        let tree = Tree::new(fx.0.clone(), expanded, false);
+        assert_eq!(names(&tree), ["alpha", "nested", "a", "readme"]);
+    }
+
+    #[test]
+    fn toggling_the_filter_relists_the_empty_folders() {
+        let fx = Fixture::new("relist");
+        let mut tree = tree_at(&fx.0);
+        assert!(tree.show_empty_dirs());
+        tree.set_show_empty_dirs(false);
+        assert!(!tree.show_empty_dirs());
+        assert_eq!(names(&tree), ["alpha", "readme"]);
+        tree.set_show_empty_dirs(true);
+        assert_eq!(names(&tree), ["alpha", "zeta", "readme"]);
+    }
+
+    #[test]
+    fn a_hidden_note_does_not_keep_its_folder() {
+        let fx = Fixture::new("hidden_note");
+        // The tree never lists a dotfile, so a folder holding only one is empty as
+        // far as the filter is concerned, as is one holding only a dot-directory.
+        std::fs::create_dir_all(fx.0.join("stash/.trash")).expect("mkdir stash/.trash");
+        std::fs::write(fx.0.join("stash/.draft.md"), b"d").expect("write draft");
+        std::fs::write(fx.0.join("stash/.trash/gone.md"), b"g").expect("write gone");
+        let tree = Tree::new(fx.0.clone(), BTreeSet::new(), false);
+        assert_eq!(names(&tree), ["alpha", "readme"]);
     }
 }

@@ -239,6 +239,9 @@ struct State {
     /// click moves focus (and, on a splitter, starts a drag).
     editors: [PaneGroup; 2],
     tree: TreePane,
+    /// Every vault's remembered settings (the sidebar's folder filter), kept whole
+    /// so saving the active vault's choice leaves the other vaults' alone.
+    vault_prefs: store::VaultPrefs,
     panes: PaneLayout,
     focus: Focus,
     /// The editor last given focus, so a file opened from the tree (which takes
@@ -493,12 +496,17 @@ impl State {
         );
 
         let expanded: BTreeSet<PathBuf> = session.expanded.iter().cloned().collect();
+        // The folder filter belongs to the vault, not the window: each vault reopens
+        // showing what it showed last, and a vault seen for the first time lists
+        // every folder.
+        let show_empty_dirs = session.vaults.show_empty_dirs(&root);
         let tree = TreePane {
-            tree: tree::Tree::new(root, expanded),
+            tree: tree::Tree::new(root, expanded, show_empty_dirs),
             scroll_y: 0,
             content_height: 0,
             hovered: None,
             selected: None,
+            filter_hovered: false,
         };
         let panes = PaneLayout {
             tree_width: session.tree_width as i32,
@@ -524,6 +532,7 @@ impl State {
             xkb: Xkb::new()?,
             editors: [editor_a, editor_b],
             tree,
+            vault_prefs: session.vaults,
             panes,
             focus,
             last_editor: match focus {
@@ -843,6 +852,7 @@ impl State {
             second_open: self.panes.second_open,
             focus,
             active_vault: Some(self.tree.tree.root().to_path_buf()),
+            vaults: self.vault_prefs.clone(),
             expanded: self.tree.tree.expanded_dirs(),
             panes: [self.editors[0].to_session(), self.editors[1].to_session()],
         }

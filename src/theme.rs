@@ -157,3 +157,11 @@ pub(crate) const TREE_MARKER_W: i32 = 18;
 pub(crate) const TREE_CHEVRON_MAX: i32 = 15;
 /// Per-depth indent step for nested rows.
 pub(crate) const TREE_INDENT: i32 = 14;
+
+/// The sidebar footer: the strip pinned below the file tree, holding the toggle for
+/// whether folders with no notes in them are listed. Its button is a tree-sized row
+/// with this padding above and below, and the gap sits between its checkbox and its
+/// label. The label reads in the muted chrome tone ([`TREE_MARKER_COLOR`]) and
+/// brightens to [`FOREGROUND`] under the pointer, the way a tab's buttons do.
+pub(crate) const TREE_FOOTER_VPAD: i32 = 6;
+pub(crate) const TREE_FOOTER_GAP: i32 = 8;

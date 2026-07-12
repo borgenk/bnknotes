@@ -554,9 +554,15 @@ impl State {
             }
             wl_pointer::EV_LEAVE => {
                 // The pointer left the surface, so drop the mouse hover highlights;
-                // otherwise the last-hovered tree row or tab stays lit with no
-                // pointer on it.
-                if self.tree.hovered.take().is_some() || self.hovered_tab.take().is_some() {
+                // otherwise the last-hovered tree row, filter toggle, or tab stays lit
+                // with no pointer on it.
+                let lit = self.tree.hovered.is_some()
+                    || self.tree.filter_hovered
+                    || self.hovered_tab.is_some();
+                self.tree.hovered = None;
+                self.tree.filter_hovered = false;
+                self.hovered_tab = None;
+                if lit {
                     self.dirty = true;
                 }
             }
@@ -671,7 +677,15 @@ impl State {
         }
         if let Some(r) = cols.tree {
             if x >= r.x && x < r.x + r.w {
-                return Hit::Tree(r);
+                let col = self.tree_column(r);
+                if py as i32 >= col.footer.y {
+                    return if col.button.contains(px, py) {
+                        Hit::TreeFilter
+                    } else {
+                        Hit::TreeFooter
+                    };
+                }
+                return Hit::Tree(col.rows);
             }
         }
         for (i, rect) in cols.editors.iter().enumerate() {
@@ -742,15 +756,19 @@ impl State {
         self.dirty = true;
     }
 
-    /// Update the tree's hovered row from the pointer, repainting if it changed.
+    /// Update what the pointer is over in the sidebar, a row or the footer's filter
+    /// toggle, repainting if it changed. Both light up under the pointer.
     pub(super) fn update_tree_hover(&mut self) {
         let (px, py) = (self.pointer_x, self.pointer_y);
-        let hovered = match self.hit_test(px, py) {
+        let hit = self.hit_test(px, py);
+        let hovered = match hit {
             Hit::Tree(rect) => self.tree_row_at(rect, py),
             _ => None,
         };
-        if hovered != self.tree.hovered {
+        let filter = matches!(hit, Hit::TreeFilter);
+        if hovered != self.tree.hovered || filter != self.tree.filter_hovered {
             self.tree.hovered = hovered;
+            self.tree.filter_hovered = filter;
             self.dirty = true;
         }
     }
@@ -814,14 +832,25 @@ impl State {
         }
     }
 
-    /// The tree column rectangle, or an empty rect when the sidebar is hidden.
+    /// The sidebar column `rect` split into its rows viewport and its footer, as the
+    /// painter lays it out.
+    pub(super) fn tree_column(&self, rect: Rect) -> crate::paint::TreeColumn {
+        crate::paint::tree_column(rect, self.fonts.metrics(self.body_size), self.scale())
+    }
+
+    /// The rows' viewport in the tree column (the part above the footer), or an empty
+    /// rect when the sidebar is hidden. What a row index and the tree's scroll are
+    /// measured against.
     pub(super) fn tree_rect(&self) -> Rect {
-        self.columns().tree.unwrap_or(Rect {
+        let empty = Rect {
             x: 0,
             y: 0,
             w: 0,
             h: 0,
-        })
+        };
+        self.columns()
+            .tree
+            .map_or(empty, |rect| self.tree_column(rect).rows)
     }
 
     /// Scroll the tree so its active row is on screen. A no-op when nothing is
@@ -923,8 +952,8 @@ impl State {
             Hit::Splitter(_) => SHAPE_EW_RESIZE,
             Hit::Tree(_) => SHAPE_DEFAULT,
             Hit::Editor(i, rect) => self.editors[i].cursor_shape_at(&self.fonts, rect, px, py),
-            Hit::Tab(..) | Hit::TabClose(..) | Hit::NewTab(_) => SHAPE_POINTER,
-            Hit::TabStrip(_) | Hit::None => SHAPE_DEFAULT,
+            Hit::Tab(..) | Hit::TabClose(..) | Hit::NewTab(_) | Hit::TreeFilter => SHAPE_POINTER,
+            Hit::TabStrip(_) | Hit::TreeFooter | Hit::None => SHAPE_DEFAULT,
         };
         if shape != self.cursor_shape {
             self.cursor_shape = shape;
@@ -940,6 +969,10 @@ impl State {
         match self.hit_test(px, py) {
             Hit::Splitter(s) => self.drag_splitter = Some(s),
             Hit::Tree(rect) => self.tree_press(rect, py),
+            Hit::TreeFilter => self.toggle_empty_dirs(),
+            // The footer beside the toggle: a click there acts on nothing, but it must
+            // not reach the row scrolled beneath the strip.
+            Hit::TreeFooter => {}
             Hit::Editor(i, rect) => {
                 // A click places the caret; that jump snaps rather than smearing.
                 self.caret_from_pointer = true;
@@ -1052,6 +1085,27 @@ impl State {
         self.editors[g].close(i);
         self.hovered_tab = None;
         self.focus_pane(g);
+        self.save_session();
+    }
+
+    /// The footer toggle: list, or hide, the folders with no notes beneath them. The
+    /// choice is the vault's, so it is remembered per vault. Rebuilding the tree
+    /// renumbers its rows, so the active row is followed by path across the rebuild
+    /// rather than by index; a row the filter just hid stops being active.
+    pub(super) fn toggle_empty_dirs(&mut self) {
+        let selected = self
+            .tree
+            .selected
+            .and_then(|i| self.tree.tree.rows().get(i))
+            .map(|row| row.path.clone());
+        let show = !self.tree.tree.show_empty_dirs();
+        self.tree.tree.set_show_empty_dirs(show);
+        self.tree.selected = selected.and_then(|path| self.tree.tree.index_of(&path));
+        self.tree.hovered = None;
+        self.vault_prefs
+            .set_show_empty_dirs(self.tree.tree.root(), show);
+        self.reveal_tree_selection();
+        self.dirty = true;
         self.save_session();
     }
 

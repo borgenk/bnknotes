@@ -10,7 +10,7 @@
 //! Format (little-endian, no padding):
 //! ```text
 //!   magic          4 bytes "BNKN"
-//!   version        u8 (2)
+//!   version        u8 (3)
 //!   window width   u32
 //!   window height  u32
 //!   tree_width     u32   (sidebar column width, px)
@@ -19,6 +19,7 @@
 //!   second_open    u8    (is content pane B open)
 //!   focus          u8    (0 = tree, 1 = pane A, 2 = pane B)
 //!   active_vault   opt string (absolute path, u8 tag + u16 len + utf-8)
+//!   vault count    u32; per: u16 len + utf-8 root, show_empty_dirs u8
 //!   expanded count u32; per: u16 len + utf-8 path
 //!   per pane (2):  tab count u32; per tab: opt string path, u64 cursor byte
 //!                  offset, i32 scroll_y; then active tab index u32
@@ -33,7 +34,45 @@ use crate::platform::error::{Error, Result};
 
 const FILENAME: &str = "state.bin";
 const MAGIC: &[u8; 4] = b"BNKN";
-const VERSION: u8 = 2;
+const VERSION: u8 = 3;
+
+/// One vault's remembered settings, keyed by its root directory: the choices that
+/// belong to a vault's contents rather than to the window.
+#[derive(Debug, Clone, PartialEq)]
+pub struct VaultSession {
+    pub root: PathBuf,
+    /// Whether the file tree lists folders holding no note anywhere beneath them.
+    pub show_empty_dirs: bool,
+}
+
+/// The settings of every vault the user has touched, not just the active one, so
+/// switching vaults (or coming back to one) restores what that vault was showing.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct VaultPrefs {
+    vaults: Vec<VaultSession>,
+}
+
+impl VaultPrefs {
+    /// Whether `root`'s file tree lists folders with no notes. A vault seen for the
+    /// first time lists them: nothing is hidden until the user asks for it.
+    pub fn show_empty_dirs(&self, root: &Path) -> bool {
+        self.vaults
+            .iter()
+            .find(|v| v.root == root)
+            .is_none_or(|v| v.show_empty_dirs)
+    }
+
+    /// Remember `show` for `root`, replacing that vault's entry or adding one.
+    pub fn set_show_empty_dirs(&mut self, root: &Path, show: bool) {
+        match self.vaults.iter_mut().find(|v| v.root == root) {
+            Some(v) => v.show_empty_dirs = show,
+            None => self.vaults.push(VaultSession {
+                root: root.to_path_buf(),
+                show_empty_dirs: show,
+            }),
+        }
+    }
+}
 
 /// One open tab: its file and where the caret and viewport sat in it.
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -91,6 +130,8 @@ pub struct Session {
     /// The active vault's root directory: the file tree roots here and every note
     /// reference resolves against it. `None` before a first vault is chosen.
     pub active_vault: Option<PathBuf>,
+    /// The per-vault settings, the active vault's among them.
+    pub vaults: VaultPrefs,
     pub expanded: Vec<PathBuf>,
     pub panes: [PaneGroupSession; 2],
 }
@@ -108,6 +149,7 @@ impl Default for Session {
             second_open: true,
             focus: Focus::PaneA,
             active_vault: None,
+            vaults: VaultPrefs::default(),
             expanded: Vec::new(),
             panes: [PaneGroupSession::default(), PaneGroupSession::default()],
         }
@@ -199,6 +241,14 @@ fn encode(s: &Session) -> Result<Vec<u8>> {
     out.push(s.focus.tag());
     write_opt_path(&mut out, s.active_vault.as_deref())?;
 
+    let vaults = u32::try_from(s.vaults.vaults.len())
+        .map_err(|_| Error::msg("too many vaults to persist"))?;
+    out.extend_from_slice(&vaults.to_le_bytes());
+    for vault in &s.vaults.vaults {
+        write_path(&mut out, &vault.root)?;
+        out.push(u8::from(vault.show_empty_dirs));
+    }
+
     let expanded = u32::try_from(s.expanded.len())
         .map_err(|_| Error::msg("too many expanded folders to persist"))?;
     out.extend_from_slice(&expanded.to_le_bytes());
@@ -238,6 +288,15 @@ fn decode(data: &[u8]) -> Result<Session> {
     let focus = Focus::from_tag(r.u8()?)?;
     let active_vault = r.opt_path()?;
 
+    let vault_count = r.u32()? as usize;
+    let mut vaults = Vec::with_capacity(vault_count.min(4096));
+    for _ in 0..vault_count {
+        vaults.push(VaultSession {
+            root: r.path()?,
+            show_empty_dirs: r.u8()? != 0,
+        });
+    }
+
     let expanded_count = r.u32()? as usize;
     let mut expanded = Vec::with_capacity(expanded_count.min(4096));
     for _ in 0..expanded_count {
@@ -253,6 +312,7 @@ fn decode(data: &[u8]) -> Result<Session> {
         second_open,
         focus,
         active_vault,
+        vaults: VaultPrefs { vaults },
         expanded,
         panes,
     })
@@ -398,6 +458,18 @@ mod tests {
             second_open: false,
             focus: Focus::PaneB,
             active_vault: Some(PathBuf::from("/home/user/notes")),
+            vaults: VaultPrefs {
+                vaults: vec![
+                    VaultSession {
+                        root: PathBuf::from("/home/user/notes"),
+                        show_empty_dirs: false,
+                    },
+                    VaultSession {
+                        root: PathBuf::from("/home/user/work"),
+                        show_empty_dirs: true,
+                    },
+                ],
+            },
             expanded: vec![
                 PathBuf::from("/home/user/notes"),
                 PathBuf::from("/home/user/notes/journal"),
@@ -507,6 +579,34 @@ mod tests {
         assert_eq!(loaded.panes[0].active, 1);
         assert_eq!(loaded.panes[1].tabs.len(), 1);
         assert_eq!(loaded, sample());
+    }
+
+    #[test]
+    fn vault_prefs_round_trip_per_vault() {
+        let loaded = decode(&encode(&sample()).expect("encode")).expect("decode");
+        // Each vault keeps its own answer, the inactive one included.
+        assert!(!loaded.vaults.show_empty_dirs(Path::new("/home/user/notes")));
+        assert!(loaded.vaults.show_empty_dirs(Path::new("/home/user/work")));
+    }
+
+    #[test]
+    fn an_unknown_vault_lists_its_empty_folders() {
+        // The first-run answer for a vault with no entry: hide nothing.
+        let prefs = VaultPrefs::default();
+        assert!(prefs.show_empty_dirs(Path::new("/home/user/fresh")));
+    }
+
+    #[test]
+    fn setting_a_vault_pref_replaces_that_vaults_entry_only() {
+        let mut prefs = sample().vaults;
+        prefs.set_show_empty_dirs(Path::new("/home/user/notes"), true);
+        prefs.set_show_empty_dirs(Path::new("/home/user/other"), false);
+        // The existing entry is updated in place, the new vault appended, and the
+        // untouched vault left alone.
+        assert_eq!(prefs.vaults.len(), 3);
+        assert!(prefs.show_empty_dirs(Path::new("/home/user/notes")));
+        assert!(prefs.show_empty_dirs(Path::new("/home/user/work")));
+        assert!(!prefs.show_empty_dirs(Path::new("/home/user/other")));
     }
 
     #[test]

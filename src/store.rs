@@ -1,29 +1,15 @@
 //! On-disk session state: a small binary blob at `~/.config/bnknotes/state.bin`
 //! remembering the pane layout across restarts, so reopening bnknotes restores
 //! the active vault and its expanded folders, the column widths, and each
-//! content pane's open file with its cursor and scroll.
+//! content pane's open tabs with their cursors and scroll. Each vault's own
+//! settings ride along, keyed by its root, so they follow the vault rather than
+//! the window.
 //!
 //! The format is a 4-byte magic (`BNKN`), a version byte, little-endian
 //! fixed-width fields, and length-prefixed UTF-8 strings, written atomically
-//! through a temp file + rename.
+//! through a temp file + rename. [`encode`] and [`decode`] below are its two
+//! halves and must stay in step.
 //!
-//! Format (little-endian, no padding):
-//! ```text
-//!   magic          4 bytes "BNKN"
-//!   version        u8 (3)
-//!   window width   u32
-//!   window height  u32
-//!   tree_width     u32   (sidebar column width, px)
-//!   split_ratio    f32   (fraction of the content area given to pane A)
-//!   tree_visible   u8
-//!   second_open    u8    (is content pane B open)
-//!   focus          u8    (0 = tree, 1 = pane A, 2 = pane B)
-//!   active_vault   opt string (absolute path, u8 tag + u16 len + utf-8)
-//!   vault count    u32; per: u16 len + utf-8 root, show_empty_dirs u8
-//!   expanded count u32; per: u16 len + utf-8 path
-//!   per pane (2):  tab count u32; per tab: opt string path, u64 cursor byte
-//!                  offset, i32 scroll_y; then active tab index u32
-//! ```
 //! A corrupt or wrong-version file is not fatal: losing the last layout must
 //! never stop the editor opening, so [`load`] logs and falls back to
 //! [`Session::default`].

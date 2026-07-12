@@ -130,11 +130,19 @@ pub(crate) const VAULT_PAD_X: i32 = 14;
 
 /// File-tree sidebar and splitter colors and metrics.
 pub(crate) const TREE_BG: u32 = 0x0016_1a1f;
-/// The disclosure chevron beside a folder. Folder and file names share
-/// [`FOREGROUND`]; only this marker is tinted, so it reads as chrome.
-pub(crate) const TREE_MARKER_COLOR: u32 = 0x008c_a0b3;
+/// Folder and file names. The sidebar is chrome, not content, so it reads a step
+/// below the body text rather than in [`FOREGROUND`].
+pub(crate) const TREE_TEXT_COLOR: u32 = 0x008c_a0b3;
+/// The disclosure chevron beside a folder, a step below the names again (the
+/// same tone as [`MARKER_COLOR`]), so the icon column recedes behind what it
+/// points at.
+pub(crate) const TREE_MARKER_COLOR: u32 = MARKER_COLOR;
 pub(crate) const TREE_HOVER_BG: u32 = 0x0028_2c34;
-pub(crate) const SPLITTER_COLOR: u32 = 0x003f_444b;
+/// Every divider the chrome draws: the splitters between columns, the line under
+/// the top bar, the hairlines between tabs, and the sidebar footer's rule. A
+/// separator only has to be found when looked for, so it sits just above the
+/// surfaces it parts.
+pub(crate) const SPLITTER_COLOR: u32 = 0x002a_2f36;
 /// Padding inside the sidebar column: the gap above the first row and below the
 /// last, and the margin the row highlight leaves at the left and right edges.
 pub(crate) const TREE_PAD: i32 = 8;

@@ -9,15 +9,13 @@ edition = "2021"
 #
 # The one exception is image decoding (src/render/image.rs). Decoders parse
 # hostile, attacker-controlled bytes, exactly the place where an in-tree decoder
-# (or binding C libpng/libjpeg/libwebp) would trade away the memory safety we
-# want, so we lean on pure-Rust, no-C decoders behind a single isolated module:
-# zune for PNG and JPEG, image-webp (the image-rs project's decoder) for WebP.
-# zune's default-features are off to compile only its decode path.
+# (or binding C libpng/libjpeg) would trade away the memory safety we want, so we
+# lean on pure-Rust, no-C decoders behind a single isolated module: zune, for PNG
+# and JPEG. Its default-features are off to compile only the decode path.
 [dependencies]
 zune-core = { version = "0.5", default-features = false, features = ["std"] }
 zune-png = { version = "0.5", default-features = false, features = ["std"] }
 zune-jpeg = { version = "0.5", default-features = false, features = ["std"] }
-image-webp = "0.2"
 
 [features]
 # Install the counting global allocator (src/dev/alloc.rs) so the perf harness can

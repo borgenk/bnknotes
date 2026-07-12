@@ -25,7 +25,7 @@ use crate::theme::{
     TAB_INACTIVE_TEXT, TAB_MAX_W, TAB_MIN_W, TAB_NEW_W, TAB_PAD_X, TAB_RADIUS, TAB_VPAD,
     TICK_HEIGHT, TICK_WIDTH, TOP_BAR_BG, TREE_BG, TREE_CHEVRON_MAX, TREE_FOOTER_GAP,
     TREE_FOOTER_VPAD, TREE_HOVER_BG, TREE_INDENT, TREE_MARKER_COLOR, TREE_MARKER_W, TREE_PAD,
-    TREE_ROW_INSET_Y, TREE_ROW_PAD, TREE_ROW_RADIUS, TREE_ROW_VPAD, VAULT_PAD_X,
+    TREE_ROW_INSET_Y, TREE_ROW_PAD, TREE_ROW_RADIUS, TREE_ROW_VPAD, TREE_TEXT_COLOR, VAULT_PAD_X,
 };
 
 /// The per-frame inputs [`build_display_list`] needs beyond the layout itself:
@@ -275,8 +275,8 @@ pub(crate) fn push_tree(
         // Names share one column, `marker_w` in from the row start, whether or not
         // a chevron is drawn, so files and folders align. A folder's chevron is a
         // vector shape (an anti-aliased distance field, like the task check mark),
-        // left-aligned in that column and centered vertically on the label, tinted;
-        // both folder and file names are drawn in the foreground.
+        // left-aligned in that column and centered vertically on the label, and
+        // dimmer than the name it points at.
         let content_x = rect.x + tree_pad + row_pad + row.depth as i32 * tree_indent;
         if row.is_dir {
             let chev = (row_h * 9 / 16).clamp(scale.px(8), scale.px(TREE_CHEVRON_MAX));
@@ -296,7 +296,7 @@ pub(crate) fn push_tree(
             content_x + marker_w,
             top + text_offset,
             text_right,
-            FOREGROUND,
+            TREE_TEXT_COLOR,
             row.name.clone(),
             m,
         ));
@@ -365,11 +365,7 @@ fn push_tree_footer(
         x,
         col.button.y + (col.button.h - (m.ascent + m.descent)) / 2 + m.ascent,
         right,
-        if hovered {
-            FOREGROUND
-        } else {
-            TREE_MARKER_COLOR
-        },
+        if hovered { FOREGROUND } else { TREE_TEXT_COLOR },
         fit_label(face, TREE_FILTER_LABEL, (right - x).max(0)),
         m,
     ));
@@ -2464,11 +2460,22 @@ mod tests {
             "the chevron sits at the row's content start"
         );
 
-        // Both names are foreground and aligned in the column past the chevron slot.
+        // Both names read in the muted sidebar tone, dimmer than the body text and
+        // brighter than the chevron beside them, aligned in the column past it. The
+        // footer's label shares the tone, so only the rows' own band is scanned.
+        let rows_bottom = tree_column(rect, fonts.metrics(FONT_SIZE), Scale::ONE)
+            .rows
+            .h;
         let names: Vec<(&str, i32)> = list
             .iter()
             .filter_map(|c| match c {
-                DrawCmd::Text { text, color, x, .. } if *color == FOREGROUND => {
+                DrawCmd::Text {
+                    text,
+                    color,
+                    x,
+                    baseline,
+                    ..
+                } if *color == TREE_TEXT_COLOR && *baseline < rows_bottom => {
                     Some((text.as_str(), *x))
                 }
                 _ => None,
@@ -2480,7 +2487,15 @@ mod tests {
                 ("folder", TREE_PAD + TREE_ROW_PAD + TREE_MARKER_W),
                 ("note", TREE_PAD + TREE_ROW_PAD + TREE_MARKER_W),
             ],
-            "folder and file names share the foreground color and one column"
+            "folder and file names share the muted color and one column"
+        );
+        assert_ne!(
+            TREE_TEXT_COLOR, FOREGROUND,
+            "the sidebar sits below the body text"
+        );
+        assert_ne!(
+            TREE_MARKER_COLOR, TREE_TEXT_COLOR,
+            "the chevron sits below the name it points at"
         );
     }
 
@@ -2608,7 +2623,7 @@ mod tests {
                 _ => None,
             })
         };
-        assert_eq!(label(&on), Some(TREE_MARKER_COLOR), "muted at rest");
+        assert_eq!(label(&on), Some(TREE_TEXT_COLOR), "muted at rest");
         let hot = paint(true, true);
         assert_eq!(
             label(&hot),

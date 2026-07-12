@@ -173,6 +173,7 @@ fn apply_editor_action(
         | KeyAction::FocusTree
         | KeyAction::FocusPaneA
         | KeyAction::FocusPaneB
+        | KeyAction::CloseTab
         | KeyAction::None => false,
     };
     // The vertical motions read `goal_x` (the remembered column). SelectAll and
@@ -316,6 +317,15 @@ impl State {
             KeyAction::FocusPaneB => {
                 if self.panes.second_open {
                     self.focus_pane(1);
+                }
+                return Ok(());
+            }
+            KeyAction::CloseTab => {
+                // The tree has no tabs of its own, so Ctrl+W there closes one in the
+                // pane the user was last editing, the pane the tree opens files into.
+                let g = self.last_editor;
+                if self.editors[g].has_tabs() {
+                    self.close_tab(g, self.editors[g].active_index());
                 }
                 return Ok(());
             }

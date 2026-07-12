@@ -145,12 +145,14 @@ pub enum KeyAction {
     /// Leave a transient mode such as the find bar (Escape).
     Escape,
     /// Pane management: toggle the file tree (Ctrl+B), toggle the second content
-    /// pane (Ctrl+\), and focus the tree / editor A / editor B (Ctrl+0/1/2).
+    /// pane (Ctrl+\), focus the tree / editor A / editor B (Ctrl+0/1/2), and close
+    /// the active tab (Ctrl+W).
     ToggleTree,
     ToggleSecondPane,
     FocusTree,
     FocusPaneA,
     FocusPaneB,
+    CloseTab,
     None,
 }
 
@@ -432,32 +434,7 @@ impl Xkb {
         };
         // SAFETY: state is valid; the call returns the effective keysym.
         let sym = unsafe { xkb_state_key_get_one_sym(state.as_ptr(), keycode + EVDEV_OFFSET) };
-        // Fold an upper-case keysym (Ctrl+Shift+letter) to lower-case ASCII.
-        let sym = if (0x41..=0x5A).contains(&sym) {
-            sym + 0x20
-        } else {
-            sym
-        };
-        match sym {
-            0x61 => KeyAction::SelectAll,                         // a
-            0x63 => KeyAction::Copy,                              // c
-            0x66 => KeyAction::Find,                              // f
-            0x68 => KeyAction::Replace,                           // h
-            0x73 => KeyAction::Save,                              // s
-            0x78 => KeyAction::Cut,                               // x
-            0x76 => KeyAction::Paste,                             // v
-            0x6B if self.shift_active() => KeyAction::DeleteLine, // Ctrl+Shift+K
-            0x62 => KeyAction::ToggleTree,                        // b: toggle sidebar
-            0x5C => KeyAction::ToggleSecondPane,                  // backslash: split
-            0x30 => KeyAction::FocusTree,                         // 0: focus tree
-            0x31 => KeyAction::FocusPaneA,                        // 1: focus editor A
-            0x32 => KeyAction::FocusPaneB,                        // 2: focus editor B
-            // Ctrl+Z undoes; Ctrl+Shift+Z and Ctrl+Y redo.
-            0x7A if self.shift_active() => KeyAction::Redo, // Z
-            0x7A => KeyAction::Undo,                        // z
-            0x79 => KeyAction::Redo,                        // y
-            _ => KeyAction::None,
-        }
+        ctrl_action_for_sym(sym, self.shift_active())
     }
 
     fn replace(&mut self, keymap: NonNull<c_void>, state: NonNull<c_void>) {
@@ -469,6 +446,39 @@ impl Xkb {
             // SAFETY: old came from xkb_keymap_new_* and is freed once.
             unsafe { xkb_keymap_unref(old.as_ptr()) };
         }
+    }
+}
+
+/// The shortcut table for a Ctrl-held key, keyed by its layout keysym so a
+/// non-QWERTY layout binds the letter the user sees, not the position. Held apart
+/// from the keymap state so the table itself is testable.
+fn ctrl_action_for_sym(sym: u32, shift: bool) -> KeyAction {
+    // Fold an upper-case keysym (Ctrl+Shift+letter) to lower-case ASCII.
+    let sym = if (0x41..=0x5A).contains(&sym) {
+        sym + 0x20
+    } else {
+        sym
+    };
+    match sym {
+        0x61 => KeyAction::SelectAll,           // a
+        0x63 => KeyAction::Copy,                // c
+        0x66 => KeyAction::Find,                // f
+        0x68 => KeyAction::Replace,             // h
+        0x73 => KeyAction::Save,                // s
+        0x78 => KeyAction::Cut,                 // x
+        0x76 => KeyAction::Paste,               // v
+        0x6B if shift => KeyAction::DeleteLine, // Ctrl+Shift+K
+        0x62 => KeyAction::ToggleTree,          // b: toggle sidebar
+        0x77 => KeyAction::CloseTab,            // w: close the active tab
+        0x5C => KeyAction::ToggleSecondPane,    // backslash: split
+        0x30 => KeyAction::FocusTree,           // 0: focus tree
+        0x31 => KeyAction::FocusPaneA,          // 1: focus editor A
+        0x32 => KeyAction::FocusPaneB,          // 2: focus editor B
+        // Ctrl+Z undoes; Ctrl+Shift+Z and Ctrl+Y redo.
+        0x7A if shift => KeyAction::Redo, // Z
+        0x7A => KeyAction::Undo,          // z
+        0x79 => KeyAction::Redo,          // y
+        _ => KeyAction::None,
     }
 }
 
@@ -537,5 +547,31 @@ mod tests {
     fn shift_is_inactive_without_a_keymap() {
         let xkb = Xkb::new().expect("xkb context");
         assert!(!xkb.shift_active());
+    }
+
+    #[test]
+    fn ctrl_shortcuts_map_by_keysym() {
+        // The letters the editor binds, by their lower-case keysym.
+        let sym = |c: char| c as u32;
+        assert_eq!(ctrl_action_for_sym(sym('w'), false), KeyAction::CloseTab);
+        assert_eq!(ctrl_action_for_sym(sym('b'), false), KeyAction::ToggleTree);
+        assert_eq!(ctrl_action_for_sym(sym('s'), false), KeyAction::Save);
+        assert_eq!(ctrl_action_for_sym(sym('f'), false), KeyAction::Find);
+        assert_eq!(ctrl_action_for_sym(sym('1'), false), KeyAction::FocusPaneA);
+        // An unbound key is inert rather than falling through to another action.
+        assert_eq!(ctrl_action_for_sym(sym('q'), false), KeyAction::None);
+    }
+
+    #[test]
+    fn ctrl_shift_folds_the_keysym_and_picks_the_shifted_action() {
+        let sym = |c: char| c as u32;
+        // Ctrl+Shift+letter arrives upper-case; the table folds it, so a binding
+        // without a shifted meaning still fires (Ctrl+Shift+W closes the tab).
+        assert_eq!(ctrl_action_for_sym(sym('W'), true), KeyAction::CloseTab);
+        // Where shift does mean something, it selects the shifted action.
+        assert_eq!(ctrl_action_for_sym(sym('z'), false), KeyAction::Undo);
+        assert_eq!(ctrl_action_for_sym(sym('Z'), true), KeyAction::Redo);
+        assert_eq!(ctrl_action_for_sym(sym('k'), false), KeyAction::None);
+        assert_eq!(ctrl_action_for_sym(sym('K'), true), KeyAction::DeleteLine);
     }
 }

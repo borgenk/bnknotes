@@ -4,6 +4,7 @@ use std::time::{Duration, Instant};
 
 use super::{State, TabDrag, TabHover};
 use crate::find;
+use crate::keymap::{self, KeyAction};
 use crate::pane::{CaretAnim, Columns, EditorPane, Focus, Hit, SPLITTER};
 use crate::platform::error::{Error, Result};
 use crate::platform::ffi;
@@ -14,7 +15,6 @@ use crate::platform::protocol::{
 };
 use crate::platform::scroll;
 use crate::platform::wire::{Arg, Reader};
-use crate::platform::xkb::KeyAction;
 use crate::theme::{TAB_DRAG_THRESHOLD, TREE_PAD};
 
 /// What the Tab key inserts: spaces (a "soft tab"), not a literal `'\t'`. This
@@ -212,7 +212,7 @@ impl State {
                 let keycode = r.u32()?;
                 let key_state = r.u32()?;
                 if key_state == wl_keyboard::KEY_STATE_PRESSED {
-                    self.apply_action(self.xkb.action(keycode))?;
+                    self.apply_action(keymap::action(&self.xkb, keycode))?;
                     self.start_repeat(keycode);
                 } else if self.key_repeat.key == Some(keycode) {
                     self.stop_repeat();
@@ -1309,7 +1309,7 @@ impl State {
         let now = Instant::now();
         let mut fired = 0;
         while at <= now && fired < REPEAT_CATCHUP_CAP {
-            self.apply_action(self.xkb.action(keycode))?;
+            self.apply_action(keymap::action(&self.xkb, keycode))?;
             at += interval;
             fired += 1;
         }

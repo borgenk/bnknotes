@@ -1,14 +1,15 @@
 //! Decoding user-provided image bytes into a flat ARGB8888 buffer for inline
-//! display. This is the single seam over the external `zune` decoders: the rest
-//! of the editor speaks only [`Image`] and never imports a decoder crate, so the
-//! backend can be swapped by rewriting this one file.
+//! display. This is the single seam over the external decoders (`zune` for
+//! PNG/JPEG, `image-webp` for WebP): the rest of the editor speaks only
+//! [`Image`] and never imports a decoder crate, so a backend can be swapped by
+//! rewriting this one file.
 //!
 //! Image decoders parse hostile, attacker-controlled bytes, so this is the one
 //! place the editor leans on memory-safe third-party code rather than an
 //! in-tree decoder. [`Limits`] guards against decompression bombs: an image's declared
 //! dimensions are read from its header and checked before any pixel buffer is
-//! allocated. The decoders' own built-in dimension cap (16384 square) sits above
-//! that as a hard backstop, so an absurd size is refused even sooner.
+//! allocated. The zune decoders' own built-in dimension cap (16384 square) sits
+//! above that as a hard backstop, so an absurd size is refused even sooner.
 
 use std::collections::HashMap;
 use std::io::Cursor;
@@ -49,12 +50,13 @@ impl Default for Limits {
 
 impl Image {
     /// Decode `bytes`, sniffing the format from its leading magic number (the
-    /// file extension is not trusted). PNG and JPEG only for now; any other
-    /// signature is rejected. `limits` bounds the dimensions that are accepted.
+    /// file extension is not trusted). PNG, JPEG, and WebP; any other signature
+    /// is rejected. `limits` bounds the dimensions that are accepted.
     pub fn decode(bytes: &[u8], limits: Limits) -> Result<Image> {
         match Format::sniff(bytes) {
             Some(Format::Png) => decode_png(bytes, limits),
             Some(Format::Jpeg) => decode_jpeg(bytes, limits),
+            Some(Format::Webp) => decode_webp(bytes, limits),
             None => Err(Error::msg("unsupported or unrecognized image format")),
         }
     }
@@ -66,6 +68,7 @@ impl Image {
 enum Format {
     Png,
     Jpeg,
+    Webp,
 }
 
 impl Format {
@@ -76,6 +79,11 @@ impl Format {
             Some(Format::Png)
         } else if bytes.starts_with(JPEG) {
             Some(Format::Jpeg)
+        } else if bytes.len() >= 12 && &bytes[0..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
+            // WebP is a RIFF container: "RIFF" <u32 chunk size> "WEBP". Both
+            // anchors are checked so a different RIFF payload (wav, avi) is not
+            // taken for an image.
+            Some(Format::Webp)
         } else {
             None
         }
@@ -144,6 +152,29 @@ fn decode_jpeg(bytes: &[u8], limits: Limits) -> Result<Image> {
         .decode()
         .map_err(|_| Error::msg("jpeg decode failed"))?;
     pack(pixels, w as u32, h as u32)
+}
+
+fn decode_webp(bytes: &[u8], limits: Limits) -> Result<Image> {
+    use image_webp::WebPDecoder;
+
+    // `new` parses the RIFF header, so dimensions are known (and checked) before
+    // any pixel buffer is sized.
+    let mut decoder =
+        WebPDecoder::new(Cursor::new(bytes)).map_err(|_| Error::msg("invalid webp"))?;
+    let (w, h) = decoder.dimensions();
+    check_dimensions(w as usize, h as usize, limits)?;
+    // The decoder reports the exact buffer it needs: w*h*3 (RGB) or w*h*4 (RGBA),
+    // which `pack` then reads back as a channel count. `None` only on a dimension
+    // overflow, already ruled out by check_dimensions.
+    let size = decoder
+        .output_buffer_size()
+        .ok_or_else(|| Error::msg("webp dimensions overflow"))?;
+    let mut buf = vec![0u8; size];
+    // Decodes the first frame; an animated webp shows that frame as a still.
+    decoder
+        .read_image(&mut buf)
+        .map_err(|_| Error::msg("webp decode failed"))?;
+    pack(buf, w, h)
 }
 
 /// Fold decoded bytes into ARGB8888 `u32`s, inferring the channel count from the
@@ -300,6 +331,7 @@ impl ImageStore {
             let mime = match Format::sniff(&bytes)? {
                 Format::Png => "image/png",
                 Format::Jpeg => "image/jpeg",
+                Format::Webp => "image/webp",
             };
             Some((bytes, mime))
         })
@@ -322,21 +354,39 @@ impl ImageStore {
 mod tests {
     use super::*;
 
-    // Real, tiny fixtures generated offline (no external sources): a 2x2 RGBA PNG
-    // and a 16x16 solid-red JPEG. See src/render/testdata.
+    // Real, tiny fixtures generated offline (no external sources): a 2x2 RGBA PNG,
+    // a 16x16 solid-red JPEG, and the same 2x2 RGBA image as a lossless (VP8L)
+    // WebP. See src/render/testdata.
     const TINY_PNG: &[u8] = include_bytes!("testdata/tiny.png");
     const TINY_JPEG: &[u8] = include_bytes!("testdata/tiny.jpg");
+    const TINY_WEBP: &[u8] = include_bytes!("testdata/tiny.webp");
 
     #[test]
-    fn sniffs_png_and_jpeg_and_rejects_others() {
+    fn sniffs_png_jpeg_webp_and_rejects_others() {
         assert!(matches!(Format::sniff(TINY_PNG), Some(Format::Png)));
         assert!(matches!(Format::sniff(TINY_JPEG), Some(Format::Jpeg)));
+        assert!(matches!(Format::sniff(TINY_WEBP), Some(Format::Webp)));
         assert!(Format::sniff(b"GIF89a....").is_none());
+        // A RIFF container that is not WebP (a wav file) shares the leading magic
+        // but not the form tag, so it is not mistaken for an image.
+        assert!(Format::sniff(b"RIFF\0\0\0\0WAVEfmt ").is_none());
         assert!(Format::sniff(b"").is_none());
         assert!(
             Format::sniff(&[0x89]).is_none(),
             "a truncated magic is not png"
         );
+    }
+
+    #[test]
+    fn decodes_lossless_webp_preserving_alpha() {
+        let img = Image::decode(TINY_WEBP, Limits::default()).expect("decode webp");
+        assert_eq!((img.width, img.height), (2, 2));
+        // The same 2x2 fixture as the png, encoded lossless (VP8L), so the exact
+        // pixels survive: red(opaque), green(half), blue(opaque), transparent.
+        assert_eq!(img.pixels[0], argb(255, 255, 0, 0));
+        assert_eq!(img.pixels[1], argb(128, 0, 255, 0));
+        assert_eq!(img.pixels[2], argb(255, 0, 0, 255));
+        assert_eq!(img.pixels[3], argb(0, 0, 0, 0));
     }
 
     #[test]
@@ -469,6 +519,19 @@ mod tests {
         let mut store = ImageStore::new(Some(dir.clone()));
         store.ensure("note.txt");
         assert!(store.get("note.txt").is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn store_reads_source_bytes_and_webp_mime_for_clipboard() {
+        let dir = temp_dir("read-source-webp");
+        std::fs::write(dir.join("pic.webp"), TINY_WEBP).unwrap();
+        let store = ImageStore::new(Some(dir.clone()));
+        // The clipboard copies the file as-is (no re-encode), so the bytes come
+        // back verbatim alongside the sniffed MIME.
+        let (bytes, mime) = store.read_source("pic.webp").expect("read source");
+        assert_eq!(bytes, TINY_WEBP);
+        assert_eq!(mime, "image/webp");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

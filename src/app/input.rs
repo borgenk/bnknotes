@@ -277,8 +277,12 @@ impl State {
     }
 
     pub(super) fn apply_action(&mut self, action: KeyAction) -> Result<()> {
-        // Window-level pane management, handled before any editor routing: toggle
-        // the sidebar/second pane, or move focus between regions.
+        // A keyboard action drives this move, so any caret navigation it causes eases
+        // rather than snapping. Set for every action (including non-caret ones); it is
+        // only read when the caret's offset actually moves.
+        self.caret_from_pointer = false;
+        // Window-level pane management, handled before any editor routing: toggle the
+        // sidebar/second pane, or move focus between regions.
         match action {
             KeyAction::ToggleTree => {
                 self.panes.tree_visible = !self.panes.tree_visible;
@@ -572,6 +576,7 @@ impl State {
                         // Drag extends the focused editor's selection from the press
                         // point, arming auto-scroll at the column's vertical edges.
                         let rect = self.editor_rect(i);
+                        self.caret_from_pointer = true;
                         if self.editors[i].place_cursor_at(&self.fonts, rect, px, py, true) {
                             self.dirty = true;
                         }
@@ -935,6 +940,8 @@ impl State {
             Hit::Splitter(s) => self.drag_splitter = Some(s),
             Hit::Tree(rect) => self.tree_press(rect, py),
             Hit::Editor(i, rect) => {
+                // A click places the caret; that jump snaps rather than smearing.
+                self.caret_from_pointer = true;
                 self.focus_pane(i);
                 self.editor_press(i, rect, px, py);
             }

@@ -37,7 +37,9 @@ use crate::paint::{
     build_display_list, build_find_paint, push_splitter, push_top_bar, push_tree, top_bar_height,
     BarCtx, CaretPaint, PaintParams, TabStrip,
 };
-use crate::pane::{restore_group, CaretAnim, Columns, Focus, PaneGroup, PaneLayout, TreePane};
+use crate::pane::{
+    restore_group, CaretAnim, CaretFrame, Columns, Focus, PaneGroup, PaneLayout, TreePane,
+};
 use crate::platform::conn::{Connection, Fill};
 use crate::platform::error::{Error, Result};
 use crate::platform::freetype::{FontConfig, Fonts};
@@ -301,6 +303,12 @@ struct State {
     /// focused editor's caret; other panes draw a dimmed, static caret.
     caret_visible: bool,
     caret_blink_at: Option<Instant>,
+    /// Whether the last input that moved the caret came from the pointer. The smear
+    /// is a keyboard-navigation affordance, so a pointer-driven move (click, drag)
+    /// snaps instead of easing. Set false by any keyboard action and true when the
+    /// pointer places the caret; only consulted when the caret's logical offset
+    /// actually moved.
+    caret_from_pointer: bool,
     /// Whether the surface holds the keyboard focus (`wl_keyboard.enter` to
     /// `leave`). The caret only blinks (and only wakes the loop on its timer)
     /// while focused; an unfocused window hides the caret and stays idle.
@@ -499,6 +507,7 @@ impl State {
             pointer_y: 0.0,
             caret_visible: true,
             caret_blink_at: None,
+            caret_from_pointer: false,
             focused: false,
             key_repeat: KeyRepeat::new(),
             last_serial: 0,
@@ -970,6 +979,7 @@ impl State {
         let body_size = self.body_size;
         let config = self.caret_config;
         let visible = self.caret_visible;
+        let from_pointer = self.caret_from_pointer;
         let fonts = &self.fonts;
         let ed = &mut self.editors[i];
         if !ed.has_tabs() {
@@ -986,17 +996,23 @@ impl State {
             .layout_cache
             .as_ref()?
             .caret(fonts, ed.text.rope(), cursor);
-        let target = (cx as f32, cy as f32);
-        let key = (rect.x, rect.w, body_size, scale.factor_120());
+        let caret_width = scale.px(CARET_WIDTH);
+        let frame = CaretFrame {
+            target: (cx as f32, cy as f32),
+            height: ch as f32,
+            width: caret_width,
+            cursor,
+            from_pointer,
+            key: (rect.x, rect.w, body_size, scale.factor_120()),
+        };
         let anim = ed.caret_anim_mut();
-        anim.update(target, ch as f32, key, &config, now);
+        anim.update(frame, &config, now);
         // Hidden this frame (unfocused window or blinked-off half): the anim is still
         // ticked above so it settles, but nothing is drawn.
         if !(focused && visible) {
             return None;
         }
-        let caret_width = scale.px(CARET_WIDTH);
-        let paint_rect = anim.smear_rect(target, ch as f32, caret_width);
+        let paint_rect = anim.draw_rect();
         // A moving caret is a rounded smear; a settled one (and the whole
         // animation-off path) is the plain bar, drawn as a sharp Fill.
         let radius = if anim.in_flight() {

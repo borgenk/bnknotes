@@ -27,15 +27,22 @@ pub struct Config {
     pub caret: CaretConfig,
 }
 
-/// Caret motion settings: one master toggle plus the two knobs that actually change
-/// the feel. When [`Self::animate`] is off the caret snaps cell to cell as before.
+/// Caret motion settings: one master toggle plus the knobs that shape the motion.
+/// When [`Self::animate`] is off the caret snaps cell to cell as before.
 #[derive(Clone, Copy, Debug)]
 pub struct CaretConfig {
-    /// Whether the caret eases toward its target and stretches along the way.
+    /// Whether keyboard-driven moves ease the caret toward its target and stretch it
+    /// along the way. Covers typing, Enter, and navigation; mouse clicks and reflows
+    /// always snap regardless of this flag.
     pub animate: bool,
-    /// Exponential decay constant, 1/second. Higher is snappier and shortens the
-    /// smear; this is the single feel knob.
+    /// Exponential decay constant, 1/second, for the edge leading the caret's travel.
+    /// Higher is snappier; this sets the overall speed.
     pub rate: f32,
+    /// The trailing edge's share of `rate`, in 0..1. The trailing edge eases at
+    /// `rate * spring`, so it lags the leading edge and the box stretches along the
+    /// caret's path. Lower is a longer, more visible smear; 1.0 is a rigid bar with no
+    /// stretch.
+    pub spring: f32,
     /// Largest animated target distance in caret heights. A larger jump (jump to
     /// end, a click across the document) settles immediately rather than drawing a
     /// document-long streak.
@@ -47,8 +54,12 @@ impl Default for CaretConfig {
         Self {
             // On, to dogfood the smooth caret on real content.
             animate: true,
-            // 30 to 50 reads as visible but not sluggish; 40 is a good start.
-            rate: 40.0,
+            // Fast enough to feel snappy while typing, still visibly a smear. Higher
+            // shortens the motion; lower makes it lazier.
+            rate: 72.0,
+            // A pronounced tail so the smear stays visible at the higher rate; 1.0
+            // removes the stretch, near 0 is a long comet.
+            spring: 0.5,
             // Wide enough that an Enter, Home/End, or a click across a full-width
             // line still animates (a content column is tens of caret heights wide);
             // only a document-spanning jump is farther than this and snaps.

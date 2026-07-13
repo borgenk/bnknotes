@@ -127,9 +127,11 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             fonts: FontConfig::default(),
-            // Around 1.8 undoes the linear-light fattening on its own; a little
-            // above that also matches the browser's edge lightening.
-            glyph_coverage_gamma: 2.0,
+            // Around 1.8 undoes the linear-light fattening on its own, and a
+            // little above that also matches the browser's edge lightening. 1.5
+            // stays under both, so prose keeps some of the fattening: bolder,
+            // with edges a little heavier than the browser's.
+            glyph_coverage_gamma: 1.5,
             // Code renders at a smaller size where the prose thinning reads as
             // faint, so it takes almost none: 1.0 leaves the coverage untouched.
             code_glyph_coverage_gamma: 1.0,

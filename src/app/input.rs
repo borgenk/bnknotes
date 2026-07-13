@@ -594,12 +594,12 @@ impl State {
                     self.drag_tab_to(px);
                 } else {
                     let i = self.active_editor();
-                    if matches!(self.focus, Focus::Editor(_)) && self.editors[i].selecting {
+                    if matches!(self.focus, Focus::Editor(_)) && self.editors[i].dragging() {
                         // Drag extends the focused editor's selection from the press
                         // point, arming auto-scroll at the column's vertical edges.
                         let rect = self.editor_rect(i);
                         self.caret_from_pointer = true;
-                        if self.editors[i].place_cursor_at(&self.fonts, rect, px, py, true) {
+                        if self.editors[i].drag_to(&self.fonts, rect, px, py) {
                             self.dirty = true;
                         }
                         self.bump_caret();
@@ -642,8 +642,8 @@ impl State {
                             }
                         }
                         let i = self.active_editor();
-                        let was_selecting = self.editors[i].selecting;
-                        self.editors[i].selecting = false;
+                        let was_selecting = self.editors[i].dragging();
+                        self.editors[i].end_drag();
                         self.editors[i].disarm_autoscroll();
                         if was_selecting {
                             // Selecting a heading from its text start takes the `#`
@@ -1352,40 +1352,34 @@ impl State {
         }
         // Click chaining for double/triple-click.
         let (click_count, chained) = self.editors[i].clicks.register(px, py, Instant::now());
-        // A plain click on a rendered horizontal rule selects the whole rule line.
-        if !shift {
-            if let Some((start, end)) = self.editors[i].rule_under_pointer(&self.fonts, rect, py) {
-                self.editors[i].text.select_range(start, end);
-                self.editors[i].selecting = false;
-                self.dirty = true;
-                self.bump_caret();
-                return;
-            }
+        // A plain click on a rendered horizontal rule selects the whole rule line,
+        // and a drag on from it sweeps the selection out of the rule.
+        if !shift && self.editors[i].press_rule(&self.fonts, rect, py) {
+            self.dirty = true;
+            self.bump_caret();
+            return;
         }
         // A plain, un-chained click on a rendered link follows it.
         if !chained && !shift {
             if let Some(dest) = self.editors[i].link_under_pointer(&self.fonts, rect, px, py) {
                 if crate::platform::browser::open_url(&dest).is_ok() {
-                    self.editors[i].selecting = false;
+                    self.editors[i].end_drag();
                     return;
                 }
             }
         }
         match click_count {
             1 => {
-                self.editors[i].place_cursor_at(&self.fonts, rect, px, py, shift);
-                self.editors[i].selecting = true;
+                self.editors[i].press_at(&self.fonts, rect, px, py, shift);
                 // Show the moved caret on the next frame, not the next blink wake.
                 self.dirty = true;
             }
             2 => {
-                let offset = self.editors[i].pointer_offset(&self.fonts, rect, px, py);
-                self.editors[i].text.select_word_at(offset);
+                self.editors[i].press_word(&self.fonts, rect, px, py);
                 self.dirty = true;
             }
             _ => {
-                let offset = self.editors[i].pointer_offset(&self.fonts, rect, px, py);
-                self.editors[i].text.select_line_at(offset);
+                self.editors[i].press_line(&self.fonts, rect, px, py);
                 self.dirty = true;
             }
         }
@@ -1399,7 +1393,7 @@ impl State {
         let i = self.active_editor();
         // A drag that ended (the selection was released) disarms; otherwise fire a
         // tick only once its deadline has passed.
-        if !self.editors[i].selecting {
+        if !self.editors[i].dragging() {
             self.editors[i].disarm_autoscroll();
             return;
         }
@@ -1411,7 +1405,7 @@ impl State {
         if self.editors[i].scroll_by(&self.fonts, rect, step) {
             self.flash_scrollbar(Focus::Editor(i));
         }
-        if self.editors[i].place_cursor_at(&self.fonts, rect, px, py, true) {
+        if self.editors[i].drag_to(&self.fonts, rect, px, py) {
             self.dirty = true;
         }
     }

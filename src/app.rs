@@ -972,7 +972,7 @@ impl State {
                 && px < (rect.x + rect.w) as f32
                 && py >= rect.y as f32
                 && py < (rect.y + rect.h) as f32;
-            let table_hover = if over && !ed.selecting && self.drag_splitter.is_none() {
+            let table_hover = if over && !ed.dragging() && self.drag_splitter.is_none() {
                 ed.layout_cache.as_ref().and_then(|l| {
                     l.table_button_at(&self.fonts, ed.text.rope(), px, ed.content_y(py))
                 })
@@ -1530,7 +1530,7 @@ impl State {
         };
         // Auto-scroll only ever runs in the focused editor (the one being dragged).
         let ed = &self.editors[self.active_editor()];
-        let autoscroll = (ed.autoscroll != 0 && ed.selecting)
+        let autoscroll = (ed.autoscroll != 0 && ed.dragging())
             .then_some(ed.autoscroll_at)
             .flatten()
             .map(until);

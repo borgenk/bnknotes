@@ -16,7 +16,7 @@ use crate::render::image::ImageStore;
 use crate::rope::Rope;
 use crate::scale::Scale;
 use crate::store;
-use crate::text::TextBuffer;
+use crate::text::{DragGrain, TextBuffer};
 use crate::theme::{FONT_SIZE, MARGIN};
 use crate::tree;
 
@@ -614,6 +614,49 @@ pub(crate) enum Hit {
     None,
 }
 
+/// A live pointer drag-selection: what the press took hold of, and how a sweep
+/// from there grows the selection.
+#[derive(Clone, Copy)]
+struct DragSelect {
+    /// The byte range the press took as a unit: the caret for a plain click, the
+    /// word or line for a double/triple-click, the whole line for a press on a
+    /// rendered horizontal rule or picture. A sweep grows out of this range and
+    /// never cuts into it, so a jitter during the click cannot break the press's
+    /// own selection apart.
+    anchor: (usize, usize),
+    /// The unit the sweep extends by, from the press that started it.
+    grain: DragGrain,
+    /// The logical-line start of the picture the press selected, if it landed on
+    /// one. The picture's border holds while the pointer stays within [`Self::anchor`]
+    /// and gives way to a text selection once the sweep leaves the image's line.
+    image: Option<usize>,
+}
+
+impl DragSelect {
+    /// A drag over text: no picture is selected under it.
+    fn text(anchor: (usize, usize), grain: DragGrain) -> Self {
+        Self {
+            anchor,
+            grain,
+            image: None,
+        }
+    }
+
+    /// A drag off the picture on the logical line `[start, end)`.
+    fn image(image: usize, (start, end): (usize, usize)) -> Self {
+        Self {
+            anchor: (start, end),
+            grain: DragGrain::Char,
+            image: Some(image),
+        }
+    }
+
+    /// Whether `offset` is still within what the press took hold of.
+    fn holds(&self, offset: usize) -> bool {
+        (self.anchor.0..=self.anchor.1).contains(&offset)
+    }
+}
+
 /// One content pane: an independent editor over its own buffer, carrying its own
 /// file, inline images, memoized layout, scroll, find bar, and the drag/selection
 /// transients a click-drag needs. Two of these live on [`State`].
@@ -638,7 +681,8 @@ pub(crate) struct EditorPane {
     /// can tell whether an offset (the cursor, a click) falls inside it.
     pub(crate) layout_band: (usize, usize),
     pub(crate) goal_x: Option<f32>,
-    pub(crate) selecting: bool,
+    /// The live pointer drag-selection, or `None` when no drag is in flight.
+    drag: Option<DragSelect>,
     pub(crate) clicks: ClickChain,
     /// Drag auto-scroll step: pixels per tick (negative up, positive down), 0 when
     /// disarmed. Armed while a selection drag holds the pointer in a column's edge
@@ -679,7 +723,7 @@ impl EditorPane {
             layout_key: None,
             layout_band: (0, 0),
             goal_x: None,
-            selecting: false,
+            drag: None,
             clicks: ClickChain::new(),
             autoscroll: 0,
             autoscroll_at: None,
@@ -755,7 +799,7 @@ impl EditorPane {
         ImageUi {
             selected: self.selected_image,
             raw: self.raw_image,
-            dragging: self.selecting,
+            dragging: self.dragging(),
         }
     }
 
@@ -785,7 +829,7 @@ impl EditorPane {
         // pointer stays put (matching the window build's `image_ui.dragging`); only
         // a corner-pinned source below still expands. Off a drag the reveal range's
         // ends expand their image sources.
-        if !self.selecting {
+        if !self.dragging() {
             let (lo, hi) = self.reveal_range();
             let l0 = rope.byte_to_line(lo);
             adjust.push(l0, index.reveal_extra(l0));
@@ -900,7 +944,7 @@ impl EditorPane {
     pub(crate) fn ensure_window(&mut self, fonts: &Fonts, rect: Rect) {
         let active = self.reveal_range();
         // Reveal depends only on which lines the active range touches, so the key
-        // is coarsened to lines. `selecting` rides the key because it holds image
+        // is coarsened to lines. The live drag rides the key because it holds image
         // sources collapsed (`image_ui.dragging`), so releasing a drag over an image
         // must rebuild to let that source expand.
         let active_lines = {
@@ -917,7 +961,7 @@ impl EditorPane {
             active_lines.1,
             self.selected_image,
             self.raw_image,
-            self.selecting,
+            self.dragging(),
         );
         let adjust = self.reveal_adjust();
         let (vis_top, vis_bot, over, n) = {
@@ -1185,8 +1229,10 @@ impl EditorPane {
     }
 
     /// Place the cursor (or, with `extend`, the selection's free end) at a window
-    /// position within this pane's column. Returns whether it moved.
-    pub(crate) fn place_cursor_at(
+    /// position within this pane's column, anchoring a drag-selection at the
+    /// selection's fixed end so holding the button and moving extends from there.
+    /// Returns whether the cursor moved.
+    pub(crate) fn press_at(
         &mut self,
         fonts: &Fonts,
         rect: Rect,
@@ -1198,7 +1244,81 @@ impl EditorPane {
             return false;
         };
         let offset = layout.offset_at(fonts, rope, px, y);
-        self.text.set_cursor_changed(offset, extend)
+        let moved = self.text.set_cursor_changed(offset, extend);
+        let anchor = self.text.selection_anchor();
+        self.drag = Some(DragSelect::text((anchor, anchor), DragGrain::Char));
+        moved
+    }
+
+    /// A double-click press: select the word under the pointer and drag on by whole
+    /// words, so a sweep keeps snapping to word bounds.
+    pub(crate) fn press_word(&mut self, fonts: &Fonts, rect: Rect, px: f32, py: f32) {
+        let offset = self.pointer_offset(fonts, rect, px, py);
+        let word = self.text.select_word_at(offset);
+        self.drag = Some(DragSelect::text(word, DragGrain::Word));
+    }
+
+    /// A triple-click press: select the line under the pointer and drag on by whole
+    /// lines.
+    pub(crate) fn press_line(&mut self, fonts: &Fonts, rect: Rect, px: f32, py: f32) {
+        let offset = self.pointer_offset(fonts, rect, px, py);
+        let line = self.text.select_line_at(offset);
+        self.drag = Some(DragSelect::text(line, DragGrain::Line));
+    }
+
+    /// A press on a rendered horizontal rule: select the whole rule line (its
+    /// `---` is collapsed, so there is no caret position between the markers to
+    /// land on) and anchor the drag on it, so a sweep off the rule grows the
+    /// selection out of it. Returns whether the press was the rule's.
+    pub(crate) fn press_rule(&mut self, fonts: &Fonts, rect: Rect, py: f32) -> bool {
+        let rule = {
+            let Some((layout, _, y)) = self.layout_at(fonts, rect, py) else {
+                return false;
+            };
+            layout.rule_at(fonts, y)
+        };
+        let Some((start, end)) = rule else {
+            return false;
+        };
+        self.text.select_range(start, end);
+        self.drag = Some(DragSelect::text((start, end), DragGrain::Char));
+        true
+    }
+
+    /// Extend the live drag-selection to a window position within this pane's
+    /// column. Returns whether anything changed; `false` with no drag in flight.
+    pub(crate) fn drag_to(&mut self, fonts: &Fonts, rect: Rect, px: f32, py: f32) -> bool {
+        let Some(drag) = self.drag else {
+            return false;
+        };
+        let offset = {
+            let Some((layout, rope, y)) = self.layout_at(fonts, rect, py) else {
+                return false;
+            };
+            layout.offset_at(fonts, rope, px, y)
+        };
+        // A picture the press selected keeps its border while the pointer stays on
+        // its line: a drag has to leave the image before the text selection takes
+        // over, so a jitter during the click does not turn a selected picture into a
+        // selected line of collapsed source.
+        if let Some(image) = drag.image {
+            if drag.holds(offset) {
+                return self.select_image(image);
+            }
+            self.selected_image = None;
+        }
+        self.text.drag_to(drag.anchor, offset, drag.grain)
+    }
+
+    /// Whether a pointer drag-selection is in flight in this pane.
+    pub(crate) fn dragging(&self) -> bool {
+        self.drag.is_some()
+    }
+
+    /// Let go of the drag-selection: the button came up, or another gesture (a
+    /// followed link) took the press.
+    pub(crate) fn end_drag(&mut self) {
+        self.drag = None;
     }
 
     /// The destination of the openable link under a window position, if its line
@@ -1257,13 +1377,18 @@ impl EditorPane {
     }
 
     /// Handle a press on an image button (toggles its raw source) or picture
-    /// (selects it). Returns whether it was consumed.
+    /// (selects it, and anchors a drag on its line so a sweep off the picture
+    /// selects it along with the text it reaches). Returns whether it was consumed.
     pub(crate) fn image_press(&mut self, fonts: &Fonts, rect: Rect, px: f32, py: f32) -> bool {
-        let Some((layout, _, y)) = self.layout_at(fonts, rect, py) else {
-            return false;
+        let (button, image) = {
+            let Some((layout, _, y)) = self.layout_at(fonts, rect, py) else {
+                return false;
+            };
+            (
+                layout.image_button_at(fonts, px, y),
+                layout.image_at(fonts, px, y),
+            )
         };
-        let button = layout.image_button_at(fonts, px, y);
-        let image = layout.image_at(fonts, px, y);
         if let Some(ls) = button {
             self.raw_image = if self.raw_image == Some(ls) {
                 None
@@ -1272,15 +1397,26 @@ impl EditorPane {
             };
             return true;
         }
-        if let Some(ls) = image {
-            self.selected_image = Some(ls);
-            self.raw_image = None;
-            let cursor = self.text.cursor();
-            self.text.set_cursor(cursor, false);
-            self.selecting = false;
-            return true;
-        }
-        false
+        let Some(ls) = image else {
+            return false;
+        };
+        let rope = self.text.rope();
+        let line = rope.line_content_range(rope.byte_to_line(ls));
+        self.raw_image = None;
+        self.select_image(ls);
+        self.drag = Some(DragSelect::image(ls, line));
+        true
+    }
+
+    /// Select the picture on the logical line starting at `ls`, dropping any text
+    /// selection: what the pointer holds is the image, not a range of source.
+    /// Returns whether anything changed.
+    fn select_image(&mut self, ls: usize) -> bool {
+        let changed = self.selected_image != Some(ls) || self.text.selection().is_some();
+        self.selected_image = Some(ls);
+        let cursor = self.text.cursor();
+        self.text.set_cursor(cursor, false);
+        changed
     }
 
     /// Handle a press on a table's add-row / add-column hover strip: grow the table
@@ -1325,19 +1461,6 @@ impl EditorPane {
             Some((layout, _, y)) if layout.image_at(fonts, px, y).is_some() => SHAPE_DEFAULT,
             _ => SHAPE_TEXT,
         }
-    }
-
-    /// The byte range of the rendered horizontal rule under a window position, if
-    /// its line is a collapsed thematic break, so a click can select the whole
-    /// rule line without the caller reaching into the layout cache.
-    pub(crate) fn rule_under_pointer(
-        &mut self,
-        fonts: &Fonts,
-        rect: Rect,
-        py: f32,
-    ) -> Option<(usize, usize)> {
-        let (layout, _, y) = self.layout_at(fonts, rect, py)?;
-        layout.rule_at(fonts, y)
     }
 
     /// Arm or disarm drag auto-scroll from the pointer's distance to this
@@ -1703,9 +1826,9 @@ mod tests {
         assert_eq!(ed.reveal_range(), (0, 7));
         // A live drag still reveals the selection, so the source you are grabbing
         // stays visible under the pointer rather than blanking out.
-        ed.selecting = true;
+        ed.drag = Some(DragSelect::text((0, 0), DragGrain::Char));
         assert_eq!(ed.reveal_range(), (0, 7));
-        ed.selecting = false;
+        ed.end_drag();
         assert_eq!(ed.reveal_range(), (0, 7));
     }
 
@@ -1761,7 +1884,8 @@ mod tests {
         );
 
         // A drag now extends a selection across that line; the marker stays shown.
-        pane.selecting = true;
+        let press = heading_start + 2;
+        pane.drag = Some(DragSelect::text((press, press), DragGrain::Char));
         pane.text.set_cursor(text.len(), true);
         pane.ensure_layout(&fonts, rect);
         assert!(
@@ -1985,13 +2109,151 @@ mod tests {
 
         // Anchor at the top and drag down across the opening fence.
         pane.text.set_cursor(0, false);
-        pane.selecting = true;
+        pane.drag = Some(DragSelect::text((0, 0), DragGrain::Char));
         pane.text.set_cursor(text.len(), true);
         pane.ensure_layout(&fonts, rect);
         assert!(
             fence_backticks_shown(&pane, 0),
             "the ``` stays visible while the drag sweeps over it"
         );
+    }
+
+    #[test]
+    fn a_drag_that_starts_on_a_rendered_rule_selects_out_of_it() {
+        // The reported bug: pressing a rendered `---` selected the rule but armed no
+        // drag, so sweeping off it selected nothing at all.
+        let fonts = Fonts::new(&markdown::all_sizes(FONT_SIZE)).expect("a default font");
+        let text = "above\n---\nbelow\n";
+        let rect = Rect {
+            x: 0,
+            y: 0,
+            w: 600,
+            h: 400,
+        };
+        let mut pane = EditorPane::empty();
+        pane.text = TextBuffer::from_text(text.to_string());
+        pane.set_scale(Scale::ONE, FONT_SIZE);
+        pane.ensure_layout(&fonts, rect);
+        let (above_y, rule_y, below_y) = {
+            let layout = pane.layout_cache.as_ref().expect("a layout");
+            let y = |i: usize| layout.lines()[i].baseline as f32;
+            (y(0), y(1), y(2))
+        };
+
+        assert!(
+            pane.press_rule(&fonts, rect, rule_y),
+            "the press lands on the rendered rule"
+        );
+        assert_eq!(
+            pane.text.selection(),
+            Some((6, 9)),
+            "the press selects the whole rule"
+        );
+        assert!(pane.dragging(), "and arms a drag anchored on it");
+
+        // Sweeping down past the end of the line below takes the rule with it.
+        assert!(pane.drag_to(&fonts, rect, 10_000.0, below_y));
+        assert_eq!(pane.text.selection(), Some((6, 15)));
+        // Sweeping the other way keeps the rule whole and grows upward instead.
+        assert!(pane.drag_to(&fonts, rect, 0.0, above_y));
+        assert_eq!(pane.text.selection(), Some((0, 9)));
+
+        pane.end_drag();
+        assert!(!pane.dragging());
+        assert!(
+            !pane.drag_to(&fonts, rect, 0.0, below_y),
+            "a released drag no longer follows the pointer"
+        );
+    }
+
+    #[test]
+    fn a_drag_after_a_double_click_extends_by_whole_words() {
+        let (mut pane, fonts, rect) = laid_out("alpha beta gamma delta\n", 0);
+        // The double-click takes "beta" (bytes 6..10).
+        let (px, py) = over(&pane, &fonts, 7);
+        pane.press_word(&fonts, rect, px, py);
+        assert_eq!(pane.text.selected_text().as_deref(), Some("beta"));
+        assert!(pane.dragging(), "the double-click arms a word-grained drag");
+        // Sweeping part-way into "gamma" takes the whole word, not the letters swept.
+        let (gx, gy) = over(&pane, &fonts, 13);
+        assert!(pane.drag_to(&fonts, rect, gx, gy));
+        assert_eq!(pane.text.selected_text().as_deref(), Some("beta gamma"));
+        // Sweeping back past the press pulls in "alpha" whole and keeps "beta".
+        let (ax, ay) = over(&pane, &fonts, 2);
+        assert!(pane.drag_to(&fonts, rect, ax, ay));
+        assert_eq!(pane.text.selected_text().as_deref(), Some("alpha beta"));
+    }
+
+    #[test]
+    fn a_drag_after_a_triple_click_extends_by_whole_lines() {
+        let (mut pane, fonts, rect) = laid_out("first line\nsecond line\nthird line\n", 0);
+        // The triple-click takes the second line (bytes 11..22).
+        let (px, py) = over(&pane, &fonts, 13);
+        pane.press_line(&fonts, rect, px, py);
+        assert_eq!(pane.text.selected_text().as_deref(), Some("second line"));
+        // Sweeping part-way into the third line takes all of it.
+        let (tx, ty) = over(&pane, &fonts, 25);
+        assert!(pane.drag_to(&fonts, rect, tx, ty));
+        assert_eq!(
+            pane.text.selected_text().as_deref(),
+            Some("second line\nthird line")
+        );
+    }
+
+    #[test]
+    fn a_drag_off_a_pressed_picture_hands_the_selection_to_the_text() {
+        let fonts = Fonts::new(&markdown::all_sizes(FONT_SIZE)).expect("a default font");
+        let rect = Rect {
+            x: 0,
+            y: 0,
+            w: 800,
+            h: 600,
+        };
+        let mut pane = pane_of("![x](cat.png)\nafter\n");
+        pane.images = ImageStore::from_decoded(vec![(
+            "cat.png".to_string(),
+            crate::render::image::Image {
+                pixels: vec![0; 80 * 80 * 4],
+                width: 80,
+                height: 80,
+            },
+        )]);
+        pane.ensure_layout(&fonts, rect);
+        // A point on the picture itself, found the way the pointer finds it.
+        let (ix, iy) = {
+            let layout = pane.layout_cache.as_ref().expect("a built layout");
+            let y = (0..rect.h)
+                .map(|y| y as f32)
+                .find(|&y| layout.image_at(&fonts, 60.0, y).is_some())
+                .expect("the picture's rows");
+            (60.0, y + 4.0)
+        };
+
+        assert!(
+            pane.image_press(&fonts, rect, ix, iy),
+            "the press lands on the picture"
+        );
+        assert_eq!(pane.selected_image, Some(0), "which the press selects");
+        assert!(pane.text.selection().is_none(), "with no text selected yet");
+        assert!(pane.dragging(), "and a drag anchored on the image's line");
+
+        // A jitter that stays on the picture leaves it selected, rather than
+        // text-selecting the collapsed source line under it.
+        assert!(!pane.drag_to(&fonts, rect, ix + 1.0, iy + 1.0));
+        assert_eq!(pane.selected_image, Some(0));
+        assert!(pane.text.selection().is_none());
+
+        // Sweeping into the text below hands over to a text selection, which carries
+        // the image line with it.
+        let (tx, ty) = over(&pane, &fonts, 19);
+        assert!(pane.drag_to(&fonts, rect, tx, ty));
+        assert_eq!(pane.selected_image, None, "the picture's border gives way");
+        assert_eq!(pane.text.selection(), Some((0, 19)));
+
+        // Sweeping back onto the picture takes it as a picture again.
+        assert!(pane.drag_to(&fonts, rect, ix, iy));
+        assert_eq!(pane.selected_image, Some(0));
+        assert!(pane.text.selection().is_none());
     }
 
     /// A group of `n` tabs, each stamped with a distinct `scroll_y` so a test can

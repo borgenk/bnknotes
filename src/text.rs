@@ -44,6 +44,16 @@ enum Coalesce {
     Delete,
 }
 
+/// The unit a pointer drag extends its selection by, set by the press that
+/// started it: a click drags by character, a double-click by word, a triple-click
+/// by line. See [`TextBuffer::drag_to`].
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum DragGrain {
+    Char,
+    Word,
+    Line,
+}
+
 /// A restorable editing state. Cloning the `Rope` is O(1) and shares the text
 /// with the live buffer, so checkpoints are cheap regardless of document size.
 #[derive(Clone)]
@@ -722,12 +732,13 @@ impl TextBuffer {
         self.set_selection(0, self.text.len());
     }
 
-    /// Select the word (or run of separators) at `offset`, for a double-click.
-    /// The word model matches the word-motion keys: a word is a run of
-    /// alphanumerics and `_`; whitespace and punctuation are separators.
-    pub fn select_word_at(&mut self, offset: usize) {
+    /// Select the word (or run of separators) at `offset`, for a double-click, and
+    /// return its range. The word model matches the word-motion keys: a word is a
+    /// run of alphanumerics and `_`; whitespace and punctuation are separators.
+    pub fn select_word_at(&mut self, offset: usize) -> (usize, usize) {
         let (start, end) = word_range_rope(&self.text, offset);
         self.set_selection(start, end);
+        (start, end)
     }
 
     /// Select the visible content of the logical line containing `offset`, for a
@@ -738,10 +749,16 @@ impl TextBuffer {
     /// line below. Removing the line itself is the explicit Ctrl+Shift+K
     /// ([`Self::delete_line`]). The buffer only ever holds `\n` (line endings are
     /// normalized on load), so one byte is stripped.
-    pub fn select_line_at(&mut self, offset: usize) {
-        let line = self.text.byte_to_line(offset.min(self.text.len()));
-        let (start, end) = self.text.line_content_range(line);
+    pub fn select_line_at(&mut self, offset: usize) -> (usize, usize) {
+        let (start, end) = self.line_range_at(offset);
         self.set_selection(start, end);
+        (start, end)
+    }
+
+    /// The visible content range of the logical line containing `offset`.
+    fn line_range_at(&self, offset: usize) -> (usize, usize) {
+        let line = self.text.byte_to_line(offset.min(self.text.len()));
+        self.text.line_content_range(line)
     }
 
     /// Delete the whole logical line(s) the cursor or selection touches, newline
@@ -774,6 +791,51 @@ impl TextBuffer {
     /// already sit on cluster boundaries.
     pub fn select_range(&mut self, start: usize, end: usize) {
         self.set_selection(start, end);
+    }
+
+    /// The selection's fixed end: its anchor, or the cursor when nothing is
+    /// selected. A pointer drag extends from here.
+    pub fn selection_anchor(&self) -> usize {
+        self.anchor.unwrap_or(self.cursor)
+    }
+
+    /// Extend a pointer drag anchored on the byte range `[start, end)` out to
+    /// `offset`, by whole units of `grain`. Past the anchor's end the selection runs
+    /// from `start`, before its start it runs from `end`, and inside it the anchor
+    /// stays selected whole, so what the press took as a unit (a word, a line, a
+    /// horizontal rule) survives a drag in either direction. A caret anchor
+    /// (`start == end`) dragged by [`DragGrain::Char`] is a plain drag from the press
+    /// point. Returns whether the selection moved.
+    pub fn drag_to(
+        &mut self,
+        (start, end): (usize, usize),
+        offset: usize,
+        grain: DragGrain,
+    ) -> bool {
+        let (lo, hi) = self.grain_range(offset, grain);
+        let (fixed, free) = if hi > end {
+            (start, hi)
+        } else if lo < start {
+            (end, lo)
+        } else {
+            (start, end)
+        };
+        let before = (self.anchor, self.cursor);
+        self.set_selection(fixed, free);
+        before != (self.anchor, self.cursor)
+    }
+
+    /// The range a drag's free end covers at `offset`: the caret there, the word
+    /// under it, or the content of its line.
+    fn grain_range(&self, offset: usize, grain: DragGrain) -> (usize, usize) {
+        match grain {
+            DragGrain::Char => {
+                let offset = self.snap(offset);
+                (offset, offset)
+            }
+            DragGrain::Word => word_range_rope(&self.text, offset),
+            DragGrain::Line => self.line_range_at(offset),
+        }
     }
 
     /// Pull the low end of a mouse-driven selection back over a heading's
@@ -2441,6 +2503,73 @@ mod tests {
         b.select_range(2, 2);
         assert_eq!(b.selection(), None);
         assert_eq!(b.cursor(), 2);
+    }
+
+    #[test]
+    fn a_drag_from_a_caret_anchor_selects_from_the_press_point() {
+        let mut b = TextBuffer::from_text("hello world".to_string());
+        let press = (5, 5);
+        // Forward and back over the press point at byte 5.
+        assert!(b.drag_to(press, 11, DragGrain::Char));
+        assert_eq!(b.selection(), Some((5, 11)));
+        assert!(b.drag_to(press, 0, DragGrain::Char));
+        assert_eq!(b.selection(), Some((0, 5)));
+        // Back onto the press point: a bare caret, no selection.
+        assert!(b.drag_to(press, 5, DragGrain::Char));
+        assert_eq!(b.selection(), None);
+        assert_eq!(b.cursor(), 5);
+        // A drag that lands where it already is changes nothing.
+        assert!(!b.drag_to(press, 5, DragGrain::Char));
+    }
+
+    #[test]
+    fn a_drag_from_a_range_anchor_keeps_that_range_selected() {
+        let mut b = TextBuffer::from_text("above\n---\nbelow".to_string());
+        let rule = (6, 9); // the "---" of the thematic break
+        b.select_range(rule.0, rule.1);
+        // Down: the rule plus the text the drag sweeps into.
+        assert!(b.drag_to(rule, 15, DragGrain::Char));
+        assert_eq!(b.selection(), Some((6, 15)));
+        // Up: the rule stays whole, and the selection grows from its far edge.
+        assert!(b.drag_to(rule, 0, DragGrain::Char));
+        assert_eq!(b.selection(), Some((0, 9)));
+        // Wandering back inside the rule selects it whole again, so a jitter during
+        // the click cannot cut the anchored element in half.
+        assert!(b.drag_to(rule, 7, DragGrain::Char));
+        assert_eq!(b.selection(), Some((6, 9)));
+    }
+
+    #[test]
+    fn a_word_grained_drag_snaps_both_ends_to_whole_words() {
+        let mut b = TextBuffer::from_text("alpha beta gamma delta".to_string());
+        // The double-click takes "beta"; the drag then extends by whole words.
+        let word = b.select_word_at(7);
+        assert_eq!(word, (6, 10));
+        // A pointer part-way into "gamma" takes all of it, not the letters swept.
+        assert!(b.drag_to(word, 13, DragGrain::Word));
+        assert_eq!(b.selected_text().as_deref(), Some("beta gamma"));
+        // On into "delta".
+        assert!(b.drag_to(word, 18, DragGrain::Word));
+        assert_eq!(b.selected_text().as_deref(), Some("beta gamma delta"));
+        // Backwards past the press: "alpha" comes in whole and the anchor word stays.
+        assert!(b.drag_to(word, 2, DragGrain::Word));
+        assert_eq!(b.selected_text().as_deref(), Some("alpha beta"));
+        // Back onto the pressed word: just it again.
+        assert!(b.drag_to(word, 8, DragGrain::Word));
+        assert_eq!(b.selected_text().as_deref(), Some("beta"));
+    }
+
+    #[test]
+    fn a_line_grained_drag_takes_whole_lines() {
+        let mut b = TextBuffer::from_text("first\nsecond\nthird\n".to_string());
+        let line = b.select_line_at(8); // inside "second"
+        assert_eq!(b.selected_text().as_deref(), Some("second"));
+        // Down into "third": the whole line comes, however far in the pointer sits.
+        assert!(b.drag_to(line, 14, DragGrain::Line));
+        assert_eq!(b.selected_text().as_deref(), Some("second\nthird"));
+        // Up into "first": the pressed line stays whole.
+        assert!(b.drag_to(line, 2, DragGrain::Line));
+        assert_eq!(b.selected_text().as_deref(), Some("first\nsecond"));
     }
 
     #[test]

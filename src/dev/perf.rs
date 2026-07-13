@@ -38,6 +38,7 @@ use crate::paint::{build_display_list, CaretPaint, PaintParams};
 use crate::platform::error::{Error, Result};
 use crate::platform::freetype::Fonts;
 use crate::platform::geom::Rect;
+use crate::platform::scroll::Scrollbar;
 use crate::render::image::{Image, ImageStore};
 use crate::rope::Rope;
 use crate::scale::Scale;
@@ -57,8 +58,18 @@ const HISTORY_PATH: &str = "perf/history.jsonl";
 const REGRESSION_RATIO: f64 = 1.10;
 
 /// The surface the harness paints into, matching the app's initial window.
-const WIDTH: usize = 800;
-const HEIGHT: usize = 600;
+const WIDTH: i32 = 800;
+const HEIGHT: i32 = 600;
+/// The pane's column: the whole (windowless) surface, so the harness paints the
+/// frame the app paints with a single pane and no chrome above it.
+const VIEW: Rect = Rect {
+    x: 0,
+    y: 0,
+    w: WIDTH,
+    h: HEIGHT,
+};
+/// A scrollbar at rest: hidden, so the measured frame is the steady-state one.
+const RESTING_BAR: Scrollbar = Scrollbar::hidden();
 
 /// Repetitions per lab scenario. The macro scenarios are expensive (a full
 /// layout over megabytes), so a handful of rounds is enough to take the minimum.
@@ -135,7 +146,7 @@ pub fn run(args: &[String]) -> Result<()> {
 /// one to borrow).
 fn boot() -> Result<(Fonts, i32, ImageStore)> {
     let fonts = Fonts::new(&markdown::all_sizes(FONT_SIZE))?;
-    let wrap = WIDTH as i32 - 2 * MARGIN;
+    let wrap = WIDTH - 2 * MARGIN;
     Ok((fonts, wrap, ImageStore::new(None)))
 }
 
@@ -314,9 +325,10 @@ fn measure() -> Result<Vec<Sample>> {
 /// Paint parameters for a frame at `scroll_y` with an optional `selection`.
 fn params(scroll_y: i32, selection: Option<(usize, usize)>) -> PaintParams<'static> {
     PaintParams {
-        width: WIDTH,
-        height: HEIGHT,
+        view: VIEW,
         scroll_y,
+        content_height: HEIGHT,
+        scrollbar: &RESTING_BAR,
         scale: Scale::ONE,
         body_size: FONT_SIZE,
         selection,

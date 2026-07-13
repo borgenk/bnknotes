@@ -89,6 +89,31 @@ pub(crate) const MARGIN: i32 = 40;
 pub(crate) const CARET_COLOR: u32 = 0x00ff_ffff;
 pub(crate) const CARET_WIDTH: i32 = 2;
 
+/// The overlay scrollbar down the right edge of a content pane and of the sidebar.
+/// It floats over the content (in the text margin, so it never covers a glyph) and
+/// is drawn only while it is lit, so the layout never reflows around it.
+///
+/// The bar rests as a thin indicator and grows to [`SCROLL_WIDE`] when the pointer
+/// enters its zone: [`SCROLL_NEAR`] of slack to the left of the lane, so it meets the
+/// pointer before the pointer has to aim. The thumb is right-aligned in the lane and
+/// grows leftward, staying anchored to the window edge (which is where a maximized
+/// window's pointer lands).
+pub(crate) const SCROLL_THIN: i32 = 4;
+pub(crate) const SCROLL_WIDE: i32 = 10;
+pub(crate) const SCROLL_NEAR: i32 = 24;
+/// Gap between the lane and the column's right edge.
+pub(crate) const SCROLL_INSET: i32 = 3;
+/// Shortest the thumb gets, so even a huge document leaves something to grab.
+pub(crate) const SCROLL_MIN_THUMB: i32 = 30;
+/// The thumb and its trough are drawn as coverage of this tone over whichever
+/// surface they sit on (the editor background, the sidebar's darker one), so both
+/// columns get a bar with the same weight, and the fade is coverage falling to zero.
+/// The thumb lifts under the pointer, the way a tab's buttons do.
+pub(crate) const SCROLL_INK: u32 = 0x00cf_d8e3;
+pub(crate) const SCROLL_THUMB_COVER: f32 = 0.20;
+pub(crate) const SCROLL_THUMB_HOVER_COVER: f32 = 0.36;
+pub(crate) const SCROLL_TROUGH_COVER: f32 = 0.05;
+
 /// Top bar (the vault label plus each pane's tab strip) colors and metrics. The
 /// bar shares the sidebar's darker tone; the active tab is filled with the editor
 /// [`BACKGROUND`] so it reads as connected to the pane below it, while inactive

@@ -9,6 +9,7 @@ use crate::pane::TreePane;
 use crate::platform::freetype::{Face, FaceKey, FontStyle, Fonts, Metrics};
 use crate::platform::geom::Rect;
 use crate::platform::grapheme;
+use crate::platform::pixel;
 use crate::platform::scroll;
 use crate::platform::shape;
 use crate::render::display::{self, DisplayList, DrawCmd};
@@ -19,23 +20,33 @@ use crate::theme::{
     CODE_STRING_COLOR, DECOR_TEXT_GAP, FIND_BG, FIND_ERROR_COLOR, FIND_MATCH_COLOR,
     FIND_TICK_COLOR, FOREGROUND, HEADING_COLORS, IMAGE_BORDER_COLOR, IMAGE_BORDER_THICKNESS,
     IMAGE_BUTTON_BG, IMAGE_BUTTON_RADIUS, LINK_COLOR, MARGIN, MARKER_COLOR, QUOTE_BAR_COLOR,
-    QUOTE_BAR_WIDTH, RULE_COLOR, RULE_THICKNESS, SELECTION_COLOR, SPLITTER_COLOR,
-    TABLE_BORDER_COLOR, TABLE_HEADER_BG, TAB_ACTIVE_BG, TAB_ACTIVE_TEXT, TAB_BUTTON_HOVER_BG,
-    TAB_BUTTON_RADIUS, TAB_CLOSE_GAP, TAB_CLOSE_W, TAB_DIRTY_COLOR, TAB_HOVER_BG,
-    TAB_INACTIVE_TEXT, TAB_MAX_W, TAB_MIN_W, TAB_NEW_W, TAB_PAD_X, TAB_RADIUS, TAB_VPAD,
-    TICK_HEIGHT, TICK_WIDTH, TOP_BAR_BG, TREE_BG, TREE_CHEVRON_MAX, TREE_FOOTER_GAP,
-    TREE_FOOTER_VPAD, TREE_HOVER_BG, TREE_INDENT, TREE_MARKER_COLOR, TREE_MARKER_W, TREE_PAD,
-    TREE_ROW_INSET_Y, TREE_ROW_PAD, TREE_ROW_RADIUS, TREE_ROW_VPAD, TREE_TEXT_COLOR, VAULT_PAD_X,
+    QUOTE_BAR_WIDTH, RULE_COLOR, RULE_THICKNESS, SCROLL_INK, SCROLL_INSET, SCROLL_MIN_THUMB,
+    SCROLL_NEAR, SCROLL_THIN, SCROLL_THUMB_COVER, SCROLL_THUMB_HOVER_COVER, SCROLL_TROUGH_COVER,
+    SCROLL_WIDE, SELECTION_COLOR, SPLITTER_COLOR, TABLE_BORDER_COLOR, TABLE_HEADER_BG,
+    TAB_ACTIVE_BG, TAB_ACTIVE_TEXT, TAB_BUTTON_HOVER_BG, TAB_BUTTON_RADIUS, TAB_CLOSE_GAP,
+    TAB_CLOSE_W, TAB_DIRTY_COLOR, TAB_HOVER_BG, TAB_INACTIVE_TEXT, TAB_MAX_W, TAB_MIN_W, TAB_NEW_W,
+    TAB_PAD_X, TAB_RADIUS, TAB_VPAD, TICK_HEIGHT, TICK_WIDTH, TOP_BAR_BG, TREE_BG,
+    TREE_CHEVRON_MAX, TREE_FOOTER_GAP, TREE_FOOTER_VPAD, TREE_HOVER_BG, TREE_INDENT,
+    TREE_MARKER_COLOR, TREE_MARKER_W, TREE_PAD, TREE_ROW_INSET_Y, TREE_ROW_PAD, TREE_ROW_RADIUS,
+    TREE_ROW_VPAD, TREE_TEXT_COLOR, VAULT_PAD_X,
 };
 
 /// The per-frame inputs [`build_display_list`] needs beyond the layout itself:
-/// the surface size, the scroll offset, the live selection and cursor, and
+/// the pane's column, the scroll offset, the live selection and cursor, and
 /// whether the caret is on this blink. Bundled so the build signature stays
 /// readable and so the perf harness can drive a build without a live surface.
 pub(crate) struct PaintParams<'a> {
-    pub width: usize,
-    pub height: usize,
+    /// The pane's column in window pixels. The layout is built at absolute positions
+    /// inside it, so the painter culls against this band and hangs its chrome (the
+    /// scrollbar, the find bar and its ticks) off these edges rather than off a size.
+    pub view: Rect,
     pub scroll_y: i32,
+    /// The document's full height, which the scrollbar's thumb and the find tick
+    /// strip both scale against. The layout only covers the visible window, so this
+    /// comes from the pane's line index.
+    pub content_height: i32,
+    /// The pane's overlay scrollbar, as lit and as wide as its last tick left it.
+    pub scrollbar: &'a scroll::Scrollbar,
     /// The display scale, so the painter's pixel constants (margin, caret, rule,
     /// tick strip) land at the right device size. Identity at [`Scale::ONE`].
     pub scale: Scale,
@@ -66,16 +77,14 @@ pub(crate) struct CaretPaint {
 }
 
 /// What the painter needs from an open find bar: the [`FindState`] itself,
-/// borrowed for the frame being built, plus the two tick-strip inputs that come
-/// from the caller's line index rather than the find state.
+/// borrowed for the frame being built, plus the tick-strip tops that come from the
+/// caller's line index rather than the find state.
 pub(crate) struct FindPaint<'a> {
     /// The open find bar's state (query, matches, current index, mode flags).
     pub state: &'a FindState,
     /// Content-space top of each match's line, from the line index, so the tick
     /// strip places a match that sits outside the painted window correctly.
     pub tick_tops: &'a [i32],
-    /// Total document content height, for the tick strip's proportional mapping.
-    pub doc_height: i32,
 }
 
 impl FindPaint<'_> {
@@ -140,13 +149,113 @@ fn code_token_color(token: markdown::CodeToken) -> u32 {
 pub(crate) fn build_find_paint<'a>(
     find: &'a FindState,
     tick_tops: &'a [i32],
-    doc_height: i32,
 ) -> Option<FindPaint<'a>> {
     find.is_open().then_some(FindPaint {
         state: find,
         tick_tops,
-        doc_height,
     })
+}
+
+/// The three rectangles an overlay scrollbar owns in a scrollable column `view`: the
+/// lane its thumb travels down, the band a press grabs it in, and the zone whose
+/// pointer wakes it into a full slider. Shared by the painter and the pointer
+/// hit-testing so the bar is grabbable exactly where it is drawn.
+///
+/// ```text
+///                      view's right edge ─┐
+///     │        zone            │  grab  │ │
+///     │                        │ track  │ │
+///     ├────────────────────────┼────────┤ │
+///     │  ....................  │  ███   │ │  ← thumb, right-aligned in the track
+/// ```
+pub(crate) struct ScrollLane {
+    /// The thumb's lane: the full scrollable height of the column, inset from its
+    /// right edge.
+    pub track: Rect,
+    /// Where a press takes the bar: the lane plus the inset out to the column's edge,
+    /// so a click at the very edge of a maximized window still lands on it.
+    pub grab: Rect,
+    /// Where the pointer expands the bar: the lane plus a margin of slack to its left.
+    pub zone: Rect,
+}
+
+/// Split the right edge of a scrollable column `view` into the scrollbar's lane, its
+/// grab band, and its proximity zone.
+pub(crate) fn scroll_lane(view: Rect, scale: Scale) -> ScrollLane {
+    let wide = scale.px(SCROLL_WIDE);
+    let inset = scale.px(SCROLL_INSET);
+    let right = view.x + view.w;
+    let track = Rect {
+        x: right - inset - wide,
+        y: view.y,
+        w: wide,
+        h: view.h,
+    };
+    let from = |x: i32| Rect {
+        x,
+        y: view.y,
+        w: (right - x).max(0),
+        h: view.h,
+    };
+    ScrollLane {
+        track,
+        grab: from(track.x),
+        zone: from(track.x - scale.px(SCROLL_NEAR)),
+    }
+}
+
+/// Draw the overlay scrollbar for a column: a faint trough (only once the pointer has
+/// grown the bar into a slider) and the thumb, both tinted over `behind`, the surface
+/// they float on, by how lit the bar is. A bar that is out of sight, or a column whose
+/// content fits, draws nothing.
+pub(crate) fn push_scrollbar(
+    list: &mut DisplayList,
+    view: Rect,
+    bar: &scroll::Scrollbar,
+    content_height: i32,
+    scroll_y: i32,
+    behind: u32,
+    scale: Scale,
+) {
+    let lit = bar.lit();
+    if lit <= 0.0 {
+        return;
+    }
+    let track = scroll_lane(view, scale).track;
+    let (thin, wide) = (scale.px(SCROLL_THIN), scale.px(SCROLL_WIDE));
+    let Some(full) = scroll::thumb(
+        track,
+        view.h,
+        content_height,
+        scroll_y,
+        scale.px(SCROLL_MIN_THUMB),
+    ) else {
+        return;
+    };
+    // The bar grows out of the window edge: the thumb keeps its right edge and widens
+    // leftward, and the trough appears under it as it goes.
+    let grown = bar.wide();
+    if grown > 0.0 {
+        list.push(DrawCmd::Fill {
+            rect: track,
+            color: pixel::tint(behind, SCROLL_INK, SCROLL_TROUGH_COVER * grown * lit),
+        });
+    }
+    let w = thin + (((wide - thin) as f32 * grown).round() as i32);
+    let rect = Rect {
+        x: full.x + full.w - w,
+        w,
+        ..full
+    };
+    // The thumb lifts under the pointer, so a bar that is merely reporting a scroll
+    // reads quieter than one that is asking to be grabbed.
+    let cover = SCROLL_THUMB_COVER + (SCROLL_THUMB_HOVER_COVER - SCROLL_THUMB_COVER) * grown;
+    list.push(DrawCmd::RoundRect {
+        rect,
+        color: pixel::tint(behind, SCROLL_INK, cover * lit),
+        radius: w / 2,
+        corners: display::RoundedCorners::Both,
+    });
 }
 
 /// Draw a splitter grab bar: its gap cleared to the background with a thin
@@ -213,16 +322,33 @@ pub(crate) fn tree_column(column: Rect, m: Metrics, scale: Scale) -> TreeColumn 
     }
 }
 
+/// The sidebar's scrollable height: every row, plus the padding above the first and
+/// below the last.
+fn tree_content_height(rows: usize, m: Metrics, scale: Scale) -> i32 {
+    rows as i32 * tree_row_height(m, scale) + 2 * scale.px(TREE_PAD)
+}
+
+/// Measure the sidebar into its column `rect`: how tall its rows stand, and its scroll
+/// clamped to them. The clamp is against the rows' viewport (the column above the
+/// pinned footer), not the whole column, so the last row cannot come to rest under the
+/// footer. The app runs this before it paints, so the tree's scroll, its scrollbar, and
+/// what [`push_tree`] draws all agree on how tall the tree is.
+pub(crate) fn measure_tree(tree: &mut TreePane, rect: Rect, m: Metrics, scale: Scale) {
+    let rows = tree.tree.rows().len();
+    tree.content_height = tree_content_height(rows, m, scale);
+    let view = tree_column(rect, m, scale).rows;
+    tree.scroll_y = scroll::clamp(tree.scroll_y, tree.content_height, view.h);
+}
+
 /// Draw the file-tree sidebar into its column `rect`: a darker background, then
 /// each visible row (a folder chevron plus the name), indented by depth and
-/// offset by the tree's own scroll, and finally the footer over the column's
-/// bottom. Updates `content_height` for scroll clamping. Rows do not wrap; a long
-/// name that overhangs is covered by the editor's own background, which is drawn
-/// after this.
+/// offset by the tree's own scroll, then its scrollbar, and finally the footer over
+/// the column's bottom. Rows do not wrap; a long name that overhangs is covered by
+/// the editor's own background, which is drawn after this.
 pub(crate) fn push_tree(
     list: &mut DisplayList,
     fonts: &Fonts,
-    tree: &mut TreePane,
+    tree: &TreePane,
     rect: Rect,
     scale: Scale,
     body_size: u32,
@@ -244,8 +370,6 @@ pub(crate) fn push_tree(
     let marker_w = scale.px(TREE_MARKER_W);
     let tree_indent = scale.px(TREE_INDENT);
     let rows = tree.tree.rows();
-    tree.content_height = rows.len() as i32 * row_h + 2 * tree_pad;
-    tree.scroll_y = scroll::clamp(tree.scroll_y, tree.content_height, view.h);
     let face = FaceKey::Prose {
         size: body_size,
         style: FontStyle::Regular,
@@ -301,6 +425,17 @@ pub(crate) fn push_tree(
             m,
         ));
     }
+    // The sidebar's own scrollbar, over the rows it scrolls (never over the footer,
+    // which is pinned below them).
+    push_scrollbar(
+        list,
+        view,
+        &tree.scrollbar,
+        tree.content_height,
+        tree.scroll_y,
+        TREE_BG,
+        scale,
+    );
     push_tree_footer(list, fonts, &col, tree, scale, body_size);
 }
 
@@ -816,30 +951,36 @@ pub(crate) fn build_display_list(
     if let Some(caret) = &p.caret {
         painter.caret(caret);
     }
-    // The find bar and its match ticks float over everything else, so they go last.
+    // The chrome floats over the content, so it goes last: the scrollbar, then the
+    // find bar and the match ticks that share the bar's lane.
+    painter.scrollbar(p.scrollbar, p.content_height);
     if let Some(find) = &p.find {
-        painter.find_ticks(find);
+        painter.find_ticks(find, p.content_height);
         painter.find_bar(find);
     }
     painter.list
 }
 
 /// Accumulates one frame's display list from the layout and rope. The read-only
-/// context (`fonts`/`layout`/`rope`) plus the viewport (`scroll_y`/`view_h`/
-/// `width`) and the content's left edge are held once so each pass reads them
+/// context (`fonts`/`layout`/`rope`) plus the viewport (`scroll_y` and the column
+/// `view`) and the content's left edge are held once so each pass reads them
 /// without re-plumbing; [`Self::screen`] and [`Self::push_text`] fold the
 /// shift-and-cull and measure-then-emit patterns the passes repeat.
+///
+/// Everything here is in window pixels: the layout bakes the column's origin into
+/// its positions (see `EditorPane::ensure_window`), so a pass culls against `view`'s
+/// band and pins its chrome to `view`'s edges, and a pane that is not the top-left
+/// one lands where it looks.
 struct Painter<'a> {
     list: DisplayList,
     fonts: &'a Fonts,
     layout: &'a Layout,
     rope: &'a crate::rope::Rope,
     scroll_y: i32,
-    view_h: i32,
-    width: i32,
+    /// The pane's column in window pixels.
+    view: Rect,
     /// The content's left edge (the column's inner margin). Text, panels, and
-    /// images hang off this so a pane's content sits in its own column; the
-    /// background clears from the column's outer edge, `MARGIN` to its left.
+    /// images hang off this so a pane's content sits in its own column.
     left: i32,
     /// The display scale, so each pixel constant scales to device pixels.
     scale: Scale,
@@ -863,20 +1004,31 @@ impl<'a> Painter<'a> {
             layout,
             rope,
             scroll_y: p.scroll_y,
-            view_h: p.height as i32,
-            width: p.width as i32,
+            view: p.view,
             left: layout.left(),
             scale: p.scale,
             body_size: p.body_size,
         }
     }
 
+    /// The window y of the column's bottom edge, the cull line every pass measures
+    /// against.
+    fn bottom(&self) -> i32 {
+        self.view.y + self.view.h
+    }
+
+    /// The width text wraps within: the column less its margins. What a full-width
+    /// decoration (a code panel, a thematic break) spans.
+    fn content_w(&self) -> i32 {
+        (self.view.w - 2 * self.scale.px(MARGIN)).max(0)
+    }
+
     /// Shift a content-space rect into screen space (up by the scroll) and cull
-    /// it when it falls entirely above or below the viewport. `None` means the
+    /// it when it falls entirely above or below the column. `None` means the
     /// caller emits nothing for it.
     fn screen(&self, rect: Rect) -> Option<Rect> {
         let y = rect.y - self.scroll_y;
-        if y + rect.h <= 0 || y >= self.view_h {
+        if y + rect.h <= self.view.y || y >= self.bottom() {
             return None;
         }
         Some(Rect { y, ..rect })
@@ -899,16 +1051,11 @@ impl<'a> Painter<'a> {
         end
     }
 
-    /// The background, full surface, first so a clipped repaint clears its region
-    /// before the rest of the list draws over it.
+    /// The background, the pane's whole column, first so a clipped repaint clears its
+    /// region before the rest of the list draws over it.
     fn background(&mut self) {
         self.list.push(DrawCmd::Fill {
-            rect: Rect {
-                x: self.left - self.scale.px(MARGIN),
-                y: 0,
-                w: self.width,
-                h: self.view_h,
-            },
+            rect: self.view,
             color: BACKGROUND,
         });
     }
@@ -923,7 +1070,7 @@ impl<'a> Painter<'a> {
     /// the whole panel reads as one softly rounded block.
     fn code_block_panels(&mut self) {
         let lines = self.layout.lines();
-        let panel_w = (self.width - 2 * self.scale.px(MARGIN)).max(0);
+        let panel_w = self.content_w();
         for (i, line) in lines.iter().enumerate() {
             if !line.code_block {
                 continue;
@@ -1000,7 +1147,7 @@ impl<'a> Painter<'a> {
     /// just painted. Only matches inside the visible byte range are measured, so a
     /// short query with thousands of hits does not price every frame by them.
     fn find_matches(&mut self, find: &FindPaint) {
-        let visible = visible_byte_range(self.fonts, self.layout, self.scroll_y, self.view_h);
+        let visible = visible_byte_range(self.fonts, self.layout, self.scroll_y, self.view);
         let matches = find.state.matches();
         let lo = matches.partition_point(|&(_, end)| end <= visible.0);
         let hi = matches.partition_point(|&(start, _)| start < visible.1);
@@ -1029,7 +1176,8 @@ impl<'a> Painter<'a> {
     /// leaves, the live-preview reveal that `layout` bakes into each run's `visible`.
     fn text(&mut self) {
         let (fonts, layout, rope) = (self.fonts, self.layout, self.rope);
-        let (scroll_y, view_h, left) = (self.scroll_y, self.view_h, self.left);
+        let (scroll_y, left) = (self.scroll_y, self.left);
+        let (top, bottom) = (self.view.y, self.bottom());
         for line in layout.lines() {
             let m = fonts.metrics(line.size);
             let baseline = line.baseline - scroll_y;
@@ -1040,7 +1188,7 @@ impl<'a> Painter<'a> {
             // decoded leaves the box blank.
             if let Some(img) = line.image {
                 let box_top = baseline - m.ascent;
-                if box_top < view_h && box_top + img.box_height() > 0 {
+                if box_top < bottom && box_top + img.box_height() > top {
                     let pic = Rect {
                         x: left + line.indent,
                         y: box_top + (img.box_height() - img.height) / 2,
@@ -1067,14 +1215,14 @@ impl<'a> Painter<'a> {
             // (taller) row box.
             if let Some(table) = &line.table {
                 let box_top = baseline - m.ascent;
-                if box_top < view_h && box_top + table.box_height() > 0 {
+                if box_top < bottom && box_top + table.box_height() > top {
                     self.table_row(left + line.indent, box_top, line.size, table, m);
                 }
                 continue;
             }
             // Skip lines fully above or below the viewport, so a frame only
             // rasterizes what is on screen.
-            if baseline + m.descent <= 0 || baseline - m.ascent >= view_h {
+            if baseline + m.descent <= top || baseline - m.ascent >= bottom {
                 continue;
             }
             // A blockquote draws a bar down its gutter, on every wrapped line.
@@ -1099,7 +1247,7 @@ impl<'a> Painter<'a> {
                     rect: Rect {
                         x: left,
                         y: mid - thickness / 2,
-                        w: (self.width - 2 * self.scale.px(MARGIN)).max(0),
+                        w: self.content_w(),
                         h: thickness,
                     },
                     color: RULE_COLOR,
@@ -1425,9 +1573,22 @@ impl<'a> Painter<'a> {
         }
     }
 
-    /// The right-edge match tick strip, floating over the content.
-    fn find_ticks(&mut self, find: &FindPaint) {
-        push_find_ticks(&mut self.list, find, self.width, self.view_h, self.scale);
+    /// The scrollbar for this pane, floating in the right margin.
+    fn scrollbar(&mut self, bar: &scroll::Scrollbar, content_height: i32) {
+        push_scrollbar(
+            &mut self.list,
+            self.view,
+            bar,
+            content_height,
+            self.scroll_y,
+            BACKGROUND,
+            self.scale,
+        );
+    }
+
+    /// The match tick strip, riding the scrollbar's lane.
+    fn find_ticks(&mut self, find: &FindPaint, content_height: i32) {
+        push_find_ticks(&mut self.list, find, self.view, content_height, self.scale);
     }
 
     /// The find bar panel, floating top-right over everything else.
@@ -1436,38 +1597,44 @@ impl<'a> Painter<'a> {
             &mut self.list,
             self.fonts,
             find,
-            self.width,
+            self.view,
             self.scale,
             self.body_size,
         );
     }
 }
 
-/// Append the right-edge tick strip while find is open: one mark per match at
-/// its document-proportional height, so the distribution of hits is visible at
-/// a glance and survives scrolling. Ticks are deduplicated per two-pixel row,
-/// which bounds the strip to O(viewport) commands however many matches exist;
-/// the current match's tick is wider and bright.
+/// Append the match tick strip while find is open: one mark per match at its
+/// document-proportional height, so the distribution of hits is visible at a glance
+/// and survives scrolling. Ticks are deduplicated per two-pixel row, which bounds the
+/// strip to O(viewport) commands however many matches exist; the current match's tick
+/// is wider and bright.
+///
+/// The strip shares the scrollbar's lane and is drawn after it, so the ticks read as
+/// marks on the bar (and stay visible where the thumb passes over them): the two say
+/// the same thing, where you are in the document and where the hits are.
 fn push_find_ticks(
     list: &mut DisplayList,
     find: &FindPaint,
-    width: i32,
-    view_h: i32,
+    view: Rect,
+    content_height: i32,
     scale: Scale,
 ) {
-    if find.state.matches().is_empty() || view_h <= 0 {
+    if find.state.matches().is_empty() || view.h <= 0 {
         return;
     }
     let tick_h = scale.px(TICK_HEIGHT);
     let tick_w = scale.px(TICK_WIDTH);
-    let content_h = find.doc_height.max(view_h) as i64;
-    let mut occupied = vec![false; (view_h / 2 + 1) as usize];
+    let content_h = content_height.max(view.h) as i64;
+    let lane = scroll_lane(view, scale).track;
+    let right = lane.x + lane.w;
+    let mut occupied = vec![false; (view.h / 2 + 1) as usize];
     for i in 0..find.state.matches().len() {
         // Each match's content-space top comes from the line index, so an offscreen
         // match still maps to its true position rather than the window's edge.
         let top = find.tick_tops.get(i).copied().unwrap_or(0) as i64;
-        let y = (top * (view_h - tick_h) as i64 / content_h) as i32;
-        let bucket = (y / 2).clamp(0, view_h / 2) as usize;
+        let offset = (top * (view.h - tick_h) as i64 / content_h) as i32;
+        let bucket = (offset / 2).clamp(0, view.h / 2) as usize;
         let current = i == find.state.current();
         if occupied[bucket] && !current {
             continue;
@@ -1480,8 +1647,8 @@ fn push_find_ticks(
         };
         list.push(DrawCmd::Fill {
             rect: Rect {
-                x: width - w - scale.px(1),
-                y,
+                x: right - w,
+                y: view.y + offset,
                 w,
                 h: tick_h,
             },
@@ -1494,17 +1661,12 @@ fn push_find_ticks(
 /// culling by byte offset before any geometry is measured. Conservative: a
 /// line's visibility is judged by its text box, and the empty viewport yields
 /// an empty range.
-fn visible_byte_range(
-    fonts: &Fonts,
-    layout: &Layout,
-    scroll_y: i32,
-    view_h: i32,
-) -> (usize, usize) {
+fn visible_byte_range(fonts: &Fonts, layout: &Layout, scroll_y: i32, view: Rect) -> (usize, usize) {
     let mut range = (usize::MAX, 0);
     for line in layout.lines() {
         let m = fonts.metrics(line.size);
         let baseline = line.baseline - scroll_y;
-        if baseline - m.ascent >= view_h || baseline + m.descent <= 0 {
+        if baseline - m.ascent >= view.y + view.h || baseline + m.descent <= view.y {
             continue;
         }
         range.0 = range.0.min(line.start);
@@ -1517,8 +1679,8 @@ fn visible_byte_range(
     }
 }
 
-/// Append the find bar: a rounded panel floating at the top-right with the
-/// query (its tail, when it overflows — the end is where editing happens), a
+/// Append the find bar: a rounded panel floating at the top-right of the pane with
+/// the query (its tail, when it overflows, since the end is where editing happens), a
 /// steady caret after it, and a match counter. Drawn from plain display-list
 /// commands, so damage tracking and clipped repaints treat it like any other
 /// content.
@@ -1526,7 +1688,7 @@ fn push_find_bar(
     list: &mut DisplayList,
     fonts: &Fonts,
     find: &FindPaint,
-    width: i32,
+    view: Rect,
     scale: Scale,
     body_size: u32,
 ) {
@@ -1577,7 +1739,7 @@ fn push_find_bar(
         }
         shown
     }
-    let field_max = (width / 3).max(3 * size as i32) as f32;
+    let field_max = (view.w / 3).max(3 * size as i32) as f32;
     let query = tail_that_fits(face, find.state.query(), field_max);
     let query_w = shape::text_advance(face, query).ceil() as i32;
     let replace = find.replace().map(|r| tail_that_fits(face, r, field_max));
@@ -1596,8 +1758,9 @@ fn push_find_bar(
     let field_w = query_w.max(replace_row_w) + caret_w + 2;
     let w = (field_w + pad + tail_w + 2 * pad).max(6 * size as i32);
     let h = rows * row_h + (rows + 1) * (pad / 2);
-    let x = width - w - margin;
-    let y = margin / 2;
+    // Tucked into the pane's top-right corner, clear of the scrollbar's lane.
+    let x = view.x + view.w - w - margin;
+    let y = view.y + margin / 2;
     list.push(DrawCmd::RoundRect {
         rect: Rect { x, y, w, h },
         color: FIND_BG,
@@ -1838,13 +2001,14 @@ fn push_image_chrome(
 
 #[cfg(test)]
 mod tests {
+    use std::time::{Duration, Instant};
+
     use super::*;
     use crate::theme::FONT_SIZE;
 
-    /// The tick strip's per-match tops and document height, matching the values
-    /// the app derives from its line index: each match's line baseline, and the
-    /// content height including margins.
-    fn tick_tops(layout: &Layout, matches: &[(usize, usize)]) -> (Vec<i32>, i32) {
+    /// The tick strip's per-match tops, matching what the app derives from its line
+    /// index: each match's line baseline.
+    fn tick_tops(layout: &Layout, matches: &[(usize, usize)]) -> Vec<i32> {
         let tops = matches
             .iter()
             .map(|&(start, _)| {
@@ -1855,15 +2019,24 @@ mod tests {
                 layout.lines().get(idx).map_or(0, |l| l.baseline)
             })
             .collect();
-        (tops, layout.text_height() + 2 * MARGIN)
+        tops
     }
     use crate::rope::Rope;
 
-    fn paint_params(width: usize, height: usize) -> PaintParams<'static> {
+    /// A pane at the window origin, the shape the layout helpers below build into,
+    /// with a document no taller than the column (so no scrollbar) and a bar at rest.
+    const RESTING_BAR: scroll::Scrollbar = scroll::Scrollbar::hidden();
+
+    fn view(w: i32, h: i32) -> Rect {
+        Rect { x: 0, y: 0, w, h }
+    }
+
+    fn paint_params(w: i32, h: i32) -> PaintParams<'static> {
         PaintParams {
-            width,
-            height,
+            view: view(w, h),
             scroll_y: 0,
+            content_height: h,
+            scrollbar: &RESTING_BAR,
             scale: Scale::ONE,
             body_size: FONT_SIZE,
             selection: None,
@@ -2003,8 +2176,8 @@ mod tests {
         let fonts = Fonts::new(&markdown::all_sizes(FONT_SIZE)).expect("a default font");
         let src = "- [ ] open\n- [x] done\nx";
         let rope = Rope::from_str(src);
-        let (w, h) = (600usize, 200usize);
-        let wrap = w as i32 - 2 * MARGIN;
+        let (w, h) = (600i32, 200i32);
+        let wrap = w - 2 * MARGIN;
         // Cursor on the trailing "x": both task lines render their boxes.
         let off = src.len() - 1;
         let layout = Layout::build(&fonts, &rope, MARGIN, MARGIN, wrap, FONT_SIZE, (off, off));
@@ -2099,8 +2272,8 @@ mod tests {
         let fonts = Fonts::new(&markdown::all_sizes(FONT_SIZE)).expect("a default font");
         let src = "- item\nx";
         let rope = Rope::from_str(src);
-        let (w, h) = (600usize, 200usize);
-        let wrap = w as i32 - 2 * MARGIN;
+        let (w, h) = (600i32, 200i32);
+        let wrap = w - 2 * MARGIN;
         let off = src.len() - 1;
         let layout = Layout::build(&fonts, &rope, MARGIN, MARGIN, wrap, FONT_SIZE, (off, off));
         let list = build_display_list(&fonts, &layout, &rope, &paint_params(w, h));
@@ -2149,8 +2322,8 @@ mod tests {
     fn find_bar_and_match_highlights_reach_the_display_list() {
         let fonts = Fonts::new(&markdown::all_sizes(FONT_SIZE)).expect("a default font");
         let rope = Rope::from_str("one two one two one\n");
-        let (w, h) = (600usize, 200usize);
-        let wrap = w as i32 - 2 * MARGIN;
+        let (w, h) = (600i32, 200i32);
+        let wrap = w - 2 * MARGIN;
         let layout = Layout::build(&fonts, &rope, MARGIN, MARGIN, wrap, FONT_SIZE, (0, 0));
         // Drive a real find state to the same shape: query "one", three matches,
         // the current one at index 1 (byte 8) — the anchor aims `current` at the
@@ -2159,18 +2332,12 @@ mod tests {
         let mut bar = FindState::new();
         bar.open_at(8, &buf);
         bar.push_str("one", &buf);
-        let (tops, doc_h) = tick_tops(&layout, bar.matches());
+        let tops = tick_tops(&layout, bar.matches());
         let params = PaintParams {
-            width: w,
-            height: h,
-            scroll_y: 0,
-            scale: Scale::ONE,
-            body_size: FONT_SIZE,
             // The app mirrors the current match into the selection.
             selection: Some((8, 11)),
-            caret: None,
-            find: build_find_paint(&bar, &tops, doc_h),
-            table_hover: None,
+            find: build_find_paint(&bar, &tops),
+            ..paint_params(w, h)
         };
         let list = build_display_list(&fonts, &layout, &rope, &params);
         let match_fills = list
@@ -2203,8 +2370,8 @@ mod tests {
     fn the_replace_row_flags_and_ticks_reach_the_display_list() {
         let fonts = Fonts::new(&markdown::all_sizes(FONT_SIZE)).expect("a default font");
         let rope = Rope::from_str("one two one\nfiller\none more\n");
-        let (w, h) = (600usize, 200usize);
-        let wrap = w as i32 - 2 * MARGIN;
+        let (w, h) = (600i32, 200i32);
+        let wrap = w - 2 * MARGIN;
         let layout = Layout::build(&fonts, &rope, MARGIN, MARGIN, wrap, FONT_SIZE, (0, 0));
         // Drive a real find state: whole-word query "one" (three matches, current
         // 0) with the replace row open, focused, and holding "two".
@@ -2215,17 +2382,11 @@ mod tests {
         bar.toggle_word(&buf);
         bar.open_replace_at(0, &buf);
         bar.push_str("two", &buf);
-        let (tops, doc_h) = tick_tops(&layout, bar.matches());
+        let tops = tick_tops(&layout, bar.matches());
         let params = PaintParams {
-            width: w,
-            height: h,
-            scroll_y: 0,
-            scale: Scale::ONE,
-            body_size: FONT_SIZE,
             selection: Some((0, 3)),
-            caret: None,
-            find: build_find_paint(&bar, &tops, doc_h),
-            table_hover: None,
+            find: build_find_paint(&bar, &tops),
+            ..paint_params(w, h)
         };
         let list = build_display_list(&fonts, &layout, &rope, &params);
         let texts: Vec<&str> = list
@@ -2243,7 +2404,7 @@ mod tests {
         );
         // The right-edge tick strip: one accent tick for the current match and
         // gold ticks for the rest (the bar caret sits well left of the edge).
-        let edge = w as i32 - 10;
+        let edge = w - 10;
         let ticks = list
             .iter()
             .filter(|c| {
@@ -2262,8 +2423,8 @@ mod tests {
         let fonts = Fonts::new(&markdown::all_sizes(FONT_SIZE)).expect("a default font");
         let src = "| Name | Score |\n| --- | ---: |\n| Ada | 92 |\n";
         let rope = Rope::from_str(src);
-        let (w, h) = (600usize, 300usize);
-        let wrap = w as i32 - 2 * MARGIN;
+        let (w, h) = (600i32, 300i32);
+        let wrap = w - 2 * MARGIN;
         // Tables render as a grid regardless of the cursor, so `active` is moot.
         let layout = Layout::build(&fonts, &rope, MARGIN, MARGIN, wrap, FONT_SIZE, (0, 0));
         let list = build_display_list(&fonts, &layout, &rope, &paint_params(w, h));
@@ -2300,8 +2461,8 @@ mod tests {
         let fonts = Fonts::new(&markdown::all_sizes(FONT_SIZE)).expect("a default font");
         let src = "| File |\n| --- |\n| `main.rs`, `error.rs` |\n";
         let rope = Rope::from_str(src);
-        let (w, h) = (600usize, 300usize);
-        let wrap = w as i32 - 2 * MARGIN;
+        let (w, h) = (600i32, 300i32);
+        let wrap = w - 2 * MARGIN;
         let body = rope.line_to_byte(2);
 
         // Cursor outside the table: the cell is cooked, so no backtick is drawn but
@@ -2350,8 +2511,8 @@ mod tests {
     fn a_hovered_table_button_reaches_the_display_list() {
         let fonts = Fonts::new(&markdown::all_sizes(FONT_SIZE)).expect("a default font");
         let rope = Rope::from_str("| a | b |\n| - | - |\n| c | d |\n");
-        let (w, h) = (600usize, 300usize);
-        let wrap = w as i32 - 2 * MARGIN;
+        let (w, h) = (600i32, 300i32);
+        let wrap = w - 2 * MARGIN;
         let layout = Layout::build(&fonts, &rope, MARGIN, MARGIN, wrap, FONT_SIZE, (0, 0));
         // Point just below the last row: the add-row strip.
         let bot = layout
@@ -2403,6 +2564,7 @@ mod tests {
             tree: crate::tree::Tree::new(root.to_path_buf(), Default::default(), true),
             scroll_y: 0,
             content_height: 0,
+            scrollbar: scroll::Scrollbar::hidden(),
             hovered: None,
             selected,
             filter_hovered: false,
@@ -2414,7 +2576,7 @@ mod tests {
         let fx = TreeDir::new("rows");
         let fonts = Fonts::new(&markdown::all_sizes(FONT_SIZE)).expect("a default font");
         // Row 0 (the folder) is active, so it draws its highlight.
-        let mut tree = tree_pane(&fx.0, Some(0));
+        let tree = tree_pane(&fx.0, Some(0));
         let rect = Rect {
             x: 0,
             y: 0,
@@ -2422,7 +2584,7 @@ mod tests {
             h: 400,
         };
         let mut list = DisplayList::new();
-        push_tree(&mut list, &fonts, &mut tree, rect, Scale::ONE, FONT_SIZE);
+        push_tree(&mut list, &fonts, &tree, rect, Scale::ONE, FONT_SIZE);
 
         // The active pill is a rounded rect in the hover gray, inset from both
         // column edges so background frames it left and right.
@@ -2513,7 +2675,7 @@ mod tests {
             let mut tree = tree_pane(&fx.0, selected);
             tree.hovered = hovered;
             let mut list = DisplayList::new();
-            push_tree(&mut list, &fonts, &mut tree, rect, Scale::ONE, FONT_SIZE);
+            push_tree(&mut list, &fonts, &tree, rect, Scale::ONE, FONT_SIZE);
             list.iter()
                 .filter_map(|c| match c {
                     DrawCmd::RoundRect { rect, color, .. } if *color == TREE_HOVER_BG => {
@@ -2581,7 +2743,7 @@ mod tests {
             tree.tree.set_show_empty_dirs(show_empty);
             tree.filter_hovered = hovered;
             let mut list = DisplayList::new();
-            push_tree(&mut list, &fonts, &mut tree, rect, Scale::ONE, FONT_SIZE);
+            push_tree(&mut list, &fonts, &tree, rect, Scale::ONE, FONT_SIZE);
             list
         };
         let col = tree_column(rect, fonts.metrics(FONT_SIZE), Scale::ONE);
@@ -2669,8 +2831,7 @@ mod tests {
                 .h,
         };
         tree.scroll_y = 10_000;
-        let mut list = DisplayList::new();
-        push_tree(&mut list, &fonts, &mut tree, rect, Scale::ONE, FONT_SIZE);
+        measure_tree(&mut tree, rect, m, Scale::ONE);
         // The scroll clamps against the rows' viewport, not the whole column, so the
         // last row cannot come to rest under the footer.
         let view = tree_column(rect, m, Scale::ONE).rows;
@@ -2679,5 +2840,244 @@ mod tests {
             (tree.content_height - view.h).max(0),
             "clamped to the rows viewport"
         );
+    }
+
+    /// The columns a pane paints into once the sidebar and the top bar are in front of
+    /// it: not the window origin, which is the case every edge-anchored piece of chrome
+    /// has to get right.
+    const OFFSET_PANE: Rect = Rect {
+        x: 246,
+        y: 28,
+        w: 800,
+        h: 600,
+    };
+
+    /// A pane laid out into `view` the way the app lays one out: absolute positions,
+    /// with the column's origin and margin baked into the layout.
+    fn pane_layout(fonts: &Fonts, rope: &Rope, view: Rect) -> Layout {
+        Layout::build(
+            fonts,
+            rope,
+            view.x + MARGIN,
+            view.y + MARGIN,
+            view.w - 2 * MARGIN,
+            FONT_SIZE,
+            (0, 0),
+        )
+    }
+
+    /// A bar as the pointer leaves it: fully lit and grown into the slider.
+    fn slider() -> scroll::Scrollbar {
+        let mut bar = scroll::Scrollbar::hidden();
+        bar.set_near(true);
+        let start = Instant::now();
+        for f in 1..=20 {
+            bar.tick(start + Duration::from_millis(f * 16));
+        }
+        assert_eq!((bar.lit(), bar.wide()), (1.0, 1.0), "the bar is fully open");
+        bar
+    }
+
+    #[test]
+    fn a_pane_away_from_the_origin_paints_into_its_own_column() {
+        // The regression this guards: the painter used to be handed the pane's size but
+        // read the layout's absolute positions, so it cleared the wrong band and culled
+        // the bottom of the column (the strip the top bar's height pushed it down by).
+        let fonts = Fonts::new(&markdown::all_sizes(FONT_SIZE)).expect("a default font");
+        let rope = Rope::from_str(&"a line of prose\n".repeat(400));
+        let view = OFFSET_PANE;
+        let layout = pane_layout(&fonts, &rope, view);
+        let params = PaintParams {
+            view,
+            scroll_y: 300,
+            content_height: layout.text_height() + 2 * MARGIN,
+            ..paint_params(view.w, view.h)
+        };
+        let list = build_display_list(&fonts, &layout, &rope, &params);
+
+        let bg = list
+            .iter()
+            .find_map(|c| match c {
+                DrawCmd::Fill { rect, color } if *color == BACKGROUND => Some(*rect),
+                _ => None,
+            })
+            .expect("the pane's background");
+        assert_eq!(bg, view, "the background clears exactly the column");
+        // Text reaches the column's bottom edge: with a scrolled document there is a
+        // line in every band of the column, including the last one.
+        let lowest = list
+            .iter()
+            .filter_map(|c| match c {
+                DrawCmd::Text { bounds, .. } => Some(bounds.y + bounds.h),
+                _ => None,
+            })
+            .max()
+            .expect("text");
+        let bottom = view.y + view.h;
+        assert!(
+            lowest > bottom - fonts.metrics(FONT_SIZE).line_height,
+            "text is drawn into the column's last line ({lowest} vs bottom {bottom})"
+        );
+        assert!(
+            list.iter().all(|c| {
+                let b = match c {
+                    DrawCmd::Text { bounds, .. } => *bounds,
+                    DrawCmd::Fill { rect, .. } => *rect,
+                    _ => return true,
+                };
+                b.x >= view.x && b.x + b.w <= view.x + view.w + MARGIN
+            }),
+            "nothing is painted outside the column"
+        );
+    }
+
+    #[test]
+    fn the_find_bar_and_its_ticks_ride_the_panes_right_edge() {
+        let fonts = Fonts::new(&markdown::all_sizes(FONT_SIZE)).expect("a default font");
+        let src = "one two one\n".repeat(50);
+        let rope = Rope::from_str(&src);
+        let view = OFFSET_PANE;
+        let layout = pane_layout(&fonts, &rope, view);
+        let buf = crate::text::TextBuffer::from_text(src);
+        let mut find = FindState::new();
+        find.open_at(0, &buf);
+        find.push_str("one", &buf);
+        let tops = tick_tops(&layout, find.matches());
+        let params = PaintParams {
+            view,
+            content_height: layout.text_height() + 2 * MARGIN,
+            find: build_find_paint(&find, &tops),
+            ..paint_params(view.w, view.h)
+        };
+        let list = build_display_list(&fonts, &layout, &rope, &params);
+
+        let panel = list
+            .iter()
+            .find_map(|c| match c {
+                DrawCmd::RoundRect { rect, color, .. } if *color == FIND_BG => Some(*rect),
+                _ => None,
+            })
+            .expect("the find panel");
+        assert!(
+            panel.y >= view.y,
+            "the panel hangs below the pane's top, not under the top bar"
+        );
+        assert_eq!(
+            view.x + view.w - (panel.x + panel.w),
+            MARGIN,
+            "and one margin in from the pane's right edge"
+        );
+        // Every tick sits in the scrollbar's lane, right-aligned with it.
+        let lane = scroll_lane(view, Scale::ONE).track;
+        let ticks: Vec<Rect> = list
+            .iter()
+            .filter_map(|c| match c {
+                DrawCmd::Fill { rect, color } if *color == FIND_TICK_COLOR => Some(*rect),
+                _ => None,
+            })
+            .collect();
+        assert!(!ticks.is_empty(), "the matches tick the strip");
+        assert!(
+            ticks.iter().all(|t| t.x + t.w == lane.x + lane.w),
+            "ticks share the scrollbar's right edge: {ticks:?} vs lane {lane:?}"
+        );
+        assert!(
+            ticks.iter().all(|t| t.y >= view.y && t.y < view.y + view.h),
+            "and stay inside the pane's band"
+        );
+    }
+
+    #[test]
+    fn the_scrollbar_thumb_tracks_the_scroll_down_the_lane() {
+        let fonts = Fonts::new(&markdown::all_sizes(FONT_SIZE)).expect("a default font");
+        let rope = Rope::from_str(&"a line of prose\n".repeat(400));
+        let view = OFFSET_PANE;
+        let layout = pane_layout(&fonts, &rope, view);
+        let content_height = layout.text_height() + 2 * MARGIN;
+        let bar = slider();
+        let thumb_at = |scroll_y: i32| {
+            let params = PaintParams {
+                view,
+                scroll_y,
+                content_height,
+                scrollbar: &bar,
+                ..paint_params(view.w, view.h)
+            };
+            build_display_list(&fonts, &layout, &rope, &params)
+                .into_iter()
+                .find_map(|c| match c {
+                    DrawCmd::RoundRect { rect, radius, .. } if radius * 2 >= rect.w => Some(rect),
+                    _ => None,
+                })
+                .expect("the thumb")
+        };
+        let lane = scroll_lane(view, Scale::ONE).track;
+        let top = thumb_at(0);
+        assert_eq!(top.w, SCROLL_WIDE, "grown to the slider's full width");
+        assert_eq!(
+            top.x + top.w,
+            lane.x + lane.w,
+            "right-aligned in the lane, so it grows leftward from the window edge"
+        );
+        assert_eq!(
+            top.y, view.y,
+            "at the top of the document, at the top of the lane"
+        );
+        assert!(top.h >= SCROLL_MIN_THUMB, "at least a grabbable length");
+
+        let end = thumb_at(scroll::max_scroll(content_height, view.h));
+        assert_eq!(
+            end.y + end.h,
+            view.y + view.h,
+            "at the end of the document its bottom meets the lane's"
+        );
+        let middle = thumb_at(scroll::max_scroll(content_height, view.h) / 2);
+        assert!(
+            middle.y > top.y && middle.y < end.y,
+            "and it travels in between"
+        );
+    }
+
+    #[test]
+    fn a_resting_bar_and_a_document_that_fits_paint_no_scrollbar() {
+        let fonts = Fonts::new(&markdown::all_sizes(FONT_SIZE)).expect("a default font");
+        let view = OFFSET_PANE;
+        // A long document, but a bar at rest: the fade is the only thing that decides.
+        let long = Rope::from_str(&"a line of prose\n".repeat(400));
+        let layout = pane_layout(&fonts, &long, view);
+        let resting = PaintParams {
+            view,
+            content_height: layout.text_height() + 2 * MARGIN,
+            ..paint_params(view.w, view.h)
+        };
+        assert!(
+            !has_scrollbar(&build_display_list(&fonts, &layout, &long, &resting)),
+            "a hidden bar draws nothing, however long the document"
+        );
+        // And an open bar over a document that fits has nothing to point at.
+        let short = Rope::from_str("one line\n");
+        let layout = pane_layout(&fonts, &short, view);
+        let bar = slider();
+        let fits = PaintParams {
+            view,
+            content_height: layout.text_height() + 2 * MARGIN,
+            scrollbar: &bar,
+            ..paint_params(view.w, view.h)
+        };
+        assert!(
+            !has_scrollbar(&build_display_list(&fonts, &layout, &short, &fits)),
+            "no bar when the whole document is on screen"
+        );
+    }
+
+    /// Whether the list holds a thumb: a pill (its radius is half its width) in the
+    /// scrollbar's lane.
+    fn has_scrollbar(list: &DisplayList) -> bool {
+        let lane = scroll_lane(OFFSET_PANE, Scale::ONE).track;
+        list.iter().any(|c| match c {
+            DrawCmd::RoundRect { rect, radius, .. } => radius * 2 >= rect.w && rect.x >= lane.x,
+            DrawCmd::Fill { rect, .. } => *rect == lane,
+            _ => false,
+        })
     }
 }

@@ -13,9 +13,9 @@ use crate::platform::geom::Rect;
 use crate::platform::protocol::{
     wl_keyboard, wl_pointer, wp_cursor_shape_device_v1, wp_cursor_shape_manager_v1,
 };
-use crate::platform::scroll;
+use crate::platform::scroll::{self, Scrollbar};
 use crate::platform::wire::{Arg, Reader};
-use crate::theme::{TAB_DRAG_THRESHOLD, TREE_PAD};
+use crate::theme::{SCROLL_MIN_THUMB, TAB_DRAG_THRESHOLD, TREE_PAD};
 
 /// What the Tab key inserts: spaces (a "soft tab"), not a literal `'\t'`. This
 /// keeps the buffer free of tab characters and spares the renderer any tab-stop
@@ -564,15 +564,19 @@ impl State {
             }
             wl_pointer::EV_LEAVE => {
                 // The pointer left the surface, so drop the mouse hover highlights;
-                // otherwise the last-hovered tree row, filter toggle, or tab stays lit
-                // with no pointer on it.
+                // otherwise the last-hovered tree row, filter toggle, tab, or scrollbar
+                // stays lit with no pointer on it.
                 let lit = self.tree.hovered.is_some()
                     || self.tree.filter_hovered
                     || self.hovered_tab.is_some();
                 self.tree.hovered = None;
                 self.tree.filter_hovered = false;
                 self.hovered_tab = None;
-                if lit {
+                let mut bars = false;
+                for region in [Focus::Tree, Focus::Editor(0), Focus::Editor(1)] {
+                    bars |= self.scrollbar_mut(region).set_near(false);
+                }
+                if lit || bars {
                     self.dirty = true;
                 }
             }
@@ -584,6 +588,8 @@ impl State {
                 let (px, py) = (self.pointer_x, self.pointer_y);
                 if let Some(s) = self.drag_splitter {
                     self.drag_splitter_to(s, px);
+                } else if self.drag_scroll.is_some() {
+                    self.drag_scroll_to(py);
                 } else if self.drag_tab.is_some() {
                     self.drag_tab_to(px);
                 } else {
@@ -602,6 +608,7 @@ impl State {
                         self.update_cursor_shape();
                         self.update_tree_hover();
                         self.update_tab_hover();
+                        self.update_scrollbar_hover();
                     }
                 }
             }
@@ -617,6 +624,13 @@ impl State {
                         // A splitter drag just ended: persist the new column sizes.
                         if self.drag_splitter.take().is_some() {
                             self.save_session();
+                        }
+                        // A scrollbar drag just ended: let go of the thumb, and let the
+                        // bar fade unless the pointer stayed on it.
+                        if let Some(region) = self.drag_scroll.take() {
+                            self.scrollbar_mut(region).release();
+                            self.update_scrollbar_hover();
+                            self.dirty = true;
                         }
                         // A tab reorder just ended: persist the new order and let the
                         // lifted tab settle back into its slot. A press that never
@@ -656,7 +670,7 @@ impl State {
                     match self.hit_test(px, py) {
                         Hit::Editor(i, rect) => {
                             if self.editors[i].scroll_by(&self.fonts, rect, delta) {
-                                self.dirty = true;
+                                self.flash_scrollbar(Focus::Editor(i));
                             }
                         }
                         Hit::Tree(rect) => self.scroll_tree(rect, delta),
@@ -824,7 +838,7 @@ impl State {
         let sy = scroll::clamp(self.tree.scroll_y + delta, self.tree.content_height, rect.h);
         if sy != self.tree.scroll_y {
             self.tree.scroll_y = sy;
-            self.dirty = true;
+            self.flash_scrollbar(Focus::Tree);
         }
     }
 
@@ -873,7 +887,7 @@ impl State {
         let rect = self.tree_rect();
         let tree_pad = self.scale().px(TREE_PAD);
         let top = tree_pad + sel as i32 * row_h;
-        self.tree.scroll_y = scroll::reveal(
+        let sy = scroll::reveal(
             self.tree.scroll_y,
             top,
             row_h,
@@ -881,6 +895,10 @@ impl State {
             self.tree.content_height,
             tree_pad,
         );
+        if sy != self.tree.scroll_y {
+            self.tree.scroll_y = sy;
+            self.flash_scrollbar(Focus::Tree);
+        }
     }
 
     /// Keyboard navigation while the tree holds focus: Up/Down move the active
@@ -952,18 +970,25 @@ impl State {
     }
 
     /// Pick and apply the pointer shape for its current position: a hand over a
-    /// selected image's button, the plain arrow over a picture, the I-beam over
-    /// text. Only re-requests when the shape changes, so it is cheap to call on
-    /// every motion event. Uses the cached layout (no clone).
+    /// selected image's button, the plain arrow over a picture or a scrollbar, the
+    /// I-beam over text. Only re-requests when the shape changes, so it is cheap to call
+    /// on every motion event. Uses the cached layout (no clone).
     pub(super) fn update_cursor_shape(&mut self) {
         use wp_cursor_shape_device_v1::{SHAPE_DEFAULT, SHAPE_EW_RESIZE, SHAPE_POINTER};
         let (px, py) = (self.pointer_x, self.pointer_y);
-        let shape = match self.hit_test(px, py) {
-            Hit::Splitter(_) => SHAPE_EW_RESIZE,
-            Hit::Tree(_) => SHAPE_DEFAULT,
-            Hit::Editor(i, rect) => self.editors[i].cursor_shape_at(&self.fonts, rect, px, py),
-            Hit::Tab(..) | Hit::TabClose(..) | Hit::NewTab(_) | Hit::TreeFilter => SHAPE_POINTER,
-            Hit::TabStrip(_) | Hit::TreeFooter | Hit::None => SHAPE_DEFAULT,
+        // A scrollbar is a control, not text, so over its grab band the I-beam gives way.
+        let shape = if self.on_scrollbar(px, py) {
+            SHAPE_DEFAULT
+        } else {
+            match self.hit_test(px, py) {
+                Hit::Splitter(_) => SHAPE_EW_RESIZE,
+                Hit::Tree(_) => SHAPE_DEFAULT,
+                Hit::Editor(i, rect) => self.editors[i].cursor_shape_at(&self.fonts, rect, px, py),
+                Hit::Tab(..) | Hit::TabClose(..) | Hit::NewTab(_) | Hit::TreeFilter => {
+                    SHAPE_POINTER
+                }
+                Hit::TabStrip(_) | Hit::TreeFooter | Hit::None => SHAPE_DEFAULT,
+            }
         };
         if shape != self.cursor_shape {
             self.cursor_shape = shape;
@@ -971,11 +996,159 @@ impl State {
         }
     }
 
-    /// Handle a left-button press: route it to whatever it landed on. A splitter
-    /// starts a drag-resize, a tree row expands a folder or opens a file, and an
-    /// editor column takes focus and then handles the click as a text press.
+    /// The scrollable column a window position falls in, paired with the rectangle its
+    /// scrollbar is measured against (the editor's whole column; the tree's rows, above
+    /// its pinned footer). `None` off every column, and for a column whose content fits,
+    /// which has no bar to speak of.
+    fn scroll_column_at(&self, px: f32, py: f32) -> Option<(Focus, Rect)> {
+        let (region, view) = match self.hit_test(px, py) {
+            Hit::Editor(i, rect) => (Focus::Editor(i), rect),
+            Hit::Tree(rows) => (Focus::Tree, rows),
+            _ => return None,
+        };
+        let (content_h, view_h) = self.scroll_extent(region, view);
+        scroll::scrollable(content_h, view_h).then_some((region, view))
+    }
+
+    /// How tall the document in `region` is and how much of it the column `view` shows,
+    /// the two numbers every scrollbar question (is it scrollable, how long is the
+    /// thumb, where does a drag land) is answered from.
+    fn scroll_extent(&self, region: Focus, view: Rect) -> (i32, i32) {
+        match region {
+            Focus::Tree => (self.tree.content_height, view.h),
+            Focus::Editor(i) => (self.editors[i].content_height, view.h),
+        }
+    }
+
+    /// This region's scrollbar.
+    fn scrollbar_mut(&mut self, region: Focus) -> &mut Scrollbar {
+        match region {
+            Focus::Tree => &mut self.tree.scrollbar,
+            Focus::Editor(i) => &mut self.editors[i].scrollbar,
+        }
+    }
+
+    /// Light the scrollbar of the region that just scrolled, so every scroll (a wheel
+    /// notch, a caret revealed by a keystroke, a drag auto-scroll) is confirmed by the
+    /// bar sliding into view and then fading back out.
+    pub(super) fn flash_scrollbar(&mut self, region: Focus) {
+        let now = Instant::now();
+        self.scrollbar_mut(region).flash(now);
+        self.dirty = true;
+    }
+
+    /// Follow the pointer with the scrollbars: the bar of the column whose zone it has
+    /// entered grows into a slider, every other bar shrinks back. Repaints when one
+    /// changed. A live drag owns its bar and ignores this.
+    pub(super) fn update_scrollbar_hover(&mut self) {
+        if self.drag_scroll.is_some() {
+            return;
+        }
+        let (px, py) = (self.pointer_x, self.pointer_y);
+        let scale = self.scale();
+        let near = self.scroll_column_at(px, py).filter(|(_, view)| {
+            crate::paint::scroll_lane(*view, scale)
+                .zone
+                .contains(px, py)
+        });
+        let mut changed = false;
+        for region in [Focus::Tree, Focus::Editor(0), Focus::Editor(1)] {
+            let is_near = near.is_some_and(|(r, _)| r == region);
+            changed |= self.scrollbar_mut(region).set_near(is_near);
+        }
+        if changed {
+            self.dirty = true;
+        }
+    }
+
+    /// Whether the pointer is on a scrollbar, meaning a press would take its thumb
+    /// rather than reach the column beneath it.
+    fn on_scrollbar(&self, px: f32, py: f32) -> bool {
+        let scale = self.scale();
+        self.scroll_column_at(px, py)
+            .is_some_and(|(_, view)| crate::paint::scroll_lane(view, scale).grab.contains(px, py))
+    }
+
+    /// A press in a scrollbar's lane: take the thumb under the pointer, or, when the
+    /// press landed on the empty track, warp the thumb to it first and take it there,
+    /// so a click jumps to that spot and holding turns it into a scrub. Returns
+    /// whether the press was the scrollbar's.
+    fn scrollbar_press(&mut self, px: f32, py: f32) -> bool {
+        if !self.on_scrollbar(px, py) {
+            return false;
+        }
+        let scale = self.scale();
+        let Some((region, view)) = self.scroll_column_at(px, py) else {
+            return false;
+        };
+        let lane = crate::paint::scroll_lane(view, scale);
+        let (content_h, view_h) = self.scroll_extent(region, view);
+        let min = scale.px(SCROLL_MIN_THUMB);
+        let Some(thumb) = scroll::thumb(lane.track, view_h, content_h, self.scroll_y(region), min)
+        else {
+            return false;
+        };
+        // On the thumb, the grab keeps its offset so it does not jump under the finger;
+        // on the track, the thumb lands centered on the pointer.
+        let grab = if py >= thumb.y as f32 && py < (thumb.y + thumb.h) as f32 {
+            py as i32 - thumb.y
+        } else {
+            thumb.h / 2
+        };
+        self.scrollbar_mut(region).press(grab);
+        self.drag_scroll = Some(region);
+        self.drag_scroll_to(py);
+        true
+    }
+
+    /// Track a scrollbar drag: put the thumb's top where the pointer holds it and scroll
+    /// the column to match.
+    pub(super) fn drag_scroll_to(&mut self, py: f32) {
+        let Some(region) = self.drag_scroll else {
+            return;
+        };
+        let scale = self.scale();
+        let view = match region {
+            Focus::Tree => self.tree_column(self.tree_rect()).rows,
+            Focus::Editor(i) => self.editor_rect(i),
+        };
+        let lane = crate::paint::scroll_lane(view, scale);
+        let (content_h, view_h) = self.scroll_extent(region, view);
+        let at = self.scroll_y(region);
+        let min = scale.px(SCROLL_MIN_THUMB);
+        let (Some(grab), Some(thumb)) = (
+            self.scrollbar_mut(region).grab(),
+            scroll::thumb(lane.track, view_h, content_h, at, min),
+        ) else {
+            return;
+        };
+        let sy = scroll::scroll_at_thumb(lane.track, thumb.h, view_h, content_h, py as i32 - grab);
+        if sy != at {
+            match region {
+                Focus::Tree => self.tree.scroll_y = sy,
+                Focus::Editor(i) => self.editors[i].scroll_y = sy,
+            }
+            self.dirty = true;
+        }
+    }
+
+    /// Where the region is scrolled to right now.
+    fn scroll_y(&self, region: Focus) -> i32 {
+        match region {
+            Focus::Tree => self.tree.scroll_y,
+            Focus::Editor(i) => self.editors[i].scroll_y,
+        }
+    }
+
+    /// Handle a left-button press: route it to whatever it landed on. A scrollbar takes
+    /// the press before the column under it, a splitter starts a drag-resize, a tree row
+    /// expands a folder or opens a file, and an editor column takes focus and then
+    /// handles the click as a text press.
     pub(super) fn on_left_press(&mut self) {
         let (px, py) = (self.pointer_x, self.pointer_y);
+        if self.scrollbar_press(px, py) {
+            return;
+        }
         match self.hit_test(px, py) {
             Hit::Splitter(s) => self.drag_splitter = Some(s),
             Hit::Tree(rect) => self.tree_press(rect, py),
@@ -1236,7 +1409,7 @@ impl State {
         let rect = self.editor_rect(i);
         let (px, py) = (self.pointer_x, self.pointer_y);
         if self.editors[i].scroll_by(&self.fonts, rect, step) {
-            self.dirty = true;
+            self.flash_scrollbar(Focus::Editor(i));
         }
         if self.editors[i].place_cursor_at(&self.fonts, rect, px, py, true) {
             self.dirty = true;

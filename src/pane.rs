@@ -11,7 +11,7 @@ use crate::platform::error::{Error, Result};
 use crate::platform::freetype::Fonts;
 use crate::platform::geom::Rect;
 use crate::platform::protocol::wp_cursor_shape_device_v1;
-use crate::platform::scroll;
+use crate::platform::scroll::{self, Scrollbar};
 use crate::render::image::ImageStore;
 use crate::rope::Rope;
 use crate::scale::Scale;
@@ -1406,6 +1406,10 @@ pub(crate) struct PaneGroup {
     /// document as it opens so a `![[name]]` finds its picture. `None` outside a
     /// vault (a bare file argument with no session root).
     vault: Option<PathBuf>,
+    /// The column's overlay scrollbar. It belongs to the column rather than to a
+    /// document, so switching tabs slides the same bar onto the new document's scroll
+    /// instead of resurrecting the one the old tab left half-faded.
+    pub(crate) scrollbar: Scrollbar,
 }
 
 impl PaneGroup {
@@ -1418,6 +1422,7 @@ impl PaneGroup {
             scale: Scale::ONE,
             body_size: FONT_SIZE,
             vault: None,
+            scrollbar: Scrollbar::default(),
         }
     }
 
@@ -1606,6 +1611,9 @@ pub(crate) struct TreePane {
     pub(crate) tree: tree::Tree,
     pub(crate) scroll_y: i32,
     pub(crate) content_height: i32,
+    /// The sidebar's overlay scrollbar, lit while the rows scroll and grabbable when
+    /// the pointer comes near it.
+    pub(crate) scrollbar: Scrollbar,
     /// The row the pointer last hovered (mouse highlight), or `None` when the
     /// pointer is off the tree.
     pub(crate) hovered: Option<usize>,
@@ -1642,6 +1650,7 @@ pub(crate) fn restore_group(
         scale: Scale::ONE,
         body_size: FONT_SIZE,
         vault: vault.map(Path::to_path_buf),
+        scrollbar: Scrollbar::default(),
     }
 }
 

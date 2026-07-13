@@ -34,8 +34,8 @@ use crate::config::{vault_name, CaretConfig, Config, Vault};
 use crate::file;
 use crate::markdown;
 use crate::paint::{
-    build_display_list, build_find_paint, push_splitter, push_top_bar, push_tree, top_bar_height,
-    BarCtx, CaretPaint, PaintParams, TabStrip,
+    build_display_list, build_find_paint, measure_tree, push_splitter, push_top_bar, push_tree,
+    top_bar_height, BarCtx, CaretPaint, PaintParams, TabStrip,
 };
 use crate::pane::{
     restore_group, CaretAnim, CaretFrame, Columns, Focus, PaneGroup, PaneLayout, TreePane,
@@ -49,7 +49,7 @@ use crate::platform::protocol::{
     wl_output, wl_registry, wl_seat, wl_surface, wp_fractional_scale_manager_v1,
     wp_fractional_scale_v1, wp_viewporter, xdg_surface, xdg_toplevel, xdg_wm_base,
 };
-use crate::platform::scroll;
+use crate::platform::scroll::{self, Scrollbar};
 use crate::platform::wire::{Arg, Message, Reader};
 use crate::platform::xkb::Xkb;
 use crate::render::display::DisplayList;
@@ -252,6 +252,11 @@ struct State {
     hovered_tab: Option<TabHover>,
     /// While a splitter is dragged, which one: 0 = tree|A edge, 1 = A|B edge.
     drag_splitter: Option<usize>,
+    /// While a scrollbar thumb is dragged, whose bar it is. The grab's offset inside
+    /// the thumb lives on that [`Scrollbar`]. [`Focus`] names the region here because
+    /// the scrollable regions are exactly the focusable ones: the sidebar and the two
+    /// content panes.
+    drag_scroll: Option<Focus>,
     /// While a tab is dragged to reorder it: which pane and tab, and the grab state.
     drag_tab: Option<TabDrag>,
     /// The toplevel title last sent, so it is only re-set when it changes.
@@ -356,6 +361,17 @@ struct State {
     /// prints its render time and the glyph-cache hit rate to stderr. Plain
     /// instrumentation so an optimization can be measured rather than guessed at.
     stats: bool,
+}
+
+/// Carry one column's scrollbar forward a frame. A column whose content fits has
+/// nothing to point at, so its bar drops out of sight at once rather than fading from
+/// a document it no longer describes.
+fn tick_scrollbar(bar: &mut Scrollbar, content_height: i32, view_h: i32, now: Instant) {
+    if scroll::scrollable(content_height, view_h) {
+        bar.tick(now);
+    } else {
+        bar.hide();
+    }
 }
 
 /// Resolve the active vault root and any file to open, from the CLI argument, the
@@ -504,6 +520,7 @@ impl State {
             tree: tree::Tree::new(root, expanded, show_empty_dirs),
             scroll_y: 0,
             content_height: 0,
+            scrollbar: Scrollbar::default(),
             hovered: None,
             selected: None,
             filter_hovered: false,
@@ -541,6 +558,7 @@ impl State {
             },
             hovered_tab: None,
             drag_splitter: None,
+            drag_scroll: None,
             drag_tab: None,
             title: String::new(),
             width: session.window.0,
@@ -709,7 +727,8 @@ impl State {
         let i = self.active_editor();
         let rect = self.editor_rect(i);
         if self.editors[i].scroll_caret_into_view(&self.fonts, rect) {
-            self.dirty = true;
+            // A keyboard scroll is a scroll: show the bar moving, the way the wheel does.
+            self.flash_scrollbar(Focus::Editor(i));
         }
     }
 
@@ -888,6 +907,7 @@ impl State {
             self.fire_autoscroll();
             self.fire_caret_blink();
             self.fire_caret_anim();
+            self.fire_scrollbar_anim();
             // Pace to the compositor's clock: only draw when no frame callback is
             // outstanding, so a burst of edits or held keys between refreshes
             // collapses into a single repaint instead of racing both buffers.
@@ -916,14 +936,14 @@ impl State {
         let mut list: DisplayList = Vec::new();
         if let Some(rect) = cols.tree {
             let (scale, body_size) = (self.scale(), self.body_size);
-            push_tree(
-                &mut list,
-                &self.fonts,
-                &mut self.tree,
-                rect,
-                scale,
-                body_size,
-            );
+            let m = self.fonts.metrics(body_size);
+            // Measure before painting, so the tree's scroll clamp and its scrollbar
+            // both see the rows this frame actually draws.
+            measure_tree(&mut self.tree, rect, m, scale);
+            let rows_h = self.tree_column(rect).rows.h;
+            let tree_h = self.tree.content_height;
+            tick_scrollbar(&mut self.tree.scrollbar, tree_h, rows_h, now);
+            push_tree(&mut list, &self.fonts, &self.tree, rect, scale, body_size);
         }
         for i in 0..self.editors.len() {
             let Some(rect) = cols.editors[i] else {
@@ -936,6 +956,7 @@ impl State {
             self.editors[i].ensure_layout(&self.fonts, rect);
             let ch = self.editors[i].content_height;
             self.editors[i].scroll_y = scroll::clamp(self.editors[i].scroll_y, ch, rect.h);
+            tick_scrollbar(&mut self.editors[i].scrollbar, ch, rect.h, now);
             let focused = self.focus == Focus::Editor(i);
             // Tick this pane's caret animation and reduce it to a paint rectangle
             // before borrowing the pane immutably for the rest of the frame.
@@ -959,14 +980,15 @@ impl State {
                 None
             };
             let params = PaintParams {
-                width: rect.w as usize,
-                height: rect.h as usize,
+                view: rect,
                 scale: self.scale(),
                 body_size: self.body_size,
                 scroll_y: ed.scroll_y,
+                content_height: ed.content_height,
+                scrollbar: &ed.scrollbar,
                 selection: ed.text.selection(),
                 caret,
-                find: build_find_paint(&ed.find, &tick_tops, ed.content_height),
+                find: build_find_paint(&ed.find, &tick_tops),
                 table_hover,
             };
             if let Some(layout) = ed.layout_cache.as_ref() {
@@ -1135,6 +1157,41 @@ impl State {
         }
     }
 
+    /// Every scrollbar in the window: the sidebar's and one per content pane.
+    fn scrollbars(&self) -> impl Iterator<Item = &Scrollbar> {
+        [&self.tree.scrollbar, &self.editors[0].scrollbar]
+            .into_iter()
+            .chain([&self.editors[1].scrollbar])
+    }
+
+    /// Whether any scrollbar is still fading or growing, so the next compositor frame
+    /// should carry it on.
+    fn scrollbars_animating(&self) -> bool {
+        self.scrollbars().any(Scrollbar::animating)
+    }
+
+    /// When the loop should next tick the scrollbars: the soonest deadline any of them
+    /// wants, whether that is the next step of a fade or the moment a lit bar's hold
+    /// lapses and it starts fading.
+    fn scrollbar_retry_at(&self) -> Option<Instant> {
+        self.scrollbars().filter_map(Scrollbar::retry_at).min()
+    }
+
+    /// The scrollbars' counterpart to [`Self::fire_caret_anim`]: a fade step whose
+    /// quantized color did not change presents nothing and arms no frame callback, so
+    /// past a bar's deadline mark a repaint and let the next frame tick it on.
+    fn fire_scrollbar_anim(&mut self) {
+        if self.frame_callback != 0 {
+            return;
+        }
+        if self
+            .scrollbar_retry_at()
+            .is_some_and(|at| at <= Instant::now())
+        {
+            self.dirty = true;
+        }
+    }
+
     fn handle(&mut self, msg: Message) -> Result<()> {
         let mut r = Reader::new(&msg.body);
 
@@ -1179,9 +1236,11 @@ impl State {
             && msg.opcode == wl_callback::EV_DONE
         {
             self.frame_callback = 0;
-            // Keep the animation going: if the caret is still easing, request the
-            // next frame now that the compositor is ready for it.
-            if self.drawable_caret_anim().is_some_and(CaretAnim::in_flight) {
+            // Keep the animations going: if the caret is still easing or a scrollbar
+            // still fading, request the next frame now that the compositor is ready.
+            if self.drawable_caret_anim().is_some_and(CaretAnim::in_flight)
+                || self.scrollbars_animating()
+            {
                 self.dirty = true;
             }
             return Ok(());
@@ -1461,7 +1520,8 @@ impl State {
     }
 
     /// How long to block for input: the soonest of the next key-repeat, the next
-    /// auto-scroll tick, and the next caret blink, or `None` when none is due.
+    /// auto-scroll tick, the next caret blink, and the next scrollbar fade step, or
+    /// `None` when none is due.
     fn next_wake(&self) -> Option<Duration> {
         let now = Instant::now();
         let until = |at: Instant| {
@@ -1489,10 +1549,23 @@ impl State {
             .then(|| self.caret_retry_at())
             .flatten()
             .map(until);
-        [self.repeat_timeout(), autoscroll, caret, caret_anim]
-            .into_iter()
+        // A scrollbar wants the loop back either to step a fade or, once its hold
+        // lapses, to start one. Same pacing rule as the caret: while a frame callback
+        // is outstanding the compositor drives the animation.
+        let scrollbar = (self.frame_callback == 0)
+            .then(|| self.scrollbar_retry_at())
             .flatten()
-            .min()
+            .map(until);
+        [
+            self.repeat_timeout(),
+            autoscroll,
+            caret,
+            caret_anim,
+            scrollbar,
+        ]
+        .into_iter()
+        .flatten()
+        .min()
     }
 
     /// Bind the just-advertised global at the version we negotiate: the

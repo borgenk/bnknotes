@@ -32,10 +32,9 @@ use self::input::KeyRepeat;
 use self::present::GpuPresentation;
 use crate::config::{vault_name, CaretConfig, Config, Vault};
 use crate::file;
-use crate::markdown;
 use crate::paint::{
-    build_display_list, build_find_paint, measure_tree, push_splitter, push_top_bar, push_tree,
-    top_bar_height, BarCtx, CaretPaint, PaintParams, TabStrip,
+    build_display_list, build_find_paint, font_sizes, measure_tree, push_splitter, push_top_bar,
+    push_tree, top_bar_height, tree_metrics, BarCtx, CaretPaint, PaintParams, TabStrip,
 };
 use crate::pane::{
     restore_group, CaretAnim, CaretFrame, Columns, Focus, PaneGroup, PaneLayout, TreePane,
@@ -470,7 +469,7 @@ impl State {
         let body_size = config_font_px(SCALE_120_UNITY);
         let fonts = Fonts::with_config(
             &config.fonts,
-            &markdown::all_sizes(body_size),
+            &font_sizes(body_size),
             config.line_height_scale,
         )?;
         // The saved layout: window/column sizes, tree root and open folders, and
@@ -694,11 +693,9 @@ impl State {
     /// invalidate and re-measure at the new size.
     fn apply_font_size(&mut self, size: u32) {
         if size != self.body_size {
-            if let Ok(fonts) = Fonts::with_config(
-                &self.font_config,
-                &markdown::all_sizes(size),
-                self.line_height_scale,
-            ) {
+            if let Ok(fonts) =
+                Fonts::with_config(&self.font_config, &font_sizes(size), self.line_height_scale)
+            {
                 self.fonts = fonts;
                 self.body_size = size;
             }
@@ -936,7 +933,7 @@ impl State {
         let mut list: DisplayList = Vec::new();
         if let Some(rect) = cols.tree {
             let (scale, body_size) = (self.scale(), self.body_size);
-            let m = self.fonts.metrics(body_size);
+            let m = tree_metrics(&self.fonts, body_size);
             // Measure before painting, so the tree's scroll clamp and its scrollbar
             // both see the rows this frame actually draws.
             measure_tree(&mut self.tree, rect, m, scale);

@@ -8,7 +8,7 @@ use crate::keymap::{self, KeyAction};
 use crate::pane::{CaretAnim, Columns, EditorPane, Focus, Hit, SPLITTER};
 use crate::platform::error::{Error, Result};
 use crate::platform::ffi;
-use crate::platform::freetype::Fonts;
+use crate::platform::freetype::{Fonts, Metrics};
 use crate::platform::geom::Rect;
 use crate::platform::protocol::{
     wl_keyboard, wl_pointer, wp_cursor_shape_device_v1, wp_cursor_shape_manager_v1,
@@ -824,7 +824,7 @@ impl State {
 
     /// The tree row index at window y `py` within the tree column, if any.
     pub(super) fn tree_row_at(&self, rect: Rect, py: f32) -> Option<usize> {
-        let row_h = crate::paint::tree_row_height(self.fonts.metrics(self.body_size), self.scale());
+        let row_h = crate::paint::tree_row_height(self.tree_metrics(), self.scale());
         let y = py as i32 - rect.y + self.tree.scroll_y - self.scale().px(TREE_PAD);
         if y < 0 {
             return None;
@@ -856,10 +856,15 @@ impl State {
         }
     }
 
+    /// The metrics the sidebar lays out in: its own text size, a step below the body.
+    fn tree_metrics(&self) -> Metrics {
+        crate::paint::tree_metrics(&self.fonts, self.body_size)
+    }
+
     /// The sidebar column `rect` split into its rows viewport and its footer, as the
     /// painter lays it out.
     pub(super) fn tree_column(&self, rect: Rect) -> crate::paint::TreeColumn {
-        crate::paint::tree_column(rect, self.fonts.metrics(self.body_size), self.scale())
+        crate::paint::tree_column(rect, self.tree_metrics(), self.scale())
     }
 
     /// The rows' viewport in the tree column (the part above the footer), or an empty
@@ -883,7 +888,7 @@ impl State {
         let Some(sel) = self.tree.selected else {
             return;
         };
-        let row_h = crate::paint::tree_row_height(self.fonts.metrics(self.body_size), self.scale());
+        let row_h = crate::paint::tree_row_height(self.tree_metrics(), self.scale());
         let rect = self.tree_rect();
         let tree_pad = self.scale().px(TREE_PAD);
         let top = tree_pad + sel as i32 * row_h;

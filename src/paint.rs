@@ -277,6 +277,32 @@ pub(crate) fn push_splitter(list: &mut DisplayList, rect: Rect, scale: Scale) {
     });
 }
 
+/// The sidebar's text size. The sidebar is chrome, not content, so its names read
+/// a step below the body, the way their muted color does: nine tenths of the body
+/// size, rounded to the nearest pixel, so it tracks the body through every font
+/// size and display scale.
+pub(crate) fn tree_font_size(body_size: u32) -> u32 {
+    (body_size * 9 + 5) / 10
+}
+
+/// The metrics the sidebar lays out in. Its rows, its footer, and the hit-testing
+/// all measure against these, so a click lands on the row it looks like.
+pub(crate) fn tree_metrics(fonts: &Fonts, body_size: u32) -> Metrics {
+    fonts.metrics(tree_font_size(body_size))
+}
+
+/// Every pixel size the editor opens a face at: the markdown styles' sizes plus the
+/// sidebar's. A size that was never opened falls back to the body face, so the
+/// sidebar's has to be in the set handed to [`Fonts`].
+pub(crate) fn font_sizes(body_size: u32) -> Vec<u32> {
+    let mut sizes = markdown::all_sizes(body_size);
+    let tree = tree_font_size(body_size);
+    if !sizes.contains(&tree) {
+        sizes.push(tree);
+    }
+    sizes
+}
+
 /// The pixel height of one tree row: the font's line height plus vertical
 /// padding above and below, so items get breathing room and a taller hit area.
 /// Shared by the painter and the pointer/scroll hit-testing so they agree.
@@ -357,7 +383,8 @@ pub(crate) fn push_tree(
         rect,
         color: TREE_BG,
     });
-    let m = fonts.metrics(body_size);
+    let size = tree_font_size(body_size);
+    let m = fonts.metrics(size);
     let col = tree_column(rect, m, scale);
     let view = col.rows;
     let row_h = tree_row_height(m, scale);
@@ -371,7 +398,7 @@ pub(crate) fn push_tree(
     let tree_indent = scale.px(TREE_INDENT);
     let rows = tree.tree.rows();
     let face = FaceKey::Prose {
-        size: body_size,
+        size,
         style: FontStyle::Regular,
     };
     let text_right = rect.x + rect.w - tree_pad - row_pad;
@@ -436,7 +463,7 @@ pub(crate) fn push_tree(
         TREE_BG,
         scale,
     );
-    push_tree_footer(list, fonts, &col, tree, scale, body_size);
+    push_tree_footer(list, fonts, &col, tree, scale, size);
 }
 
 /// The sidebar footer's toggle: whether the tree lists folders that hold no note
@@ -454,9 +481,9 @@ fn push_tree_footer(
     col: &TreeColumn,
     tree: &TreePane,
     scale: Scale,
-    body_size: u32,
+    size: u32,
 ) {
-    let m = fonts.metrics(body_size);
+    let m = fonts.metrics(size);
     let hovered = tree.filter_hovered;
     list.push(DrawCmd::Fill {
         rect: col.footer,
@@ -491,10 +518,10 @@ fn push_tree_footer(
     push_checkbox(list, box_, tree.tree.show_empty_dirs(), behind);
     let x = box_.x + box_.w + scale.px(TREE_FOOTER_GAP);
     let right = col.button.x + col.button.w - scale.px(TREE_ROW_PAD);
-    let face = fonts.face(body_size, FontStyle::Regular);
+    let face = fonts.face(size, FontStyle::Regular);
     list.push(text_cmd(
         FaceKey::Prose {
-            size: body_size,
+            size,
             style: FontStyle::Regular,
         },
         x,
@@ -2572,9 +2599,56 @@ mod tests {
     }
 
     #[test]
+    fn the_sidebar_reads_a_step_below_the_body_in_a_face_that_is_opened() {
+        // A step down, and one that survives rounding at every size the body takes
+        // across the DPI scales (14 -> 13, 28 at 2x -> 25).
+        assert_eq!(tree_font_size(14), 13);
+        assert_eq!(tree_font_size(28), 25);
+        for body in 8..=64 {
+            assert!(tree_font_size(body) < body, "body {body}");
+            assert!(
+                font_sizes(body).contains(&tree_font_size(body)),
+                "the sidebar's face is opened, so it never falls back to the body's"
+            );
+        }
+
+        // Every string the sidebar draws (its rows and its footer's label) is in that
+        // size, not the body's.
+        let fx = TreeDir::new("size");
+        let fonts = Fonts::new(&font_sizes(FONT_SIZE)).expect("a default font");
+        let mut list = DisplayList::new();
+        let rect = Rect {
+            x: 0,
+            y: 0,
+            w: 320,
+            h: 400,
+        };
+        push_tree(
+            &mut list,
+            &fonts,
+            &tree_pane(&fx.0, None),
+            rect,
+            Scale::ONE,
+            FONT_SIZE,
+        );
+        let sizes: Vec<u32> = list
+            .iter()
+            .filter_map(|c| match c {
+                DrawCmd::Text { face, .. } => Some(face.size()),
+                _ => None,
+            })
+            .collect();
+        assert!(sizes.len() >= 3, "two rows and the footer label");
+        assert!(
+            sizes.iter().all(|&s| s == tree_font_size(FONT_SIZE)),
+            "the sidebar draws in its own size, got {sizes:?}"
+        );
+    }
+
+    #[test]
     fn tree_rows_paint_chevron_column_names_and_inset_highlight() {
         let fx = TreeDir::new("rows");
-        let fonts = Fonts::new(&markdown::all_sizes(FONT_SIZE)).expect("a default font");
+        let fonts = Fonts::new(&font_sizes(FONT_SIZE)).expect("a default font");
         // Row 0 (the folder) is active, so it draws its highlight.
         let tree = tree_pane(&fx.0, Some(0));
         let rect = Rect {
@@ -2625,7 +2699,7 @@ mod tests {
         // Both names read in the muted sidebar tone, dimmer than the body text and
         // brighter than the chevron beside them, aligned in the column past it. The
         // footer's label shares the tone, so only the rows' own band is scanned.
-        let rows_bottom = tree_column(rect, fonts.metrics(FONT_SIZE), Scale::ONE)
+        let rows_bottom = tree_column(rect, tree_metrics(&fonts, FONT_SIZE), Scale::ONE)
             .rows
             .h;
         let names: Vec<(&str, i32)> = list
@@ -2664,7 +2738,7 @@ mod tests {
     #[test]
     fn tree_active_and_hover_share_the_gray_highlight() {
         let fx = TreeDir::new("hover");
-        let fonts = Fonts::new(&markdown::all_sizes(FONT_SIZE)).expect("a default font");
+        let fonts = Fonts::new(&font_sizes(FONT_SIZE)).expect("a default font");
         let rect = Rect {
             x: 0,
             y: 0,
@@ -2700,8 +2774,8 @@ mod tests {
 
     #[test]
     fn the_footer_takes_its_row_off_the_bottom_of_the_column() {
-        let fonts = Fonts::new(&markdown::all_sizes(FONT_SIZE)).expect("a default font");
-        let m = fonts.metrics(FONT_SIZE);
+        let fonts = Fonts::new(&font_sizes(FONT_SIZE)).expect("a default font");
+        let m = tree_metrics(&fonts, FONT_SIZE);
         let column = Rect {
             x: 10,
             y: 30,
@@ -2729,7 +2803,7 @@ mod tests {
     #[test]
     fn the_footer_filter_draws_its_state_and_lights_up_when_hovered() {
         let fx = TreeDir::new("footer");
-        let fonts = Fonts::new(&markdown::all_sizes(FONT_SIZE)).expect("a default font");
+        let fonts = Fonts::new(&font_sizes(FONT_SIZE)).expect("a default font");
         // Wide enough for the whole label, so the assertions below name it in full; a
         // narrower sidebar ellipsizes it like any other row.
         let rect = Rect {
@@ -2746,7 +2820,7 @@ mod tests {
             push_tree(&mut list, &fonts, &tree, rect, Scale::ONE, FONT_SIZE);
             list
         };
-        let col = tree_column(rect, fonts.metrics(FONT_SIZE), Scale::ONE);
+        let col = tree_column(rect, tree_metrics(&fonts, FONT_SIZE), Scale::ONE);
         let in_footer = |r: &Rect| r.y >= col.footer.y && r.y + r.h <= col.footer.y + col.footer.h;
 
         // Listing the empty folders is the checked state: the box fills with the
@@ -2808,10 +2882,10 @@ mod tests {
     #[test]
     fn tree_rows_scroll_within_the_viewport_above_the_footer() {
         let fx = TreeDir::new("scroll");
-        let fonts = Fonts::new(&markdown::all_sizes(FONT_SIZE)).expect("a default font");
+        let fonts = Fonts::new(&font_sizes(FONT_SIZE)).expect("a default font");
         let mut tree = tree_pane(&fx.0, None);
         // A column too short for both rows, so the scroll has somewhere to go.
-        let m = fonts.metrics(FONT_SIZE);
+        let m = tree_metrics(&fonts, FONT_SIZE);
         let rect = Rect {
             x: 0,
             y: 0,

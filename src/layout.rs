@@ -382,6 +382,36 @@ pub struct Run {
     pub visible: bool,
 }
 
+/// What a walk over a line's runs needs to lay them the way the painter did: the
+/// size and heading flag that pick each run's face, and whether the line is a fenced
+/// code block (where inline code draws no pill pad).
+#[derive(Clone, Copy)]
+struct RunStyle {
+    size: u32,
+    heading: bool,
+    code_block: bool,
+}
+
+impl RunStyle {
+    fn of(line: &VisualLine) -> Self {
+        Self {
+            size: line.size,
+            heading: line.heading.is_some(),
+            code_block: line.code_block,
+        }
+    }
+
+    /// A table cell draws prose at the row's size, bold in a header row, and never
+    /// as a code block.
+    fn of_cell(line: &VisualLine, t: &TableRow) -> Self {
+        Self {
+            size: line.size,
+            heading: t.header,
+            code_block: false,
+        }
+    }
+}
+
 /// Map a span/run kind to the face style it renders in within the prose family.
 /// Markers use the regular face; only bold/italic emphasis selects a variant.
 /// Code is not handled here (it draws in the separate code family, see
@@ -892,11 +922,94 @@ impl Layout {
         line.rule.then_some((line.start, line.end))
     }
 
-    /// Whether the visual line at content-space `y` sits in a fenced code block. Its
-    /// text is not parsed as inline markdown, so a URL there is code, not a link, and
-    /// the editor must neither offer to follow it nor point a hand at it.
-    pub fn code_block_at(&self, fonts: &Fonts, y: f32) -> bool {
-        self.line_for_y(fonts, y).code_block
+    /// Whether content-space `(x, y)` lands on the glyphs the painter drew for the
+    /// byte range `span` on `line`. The caller has the row from [`Self::row_at`] and
+    /// the span from the markdown, so a link hit-tests against its own drawn box the
+    /// way a checkbox does: the dead space a click otherwise clamps into (the left
+    /// margin, the ragged run-out past the last glyph of a wrapped line, a widget
+    /// row's padding) belongs to no span and lands the caret instead.
+    pub(crate) fn span_hit(
+        &self,
+        fonts: &Fonts,
+        rope: &Rope,
+        line: &VisualLine,
+        span: (usize, usize),
+        x: f32,
+        y: f32,
+    ) -> bool {
+        let drawn = match &line.table {
+            Some(t) => self.table_span_x(fonts, rope, (line, t), span, x, y),
+            None => self.runs_span_x(
+                fonts,
+                rope,
+                RunStyle::of(line),
+                self.run_slice(line),
+                (self.left + line.indent) as f32,
+                span,
+            ),
+        };
+        drawn.is_some_and(|(x0, x1)| x >= x0 && x < x1)
+    }
+
+    /// The x-range of `span` within the cell of table row `line` the pointer is
+    /// over. A span in another cell, or on another of that cell's wrapped lines,
+    /// draws none of its glyphs here and yields `None`.
+    fn table_span_x(
+        &self,
+        fonts: &Fonts,
+        rope: &Rope,
+        (line, t): (&VisualLine, &TableRow),
+        span: (usize, usize),
+        x: f32,
+        y: f32,
+    ) -> Option<(f32, f32)> {
+        let col = self.table_col_at(line, t, x)?;
+        let cell = t.cells.get(col)?;
+        let k = self.cell_line_at(fonts, line, t, cell, y)?;
+        let cl = cell.lines.get(k)?;
+        let content_x = t.columns.get(col).map_or(0, |c| aligned_x(*c, cl.width));
+        let left = (self.left + line.indent + content_x) as f32;
+        self.runs_span_x(
+            fonts,
+            rope,
+            RunStyle::of_cell(line, t),
+            &cl.runs,
+            left,
+            span,
+        )
+    }
+
+    /// The x-range the glyphs of `span` occupy within `runs`, laid from pen `left`,
+    /// or `None` when the runs draw none of the span. A collapsed marker is
+    /// zero-width, so a span reaches only as far as the text actually shown; a code
+    /// run's pill pad frames its glyphs the way the painter lays it.
+    fn runs_span_x(
+        &self,
+        fonts: &Fonts,
+        rope: &Rope,
+        style: RunStyle,
+        runs: &[Run],
+        left: f32,
+        span: (usize, usize),
+    ) -> Option<(f32, f32)> {
+        let mut pen = left;
+        let mut drawn: Option<(f32, f32)> = None;
+        for run in runs {
+            if !run.visible {
+                continue;
+            }
+            let face = run_face(fonts, style.size, run.kind, style.heading);
+            let pad = inline_code_pad(run.kind, style.code_block, self.scale) as f32;
+            pen += pad;
+            let (s, e) = (span.0.max(run.start), span.1.min(run.end));
+            if s < e {
+                let x0 = pen + shape::text_advance(face, &rope.slice(run.start..s).as_cow());
+                let x1 = x0 + shape::text_advance(face, &rope.slice(s..e).as_cow());
+                drawn = Some((drawn.map_or(x0, |(a, _)| a), x1));
+            }
+            pen += shape::text_advance(face, &rope.slice(run.start..run.end).as_cow()) + pad;
+        }
+        drawn
     }
 
     /// The drawn checkbox's rectangle in content space for a task line whose
@@ -1257,20 +1370,32 @@ impl Layout {
     fn line_for_y(&self, fonts: &Fonts, y: f32) -> &VisualLine {
         self.lines
             .iter()
-            .find(|l| {
-                let m = fonts.metrics(l.size);
-                // A widget line's band spans its full (taller) box, so a click
-                // anywhere on the picture or table row lands on that line.
-                let bottom = if let Some(img) = l.image {
-                    l.baseline - m.ascent + img.box_height()
-                } else if let Some(table) = &l.table {
-                    l.baseline - m.ascent + table.box_height()
-                } else {
-                    l.baseline - m.ascent + m.line_height
-                };
-                y < bottom as f32
-            })
+            .find(|l| y < self.line_bottom(fonts, l) as f32)
             .unwrap_or_else(|| self.last_line())
+    }
+
+    /// The bottom of `line`'s box in content space. A widget line's box is its full
+    /// (taller) picture or table row, so a click anywhere on it lands on that line.
+    fn line_bottom(&self, fonts: &Fonts, line: &VisualLine) -> i32 {
+        let m = fonts.metrics(line.size);
+        let height = match (line.image, &line.table) {
+            (Some(img), _) => img.box_height(),
+            (None, Some(table)) => table.box_height(),
+            (None, None) => m.line_height,
+        };
+        line.baseline - m.ascent + height
+    }
+
+    /// The visual line whose box contains `y`, or `None` when `y` lands in no
+    /// line's box at all: the margin above the first, the gap below the last, or
+    /// the space between two blocks. [`Self::line_for_y`] clamps such a point onto
+    /// the nearest line so a caret always has somewhere to go; this reports only
+    /// what the painter actually drew there, which is what a click on a rendered
+    /// widget (a link, say) has to hit.
+    pub(crate) fn row_at(&self, fonts: &Fonts, y: f32) -> Option<&VisualLine> {
+        let line = self.line_for_y(fonts, y);
+        let top = (line.baseline - fonts.metrics(line.size).ascent) as f32;
+        (y >= top && y < self.line_bottom(fonts, line) as f32).then_some(line)
     }
 
     /// The byte offset within `line` nearest window x `x`, snapped to a grapheme
@@ -1481,6 +1606,40 @@ impl Layout {
         true
     }
 
+    /// The column of table row `line` whose grid slot holds content-space `x`; a
+    /// point past the last column falls to it. `None` for a row with no cells.
+    fn table_col_at(&self, line: &VisualLine, t: &TableRow, x: f32) -> Option<usize> {
+        let last = t.cells.len().checked_sub(1)?;
+        let rel_x = (x - (self.left + line.indent) as f32) as i32;
+        Some(
+            t.borders
+                .windows(2)
+                .position(|w| rel_x < w[1])
+                .unwrap_or(last)
+                .min(last),
+        )
+    }
+
+    /// The wrapped line of `cell` that content-space `y` falls on, clamped to its
+    /// last; `None` for an empty cell. The cell's text starts below the row's cell
+    /// padding, plus the block pad that centers a short cell in a taller row.
+    fn cell_line_at(
+        &self,
+        fonts: &Fonts,
+        line: &VisualLine,
+        t: &TableRow,
+        cell: &TableCell,
+        y: f32,
+    ) -> Option<usize> {
+        let last = cell.lines.len().checked_sub(1)?;
+        let m = fonts.metrics(line.size);
+        let box_top = line.baseline - m.ascent;
+        let max_lines = row_max_lines(t.height, m.line_height, self.scale);
+        let block_pad = cell_block_pad(cell.lines.len(), max_lines, m.line_height);
+        let rel_y = (y - (box_top + self.scale.px(TABLE_CELL_PAD_Y) + block_pad) as f32).max(0.0);
+        Some(((rel_y / m.line_height as f32) as usize).min(last))
+    }
+
     /// The byte offset nearest content-space `(x, y)` inside table row `line`: the
     /// column under `x`, the wrapped line under `y`, then the nearest glyph in that
     /// cell line. An empty cell (or a click before its text) lands at the cell start.
@@ -1493,33 +1652,18 @@ impl Layout {
         x: f32,
         y: f32,
     ) -> usize {
-        let m = fonts.metrics(line.size);
-        let row_left = self.left + line.indent;
-        let box_top = line.baseline - m.ascent;
-        let ncols = t.cells.len();
-        if ncols == 0 {
+        let Some(col) = self.table_col_at(line, t, x) else {
             return line.start;
-        }
-        // The column whose right grid line is the first past x; a click past the
-        // last column falls to it.
-        let rel_x = (x - row_left as f32) as i32;
-        let col = t
-            .borders
-            .windows(2)
-            .position(|w| rel_x < w[1])
-            .unwrap_or(ncols - 1)
-            .min(ncols - 1);
+        };
         let cell = &t.cells[col];
-        if cell.lines.is_empty() {
+        let Some(cl) = self
+            .cell_line_at(fonts, line, t, cell, y)
+            .and_then(|k| cell.lines.get(k))
+        else {
             return cell.start;
-        }
-        let max_lines = row_max_lines(t.height, m.line_height, self.scale);
-        let block_pad = cell_block_pad(cell.lines.len(), max_lines, m.line_height);
-        let rel_y = (y - (box_top + self.scale.px(TABLE_CELL_PAD_Y) + block_pad) as f32).max(0.0);
-        let k = ((rel_y / m.line_height as f32) as usize).min(cell.lines.len() - 1);
-        let cl = &cell.lines[k];
+        };
         let content_x = t.columns.get(col).map_or(0, |c| aligned_x(*c, cl.width));
-        let mut acc = (row_left + content_x) as f32;
+        let mut acc = (self.left + line.indent + content_x) as f32;
         for run in &cl.runs {
             if !run.visible {
                 continue;
@@ -1633,9 +1777,9 @@ struct LayoutScratch {
     /// The line's inline spans (block marker plus code/emphasis/link runs),
     /// produced by [`line_spans_into`]/[`code_block_spans_into`].
     spans: Vec<markdown::Span>,
-    /// One entry per grapheme cluster: its byte offset, pixel width, and whether it
-    /// is a space (a wrap opportunity). Sized to the widest line seen.
-    clusters: Vec<(usize, f32, bool)>,
+    /// One entry per grapheme cluster of the line being wrapped. Sized to the widest
+    /// line seen.
+    clusters: Vec<Cluster>,
     /// The wrapped visual segments' byte ranges, produced by [`wrap_segments`].
     segments: Vec<(usize, usize)>,
     /// The inline parser's own reusable buffers, so classifying a line's markup
@@ -2645,13 +2789,30 @@ fn clip_runs_into(
     }
 }
 
+/// One measured grapheme cluster of the line being wrapped.
+#[derive(Clone, Copy)]
+struct Cluster {
+    /// Byte offset within the line.
+    off: usize,
+    /// Advance in the cluster's own face, with an inline code span's pill pads
+    /// folded onto the span's first cluster.
+    w: f32,
+    /// A space, so a wrap may break after it.
+    space: bool,
+    /// Markup rather than text: a block marker (`> `, `# `, `- `) or an inline
+    /// delimiter. It collapses off the cursor's line, so a segment holding nothing
+    /// but markers draws an empty row.
+    marker: bool,
+}
+
 /// Greedily word-wrap the logical `line` to `wrap_width` pixels, returning the
-/// byte ranges of its visual segments. Breaks after the last space that fits; a
-/// word wider than `wrap_width` breaks at a grapheme boundary so every segment
-/// holds at least one cluster. `wrap_width <= 0` disables wrapping. Each cluster
-/// is measured in its run's face (per `spans` and `size`), so bold/italic widths
-/// wrap correctly; the source text is measured in full (markers included), so
-/// hiding markers later never reflows the line.
+/// byte ranges of its visual segments. Breaks after the last space that fits and
+/// has text before it; a word wider than `wrap_width` breaks at a grapheme
+/// boundary, so every segment holds at least one cluster and no segment is markup
+/// alone. `wrap_width <= 0` disables wrapping. Each cluster is measured in its
+/// run's face (per `spans` and `size`), so bold/italic widths wrap correctly; the
+/// source text is measured in full (markers included), so hiding markers later
+/// never reflows the line.
 ///
 /// `block_indent` is the hanging indent of a list or quote item: the first
 /// segment uses the full `wrap_width` (its marker sits in that width), and every
@@ -2668,7 +2829,7 @@ fn wrap_segments(
     heading: bool,
     pad_code: bool,
     scale: Scale,
-    clusters: &mut Vec<(usize, f32, bool)>,
+    clusters: &mut Vec<Cluster>,
     segments: &mut Vec<(usize, usize)>,
 ) {
     segments.clear();
@@ -2676,10 +2837,9 @@ fn wrap_segments(
         segments.push((0, line.len()));
         return;
     }
-    // Measure each cluster once: its offset within the line, width in its run's
-    // face, and whether it is a space (a wrap opportunity). The pooled buffer is
-    // cleared and refilled, so it reuses its capacity across lines instead of
-    // allocating one sized to the line on every call.
+    // Measure each cluster once. The pooled buffer is cleared and refilled, so it
+    // reuses its capacity across lines instead of allocating one sized to the line
+    // on every call.
     clusters.clear();
     let mut prev_code = false;
     clusters.extend(grapheme::graphemes(line).map(|(off, cluster)| {
@@ -2695,7 +2855,12 @@ fn wrap_segments(
             w += (2 * scale.px(crate::theme::CODE_PAD_X)) as f32;
         }
         prev_code = is_code;
-        (off, w, cluster == " ")
+        Cluster {
+            off,
+            w,
+            space: cluster == " ",
+            marker: matches!(kind, markdown::SpanKind::Marker),
+        }
     }));
     if clusters.is_empty() {
         segments.push((0, line.len()));
@@ -2707,22 +2872,29 @@ fn wrap_segments(
         // The first segment gets the full width; continuations are narrower by
         // the hanging indent, since they render inset by it.
         let limit = (wrap_width - if segments.is_empty() { 0 } else { block_indent }).max(1) as f32;
-        let seg_start = clusters[i].0;
+        let seg_start = clusters[i].off;
         let mut width = 0.0;
         // Cluster index that would start the next segment if we break at the
         // last fitting space; `None` until a space is seen in this segment.
         let mut last_break: Option<usize> = None;
+        // Whether the segment has any text to keep yet. A space before there is any
+        // is no break opportunity: breaking there would leave a segment of markup
+        // that draws nothing, so `> <long url>` would hand the quote's first row to
+        // the collapsed `> ` and drop the URL, blank row and all, onto the next.
+        let mut text = false;
         let mut j = i;
         while j < clusters.len() {
-            let (_, w, is_space) = clusters[j];
+            let c = clusters[j];
             // Always keep at least one cluster (j > i) before allowing a break.
-            if width + w > limit && j > i {
+            if width + c.w > limit && j > i {
                 break;
             }
-            width += w;
+            width += c.w;
             j += 1;
-            if is_space {
-                last_break = Some(j);
+            match (c.space, c.marker) {
+                (true, _) if text => last_break = Some(j),
+                (false, false) => text = true,
+                _ => {}
             }
         }
         if j >= clusters.len() {
@@ -2734,7 +2906,7 @@ fn wrap_segments(
             Some(b) if b > i => b,
             _ => j,
         };
-        segments.push((seg_start, clusters[next].0));
+        segments.push((seg_start, clusters[next].off));
         i = next;
     }
 }
@@ -4455,6 +4627,59 @@ mod tests {
             Gutter::None,
             "raw '> ' shows while editing"
         );
+    }
+
+    #[test]
+    fn a_long_word_after_a_marker_starts_on_the_markers_own_row() {
+        let f = fonts();
+        // The URL is one unbreakable word, wider than the column. The space in `> `
+        // is no place to break: the first row would hold nothing but a marker that
+        // collapses to a quote bar, so the quote would open with a blank line and
+        // the URL would break mid-word on the next row anyway. It starts on the
+        // marker's row instead.
+        let src = "> https://example.com/a-very-long-path-that-cannot-fit\nz";
+        let off = src.find('z').expect("the plain line");
+        let r = rope(src);
+        let l = Layout::build(
+            &f,
+            &r,
+            LEFT,
+            TOP,
+            wrap_after(&f, "> https://exam"),
+            BODY,
+            (off, off),
+        );
+        let lines = l.lines();
+        let marker = "> ".len();
+        assert!(
+            lines[0].end > marker,
+            "the URL starts on the quote's first row, not below it"
+        );
+        assert_eq!(lines[0].gutter, Gutter::QuoteBar { marker: true });
+        // The word breaks mid-word from there, and the whole URL is still laid out.
+        assert!(lines.len() > 2, "the URL wraps on past the first row");
+        assert_eq!(
+            lines[..lines.len() - 1].last().map(|l| l.end),
+            Some(src.find('\n').expect("the newline")),
+            "the last quote row ends the URL"
+        );
+    }
+
+    #[test]
+    fn a_long_word_still_moves_below_the_text_it_follows() {
+        let f = fonts();
+        // With text on the row already, the space is a real break: "aaa" keeps the
+        // row and the long word starts on the next one (and breaks up from there).
+        let src = "aaa bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        let r = rope(src);
+        let l = Layout::build(&f, &r, LEFT, TOP, wrap_after(&f, "aaa "), BODY, (0, 0));
+        let lines = l.lines();
+        assert_eq!(
+            (lines[0].start, lines[0].end),
+            (0, 4),
+            "'aaa ' keeps the first row"
+        );
+        assert!(lines.len() > 2, "the long word breaks across the rest");
     }
 
     #[test]

@@ -1205,6 +1205,12 @@ impl EditorPane {
     /// is rendered (markup collapsed) and the scheme is one the browser opens. An
     /// inline `[text](dest)` and a bare URL both resolve here, since a bare URL is
     /// just the link whose text is its own destination.
+    ///
+    /// The pointer has to sit on the link's own glyphs. The empty space around them
+    /// (the margins, the padding above the first line, the run-out past the end of a
+    /// wrapped URL) is space the painter drew no link on, so a click there drops the
+    /// caret rather than opening a browser: a note that is mostly link stays a note
+    /// you can edit.
     pub(crate) fn link_under_pointer(
         &mut self,
         fonts: &Fonts,
@@ -1212,28 +1218,27 @@ impl EditorPane {
         px: f32,
         py: f32,
     ) -> Option<String> {
+        self.ensure_layout(fonts, rect);
+        let y = self.content_y(py);
+        let (a0, a1) = self.reveal_range();
+        let layout = self.layout_cache.as_ref()?;
+        let row = layout.row_at(fonts, y)?;
         // A fenced code block is not parsed as inline markdown, so nothing in it is a
         // link however much it looks like one: a `curl https://…` renders as code and
         // must stay code when clicked.
-        if self
-            .layout_at(fonts, rect, py)
-            .is_some_and(|(layout, _, y)| layout.code_block_at(fonts, y))
-        {
+        if row.code_block {
             return None;
         }
-        let off = self.pointer_offset(fonts, rect, px, py);
-        let (a0, a1) = self.reveal_range();
         let rope = self.text.rope();
-        let line = rope.byte_to_line(off);
-        let (ls, le) = rope.line_content_range(line);
+        let (ls, le) = rope.line_content_range(rope.byte_to_line(row.start));
+        // The revealed line shows its raw source, which the caret is editing.
         if a0 <= le && a1 >= ls {
             return None;
         }
         let content = rope.slice(ls..le).as_cow();
-        let rel = off - ls;
         let link = markdown::links(&content, &mut self.link_scratch)
             .into_iter()
-            .find(|l| l.text.0 <= rel && rel <= l.text.1)?;
+            .find(|l| layout.span_hit(fonts, rope, row, (ls + l.text.0, ls + l.text.1), px, y))?;
         let dest = content[link.dest.0..link.dest.1].to_string();
         crate::platform::browser::can_open(&dest).then_some(dest)
     }
@@ -1766,11 +1771,9 @@ mod tests {
         pane
     }
 
-    /// The link the pointer finds over the first character of `needle` in `text`,
-    /// driving the real layout so the hit-test, the reveal rule, and the code-block
-    /// rule all run. `text` is laid under a spacer line that the cursor parks on, so
-    /// no line under test is the revealed one (that rule has its own case below).
-    fn link_over(text: &str, needle: &str) -> Option<String> {
+    /// A pane holding `text`, laid out in an 800x600 column with the cursor at
+    /// `cursor`, ready for pointer probes against the real layout.
+    fn laid_out(text: &str, cursor: usize) -> (EditorPane, Fonts, Rect) {
         let fonts = Fonts::new(&markdown::all_sizes(FONT_SIZE)).expect("a default font");
         let rect = Rect {
             x: 0,
@@ -1778,16 +1781,30 @@ mod tests {
             w: 800,
             h: 600,
         };
-        let doc = format!("spacer\n{text}");
-        let mut pane = pane_of(&doc);
-        let at = doc.find(needle).expect("needle not in text");
+        let mut pane = pane_of(text);
+        pane.text.set_cursor(cursor, false);
         pane.ensure_layout(&fonts, rect);
+        (pane, fonts, rect)
+    }
+
+    /// The pointer position over the glyph at byte `at`: a nudge right of its caret,
+    /// so the hit lands on the glyph and not on the boundary with the one before, and
+    /// halfway down the line.
+    fn over(pane: &EditorPane, fonts: &Fonts, at: usize) -> (f32, f32) {
         let layout = pane.layout_cache.as_ref().expect("a built layout");
-        // The caret of the needle's first byte is the pixel the pointer hovers.
-        let (x, y, h) = layout.caret(&fonts, pane.text.rope(), at);
-        // Nudge into the middle of the glyph's box, so the hit lands on it and not on
-        // the boundary with the character before.
-        let (px, py) = (x as f32 + 1.0, (y + h / 2) as f32);
+        let (x, y, h) = layout.caret(fonts, pane.text.rope(), at);
+        (x as f32 + 1.0, (y + h / 2) as f32)
+    }
+
+    /// The link the pointer finds over the first character of `needle` in `text`,
+    /// driving the real layout so the hit-test, the reveal rule, and the code-block
+    /// rule all run. `text` is laid under a spacer line that the cursor parks on, so
+    /// no line under test is the revealed one (that rule has its own case below).
+    fn link_over(text: &str, needle: &str) -> Option<String> {
+        let doc = format!("spacer\n{text}");
+        let (mut pane, fonts, rect) = laid_out(&doc, 0);
+        let at = doc.find(needle).expect("needle not in text");
+        let (px, py) = over(&pane, &fonts, at);
         pane.link_under_pointer(&fonts, rect, px, py)
     }
 
@@ -1813,6 +1830,94 @@ mod tests {
     }
 
     #[test]
+    fn only_a_links_own_glyphs_follow_it() {
+        // A URL alone on a line leaves most of the line, and the margins around it,
+        // empty. A click on that empty space is a click into the text, so it drops
+        // the caret; only the drawn URL follows. Otherwise a note whose first line
+        // is a link is nearly impossible to click into.
+        let url = "https://example.com/a";
+        let doc = format!("{url}\ntail");
+        let (mut pane, fonts, rect) = laid_out(&doc, doc.len());
+        let (px, py) = over(&pane, &fonts, 0);
+        assert_eq!(
+            pane.link_under_pointer(&fonts, rect, px, py),
+            Some(url.into()),
+            "the URL's own glyphs follow"
+        );
+        let (end_x, _) = over(&pane, &fonts, url.len());
+        for (name, x, y) in [
+            ("past the last character", end_x + 8.0, py),
+            ("the far right of the line", 780.0, py),
+            ("the left margin", 1.0, py),
+            ("the padding above the first line", px, 1.0),
+        ] {
+            assert_eq!(
+                pane.link_under_pointer(&fonts, rect, x, y),
+                None,
+                "{name} is not the link"
+            );
+        }
+    }
+
+    #[test]
+    fn the_run_out_past_a_wrapped_url_is_not_the_link() {
+        // A URL long enough to wrap ends its last row early, leaving the rest of that
+        // row blank. The blank part belongs to no glyph, so it is not the link.
+        let url = "https://example.com/en/articles/9267400-move-your-personal-account-to-a-team-or-an-enterprise-organization-with-the-existing-notes";
+        let doc = format!("spacer\n{url}");
+        let (mut pane, fonts, rect) = laid_out(&doc, 0);
+        let rows = pane
+            .layout_cache
+            .as_ref()
+            .expect("a built layout")
+            .lines()
+            .len();
+        // The spacer, then the URL over at least two rows.
+        assert!(
+            rows > 2,
+            "the URL has to wrap for this case to mean anything"
+        );
+        // The tail row: its last glyph is the link, the blank rest of the row is not.
+        let (tail_x, tail_y) = over(&pane, &fonts, doc.len() - 1);
+        assert_eq!(
+            pane.link_under_pointer(&fonts, rect, tail_x, tail_y),
+            Some(url.into()),
+            "the wrapped tail still follows"
+        );
+        let (end_x, _) = over(&pane, &fonts, doc.len());
+        assert_eq!(
+            pane.link_under_pointer(&fonts, rect, end_x + 8.0, tail_y),
+            None,
+            "the blank run-out after the tail is not the link"
+        );
+        assert_eq!(
+            pane.link_under_pointer(&fonts, rect, 700.0, tail_y),
+            None,
+            "nor is the far end of that row"
+        );
+    }
+
+    #[test]
+    fn a_link_in_a_table_cell_follows_from_its_own_cell() {
+        // A cell's link hit-tests against the glyphs drawn in that cell, so the link
+        // follows from its own text and from nowhere else in the row.
+        let doc = "| a | b |\n| --- | --- |\n| [docs](https://example.com/t) | plain |\ntail";
+        let (mut pane, fonts, rect) = laid_out(doc, doc.len());
+        let (px, py) = over(&pane, &fonts, doc.find("docs").expect("link text"));
+        assert_eq!(
+            pane.link_under_pointer(&fonts, rect, px, py),
+            Some("https://example.com/t".into()),
+            "the cell's link text follows"
+        );
+        let (qx, qy) = over(&pane, &fonts, doc.find("plain").expect("plain cell"));
+        assert_eq!(
+            pane.link_under_pointer(&fonts, rect, qx, qy),
+            None,
+            "the next cell over is not the link"
+        );
+    }
+
+    #[test]
     fn a_url_in_a_fenced_code_block_is_code_not_a_link() {
         // The block is not parsed as inline markdown, so the URL renders as plain
         // code; following it would mean the pointer offering a link the painter never
@@ -1830,21 +1935,10 @@ mod tests {
         // The active line shows its raw source and belongs to the keyboard: clicking
         // a URL there places the caret rather than launching a browser, which is what
         // lets a URL be edited at all.
-        let fonts = Fonts::new(&markdown::all_sizes(FONT_SIZE)).expect("a default font");
-        let rect = Rect {
-            x: 0,
-            y: 0,
-            w: 800,
-            h: 600,
-        };
         let text = "see https://example.com/a now";
         let at = text.find("https").expect("url present");
-        let mut pane = pane_of(text);
-        pane.text.set_cursor(at, false);
-        pane.ensure_layout(&fonts, rect);
-        let layout = pane.layout_cache.as_ref().expect("a built layout");
-        let (x, y, h) = layout.caret(&fonts, pane.text.rope(), at);
-        let (px, py) = (x as f32 + 1.0, (y + h / 2) as f32);
+        let (mut pane, fonts, rect) = laid_out(text, at);
+        let (px, py) = over(&pane, &fonts, at);
         assert_eq!(pane.link_under_pointer(&fonts, rect, px, py), None);
     }
 

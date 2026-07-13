@@ -846,8 +846,6 @@ fn bare_urls_into(content: &str, flags: &[u16], out: &mut Vec<Range<usize>>) {
     );
 }
 
-/// One inline link `[text](dest)` located in a line, as byte ranges into that
-/// line. See [`links`].
 /// One link located in a line, as byte ranges into that line. Either an inline
 /// `[text](dest)` or a bare URL, which is simply the link whose text *is* its
 /// destination, so a caller follows both without telling them apart. See [`links`].

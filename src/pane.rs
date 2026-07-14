@@ -478,6 +478,17 @@ pub(crate) enum Focus {
 /// thin divider line drawn down its middle.
 pub(crate) const SPLITTER: i32 = 6;
 
+/// The visible divider inside a splitter's grab bar: one device pixel down its
+/// middle, spanning the bar's height. The rest of the bar is hit zone.
+pub(crate) fn divider_line(splitter: Rect, scale: Scale) -> Rect {
+    let w = scale.px(1).max(1);
+    Rect {
+        x: splitter.x + (splitter.w - w) / 2,
+        w,
+        ..splitter
+    }
+}
+
 /// The adjustable column layout. The sidebar has a logical pixel width; the two
 /// content panes split the remaining width by a ratio. Splitters drag these
 /// values. `tree_width` is logical (the persisted, scale-free unit); [`Self::columns`]
@@ -567,16 +578,27 @@ impl PaneLayout {
                 h: body,
             });
         }
-        // Each pane's tab strip takes its column's x-span at the top strip's height.
-        let strip = |col: Option<Rect>| {
-            col.map(|c| Rect {
-                x: c.x,
-                y: 0,
-                w: c.w,
-                h: top,
+        // Each pane's tab strip takes its column's x-span at the top strip's height,
+        // reaching left across the splitter's grab margin so the first tab sits flush
+        // against the divider line that continues up through the bar.
+        let strip = |col: Option<Rect>, left: Option<Rect>| {
+            col.map(|c| {
+                let x = left.map_or(c.x, |s| {
+                    let line = divider_line(s, scale);
+                    line.x + line.w
+                });
+                Rect {
+                    x,
+                    y: 0,
+                    w: c.w + (c.x - x),
+                    h: top,
+                }
             })
         };
-        let tab_strips = [strip(editors[0]), strip(editors[1])];
+        let tab_strips = [
+            strip(editors[0], splitters[0]),
+            strip(editors[1], splitters[1]),
+        ];
         Columns {
             tree,
             editors,
@@ -2378,14 +2400,25 @@ mod tests {
         let a = cols.editors[0].expect("editor A");
         let b = cols.editors[1].expect("editor B");
         assert_eq!((a.y, a.h), (30, 670));
-        // Each pane's tab strip sits above its column at the bar height.
+        // Each pane's tab strip sits above its column at the bar height, starting at
+        // the divider line so the first tab abuts it with no gap.
         let strip_a = cols.tab_strips[0].expect("strip A");
         let strip_b = cols.tab_strips[1].expect("strip B");
+        let line_a = divider_line(cols.splitters[0].expect("splitter 0"), Scale::ONE);
+        let line_b = divider_line(cols.splitters[1].expect("splitter 1"), Scale::ONE);
+        let (left_a, left_b) = (line_a.x + line_a.w, line_b.x + line_b.w);
         assert_eq!(
             (strip_a.x, strip_a.y, strip_a.w, strip_a.h),
-            (a.x, 0, a.w, 30)
+            (left_a, 0, a.w + (a.x - left_a), 30)
         );
-        assert_eq!((strip_b.x, strip_b.w, strip_b.h), (b.x, b.w, 30));
+        assert_eq!(
+            (strip_b.x, strip_b.w, strip_b.h),
+            (left_b, b.w + (b.x - left_b), 30)
+        );
+        // Each strip still ends at its column's right edge, so they never overlap.
+        assert_eq!(strip_a.x + strip_a.w, a.x + a.w);
+        assert_eq!(strip_b.x + strip_b.w, b.x + b.w);
+        assert!(strip_a.x + strip_a.w <= strip_b.x);
     }
 
     #[test]

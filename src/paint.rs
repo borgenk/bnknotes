@@ -25,10 +25,10 @@ use crate::theme::{
     SCROLL_WIDE, SELECTION_COLOR, SPLITTER_COLOR, TABLE_BORDER_COLOR, TABLE_HEADER_BG,
     TAB_ACTIVE_BG, TAB_ACTIVE_TEXT, TAB_BUTTON_HOVER_BG, TAB_BUTTON_RADIUS, TAB_CLOSE_GAP,
     TAB_CLOSE_W, TAB_DIRTY_COLOR, TAB_HOVER_BG, TAB_INACTIVE_TEXT, TAB_MAX_W, TAB_MIN_W, TAB_NEW_W,
-    TAB_PAD_X, TAB_RADIUS, TAB_VPAD, TICK_HEIGHT, TICK_WIDTH, TOP_BAR_BG, TREE_BG,
-    TREE_CHEVRON_MAX, TREE_FOOTER_GAP, TREE_FOOTER_VPAD, TREE_HOVER_BG, TREE_INDENT,
-    TREE_MARKER_COLOR, TREE_MARKER_W, TREE_PAD, TREE_ROW_INSET_Y, TREE_ROW_PAD, TREE_ROW_RADIUS,
-    TREE_ROW_VPAD, TREE_TEXT_COLOR, VAULT_PAD_X,
+    TAB_PAD_X, TAB_VPAD, TICK_HEIGHT, TICK_WIDTH, TOP_BAR_BG, TREE_BG, TREE_CHEVRON_MAX,
+    TREE_FOOTER_GAP, TREE_FOOTER_VPAD, TREE_HOVER_BG, TREE_INDENT, TREE_MARKER_COLOR,
+    TREE_MARKER_W, TREE_PAD, TREE_ROW_INSET_Y, TREE_ROW_PAD, TREE_ROW_RADIUS, TREE_ROW_VPAD,
+    TREE_TEXT_COLOR, VAULT_PAD_X,
 };
 
 /// The per-frame inputs [`build_display_list`] needs beyond the layout itself:
@@ -265,14 +265,8 @@ pub(crate) fn push_splitter(list: &mut DisplayList, rect: Rect, scale: Scale) {
         rect,
         color: BACKGROUND,
     });
-    let divider = scale.px(1).max(1);
     list.push(DrawCmd::Fill {
-        rect: Rect {
-            x: rect.x + (rect.w - divider) / 2,
-            y: rect.y,
-            w: divider,
-            h: rect.h,
-        },
+        rect: crate::pane::divider_line(rect, scale),
         color: SPLITTER_COLOR,
     });
 }
@@ -748,11 +742,12 @@ pub(crate) fn push_top_bar(
     // The column splitters' divider lines continue up through the bar, so the bar
     // reads as segmented into each pane's strip.
     for d in dividers {
+        let line = crate::pane::divider_line(*d, ctx.scale);
         list.push(DrawCmd::Fill {
             rect: Rect {
-                x: d.x + (d.w - divider) / 2,
+                x: line.x,
                 y: bar.y,
-                w: divider,
+                w: line.w,
                 h: bar.h,
             },
             color: SPLITTER_COLOR,
@@ -903,14 +898,11 @@ fn push_tab_body(
 ) {
     let scale = ctx.scale;
     let m = ctx.metrics();
-    let radius = scale.px(TAB_RADIUS);
     let pad = scale.px(TAB_PAD_X);
     if active || hovered {
-        list.push(DrawCmd::RoundRect {
+        list.push(DrawCmd::Fill {
             rect: tab.rect,
             color: if active { TAB_ACTIVE_BG } else { TAB_HOVER_BG },
-            radius,
-            corners: display::RoundedCorners::Top,
         });
     }
     let color = if active {
@@ -2186,9 +2178,17 @@ mod tests {
         assert!(has_text("Notes"), "vault label");
         assert!(has_text("intro"), "resting tab label");
         assert!(has_text("todo"), "active tab label");
-        // The active tab (index 1) melts into the pane background and shows a close
-        // glyph; the resting unsaved tab (index 0) shows a dirty dot instead.
-        assert!(has_round(TAB_ACTIVE_BG), "active tab highlight");
+        // The active tab (index 1) melts into the pane background over its whole
+        // square box and shows a close glyph; the resting unsaved tab (index 0) shows
+        // a dirty dot instead.
+        let tabs = tab_rects(strip_rect, &labels, &fonts, FONT_SIZE, Scale::ONE);
+        let active = tabs[1].rect;
+        assert!(
+            list.iter().any(
+                |c| matches!(c, DrawCmd::Fill { rect, color } if *rect == active && *color == TAB_ACTIVE_BG)
+            ),
+            "active tab highlight"
+        );
         assert!(has_text("×"), "close glyph on the active tab");
         assert!(
             has_round(TAB_DIRTY_COLOR),

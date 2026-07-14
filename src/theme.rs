@@ -128,9 +128,6 @@ pub(crate) const TAB_INACTIVE_TEXT: u32 = 0x008c_a0b3;
 pub(crate) const TAB_HOVER_BG: u32 = 0x0028_2c34;
 /// The unsaved-changes dot shown on a tab that is neither active nor hovered.
 pub(crate) const TAB_DIRTY_COLOR: u32 = 0x008c_a0b3;
-/// Corner radius of a tab's fill (rounded at the top, square where it meets the
-/// pane).
-pub(crate) const TAB_RADIUS: i32 = 6;
 /// The rounded button that lights up behind a tab's close glyph or the new-tab
 /// (+) button under the pointer, and its corner radius.
 pub(crate) const TAB_BUTTON_HOVER_BG: u32 = 0x0039_3f47;

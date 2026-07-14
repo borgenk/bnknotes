@@ -45,8 +45,12 @@ pub mod keycode {
 }
 
 const XKB_KEYMAP_FORMAT_TEXT_V1: u32 = 1;
-/// Query the effective modifier state (depressed, latched, or locked).
-const XKB_STATE_MODS_EFFECTIVE: u32 = 1 << 0;
+/// The *effective* modifier state: depressed (physically held), latched (sticky
+/// keys: tapped, released, and applied to the next key), and locked (Caps Lock)
+/// folded together. Position 3 in `enum xkb_state_component`, not 0 — that one is
+/// `XKB_STATE_MODS_DEPRESSED`, and asking it would tell a sticky-keys user that
+/// their Ctrl is not pressed, so every editor chord would silently do nothing.
+const XKB_STATE_MODS_EFFECTIVE: u32 = 1 << 3;
 /// libxkbcommon's canonical names for the Shift and Control modifiers.
 const XKB_MOD_NAME_SHIFT: &[u8] = b"Shift\0";
 const XKB_MOD_NAME_CTRL: &[u8] = b"Control\0";
@@ -406,5 +410,52 @@ mod tests {
         assert!(!xkb.shift_active());
         assert!(!xkb.ctrl_active());
         assert!(!xkb.alt_active());
+    }
+
+    /// The smallest keymap that can answer "is Ctrl held": one key bound to
+    /// `Control_L` and mapped into the real `Control` modifier. Written out here
+    /// rather than read from the system's xkb data so the test depends on nothing
+    /// outside the process.
+    const MINIMAL_KEYMAP: &str = r#"
+xkb_keymap {
+  xkb_keycodes "min" { minimum = 8; maximum = 255; <LCTL> = 37; };
+  xkb_types "min" {
+    type "ONE_LEVEL" { modifiers = none; map[none] = Level1; level_name[Level1] = "Any"; };
+  };
+  xkb_compatibility "min" {
+    interpret Control_L { action = SetMods(modifiers = Control); };
+  };
+  xkb_symbols "min" {
+    key <LCTL> { type = "ONE_LEVEL", [ Control_L ] };
+    modifier_map Control { <LCTL> };
+  };
+};
+"#;
+
+    #[test]
+    fn a_latched_or_locked_modifier_counts_as_active() {
+        // Sticky keys do not hold a modifier down, they *latch* it: the user taps
+        // Ctrl, releases it, and it applies to the next key. The compositor reports
+        // that in the latched mask with nothing in the depressed one, so asking only
+        // about depressed modifiers answers "Ctrl is not pressed" and every Ctrl
+        // chord in the editor quietly does nothing. Locked modifiers (Caps Lock, or a
+        // layout that locks Shift) have the same shape. Effective state is the union.
+        let mut xkb = Xkb::new().expect("xkb context");
+        xkb.load_keymap(MINIMAL_KEYMAP.as_bytes(), XKB_KEYMAP_FORMAT_TEXT_V1)
+            .expect("the minimal keymap compiles");
+
+        // `Control` is real modifier index 2 in every keymap, so its mask is 1 << 2 —
+        // the same bits a compositor puts in wl_keyboard.modifiers.
+        xkb.update_modifiers(1 << 2, 0, 0, 0);
+        assert!(xkb.ctrl_active(), "a depressed Ctrl is active");
+
+        xkb.update_modifiers(0, 1 << 2, 0, 0);
+        assert!(xkb.ctrl_active(), "a latched Ctrl is active");
+
+        xkb.update_modifiers(0, 0, 1 << 2, 0);
+        assert!(xkb.ctrl_active(), "a locked Ctrl is active");
+
+        xkb.update_modifiers(0, 0, 0, 0);
+        assert!(!xkb.ctrl_active(), "and none of them outlives a reset");
     }
 }

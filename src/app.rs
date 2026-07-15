@@ -486,9 +486,18 @@ impl State {
             &config.vaults,
         );
 
+        // Tabs and expanded folders travel with the vault, not the window: restore
+        // the resolved vault's own layout, defaulting to a first-run one (no tabs,
+        // nothing expanded) for a vault seen for the first time.
+        let layout = session
+            .vaults
+            .get(&root)
+            .cloned()
+            .unwrap_or_else(|| store::VaultSession::new(root.clone()));
+
         // Editor A: a file argument opens as a single tab; otherwise restore the
-        // session's pane A tabs. Editor B always restores from the session (one
-        // blank tab if it had none).
+        // vault's pane A tabs. Editor B always restores from the vault (one blank
+        // tab if it had none).
         let editor_a = match &cli_file {
             Some(p) => restore_group(
                 &[store::PaneSession {
@@ -499,18 +508,18 @@ impl State {
                 Some(root.as_path()),
             ),
             None => restore_group(
-                &session.panes[0].tabs,
-                session.panes[0].active as usize,
+                &layout.panes[0].tabs,
+                layout.panes[0].active as usize,
                 Some(root.as_path()),
             ),
         };
         let editor_b = restore_group(
-            &session.panes[1].tabs,
-            session.panes[1].active as usize,
+            &layout.panes[1].tabs,
+            layout.panes[1].active as usize,
             Some(root.as_path()),
         );
 
-        let expanded: BTreeSet<PathBuf> = session.expanded.iter().cloned().collect();
+        let expanded: BTreeSet<PathBuf> = layout.expanded.iter().cloned().collect();
         // The folder filter belongs to the vault, not the window: each vault reopens
         // showing what it showed last, and a vault seen for the first time lists
         // every folder.
@@ -858,6 +867,15 @@ impl State {
             Focus::Editor(1) => store::Focus::PaneB,
             Focus::Editor(_) => store::Focus::PaneA,
         };
+        // Fold the active vault's live tabs and expanded folders back into its
+        // entry, leaving every other vault's remembered layout untouched.
+        let root = self.tree.tree.root();
+        let mut vaults = self.vault_prefs.clone();
+        vaults.set_layout(
+            root,
+            self.tree.tree.expanded_dirs(),
+            [self.editors[0].to_session(), self.editors[1].to_session()],
+        );
         store::Session {
             // The persisted window is the logical size (scale-free); the device
             // buffer size lives in width/height.
@@ -867,10 +885,8 @@ impl State {
             tree_visible: self.panes.tree_visible,
             second_open: self.panes.second_open,
             focus,
-            active_vault: Some(self.tree.tree.root().to_path_buf()),
-            vaults: self.vault_prefs.clone(),
-            expanded: self.tree.tree.expanded_dirs(),
-            panes: [self.editors[0].to_session(), self.editors[1].to_session()],
+            active_vault: Some(root.to_path_buf()),
+            vaults,
         }
     }
 

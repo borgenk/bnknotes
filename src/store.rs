@@ -13,50 +13,107 @@
 //! A corrupt or wrong-version file is not fatal: losing the last layout must
 //! never stop the editor opening, so [`load`] logs and falls back to
 //! [`Session::default`].
+//!
+//! Because several bnknotes can share one state file, a save is a read-merge-write
+//! under an exclusive lock, not a blind overwrite: it re-reads the latest state and
+//! replaces only the window fields and its own active vault, so a sibling instance
+//! editing another vault does not lose its tabs. See [`save_to`] and [`merged_session`].
 
 use std::path::{Path, PathBuf};
 
 use crate::platform::error::{Error, Result};
 
 const FILENAME: &str = "state.bin";
+/// Sibling of the state file, flock'd for the duration of a save so concurrent
+/// bnknotes instances serialize their read-merge-write instead of racing.
+const LOCK_FILENAME: &str = "state.lock";
 const MAGIC: &[u8; 4] = b"BNKN";
-const VERSION: u8 = 3;
+const VERSION: u8 = 4;
 
-/// One vault's remembered settings, keyed by its root directory: the choices that
-/// belong to a vault's contents rather than to the window.
+/// One vault's remembered state, keyed by its root directory: everything that
+/// belongs to a vault's contents rather than to the window. What was open where
+/// travels with the vault, so reopening a vault restores its tabs and its file
+/// tree, not the last window's.
 #[derive(Debug, Clone, PartialEq)]
 pub struct VaultSession {
     pub root: PathBuf,
     /// Whether the file tree lists folders holding no note anywhere beneath them.
     pub show_empty_dirs: bool,
+    /// The folders the file tree had expanded, as absolute paths under `root`.
+    pub expanded: Vec<PathBuf>,
+    /// Each content pane's open tabs and active index while this vault was shown.
+    pub panes: [PaneGroupSession; 2],
 }
 
-/// The settings of every vault the user has touched, not just the active one, so
-/// switching vaults (or coming back to one) restores what that vault was showing.
+impl VaultSession {
+    /// A vault seen for the first time: its tree lists every folder (nothing
+    /// hidden until asked), nothing expanded, and no tabs open.
+    pub fn new(root: PathBuf) -> Self {
+        Self {
+            root,
+            show_empty_dirs: true,
+            expanded: Vec::new(),
+            panes: [PaneGroupSession::default(), PaneGroupSession::default()],
+        }
+    }
+}
+
+/// The remembered state of every vault the user has touched, not just the active
+/// one, so switching vaults (or coming back to one) restores what that vault was
+/// showing.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct VaultPrefs {
     vaults: Vec<VaultSession>,
 }
 
 impl VaultPrefs {
+    /// The stored state for `root`, or `None` if this vault has never been seen.
+    pub fn get(&self, root: &Path) -> Option<&VaultSession> {
+        self.vaults.iter().find(|v| v.root == root)
+    }
+
+    /// Replace `vault.root`'s entry with `vault`, or append it if that vault is new.
+    fn insert(&mut self, vault: VaultSession) {
+        match self.vaults.iter().position(|v| v.root == vault.root) {
+            Some(i) => self.vaults[i] = vault,
+            None => self.vaults.push(vault),
+        }
+    }
+
+    /// The entry for `root`, inserting a first-run one if this vault is new.
+    fn entry_mut(&mut self, root: &Path) -> &mut VaultSession {
+        match self.vaults.iter().position(|v| v.root == root) {
+            Some(i) => &mut self.vaults[i],
+            None => {
+                self.vaults.push(VaultSession::new(root.to_path_buf()));
+                self.vaults.last_mut().expect("just pushed an entry")
+            }
+        }
+    }
+
     /// Whether `root`'s file tree lists folders with no notes. A vault seen for the
     /// first time lists them: nothing is hidden until the user asks for it.
     pub fn show_empty_dirs(&self, root: &Path) -> bool {
-        self.vaults
-            .iter()
-            .find(|v| v.root == root)
-            .is_none_or(|v| v.show_empty_dirs)
+        self.get(root).is_none_or(|v| v.show_empty_dirs)
     }
 
     /// Remember `show` for `root`, replacing that vault's entry or adding one.
     pub fn set_show_empty_dirs(&mut self, root: &Path, show: bool) {
-        match self.vaults.iter_mut().find(|v| v.root == root) {
-            Some(v) => v.show_empty_dirs = show,
-            None => self.vaults.push(VaultSession {
-                root: root.to_path_buf(),
-                show_empty_dirs: show,
-            }),
-        }
+        self.entry_mut(root).show_empty_dirs = show;
+    }
+
+    /// Fold the active vault's live layout back into its entry, adding one if this
+    /// vault is new. The other vaults' entries are left untouched, so each vault
+    /// keeps the tabs and expanded folders it last had.
+    pub fn set_layout(
+        &mut self,
+        root: &Path,
+        expanded: Vec<PathBuf>,
+        panes: [PaneGroupSession; 2],
+    ) {
+        let entry = self.entry_mut(root);
+        entry.expanded = expanded;
+        entry.panes = panes;
     }
 }
 
@@ -114,12 +171,12 @@ pub struct Session {
     pub second_open: bool,
     pub focus: Focus,
     /// The active vault's root directory: the file tree roots here and every note
-    /// reference resolves against it. `None` before a first vault is chosen.
+    /// reference resolves against it. `None` before a first vault is chosen. The
+    /// active vault's tabs and expanded folders live in its [`VaultSession`],
+    /// keyed by this root, not on the window.
     pub active_vault: Option<PathBuf>,
-    /// The per-vault settings, the active vault's among them.
+    /// The per-vault state, the active vault's among them.
     pub vaults: VaultPrefs,
-    pub expanded: Vec<PathBuf>,
-    pub panes: [PaneGroupSession; 2],
 }
 
 /// First-run defaults: sidebar and both content panes shown, an even split, no
@@ -136,8 +193,6 @@ impl Default for Session {
             focus: Focus::PaneA,
             active_vault: None,
             vaults: VaultPrefs::default(),
-            expanded: Vec::new(),
-            panes: [PaneGroupSession::default(), PaneGroupSession::default()],
         }
     }
 }
@@ -183,10 +238,18 @@ pub fn session_path() -> Option<PathBuf> {
 /// unreadable. Never fails: a missing, corrupt, or wrong-version file logs (once)
 /// and falls back, because a bad layout file must not stop the editor opening.
 pub fn load() -> Session {
-    let Some(path) = session_path() else {
-        return Session::default();
-    };
-    match std::fs::read(&path) {
+    match session_path() {
+        Some(path) => load_from(&path),
+        None => Session::default(),
+    }
+}
+
+/// Read and decode the state at `path`, falling back to the first-run default on a
+/// missing, unreadable, corrupt, or wrong-version file. A plain absence is silent;
+/// anything else logs once. Reads need no lock: an atomic rename means a concurrent
+/// save is seen as either the whole old file or the whole new one, never a tear.
+fn load_from(path: &Path) -> Session {
+    match std::fs::read(path) {
         Ok(bytes) => decode(&bytes).map(Session::sanitized).unwrap_or_else(|e| {
             eprintln!(
                 "bnknotes: ignoring unreadable state file {}: {e}",
@@ -202,16 +265,71 @@ pub fn load() -> Session {
     }
 }
 
-/// Save the layout atomically (temp file + rename via [`crate::file::save_atomic`]),
-/// creating the config directory if needed. Best-effort at the call site: a
-/// failure to persist the layout is reported, never fatal.
+/// Persist the layout, creating the config directory if needed. Best-effort at the
+/// call site: a failure to persist is reported, never fatal.
 pub fn save(session: &Session) -> Result<()> {
     let path =
         session_path().ok_or_else(|| Error::msg("no XDG_CONFIG_HOME or HOME to save state"))?;
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
     }
-    crate::file::save_atomic(&path, &encode(session)?)
+    save_to(&path, session)
+}
+
+/// Persist `session` to `path`, but never by blind overwrite: with a second
+/// bnknotes open on another vault, that vault's tabs live only in the other
+/// process, so writing this instance's whole view would drop them. Instead the
+/// read, merge, and atomic write run as one step under an exclusive lock, and only
+/// the window fields and this instance's own active vault are taken from `session`;
+/// every other vault keeps what is on disk. See [`merged_session`].
+fn save_to(path: &Path, session: &Session) -> Result<()> {
+    let _lock = FileLock::acquire(path);
+    let merged = merged_session(&load_from(path), session);
+    crate::file::save_atomic(path, &encode(&merged)?)
+}
+
+/// Fold a saving instance's live state onto the current on-disk state. The window
+/// geometry, focus, and active vault come from the instance (last writer wins,
+/// since they describe its window). Of the vaults, only the instance's active one
+/// is replaced, the single entry it can have changed; every other vault keeps the
+/// tabs and folders it has on disk, so a concurrent instance's vault survives.
+fn merged_session(disk: &Session, incoming: &Session) -> Session {
+    let mut out = disk.clone();
+    out.window = incoming.window;
+    out.tree_width = incoming.tree_width;
+    out.split_ratio = incoming.split_ratio;
+    out.tree_visible = incoming.tree_visible;
+    out.second_open = incoming.second_open;
+    out.focus = incoming.focus;
+    out.active_vault = incoming.active_vault.clone();
+    if let Some(entry) = incoming
+        .active_vault
+        .as_deref()
+        .and_then(|root| incoming.vaults.get(root))
+    {
+        out.vaults.insert(entry.clone());
+    }
+    out
+}
+
+/// An exclusive advisory lock over the state file, held across one read-merge-write
+/// so two instances saving at once serialize rather than clobber each other. It
+/// guards a sibling `state.lock` rather than the state file itself, whose inode a
+/// save replaces by rename; the kernel releases the lock when the file closes, so a
+/// crashed holder never wedges the others. Best-effort: if the lock cannot be taken
+/// (no parent directory, or a filesystem without flock), the save proceeds unlocked
+/// rather than not at all.
+struct FileLock {
+    _file: std::fs::File,
+}
+
+impl FileLock {
+    fn acquire(state_path: &Path) -> Option<Self> {
+        let lock_path = state_path.with_file_name(LOCK_FILENAME);
+        let file = std::fs::File::create(&lock_path).ok()?;
+        file.lock().ok()?;
+        Some(Self { _file: file })
+    }
 }
 
 fn encode(s: &Session) -> Result<Vec<u8>> {
@@ -231,28 +349,41 @@ fn encode(s: &Session) -> Result<Vec<u8>> {
         .map_err(|_| Error::msg("too many vaults to persist"))?;
     out.extend_from_slice(&vaults.to_le_bytes());
     for vault in &s.vaults.vaults {
-        write_path(&mut out, &vault.root)?;
-        out.push(u8::from(vault.show_empty_dirs));
-    }
-
-    let expanded = u32::try_from(s.expanded.len())
-        .map_err(|_| Error::msg("too many expanded folders to persist"))?;
-    out.extend_from_slice(&expanded.to_le_bytes());
-    for dir in &s.expanded {
-        write_path(&mut out, dir)?;
-    }
-    for pane in &s.panes {
-        let count =
-            u32::try_from(pane.tabs.len()).map_err(|_| Error::msg("too many tabs to persist"))?;
-        out.extend_from_slice(&count.to_le_bytes());
-        for tab in &pane.tabs {
-            write_opt_path(&mut out, tab.path.as_deref())?;
-            out.extend_from_slice(&tab.cursor.to_le_bytes());
-            out.extend_from_slice(&tab.scroll_y.to_le_bytes());
-        }
-        out.extend_from_slice(&pane.active.to_le_bytes());
+        write_vault(&mut out, vault)?;
     }
     Ok(out)
+}
+
+/// One vault's block: its root and filter, then the folders it had expanded and
+/// each content pane's tabs. Mirror of [`read_vault`].
+fn write_vault(out: &mut Vec<u8>, vault: &VaultSession) -> Result<()> {
+    write_path(out, &vault.root)?;
+    out.push(u8::from(vault.show_empty_dirs));
+
+    let expanded = u32::try_from(vault.expanded.len())
+        .map_err(|_| Error::msg("too many expanded folders to persist"))?;
+    out.extend_from_slice(&expanded.to_le_bytes());
+    for dir in &vault.expanded {
+        write_path(out, dir)?;
+    }
+    for pane in &vault.panes {
+        write_pane_group(out, pane)?;
+    }
+    Ok(())
+}
+
+/// One pane's tab list and active index. Mirror of [`read_pane_group`].
+fn write_pane_group(out: &mut Vec<u8>, pane: &PaneGroupSession) -> Result<()> {
+    let count =
+        u32::try_from(pane.tabs.len()).map_err(|_| Error::msg("too many tabs to persist"))?;
+    out.extend_from_slice(&count.to_le_bytes());
+    for tab in &pane.tabs {
+        write_opt_path(out, tab.path.as_deref())?;
+        out.extend_from_slice(&tab.cursor.to_le_bytes());
+        out.extend_from_slice(&tab.scroll_y.to_le_bytes());
+    }
+    out.extend_from_slice(&pane.active.to_le_bytes());
+    Ok(())
 }
 
 fn decode(data: &[u8]) -> Result<Session> {
@@ -277,18 +408,8 @@ fn decode(data: &[u8]) -> Result<Session> {
     let vault_count = r.u32()? as usize;
     let mut vaults = Vec::with_capacity(vault_count.min(4096));
     for _ in 0..vault_count {
-        vaults.push(VaultSession {
-            root: r.path()?,
-            show_empty_dirs: r.u8()? != 0,
-        });
+        vaults.push(read_vault(&mut r)?);
     }
-
-    let expanded_count = r.u32()? as usize;
-    let mut expanded = Vec::with_capacity(expanded_count.min(4096));
-    for _ in 0..expanded_count {
-        expanded.push(r.path()?);
-    }
-    let panes = [read_pane_group(&mut r)?, read_pane_group(&mut r)?];
     r.expect_end()?;
     Ok(Session {
         window,
@@ -299,6 +420,21 @@ fn decode(data: &[u8]) -> Result<Session> {
         focus,
         active_vault,
         vaults: VaultPrefs { vaults },
+    })
+}
+
+fn read_vault(r: &mut Reader) -> Result<VaultSession> {
+    let root = r.path()?;
+    let show_empty_dirs = r.u8()? != 0;
+    let expanded_count = r.u32()? as usize;
+    let mut expanded = Vec::with_capacity(expanded_count.min(4096));
+    for _ in 0..expanded_count {
+        expanded.push(r.path()?);
+    }
+    let panes = [read_pane_group(r)?, read_pane_group(r)?];
+    Ok(VaultSession {
+        root,
+        show_empty_dirs,
         expanded,
         panes,
     })
@@ -449,42 +585,56 @@ mod tests {
                     VaultSession {
                         root: PathBuf::from("/home/user/notes"),
                         show_empty_dirs: false,
+                        expanded: vec![
+                            PathBuf::from("/home/user/notes"),
+                            PathBuf::from("/home/user/notes/journal"),
+                        ],
+                        panes: [
+                            PaneGroupSession {
+                                tabs: vec![
+                                    PaneSession {
+                                        path: Some(PathBuf::from("/home/user/notes/todo.md")),
+                                        cursor: 42,
+                                        scroll_y: 128,
+                                    },
+                                    PaneSession {
+                                        path: Some(PathBuf::from(
+                                            "/home/user/notes/journal/day.md",
+                                        )),
+                                        cursor: 7,
+                                        scroll_y: 0,
+                                    },
+                                ],
+                                active: 1,
+                            },
+                            PaneGroupSession {
+                                tabs: vec![PaneSession {
+                                    path: None,
+                                    cursor: 0,
+                                    scroll_y: -5,
+                                }],
+                                active: 0,
+                            },
+                        ],
                     },
                     VaultSession {
                         root: PathBuf::from("/home/user/work"),
                         show_empty_dirs: true,
+                        expanded: vec![PathBuf::from("/home/user/work")],
+                        panes: [
+                            PaneGroupSession {
+                                tabs: vec![PaneSession {
+                                    path: Some(PathBuf::from("/home/user/work/spec.md")),
+                                    cursor: 3,
+                                    scroll_y: 12,
+                                }],
+                                active: 0,
+                            },
+                            PaneGroupSession::default(),
+                        ],
                     },
                 ],
             },
-            expanded: vec![
-                PathBuf::from("/home/user/notes"),
-                PathBuf::from("/home/user/notes/journal"),
-            ],
-            panes: [
-                PaneGroupSession {
-                    tabs: vec![
-                        PaneSession {
-                            path: Some(PathBuf::from("/home/user/notes/todo.md")),
-                            cursor: 42,
-                            scroll_y: 128,
-                        },
-                        PaneSession {
-                            path: Some(PathBuf::from("/home/user/notes/journal/day.md")),
-                            cursor: 7,
-                            scroll_y: 0,
-                        },
-                    ],
-                    active: 1,
-                },
-                PaneGroupSession {
-                    tabs: vec![PaneSession {
-                        path: None,
-                        cursor: 0,
-                        scroll_y: -5,
-                    }],
-                    active: 0,
-                },
-            ],
         }
     }
 
@@ -537,42 +687,72 @@ mod tests {
 
     #[test]
     fn unicode_paths_round_trip() {
+        let root = PathBuf::from("/home/user/notità/日本語");
         let s = Session {
-            active_vault: Some(PathBuf::from("/home/user/notità/日本語")),
-            panes: [
-                PaneGroupSession {
-                    tabs: vec![PaneSession {
-                        path: Some(PathBuf::from("/home/user/café.md")),
-                        ..Default::default()
-                    }],
-                    active: 0,
-                },
-                PaneGroupSession::default(),
-            ],
+            active_vault: Some(root.clone()),
+            vaults: VaultPrefs {
+                vaults: vec![VaultSession {
+                    root: root.clone(),
+                    show_empty_dirs: true,
+                    expanded: vec![PathBuf::from("/home/user/notità/日本語/café")],
+                    panes: [
+                        PaneGroupSession {
+                            tabs: vec![PaneSession {
+                                path: Some(PathBuf::from("/home/user/café.md")),
+                                ..Default::default()
+                            }],
+                            active: 0,
+                        },
+                        PaneGroupSession::default(),
+                    ],
+                }],
+            },
             ..Session::default()
         };
         let loaded = decode(&encode(&s).expect("encode")).expect("decode");
         assert_eq!(loaded.active_vault, s.active_vault);
-        assert_eq!(loaded.panes[0].tabs[0].path, s.panes[0].tabs[0].path);
+        let vault = loaded.vaults.get(&root).expect("vault entry");
+        assert_eq!(
+            vault.panes[0].tabs[0].path,
+            Some(PathBuf::from("/home/user/café.md"))
+        );
+        assert_eq!(
+            vault.expanded,
+            vec![PathBuf::from("/home/user/notità/日本語/café")]
+        );
     }
 
     #[test]
-    fn multi_tab_pane_round_trips() {
-        // A pane with several tabs and a non-zero active index survives the codec.
-        let bytes = encode(&sample()).expect("encode");
-        let loaded = decode(&bytes).expect("decode");
-        assert_eq!(loaded.panes[0].tabs.len(), 2);
-        assert_eq!(loaded.panes[0].active, 1);
-        assert_eq!(loaded.panes[1].tabs.len(), 1);
+    fn multi_tab_vault_round_trips() {
+        // A vault whose active pane holds several tabs at a non-zero active index
+        // survives the codec, tabs, expanded folders and all.
+        let loaded = decode(&encode(&sample()).expect("encode")).expect("decode");
+        let notes = loaded
+            .vaults
+            .get(Path::new("/home/user/notes"))
+            .expect("vault");
+        assert_eq!(notes.panes[0].tabs.len(), 2);
+        assert_eq!(notes.panes[0].active, 1);
+        assert_eq!(notes.panes[1].tabs.len(), 1);
+        assert_eq!(notes.expanded.len(), 2);
         assert_eq!(loaded, sample());
     }
 
     #[test]
     fn vault_prefs_round_trip_per_vault() {
         let loaded = decode(&encode(&sample()).expect("encode")).expect("decode");
-        // Each vault keeps its own answer, the inactive one included.
+        // Each vault keeps its own state, the inactive one included: the filter,
+        // the expanded folders, and the open tabs all travel with the root.
         assert!(!loaded.vaults.show_empty_dirs(Path::new("/home/user/notes")));
         assert!(loaded.vaults.show_empty_dirs(Path::new("/home/user/work")));
+        let work = loaded
+            .vaults
+            .get(Path::new("/home/user/work"))
+            .expect("vault");
+        assert_eq!(
+            work.panes[0].tabs[0].path,
+            Some(PathBuf::from("/home/user/work/spec.md"))
+        );
     }
 
     #[test]
@@ -617,5 +797,166 @@ mod tests {
         }
         .sanitized();
         assert_eq!(s.window, (1280, 800));
+    }
+
+    /// A vault rooted at `root` whose active pane holds the single tab `tab`.
+    fn vault_with(root: &str, tab: &str) -> VaultSession {
+        VaultSession {
+            root: PathBuf::from(root),
+            show_empty_dirs: true,
+            expanded: Vec::new(),
+            panes: [
+                PaneGroupSession {
+                    tabs: vec![PaneSession {
+                        path: Some(PathBuf::from(tab)),
+                        ..Default::default()
+                    }],
+                    active: 0,
+                },
+                PaneGroupSession::default(),
+            ],
+        }
+    }
+
+    /// A session active on `root`, carrying the given vault entries.
+    fn session_on(root: &str, vaults: Vec<VaultSession>) -> Session {
+        Session {
+            active_vault: Some(PathBuf::from(root)),
+            vaults: VaultPrefs { vaults },
+            ..Session::default()
+        }
+    }
+
+    /// The first tab's path of `root`'s vault in `session`, as a string.
+    fn tab_of(session: &Session, root: &str) -> String {
+        session
+            .vaults
+            .get(Path::new(root))
+            .and_then(|v| v.panes[0].tabs.first())
+            .and_then(|t| t.path.as_ref())
+            .map(|p| p.display().to_string())
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn merge_replaces_only_the_incoming_active_vault() {
+        // Disk has two vaults; the saver is active on the first and holds a stale
+        // copy of the second. The merge takes the saver's first vault and keeps the
+        // disk's second, so the other vault's tabs are never overwritten.
+        let disk = session_on(
+            "/x",
+            vec![
+                vault_with("/x", "/x/old.md"),
+                vault_with("/y", "/y/live.md"),
+            ],
+        );
+        let incoming = session_on(
+            "/x",
+            vec![
+                vault_with("/x", "/x/new.md"),
+                vault_with("/y", "/y/stale.md"),
+            ],
+        );
+        let merged = merged_session(&disk, &incoming);
+        assert_eq!(tab_of(&merged, "/x"), "/x/new.md");
+        assert_eq!(tab_of(&merged, "/y"), "/y/live.md");
+    }
+
+    #[test]
+    fn merge_takes_window_fields_from_the_saver() {
+        let disk = Session {
+            window: (100, 100),
+            ..session_on("/x", vec![vault_with("/x", "/x/a.md")])
+        };
+        let incoming = Session {
+            window: (1600, 900),
+            focus: Focus::Tree,
+            ..session_on("/x", vec![vault_with("/x", "/x/a.md")])
+        };
+        let merged = merged_session(&disk, &incoming);
+        assert_eq!(merged.window, (1600, 900));
+        assert_eq!(merged.focus, Focus::Tree);
+    }
+
+    #[test]
+    fn merge_adds_a_vault_absent_from_disk() {
+        let disk = Session::default();
+        let incoming = session_on("/fresh", vec![vault_with("/fresh", "/fresh/note.md")]);
+        let merged = merged_session(&disk, &incoming);
+        assert_eq!(merged.active_vault, Some(PathBuf::from("/fresh")));
+        assert_eq!(tab_of(&merged, "/fresh"), "/fresh/note.md");
+    }
+
+    /// A scratch directory under the system temp dir, unique per test name so the
+    /// parallel test runner does not collide two file-backed saves.
+    fn tmp_dir(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("bnknotes-store-{}-{}", std::process::id(), name))
+    }
+
+    #[test]
+    fn save_to_then_load_from_round_trips() {
+        // A first save writes the active vault; reloading returns it verbatim. (Only
+        // the active vault, since a fresh disk holds no others: an instance can only
+        // be in one vault, so that is the only one it can have.)
+        let dir = tmp_dir("roundtrip");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let path = dir.join(FILENAME);
+        let s = session_on(
+            "/home/user/notes",
+            vec![vault_with("/home/user/notes", "/home/user/notes/todo.md")],
+        );
+        save_to(&path, &s).expect("save");
+        assert_eq!(load_from(&path), s);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_second_instance_save_keeps_the_first_instances_vault() {
+        // The reported bug: two instances on different vaults, the second save must
+        // not reset the first's vault to stale state. Modeled sequentially on one
+        // file, since each save re-reads the latest before writing.
+        let dir = tmp_dir("concurrent");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let path = dir.join(FILENAME);
+
+        // Both instances start from this shared state: /x -> x1, /y -> y1.
+        save_to(
+            &path,
+            &session_on(
+                "/x",
+                vec![vault_with("/x", "/x/x1.md"), vault_with("/y", "/y/y1.md")],
+            ),
+        )
+        .expect("seed");
+
+        // Instance A (active on /x) advances /x to x2. Its /y copy is the stale y1.
+        save_to(
+            &path,
+            &session_on(
+                "/x",
+                vec![vault_with("/x", "/x/x2.md"), vault_with("/y", "/y/y1.md")],
+            ),
+        )
+        .expect("save A");
+
+        // Instance B (active on /y) advances /y to y2. It never saw x2, so its /x
+        // copy is the stale x1: a blind overwrite here would roll /x back to x1.
+        save_to(
+            &path,
+            &session_on(
+                "/y",
+                vec![vault_with("/x", "/x/x1.md"), vault_with("/y", "/y/y2.md")],
+            ),
+        )
+        .expect("save B");
+
+        let loaded = load_from(&path);
+        assert_eq!(
+            tab_of(&loaded, "/x"),
+            "/x/x2.md",
+            "A's vault survived B's save"
+        );
+        assert_eq!(tab_of(&loaded, "/y"), "/y/y2.md", "B's vault was written");
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

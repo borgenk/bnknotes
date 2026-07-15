@@ -1444,8 +1444,9 @@ impl State {
                 self.presentation.dmabuf = Some(id);
                 self.presentation.dmabuf_version = version.min(protocol::VERSION_DMABUF);
             }
-            // Explicit sync: bound only to be wired up
-            // once a GPU backend exists; absent it, the bridge path is used.
+            // The drm_syncobj timeline manager for explicit-sync present: the GPU
+            // path waits on and signals timeline points through it, falling back to
+            // the dmabuf's implicit fences where a compositor does not offer it.
             protocol::IFACE_DRM_SYNCOBJ => {
                 let id = self.bind_capped(name, interface, version, protocol::VERSION_DRM_SYNCOBJ);
                 self.presentation.syncobj_manager = Some(id);

@@ -29,8 +29,9 @@ mod tree;
 
 fn main() {
     // `--perf` runs the offline regression gate, `--perf-lab` the corpus-driven
-    // performance lab, and `--gpu-probe` reports what the compositor offers the
-    // GPU presentation path, all without opening a window; everything else
+    // performance lab, `--gpu-probe` reports what the compositor offers the GPU
+    // presentation path, and `--gen-tables` regenerates the Unicode property
+    // tables from the vendored UCD; all without opening a window. Everything else
     // launches the editor (with an optional file path).
     let args: Vec<String> = std::env::args().skip(1).collect();
     let result = if args.iter().any(|a| a == "--perf-lab") {
@@ -41,6 +42,8 @@ fn main() {
         dev::perf::run_mem_report(&args)
     } else if args.iter().any(|a| a == "--perf") {
         dev::perf::run(&args)
+    } else if args.iter().any(|a| a == "--gen-tables") {
+        dev::gen_tables::run(&args)
     } else if args.iter().any(|a| a == "--gpu-probe") {
         app::gpu_probe()
     } else {

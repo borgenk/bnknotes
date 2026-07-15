@@ -19,6 +19,13 @@ pub(crate) const FIND_TICK_COLOR: u32 = 0x00a8_9040;
 /// Geometry of one right-edge match tick.
 pub(crate) const TICK_WIDTH: i32 = 4;
 pub(crate) const TICK_HEIGHT: i32 = 3;
+/// The banner shown when a file changed outside the editor: an amber strip warm
+/// enough to draw the eye without the alarm of a red error. Its buttons sit a
+/// shade lighter and brighten under the pointer, the way a tab's controls do.
+pub(crate) const CONFLICT_BANNER_BG: u32 = 0x0053_411a;
+pub(crate) const CONFLICT_BANNER_TEXT: u32 = 0x00f2_d9a3;
+pub(crate) const CONFLICT_BUTTON_BG: u32 = 0x0074_5c23;
+pub(crate) const CONFLICT_BUTTON_HOVER_BG: u32 = 0x0091_7530;
 /// Dimmed color for markdown syntax markers (a heading's `#`s, a code span's
 /// backticks), so they read as syntax rather than content.
 pub(crate) const MARKER_COLOR: u32 = 0x005d_6c7e;

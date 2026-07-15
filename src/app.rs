@@ -33,14 +33,17 @@ use self::present::GpuPresentation;
 use crate::config::{vault_name, CaretConfig, Config, Vault};
 use crate::file;
 use crate::paint::{
-    build_display_list, build_find_paint, font_sizes, measure_tree, push_splitter, push_top_bar,
-    push_tree, top_bar_height, tree_metrics, BarCtx, CaretPaint, PaintParams, TabStrip,
+    build_display_list, build_find_paint, conflict_banner_layout, font_sizes, measure_tree,
+    push_conflict_banner, push_splitter, push_top_bar, push_tree, top_bar_height, tree_metrics,
+    BarCtx, CaretPaint, PaintParams, TabStrip,
 };
 use crate::pane::{
-    restore_group, CaretAnim, CaretFrame, Columns, Focus, PaneGroup, PaneLayout, TreePane,
+    restore_group, CaretAnim, CaretFrame, Columns, DiskConflict, Focus, PaneGroup, PaneLayout,
+    TreePane,
 };
 use crate::platform::conn::{Connection, Fill};
 use crate::platform::error::{Error, Result};
+use crate::platform::ffi;
 use crate::platform::freetype::{FontConfig, Fonts};
 use crate::platform::geom::Rect;
 use crate::platform::protocol::{
@@ -56,6 +59,7 @@ use crate::scale::Scale;
 use crate::store;
 use crate::theme::{CARET_WIDTH, FONT_SIZE};
 use crate::tree;
+use crate::watch::FileWatcher;
 
 /// Upper bound on either surface dimension, applied to a compositor-supplied
 /// configure size. Far beyond any real display (8K is 7680 wide), it just keeps a
@@ -360,6 +364,10 @@ struct State {
     /// prints its render time and the glyph-cache hit rate to stderr. Plain
     /// instrumentation so an optimization can be measured rather than guessed at.
     stats: bool,
+    /// Watches the directories of open files, so a change made outside the editor
+    /// is noticed while the window sits idle. Polled alongside the compositor
+    /// socket; a wake re-checks the open files against disk.
+    watcher: FileWatcher,
 }
 
 /// Carry one column's scrollbar forward a frame. A column whose content fits has
@@ -610,6 +618,7 @@ impl State {
             dirty: true,
             frame_callback: 0,
             stats: std::env::var_os("BNKNOTES_STATS").is_some(),
+            watcher: FileWatcher::new(),
         })
     }
 
@@ -930,11 +939,81 @@ impl State {
             if done(self) {
                 return Ok(());
             }
+            // Keep the file watches aligned with the open tabs (cheap when
+            // unchanged), then wait on the compositor socket and the watcher fd.
+            self.sync_watches();
             self.conn.flush()?;
             let timeout = self.next_wake();
-            if let Fill::Bytes(0) = self.conn.fill(timeout)? {
-                return Err(Error::msg("compositor closed the connection"));
+            self.wait_for_events(timeout)?;
+        }
+    }
+
+    /// Align the set of watched directories with the open tabs. The steady state
+    /// (no tab opened or closed since last time) allocates nothing.
+    fn sync_watches(&mut self) {
+        if self
+            .watcher
+            .watches_exactly(self.editors.iter().flat_map(PaneGroup::paths))
+        {
+            return;
+        }
+        self.watcher
+            .sync(self.editors.iter().flat_map(PaneGroup::paths));
+    }
+
+    /// Wait for the compositor socket or the file watcher to become ready, up to
+    /// `timeout` (or indefinitely when `None`). A socket wake pulls the pending
+    /// bytes; a watcher wake re-checks the open files against disk. A pure timeout
+    /// returns so the caller can service its timers.
+    fn wait_for_events(&mut self, timeout: Option<Duration>) -> Result<()> {
+        let conn_fd = self.conn.fd();
+        match self.watcher.fd() {
+            Some(watch_fd) => {
+                // Bit 0 is the socket, bit 1 the watcher, per the fd order below.
+                let ready = ffi::poll_readable(&[conn_fd, watch_fd], timeout)?;
+                if ready & 0b10 != 0 {
+                    self.handle_watch_events();
+                }
+                if ready & 0b01 != 0 {
+                    self.pull_socket()?;
+                }
             }
+            None => {
+                if ffi::poll_readable(&[conn_fd], timeout)? & 0b01 != 0 {
+                    self.pull_socket()?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Read whatever the compositor has queued. Called only when poll reports the
+    /// socket readable, so the recv returns at once; a zero-length read means the
+    /// compositor closed the connection.
+    fn pull_socket(&mut self) -> Result<()> {
+        if let Fill::Bytes(0) = self.conn.fill(Some(Duration::from_millis(1)))? {
+            return Err(Error::msg("compositor closed the connection"));
+        }
+        Ok(())
+    }
+
+    /// Drain the file watcher and, when something changed on disk, re-check every
+    /// open tab: silently reload the clean ones, flag a conflict on the edited
+    /// ones, and repaint.
+    fn handle_watch_events(&mut self) {
+        if !self.watcher.drain() {
+            return;
+        }
+        // A watch the kernel dropped (a directory removed then recreated) re-arms
+        // on the next reconcile.
+        self.sync_watches();
+        let mut changed = false;
+        for group in &mut self.editors {
+            changed |= group.recheck_disk();
+        }
+        if changed {
+            self.dirty = true;
+            self.refresh_title();
         }
     }
 
@@ -1011,6 +1090,13 @@ impl State {
                     ed.text.rope(),
                     &params,
                 ));
+            }
+            // The disk-conflict banner floats over the pane's top edge, so it goes
+            // after the content. Only the active tab's conflict is shown here.
+            if let Some(kind) = ed.conflict {
+                let banner = conflict_banner_layout(rect, kind, self.body_size, &self.fonts);
+                let hover = banner.button_at(self.pointer_x, self.pointer_y);
+                push_conflict_banner(&mut list, &self.fonts, &banner, kind, hover, self.body_size);
             }
         }
         let scale = self.scale();
@@ -1494,9 +1580,26 @@ impl State {
             eprintln!("bnknotes: no file to save to; start bnknotes with a path");
             return Ok(());
         };
+        // Refuse to overwrite a file that changed on disk since we last synced
+        // with it: another writer's version sits there now. Raise a conflict for
+        // the user rather than clobber it. A missing file is safe to recreate, and
+        // an unchanged snapshot is our own last save.
+        let current = file::DiskSnapshot::of(&path);
+        if current.is_some() && current != self.editors[i].disk {
+            self.editors[i].active_doc_mut().conflict = Some(DiskConflict::Changed);
+            self.dirty = true;
+            eprintln!(
+                "bnknotes: {} changed on disk; not overwriting",
+                path.display()
+            );
+            return Ok(());
+        }
         let bytes = file::encode(&self.editors[i].text.text(), &self.editors[i].format);
         file::save_atomic(&path, &bytes)?;
         self.editors[i].text.mark_saved();
+        // Record the just-written file as the new synced state, so its own change
+        // events (and any conflict) clear rather than bounce back as external.
+        self.editors[i].active_doc_mut().sync_disk();
         self.refresh_title();
         eprintln!("bnknotes: saved {}", path.display());
         Ok(())

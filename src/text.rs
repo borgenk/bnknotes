@@ -145,6 +145,23 @@ impl TextBuffer {
         self.group = Coalesce::None;
     }
 
+    /// Replace the whole buffer with `text` freshly read from disk, and mark it
+    /// clean: the contents now match the file again. Used when the editor reloads
+    /// a document changed outside it. Undo history is dropped (it described the
+    /// old contents), the cursor returns to the top, and the version advances
+    /// (never reused) so anything keyed on the version re-derives against the new
+    /// text rather than a stale cache from a coincidentally equal number.
+    pub fn reload(&mut self, text: String) {
+        self.text = Rope::from_str(&text);
+        self.cursor = 0;
+        self.anchor = None;
+        self.undo.clear();
+        self.redo.clear();
+        self.group = Coalesce::None;
+        self.touch();
+        self.saved_version = self.version;
+    }
+
     /// Stamp the contents with a fresh version. Called after every change so
     /// modified-tracking and undo can tell distinct states apart.
     fn touch(&mut self) {
@@ -1338,6 +1355,30 @@ mod tests {
         b.insert_str("hi");
         assert_eq!(b.text(), "hi");
         assert_eq!(b.cursor, 2);
+    }
+
+    #[test]
+    fn reload_replaces_contents_clean_at_a_fresh_version() {
+        let mut b = TextBuffer::from_text("old text".to_string());
+        b.insert_str(" and edits");
+        assert!(b.is_modified(), "edits leave the buffer dirty");
+        let dirty_version = b.version();
+
+        b.reload("brand new from disk".to_string());
+        assert_eq!(b.text(), "brand new from disk");
+        assert!(!b.is_modified(), "a reload matches disk, so it reads clean");
+        assert_eq!(b.cursor, 0, "the caret returns to the top");
+        assert!(
+            b.version() > dirty_version,
+            "the version advances so caches keyed on it re-derive"
+        );
+        // Undo must not walk back into the pre-reload contents.
+        b.undo();
+        assert_eq!(
+            b.text(),
+            "brand new from disk",
+            "reload clears undo history"
+        );
     }
 
     // --- In-grid table editing ---------------------------------------------

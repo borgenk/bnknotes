@@ -26,6 +26,7 @@ mod table;
 mod text;
 mod theme;
 mod tree;
+mod watch;
 
 fn main() {
     // `--perf` runs the offline regression gate, `--perf-lab` the corpus-driven

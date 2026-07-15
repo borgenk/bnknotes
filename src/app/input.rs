@@ -5,7 +5,8 @@ use std::time::{Duration, Instant};
 use super::{State, TabDrag, TabHover};
 use crate::find;
 use crate::keymap::{self, KeyAction};
-use crate::pane::{CaretAnim, Columns, EditorPane, Focus, Hit, SPLITTER};
+use crate::paint::{conflict_banner_layout, BannerButton};
+use crate::pane::{CaretAnim, Columns, DiskConflict, EditorPane, Focus, Hit, SPLITTER};
 use crate::platform::error::{Error, Result};
 use crate::platform::ffi;
 use crate::platform::freetype::{Fonts, Metrics};
@@ -1162,6 +1163,11 @@ impl State {
             // not reach the row scrolled beneath the strip.
             Hit::TreeFooter => {}
             Hit::Editor(i, rect) => {
+                // A disk-conflict banner sits over the pane's top edge; a press on
+                // it acts on its buttons rather than placing a caret beneath it.
+                if self.conflict_banner_press(i, rect, px, py) {
+                    return;
+                }
                 // A click places the caret; that jump snaps rather than smearing.
                 self.caret_from_pointer = true;
                 self.focus_pane(i);
@@ -1174,6 +1180,59 @@ impl State {
             Hit::TabStrip(g) => self.focus_pane(g),
             Hit::None => {}
         }
+    }
+
+    /// A press inside pane `i`: when its active tab shows a disk-conflict banner and
+    /// the press lands on the banner, act on the button under it (and swallow a press
+    /// anywhere else on the strip so it does not reach the text). Reports whether the
+    /// click was the banner's.
+    fn conflict_banner_press(&mut self, i: usize, rect: Rect, px: f32, py: f32) -> bool {
+        let Some(kind) = self.editors[i].conflict else {
+            return false;
+        };
+        let banner = conflict_banner_layout(rect, kind, self.body_size, &self.fonts);
+        if !banner.contains(px, py) {
+            return false;
+        }
+        self.focus_pane(i);
+        if let Some(button) = banner.button_at(px, py) {
+            self.resolve_conflict(i, kind, button);
+        }
+        true
+    }
+
+    /// Apply the user's choice on pane `i`'s disk-conflict banner: take the on-disk
+    /// version, or keep the buffer's.
+    fn resolve_conflict(&mut self, i: usize, kind: DiskConflict, button: BannerButton) {
+        match (kind, button) {
+            // Reload: drop the buffer's edits for the file's on-disk contents.
+            (DiskConflict::Changed, BannerButton::Primary) => {
+                if let Err(e) = self.editors[i].active_doc_mut().reload_from_disk() {
+                    eprintln!("bnknotes: reload failed: {e}");
+                }
+            }
+            // Keep mine: accept the on-disk version as seen and keep the edits, so a
+            // later save overwrites it deliberately rather than being blocked again.
+            (DiskConflict::Changed, BannerButton::Secondary) => {
+                self.editors[i].active_doc_mut().sync_disk();
+            }
+            // Save: recreate the deleted file from the buffer. The save's success
+            // clears the conflict.
+            (DiskConflict::Deleted, BannerButton::Primary) => {
+                self.focus_pane(i);
+                if let Err(e) = self.save() {
+                    eprintln!("bnknotes: {e}");
+                }
+            }
+            // Dismiss: treat the file as gone (an unsaved buffer); a later save
+            // recreates it.
+            (DiskConflict::Deleted, BannerButton::Secondary) => {
+                self.editors[i].active_doc_mut().sync_disk();
+            }
+        }
+        self.dirty = true;
+        self.refresh_title();
+        self.save_session();
     }
 
     /// Switch pane `g` to tab `i` and focus that pane.

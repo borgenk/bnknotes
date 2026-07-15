@@ -19,6 +19,7 @@
 use std::ffi::OsString;
 use std::fs::File;
 use std::io::Write;
+use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 
 use crate::platform::error::{Error, Result};
@@ -59,6 +60,36 @@ pub struct FileFormat {
     pub line_ending: LineEnding,
     /// Whether the file began with a UTF-8 BOM.
     pub bom: bool,
+}
+
+/// A file's on-disk identity at a moment in time, used to notice a change made
+/// outside the editor. Two snapshots that compare unequal mean the file was
+/// written, truncated, moved, or replaced between them. It holds the raw stat
+/// fields editors rely on for this: the inode identity (device plus inode, which
+/// an atomic-rename save changes) alongside the size and modification time.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct DiskSnapshot {
+    dev: u64,
+    ino: u64,
+    size: u64,
+    mtime: i64,
+    mtime_nsec: i64,
+}
+
+impl DiskSnapshot {
+    /// The file's current on-disk state, or `None` when it does not exist: a
+    /// buffer whose file has not been saved yet, or one deleted under us. A
+    /// `None` to `Some` transition (or the reverse) is itself a change.
+    pub fn of(path: &Path) -> Option<Self> {
+        let m = std::fs::metadata(path).ok()?;
+        Some(Self {
+            dev: m.dev(),
+            ino: m.ino(),
+            size: m.size(),
+            mtime: m.mtime(),
+            mtime_nsec: m.mtime_nsec(),
+        })
+    }
 }
 
 /// Decode a file's raw bytes into buffer text plus the [`FileFormat`] needed to
@@ -309,6 +340,48 @@ mod tests {
         save_atomic(&path, b"still secret").unwrap();
         let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600, "permissions survive an atomic save");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn disk_snapshot_tracks_existence_and_change() {
+        let dir = tmp_dir("snapshot");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("note.md");
+
+        // A file that does not exist yet snapshots to None.
+        assert_eq!(DiskSnapshot::of(&path), None);
+
+        save_atomic(&path, b"first").unwrap();
+        let a = DiskSnapshot::of(&path).expect("exists after save");
+        // A re-stat with nothing touched is equal to itself.
+        assert_eq!(DiskSnapshot::of(&path), Some(a));
+
+        // A different-length write changes the size, so the snapshot differs.
+        save_atomic(&path, b"second, longer").unwrap();
+        let b = DiskSnapshot::of(&path).expect("still exists");
+        assert_ne!(a, b, "a rewrite must change the snapshot");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn disk_snapshot_notices_an_atomic_replace_with_identical_content() {
+        // The subtle case: another editor replaces the file with byte-identical
+        // content via rename. Size and (often) mtime match, but the inode does
+        // not, so the snapshot still reports a change.
+        let dir = tmp_dir("snapshot_replace");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("note.md");
+
+        save_atomic(&path, b"same").unwrap();
+        let before = DiskSnapshot::of(&path).unwrap();
+
+        // A fresh inode carrying the same bytes, renamed over the target.
+        save_atomic(&path, b"same").unwrap();
+        let after = DiskSnapshot::of(&path).unwrap();
+        assert_ne!(before, after, "an inode swap must register as a change");
 
         std::fs::remove_dir_all(&dir).ok();
     }

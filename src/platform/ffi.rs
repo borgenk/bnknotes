@@ -17,9 +17,10 @@
 //! Struct layouts (`msghdr`, `iovec`, `cmsghdr`) mirror the Linux x86_64/arm64
 //! ABI; this targets Linux/Wayland and nothing else.
 
-use core::ffi::{c_char, c_int, c_uint, c_ulong, c_void, CStr};
+use core::ffi::{c_char, c_int, c_short, c_uint, c_ulong, c_void, CStr};
 use std::mem;
 use std::os::fd::{FromRawFd, OwnedFd, RawFd};
+use std::time::Duration;
 
 use crate::platform::error::{Error, Result};
 
@@ -120,6 +121,7 @@ extern "C" {
     fn sendmsg(sockfd: c_int, msg: *const MsgHdr, flags: c_int) -> isize;
     fn recvmsg(sockfd: c_int, msg: *mut MsgHdr, flags: c_int) -> isize;
     fn pipe2(pipefd: *mut c_int, flags: c_int) -> c_int;
+    fn poll(fds: *mut PollFd, nfds: c_ulong, timeout: c_int) -> c_int;
     fn read(fd: c_int, buf: *mut c_void, count: usize) -> isize;
     fn write(fd: c_int, buf: *const c_void, count: usize) -> isize;
     fn __errno_location() -> *mut c_int;
@@ -145,6 +147,65 @@ fn ok_or_errno(rc: c_int, what: &str) -> Result<()> {
     } else {
         Err(Error::msg(format!("{what} failed: errno {}", errno())))
     }
+}
+
+// ---------------------------------------------------------------------------
+// Waiting on several fds at once (the compositor socket + the inotify fd).
+// ---------------------------------------------------------------------------
+
+// Data to read, plus the error and hang-up conditions. The latter two also make
+// a following read return at once (with the error or EOF), so the caller treats
+// them as "ready, go find out" rather than a reason to keep waiting.
+const POLLIN: c_short = 0x0001;
+const POLLERR: c_short = 0x0008;
+const POLLHUP: c_short = 0x0010;
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct PollFd {
+    fd: c_int,
+    events: c_short,
+    revents: c_short,
+}
+
+/// Block until one of `fds` is readable (or errored / hung up), or `timeout`
+/// elapses; `None` waits indefinitely. Returns a bitmask whose bit `i` is set
+/// when `fds[i]` is ready, so the caller drains exactly the ready ones. An
+/// interrupting signal returns an empty mask (bit none set), which the event
+/// loop treats as a timeout: it services its timers and polls again.
+pub fn poll_readable(fds: &[RawFd], timeout: Option<Duration>) -> Result<u32> {
+    assert!(fds.len() <= 32, "poll_readable handles at most 32 fds");
+    let mut pollfds = [PollFd {
+        fd: -1,
+        events: 0,
+        revents: 0,
+    }; 32];
+    for (slot, &fd) in pollfds.iter_mut().zip(fds) {
+        slot.fd = fd;
+        slot.events = POLLIN;
+    }
+    // poll's timeout is milliseconds, -1 for an infinite wait; clamp the
+    // conversion so a very long duration cannot wrap the c_int.
+    let ms = match timeout {
+        None => -1,
+        Some(d) => d.as_millis().min(c_int::MAX as u128) as c_int,
+    };
+    // SAFETY: pollfds is a valid array of fds.len() entries; poll reads events
+    // and writes revents on the first nfds of them.
+    let n = unsafe { poll(pollfds.as_mut_ptr(), fds.len() as c_ulong, ms) };
+    if n < 0 {
+        if errno() == EINTR {
+            return Ok(0);
+        }
+        return Err(Error::msg(format!("poll failed: errno {}", errno())));
+    }
+    let mut ready = 0u32;
+    for (i, slot) in pollfds.iter().take(fds.len()).enumerate() {
+        if slot.revents & (POLLIN | POLLERR | POLLHUP) != 0 {
+            ready |= 1 << i;
+        }
+    }
+    Ok(ready)
 }
 
 // ---------------------------------------------------------------------------

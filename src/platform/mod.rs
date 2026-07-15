@@ -26,6 +26,7 @@ pub(crate) mod ffi;
 pub(crate) mod freetype;
 pub(crate) mod geom;
 pub(crate) mod grapheme;
+pub(crate) mod inotify;
 pub(crate) mod link;
 pub(crate) mod pixel;
 pub(crate) mod protocol;

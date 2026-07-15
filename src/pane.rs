@@ -682,10 +682,30 @@ impl DragSelect {
 /// One content pane: an independent editor over its own buffer, carrying its own
 /// file, inline images, memoized layout, scroll, find bar, and the drag/selection
 /// transients a click-drag needs. Two of these live on [`State`].
+/// How a document's file on disk has diverged from the buffer, once the editor
+/// notices a change made outside it that it cannot silently absorb. `None` while
+/// the buffer and the file agree (or the buffer was cleanly reloaded).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum DiskConflict {
+    /// The file changed on disk while the buffer held unsaved edits. Reloading
+    /// would lose those edits and saving would clobber the other writer, so the
+    /// choice is the user's.
+    Changed,
+    /// The file the buffer tracks was deleted or moved away on disk.
+    Deleted,
+}
+
 pub(crate) struct EditorPane {
     pub(crate) text: TextBuffer,
     pub(crate) path: Option<PathBuf>,
     pub(crate) format: FileFormat,
+    /// The file's on-disk identity the last time the buffer and the file agreed
+    /// (at open, after a save, or after a reload), against which an external
+    /// change is measured. `None` for a buffer whose file does not exist yet.
+    pub(crate) disk: Option<file::DiskSnapshot>,
+    /// An unresolved external change awaiting the user's decision; drawn as a
+    /// banner over the pane. `None` when the buffer and the file are in sync.
+    pub(crate) conflict: Option<DiskConflict>,
     pub(crate) images: ImageStore,
     pub(crate) selected_image: Option<usize>,
     pub(crate) raw_image: Option<usize>,
@@ -732,6 +752,8 @@ impl EditorPane {
             text: TextBuffer::new(),
             path: None,
             format: FileFormat::default(),
+            disk: None,
+            conflict: None,
             images: ImageStore::new(None),
             selected_image: None,
             raw_image: None,
@@ -780,9 +802,71 @@ impl EditorPane {
             text: TextBuffer::from_text(contents),
             path: Some(path.to_path_buf()),
             format,
+            disk: file::DiskSnapshot::of(path),
             images: ImageStore::new(image_dir),
             ..Self::empty()
         })
+    }
+
+    /// Record the file's current on-disk identity as the last-synced state and
+    /// clear any conflict, so a later external change is measured against this
+    /// point. Called after a save writes the buffer out, and when the user keeps
+    /// their version in a conflict (accepting that the next save overwrites).
+    pub(crate) fn sync_disk(&mut self) {
+        self.disk = self.path.as_deref().and_then(file::DiskSnapshot::of);
+        self.conflict = None;
+    }
+
+    /// Replace the buffer with the file's current on-disk contents, re-syncing the
+    /// change-tracking snapshot and clearing any conflict. Used when the file
+    /// changed outside the editor and the buffer's edits are being discarded (or
+    /// there were none). A file-less buffer has nothing to reload.
+    pub(crate) fn reload_from_disk(&mut self) -> Result<()> {
+        let Some(path) = self.path.clone() else {
+            return Ok(());
+        };
+        let (contents, format) = load(&path)?;
+        self.format = format;
+        // A fresh version invalidates the layout and index caches (their keys
+        // carry it), so the next frame re-measures against the new contents.
+        self.text.reload(contents);
+        self.disk = file::DiskSnapshot::of(&path);
+        self.conflict = None;
+        self.scan_images();
+        self.request_caret_snap();
+        Ok(())
+    }
+
+    /// Compare the file on disk against the last-synced snapshot and react to any
+    /// change made outside the editor: reload silently when the buffer is clean,
+    /// raise a conflict for the user when it holds unsaved edits, or flag a delete
+    /// when the file is gone. Returns whether the document changed, so the caller
+    /// repaints. A file-less buffer, an in-sync file, or one already in conflict is
+    /// left untouched.
+    pub(crate) fn recheck_disk(&mut self) -> bool {
+        let Some(path) = self.path.clone() else {
+            return false;
+        };
+        // A conflict is already parked for the user; don't re-raise it each event.
+        if self.conflict.is_some() {
+            return false;
+        }
+        let current = file::DiskSnapshot::of(&path);
+        if current == self.disk {
+            return false;
+        }
+        if current.is_none() {
+            self.conflict = Some(DiskConflict::Deleted);
+            return true;
+        }
+        if self.text.is_modified() {
+            self.conflict = Some(DiskConflict::Changed);
+        } else if self.reload_from_disk().is_err() {
+            // The file changed but a re-read failed (a transient rename in
+            // flight, a permission flip): surface it rather than sit out of sync.
+            self.conflict = Some(DiskConflict::Changed);
+        }
+        true
     }
 
     /// The tab's label: the file's name without its .md suffix (matching the
@@ -1602,6 +1686,22 @@ impl PaneGroup {
         self.docs.iter().map(|d| d.text.is_modified()).collect()
     }
 
+    /// Every open tab's file path, for the file watcher's set of directories to
+    /// watch. Scratch tabs (no path) contribute nothing.
+    pub(crate) fn paths(&self) -> impl Iterator<Item = &Path> {
+        self.docs.iter().filter_map(|d| d.path.as_deref())
+    }
+
+    /// Re-check every open tab against its file on disk, reloading clean buffers
+    /// and flagging conflicts on dirty ones. Returns whether any tab changed.
+    pub(crate) fn recheck_disk(&mut self) -> bool {
+        let mut changed = false;
+        for doc in &mut self.docs {
+            changed |= doc.recheck_disk();
+        }
+        changed
+    }
+
     /// Switch the active tab. Out-of-range indices are ignored.
     pub(crate) fn activate(&mut self, i: usize) {
         if i < self.docs.len() {
@@ -1860,6 +1960,98 @@ mod tests {
         ed.text.insert_str("# Title");
         ed.text.set_cursor(3, false);
         assert_eq!(ed.reveal_range(), (3, 3));
+    }
+
+    /// A scratch note path under the system temp dir, seeded with `contents`.
+    fn tmp_note(name: &str, contents: &str) -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("bnknotes-pane-{}-{}", std::process::id(), name));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("note.md");
+        std::fs::write(&path, contents).unwrap();
+        path
+    }
+
+    #[test]
+    fn recheck_reloads_a_clean_buffer_changed_on_disk() {
+        let path = tmp_note("clean-reload", "original\n");
+        let mut ed = EditorPane::open(&path).unwrap();
+        assert_eq!(ed.text.text(), "original\n");
+
+        // Another writer changes the file; the buffer has no edits.
+        std::fs::write(&path, "rewritten from elsewhere\n").unwrap();
+        assert!(ed.recheck_disk(), "an external change is detected");
+        assert_eq!(
+            ed.text.text(),
+            "rewritten from elsewhere\n",
+            "a clean buffer reloads"
+        );
+        assert!(ed.conflict.is_none(), "a silent reload raises no conflict");
+
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn recheck_flags_a_conflict_on_a_dirty_buffer() {
+        let path = tmp_note("dirty-conflict", "original\n");
+        let mut ed = EditorPane::open(&path).unwrap();
+        // The buffer has unsaved edits.
+        ed.text.insert_str("my local edit ");
+        assert!(ed.text.is_modified());
+
+        std::fs::write(&path, "someone else's version\n").unwrap();
+        assert!(ed.recheck_disk());
+        assert_eq!(
+            ed.conflict,
+            Some(DiskConflict::Changed),
+            "a dirty buffer conflicts"
+        );
+        assert!(
+            ed.text.text().starts_with("my local edit "),
+            "the edits are kept, not clobbered by a reload"
+        );
+
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn recheck_flags_a_delete() {
+        let path = tmp_note("deleted", "here for now\n");
+        let mut ed = EditorPane::open(&path).unwrap();
+
+        std::fs::remove_file(&path).unwrap();
+        assert!(ed.recheck_disk());
+        assert_eq!(ed.conflict, Some(DiskConflict::Deleted));
+
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn recheck_is_a_no_op_when_the_file_is_unchanged() {
+        let path = tmp_note("unchanged", "steady\n");
+        let mut ed = EditorPane::open(&path).unwrap();
+        assert!(!ed.recheck_disk(), "no external change means no work");
+        assert!(ed.conflict.is_none());
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn recheck_holds_a_raised_conflict_until_resolved() {
+        // Once a conflict is parked for the user, further events must not thrash it
+        // (or silently reload over the pending decision).
+        let path = tmp_note("held", "v1\n");
+        let mut ed = EditorPane::open(&path).unwrap();
+        ed.text.insert_str("edit ");
+        std::fs::write(&path, "v2\n").unwrap();
+        assert!(ed.recheck_disk());
+        assert_eq!(ed.conflict, Some(DiskConflict::Changed));
+
+        // A second external change while the conflict stands changes nothing.
+        std::fs::write(&path, "v3\n").unwrap();
+        assert!(!ed.recheck_disk(), "a standing conflict is not re-raised");
+        assert_eq!(ed.conflict, Some(DiskConflict::Changed));
+
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
     }
 
     /// Whether the heading logical line starting at `heading_start` has its `#`

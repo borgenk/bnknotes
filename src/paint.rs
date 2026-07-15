@@ -5,7 +5,7 @@ use crate::layout::{
     TABLE_CELL_PAD_Y,
 };
 use crate::markdown;
-use crate::pane::TreePane;
+use crate::pane::{DiskConflict, TreePane};
 use crate::platform::freetype::{Face, FaceKey, FontStyle, Fonts, Metrics};
 use crate::platform::geom::Rect;
 use crate::platform::grapheme;
@@ -17,7 +17,8 @@ use crate::scale::Scale;
 use crate::theme::{
     BACKGROUND, CARET_COLOR, CARET_WIDTH, CODE_BG, CODE_COLOR, CODE_COMMENT_COLOR,
     CODE_KEYWORD_COLOR, CODE_MARKER_COLOR, CODE_NUMBER_COLOR, CODE_PAD_X, CODE_PAD_Y, CODE_RADIUS,
-    CODE_STRING_COLOR, DECOR_TEXT_GAP, FIND_BG, FIND_ERROR_COLOR, FIND_MATCH_COLOR,
+    CODE_STRING_COLOR, CONFLICT_BANNER_BG, CONFLICT_BANNER_TEXT, CONFLICT_BUTTON_BG,
+    CONFLICT_BUTTON_HOVER_BG, DECOR_TEXT_GAP, FIND_BG, FIND_ERROR_COLOR, FIND_MATCH_COLOR,
     FIND_TICK_COLOR, FOREGROUND, HEADING_COLORS, IMAGE_BORDER_COLOR, IMAGE_BORDER_THICKNESS,
     IMAGE_BUTTON_BG, IMAGE_BUTTON_RADIUS, LINK_COLOR, MARGIN, MARKER_COLOR, QUOTE_BAR_COLOR,
     QUOTE_BAR_WIDTH, RULE_COLOR, RULE_THICKNESS, SCROLL_INK, SCROLL_INSET, SCROLL_MIN_THUMB,
@@ -2018,6 +2019,176 @@ fn push_image_chrome(
     ));
 }
 
+/// Which button of a conflict banner a click lands on. The primary action takes
+/// the disk's side (reload, or recreate a deleted file); the secondary keeps the
+/// buffer's.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum BannerButton {
+    Primary,
+    Secondary,
+}
+
+/// The rectangles a conflict banner occupies: the full strip and its two buttons.
+/// Shared by the painter and the pointer hit-testing so a click lands on the
+/// button it looks like.
+#[derive(Clone, Copy)]
+pub(crate) struct BannerLayout {
+    pub bar: Rect,
+    pub primary: Rect,
+    pub secondary: Rect,
+}
+
+impl BannerLayout {
+    /// The button at window point `(x, y)`, if the point is on one.
+    pub(crate) fn button_at(&self, x: f32, y: f32) -> Option<BannerButton> {
+        if rect_contains(self.primary, x, y) {
+            Some(BannerButton::Primary)
+        } else if rect_contains(self.secondary, x, y) {
+            Some(BannerButton::Secondary)
+        } else {
+            None
+        }
+    }
+
+    /// Whether the point falls anywhere on the banner strip (so a click there is
+    /// the banner's, not the text beneath it).
+    pub(crate) fn contains(&self, x: f32, y: f32) -> bool {
+        rect_contains(self.bar, x, y)
+    }
+}
+
+fn rect_contains(r: Rect, x: f32, y: f32) -> bool {
+    x >= r.x as f32 && x < (r.x + r.w) as f32 && y >= r.y as f32 && y < (r.y + r.h) as f32
+}
+
+/// The message and the two button labels a conflict of `kind` presents.
+fn banner_labels(kind: DiskConflict) -> (&'static str, &'static str, &'static str) {
+    match kind {
+        DiskConflict::Changed => ("This file changed on disk.", "Reload", "Keep mine"),
+        DiskConflict::Deleted => ("This file was deleted on disk.", "Save", "Dismiss"),
+    }
+}
+
+/// Lay out the conflict banner across the top of pane `view`: a full-width strip
+/// with the primary and secondary buttons right-aligned. Pure geometry, so the
+/// painter and the click hit-test agree on where the buttons are.
+pub(crate) fn conflict_banner_layout(
+    view: Rect,
+    kind: DiskConflict,
+    body_size: u32,
+    fonts: &Fonts,
+) -> BannerLayout {
+    let face = fonts.face(body_size, FontStyle::Regular);
+    let m = fonts.metrics(body_size);
+    let pad = (body_size as i32 / 2).max(4);
+    let row_h = m.ascent + m.descent;
+    let h = row_h + 2 * pad;
+    let bar = Rect {
+        x: view.x,
+        y: view.y,
+        w: view.w,
+        h,
+    };
+
+    let (_, primary_label, secondary_label) = banner_labels(kind);
+    let button_w = |label: &str| shape::text_advance(face, label).ceil() as i32 + 2 * pad;
+    let btn_h = row_h + pad;
+    let btn_y = bar.y + (h - btn_h) / 2;
+    let sec_w = button_w(secondary_label);
+    let pri_w = button_w(primary_label);
+    let secondary = Rect {
+        x: bar.x + bar.w - pad - sec_w,
+        y: btn_y,
+        w: sec_w,
+        h: btn_h,
+    };
+    let primary = Rect {
+        x: secondary.x - pad - pri_w,
+        y: btn_y,
+        w: pri_w,
+        h: btn_h,
+    };
+    BannerLayout {
+        bar,
+        primary,
+        secondary,
+    }
+}
+
+/// Draw the conflict banner into `list` for a document in conflict of `kind`,
+/// using the already-computed `layout`; `hover` names the button under the
+/// pointer so it can light up. The message sits on the left, the two buttons on
+/// the right.
+pub(crate) fn push_conflict_banner(
+    list: &mut DisplayList,
+    fonts: &Fonts,
+    layout: &BannerLayout,
+    kind: DiskConflict,
+    hover: Option<BannerButton>,
+    body_size: u32,
+) {
+    let face = fonts.face(body_size, FontStyle::Regular);
+    let m = fonts.metrics(body_size);
+    let key = FaceKey::Prose {
+        size: body_size,
+        style: FontStyle::Regular,
+    };
+    let pad = (body_size as i32 / 2).max(4);
+    let (message, primary_label, secondary_label) = banner_labels(kind);
+
+    list.push(DrawCmd::Fill {
+        rect: layout.bar,
+        color: CONFLICT_BANNER_BG,
+    });
+
+    // The message, left-aligned and vertically centered in the strip.
+    let baseline = layout.bar.y + (layout.bar.h - (m.ascent + m.descent)) / 2 + m.ascent;
+    let msg_x = layout.bar.x + pad;
+    let msg_w = shape::text_advance(face, message).ceil() as i32;
+    list.push(text_cmd(
+        key,
+        msg_x,
+        baseline,
+        msg_x + msg_w,
+        CONFLICT_BANNER_TEXT,
+        message.to_string(),
+        m,
+    ));
+
+    let mut button = |rect: Rect, label: &str, hot: bool| {
+        list.push(DrawCmd::Fill {
+            rect,
+            color: if hot {
+                CONFLICT_BUTTON_HOVER_BG
+            } else {
+                CONFLICT_BUTTON_BG
+            },
+        });
+        let label_w = shape::text_advance(face, label).ceil() as i32;
+        let lx = rect.x + (rect.w - label_w) / 2;
+        let lb = rect.y + (rect.h - (m.ascent + m.descent)) / 2 + m.ascent;
+        list.push(text_cmd(
+            key,
+            lx,
+            lb,
+            lx + label_w,
+            FOREGROUND,
+            label.to_string(),
+            m,
+        ));
+    };
+    button(
+        layout.primary,
+        primary_label,
+        hover == Some(BannerButton::Primary),
+    );
+    button(
+        layout.secondary,
+        secondary_label,
+        hover == Some(BannerButton::Secondary),
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use std::time::{Duration, Instant};
@@ -3153,5 +3324,92 @@ mod tests {
             DrawCmd::Fill { rect, .. } => *rect == lane,
             _ => false,
         })
+    }
+
+    #[test]
+    fn conflict_banner_buttons_are_ordered_and_hit_where_drawn() {
+        let fonts = Fonts::new(&font_sizes(FONT_SIZE)).expect("a default font");
+        let view = Rect {
+            x: 40,
+            y: 12,
+            w: 600,
+            h: 400,
+        };
+        let banner = conflict_banner_layout(view, DiskConflict::Changed, FONT_SIZE, &fonts);
+
+        // The strip spans the pane width along its top edge.
+        assert_eq!(
+            (banner.bar.x, banner.bar.y, banner.bar.w),
+            (view.x, view.y, view.w)
+        );
+
+        // Primary sits left of secondary; both lie inside the strip and do not overlap.
+        assert!(banner.primary.x + banner.primary.w <= banner.secondary.x);
+        for b in [banner.primary, banner.secondary] {
+            assert!(b.x >= banner.bar.x && b.x + b.w <= banner.bar.x + banner.bar.w);
+            assert!(b.y >= banner.bar.y && b.y + b.h <= banner.bar.y + banner.bar.h);
+        }
+
+        // A click on each button resolves to it; the message area and points off the
+        // strip resolve to nothing.
+        let mid = |r: Rect| ((r.x + r.w / 2) as f32, (r.y + r.h / 2) as f32);
+        let (px, py) = mid(banner.primary);
+        assert_eq!(banner.button_at(px, py), Some(BannerButton::Primary));
+        let (sx, sy) = mid(banner.secondary);
+        assert_eq!(banner.button_at(sx, sy), Some(BannerButton::Secondary));
+        assert_eq!(
+            banner.button_at((view.x + 4) as f32, (view.y + 2) as f32),
+            None,
+            "the message side is not a button"
+        );
+        assert!(banner.contains(px, py));
+        assert!(
+            !banner.contains(px, (banner.bar.y + banner.bar.h + 5) as f32),
+            "a point below the strip is not on the banner"
+        );
+    }
+
+    #[test]
+    fn conflict_banner_paints_a_strip_with_a_lit_button() {
+        let fonts = Fonts::new(&font_sizes(FONT_SIZE)).expect("a default font");
+        let view = Rect {
+            x: 0,
+            y: 0,
+            w: 500,
+            h: 300,
+        };
+        let banner = conflict_banner_layout(view, DiskConflict::Deleted, FONT_SIZE, &fonts);
+        let mut list = DisplayList::new();
+        push_conflict_banner(
+            &mut list,
+            &fonts,
+            &banner,
+            DiskConflict::Deleted,
+            Some(BannerButton::Primary),
+            FONT_SIZE,
+        );
+
+        assert!(
+            list.iter()
+                .any(|c| matches!(c, DrawCmd::Fill { rect, color }
+                if *rect == banner.bar && *color == CONFLICT_BANNER_BG)),
+            "the strip background is drawn"
+        );
+        assert!(
+            list.iter()
+                .any(|c| matches!(c, DrawCmd::Fill { rect, color }
+                if *rect == banner.primary && *color == CONFLICT_BUTTON_HOVER_BG)),
+            "the hovered primary button lights up"
+        );
+        assert!(
+            list.iter()
+                .any(|c| matches!(c, DrawCmd::Fill { rect, color }
+                if *rect == banner.secondary && *color == CONFLICT_BUTTON_BG)),
+            "the un-hovered secondary button uses the idle color"
+        );
+        assert!(
+            list.iter().any(|c| matches!(c, DrawCmd::Text { .. })),
+            "the message and labels are drawn"
+        );
     }
 }

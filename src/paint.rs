@@ -129,7 +129,23 @@ fn text_cmd(
         face,
         color,
         text,
+        clip_x: None,
     }
+}
+
+/// Scissor a text command to the window x-range `[left, right)`: each glyph is
+/// clipped there at draw time, and the damage bounds tighten to the same range so
+/// a repaint stays inside it. Used for the tab labels, which slide under the
+/// strip's edges when the strip scrolls. A non-text command passes through.
+fn clip_text_x(mut cmd: DrawCmd, left: i32, right: i32) -> DrawCmd {
+    if let DrawCmd::Text { clip_x, bounds, .. } = &mut cmd {
+        *clip_x = Some([left, right]);
+        let x0 = bounds.x.max(left);
+        let x1 = (bounds.x + bounds.w).min(right);
+        bounds.x = x0;
+        bounds.w = (x1 - x0).max(0);
+    }
+    cmd
 }
 
 /// The color for a code-block token's class (see [`crate::syntax`]); plain code
@@ -536,8 +552,9 @@ pub(crate) fn top_bar_height(m: Metrics, scale: Scale) -> i32 {
 }
 
 /// One tab's geometry within a strip: its full pill, the close-glyph box inside
-/// it, and the label already truncated to fit. Shared by the painter and the
-/// pointer hit-testing so a click lands where the eye expects.
+/// it, and its label. The label is untrimmed; the painter scissors it to the space
+/// before the close box (a long name hard-cuts, no ellipsis). Shared by the painter
+/// and the pointer hit-testing so a click lands where the eye expects.
 pub(crate) struct TabHit {
     pub rect: Rect,
     pub close: Rect,
@@ -556,6 +573,9 @@ pub(crate) struct TabStrip<'a> {
     pub hovered: Option<usize>,
     pub close_hover: Option<usize>,
     pub new_hover: bool,
+    /// How far the tab run is scrolled left, in device pixels, when the tabs
+    /// overflow the strip. Zero while they all fit.
+    pub scroll_x: i32,
     /// The tab being dragged to reorder, if any: it lifts out of the run (leaving a
     /// gap) and follows the pointer.
     pub drag: Option<TabDragView>,
@@ -573,12 +593,55 @@ fn tab_close_side(scale: Scale) -> i32 {
     scale.px(TAB_CLOSE_W)
 }
 
-/// The new-tab (+) button's box: a square just past the last tab (or at the strip
-/// start when the pane is empty). Shared by the painter and the hit-testing.
-pub(crate) fn new_tab_button_rect(strip: Rect, tabs: &[TabHit], scale: Scale) -> Rect {
+/// One strip's tab geometry, derived from the strip width and the tab count. Every
+/// tab shares `width`, which shrinks from `TAB_MAX_W` toward `TAB_MIN_W` as tabs
+/// pile up; below that floor the run overflows and the strip scrolls, so `content`
+/// (the tabs' total width) exceeds `avail` (the strip minus the reserved new-tab
+/// lane). The scroll clamp turns that difference into the overflow (see
+/// [`crate::platform::scroll::clamp`]).
+#[derive(Clone, Copy)]
+pub(crate) struct TabLayout {
+    /// The shared width of every tab.
+    pub width: i32,
+    /// The tabs' total width, `width * count`.
+    pub content: i32,
+    /// The visible tab lane: the strip minus the reserved new-tab (+) button.
+    pub avail: i32,
+}
+
+impl TabLayout {
+    /// The right edge of the visible tab lane, where the pinned new-tab button
+    /// begins; tabs are culled and their labels scissored to `[strip.x, this)`.
+    pub(crate) fn viewport_right(&self, strip: Rect) -> i32 {
+        strip.x + self.avail
+    }
+}
+
+/// Lay out `count` equal-width tabs in `strip`, reserving a lane at the right for
+/// the always-reachable new-tab button. Shared by the painter, the hit-testing,
+/// and the scroll clamp so all three agree on the width and the scroll range.
+pub(crate) fn tab_layout(strip: Rect, count: usize, scale: Scale) -> TabLayout {
+    let new_lane = scale.px(TAB_CLOSE_GAP) + scale.px(TAB_NEW_W);
+    let avail = (strip.w - new_lane).max(0);
+    let width = if count == 0 {
+        0
+    } else {
+        (avail / count as i32).clamp(scale.px(TAB_MIN_W), scale.px(TAB_MAX_W))
+    };
+    TabLayout {
+        width,
+        content: width * count as i32,
+        avail,
+    }
+}
+
+/// The new-tab (+) button's box: just past the last tab while the tabs fit, or
+/// pinned at the right of the strip once they overflow and scroll under it, so it
+/// stays reachable. Shared by the painter and the hit-testing.
+pub(crate) fn new_tab_button_rect(strip: Rect, layout: TabLayout, scale: Scale) -> Rect {
     let gap = scale.px(TAB_CLOSE_GAP);
     let side = scale.px(TAB_NEW_W);
-    let x = tabs.last().map(|t| t.rect.x + t.rect.w).unwrap_or(strip.x) + gap;
+    let x = strip.x + layout.content.min(layout.avail) + gap;
     Rect {
         x,
         y: strip.y + (strip.h - side) / 2,
@@ -607,55 +670,40 @@ fn fit_label(face: &Face, label: &str, max_w: i32) -> String {
     out
 }
 
-/// The tabs of one strip, laid left to right, each sized to its label between a
-/// min and max width. A tab that would spill past the strip's right edge stops the
-/// run (overflow is clipped this way), but the first tab always draws even in a
-/// narrow strip. Shared by the painter and the hit-testing.
+/// The tabs of one strip, every tab the same width (see [`tab_layout`]), laid left
+/// to right from `strip.x` and shifted left by `scroll_x`. The result stays
+/// index-aligned with `labels`: a tab scrolled out of view keeps its slot with an
+/// off-strip rect, so the painter and the hit-testing cull it by position against
+/// the viewport. Labels are carried untrimmed; the painter scissors them. Shared by
+/// both so a click lands where the eye expects.
 pub(crate) fn tab_rects(
     strip: Rect,
     labels: &[String],
-    fonts: &Fonts,
-    body_size: u32,
     scale: Scale,
+    scroll_x: i32,
 ) -> Vec<TabHit> {
-    let face = fonts.face(body_size, FontStyle::Regular);
     let pad = scale.px(TAB_PAD_X);
-    let gap = scale.px(TAB_CLOSE_GAP);
-    let min_w = scale.px(TAB_MIN_W);
-    let max_w = scale.px(TAB_MAX_W);
     let close = tab_close_side(scale);
-    let strip_right = strip.x + strip.w;
+    let w = tab_layout(strip, labels.len(), scale).width;
     let mut out = Vec::with_capacity(labels.len());
-    let mut x = strip.x;
-    for label in labels {
-        if x >= strip_right {
-            break;
-        }
-        let label_w = shape::text_advance(face, label).ceil() as i32;
-        let tab_w = (pad + label_w + gap + close + pad).clamp(min_w, max_w);
-        // Stop before a tab that would spill, but never drop the first one.
-        if x + tab_w > strip_right && x > strip.x {
-            break;
-        }
+    for (i, label) in labels.iter().enumerate() {
         let rect = Rect {
-            x,
+            x: strip.x + i as i32 * w - scroll_x,
             y: strip.y,
-            w: tab_w.min(strip_right - x),
+            w,
             h: strip.h,
         };
         let close_rect = Rect {
-            x: rect.x + rect.w - pad - close,
+            x: rect.x + w - pad - close,
             y: rect.y + (rect.h - close) / 2,
             w: close,
             h: close,
         };
-        let budget = (close_rect.x - gap - (rect.x + pad)).max(0);
         out.push(TabHit {
             rect,
             close: close_rect,
-            label: fit_label(face, label, budget),
+            label: label.clone(),
         });
-        x += tab_w;
     }
     out
 }
@@ -809,24 +857,31 @@ fn push_glyph_button(list: &mut DisplayList, ctx: &BarCtx, box_: Rect, glyph: &s
     ));
 }
 
-/// Draw one pane's tabs and its new-tab button (see [`push_top_bar`]).
+/// Draw one pane's tabs and its new-tab button (see [`push_top_bar`]). The tabs
+/// are scissored to the viewport `[strip.x, viewport_right)`, so a scrolled run
+/// slides under the strip's edges and the pinned + button; a tab fully outside it
+/// is skipped.
 fn push_tab_strip(list: &mut DisplayList, ctx: &BarCtx, strip: &TabStrip) {
     let scale = ctx.scale;
-    let tabs = tab_rects(strip.rect, strip.labels, ctx.fonts, ctx.body_size, scale);
+    let layout = tab_layout(strip.rect, strip.labels.len(), scale);
+    let tabs = tab_rects(strip.rect, strip.labels, scale, strip.scroll_x);
     let vpad = scale.px(TAB_VPAD);
     let divider = scale.px(1).max(1);
+    let clip = [strip.rect.x, layout.viewport_right(strip.rect)];
+    let visible = |t: &TabHit| t.rect.x < clip[1] && t.rect.x + t.rect.w > clip[0];
     let dragged = strip.drag.as_ref().map(|d| d.tab);
     let is_active = |i: usize| i == strip.active;
     for (i, tab) in tabs.iter().enumerate() {
         // The dragged tab lifts out of the run and is drawn floating below, leaving
-        // a gap here.
-        if dragged == Some(i) {
+        // a gap here; a tab scrolled out of the viewport draws nothing.
+        if dragged == Some(i) || !visible(tab) {
             continue;
         }
         let active = is_active(i);
         let hovered = strip.hovered == Some(i);
         // A hairline between two resting tabs, but never touching the active or
-        // hovered tab, nor the gap a lifted tab left behind.
+        // hovered tab, nor the gap a lifted tab left behind, and clipped to the
+        // viewport so it does not draw under the + button.
         if !active
             && !hovered
             && i + 1 < tabs.len()
@@ -834,15 +889,18 @@ fn push_tab_strip(list: &mut DisplayList, ctx: &BarCtx, strip: &TabStrip) {
             && !is_active(i + 1)
             && strip.hovered != Some(i + 1)
         {
-            list.push(DrawCmd::Fill {
-                rect: Rect {
-                    x: tab.rect.x + tab.rect.w - divider,
-                    y: tab.rect.y + vpad,
-                    w: divider,
-                    h: (tab.rect.h - 2 * vpad).max(1),
-                },
-                color: SPLITTER_COLOR,
-            });
+            let x = tab.rect.x + tab.rect.w - divider;
+            if x >= clip[0] && x + divider <= clip[1] {
+                list.push(DrawCmd::Fill {
+                    rect: Rect {
+                        x,
+                        y: tab.rect.y + vpad,
+                        w: divider,
+                        h: (tab.rect.h - 2 * vpad).max(1),
+                    },
+                    color: SPLITTER_COLOR,
+                });
+            }
         }
         let dirty = strip.dirty.get(i).copied().unwrap_or(false);
         push_tab_body(
@@ -853,18 +911,20 @@ fn push_tab_strip(list: &mut DisplayList, ctx: &BarCtx, strip: &TabStrip) {
             hovered,
             strip.close_hover == Some(i),
             dirty,
+            clip,
         );
     }
-    // The new-tab (+) button at the end of the strip, drawn when it fits.
-    let plus = new_tab_button_rect(strip.rect, &tabs, scale);
+    // The new-tab (+) button: after the last tab, or pinned at the strip's right
+    // once the tabs overflow.
+    let plus = new_tab_button_rect(strip.rect, layout, scale);
     if plus.x + plus.w <= strip.rect.x + strip.rect.w {
         push_glyph_button(list, ctx, plus, "+", strip.new_hover);
     }
     // The floating dragged tab, drawn last so it rides over its neighbors and the
-    // + button. It follows the pointer, clamped to stay within the strip.
+    // + button. It follows the pointer, clamped to stay within the visible lane.
     if let Some(d) = &strip.drag {
         if let Some(tab) = tabs.get(d.tab) {
-            let max_left = (strip.rect.x + strip.rect.w - tab.rect.w).max(strip.rect.x);
+            let max_left = (clip[1] - tab.rect.w).max(strip.rect.x);
             let left = d.left.clamp(strip.rect.x, max_left);
             let dx = left - tab.rect.x;
             let floated = TabHit {
@@ -879,7 +939,18 @@ fn push_tab_strip(list: &mut DisplayList, ctx: &BarCtx, strip: &TabStrip) {
                 label: tab.label.clone(),
             };
             let dirty = strip.dirty.get(d.tab).copied().unwrap_or(false);
-            push_tab_body(list, ctx, &floated, true, false, false, dirty);
+            // The float rides above the run, clipped to the whole strip so it is not
+            // cut at the + lane it may overlap.
+            push_tab_body(
+                list,
+                ctx,
+                &floated,
+                true,
+                false,
+                false,
+                dirty,
+                [strip.rect.x, strip.rect.x + strip.rect.w],
+            );
         }
     }
 }
@@ -887,7 +958,11 @@ fn push_tab_strip(list: &mut DisplayList, ctx: &BarCtx, strip: &TabStrip) {
 /// Draw one tab's contents: its active or hover background, the label, and either
 /// the close glyph (active or hovered tab) or the unsaved dot (a resting modified
 /// tab). The inter-tab hairline is the strip's business, not a tab's, so it stays
-/// out of here.
+/// out of here. Everything is scissored to `clip` (a window x-range): the fill
+/// clamps to it, the label glyphs slide under its edges, and the close box or dot
+/// draws only while it sits wholly inside, so a scrolled tab never spills past the
+/// viewport.
+#[allow(clippy::too_many_arguments)]
 fn push_tab_body(
     list: &mut DisplayList,
     ctx: &BarCtx,
@@ -896,15 +971,24 @@ fn push_tab_body(
     hovered: bool,
     close_hover: bool,
     dirty: bool,
+    clip: [i32; 2],
 ) {
     let scale = ctx.scale;
     let m = ctx.metrics();
     let pad = scale.px(TAB_PAD_X);
     if active || hovered {
-        list.push(DrawCmd::Fill {
-            rect: tab.rect,
-            color: if active { TAB_ACTIVE_BG } else { TAB_HOVER_BG },
-        });
+        let x0 = tab.rect.x.max(clip[0]);
+        let x1 = (tab.rect.x + tab.rect.w).min(clip[1]);
+        if x1 > x0 {
+            list.push(DrawCmd::Fill {
+                rect: Rect {
+                    x: x0,
+                    w: x1 - x0,
+                    ..tab.rect
+                },
+                color: if active { TAB_ACTIVE_BG } else { TAB_HOVER_BG },
+            });
+        }
     }
     let color = if active {
         TAB_ACTIVE_TEXT
@@ -912,18 +996,30 @@ fn push_tab_body(
         TAB_INACTIVE_TEXT
     };
     let baseline = tab.rect.y + (tab.rect.h - (m.ascent + m.descent)) / 2 + m.ascent;
-    list.push(text_cmd(
-        ctx.regular(),
-        tab.rect.x + pad,
-        baseline,
-        tab.close.x - scale.px(TAB_CLOSE_GAP),
-        color,
-        tab.label.clone(),
-        m,
+    // The label hard-cuts at the gap before the close box (no ellipsis), and never
+    // past the viewport, so a long name fills the space and slides under both edges.
+    let label_right = (tab.close.x - scale.px(TAB_CLOSE_GAP)).min(clip[1]);
+    list.push(clip_text_x(
+        text_cmd(
+            ctx.regular(),
+            tab.rect.x + pad,
+            baseline,
+            label_right,
+            color,
+            tab.label.clone(),
+            m,
+        ),
+        clip[0],
+        label_right,
     ));
+    // The close box and the dot are small targets, so they show only while wholly
+    // inside the viewport rather than as a sheared sliver.
+    let close_in = tab.close.x >= clip[0] && tab.close.x + tab.close.w <= clip[1];
     if active || hovered {
-        push_glyph_button(list, ctx, tab.close, "×", close_hover);
-    } else if dirty {
+        if close_in {
+            push_glyph_button(list, ctx, tab.close, "×", close_hover);
+        }
+    } else if dirty && close_in {
         let dot = scale.px(7);
         list.push(DrawCmd::RoundRect {
             rect: Rect {
@@ -2310,6 +2406,7 @@ mod tests {
                 hovered: None,
                 close_hover: None,
                 new_hover: false,
+                scroll_x: 0,
                 drag: None,
             }),
             None,
@@ -2352,7 +2449,7 @@ mod tests {
         // The active tab (index 1) melts into the pane background over its whole
         // square box and shows a close glyph; the resting unsaved tab (index 0) shows
         // a dirty dot instead.
-        let tabs = tab_rects(strip_rect, &labels, &fonts, FONT_SIZE, Scale::ONE);
+        let tabs = tab_rects(strip_rect, &labels, Scale::ONE, 0);
         let active = tabs[1].rect;
         assert!(
             list.iter().any(
@@ -2367,6 +2464,157 @@ mod tests {
         );
         // The new-tab button sits at the end of the strip.
         assert!(has_text("+"), "new-tab button");
+    }
+
+    #[test]
+    fn tabs_share_one_width_that_shrinks_with_the_count() {
+        let strip = Rect {
+            x: 0,
+            y: 0,
+            w: 800,
+            h: 30,
+        };
+        let avail = 800 - (TAB_CLOSE_GAP + TAB_NEW_W);
+        // Few tabs: capped at the max width, leaving the rest of the lane empty.
+        let two = tab_layout(strip, 2, Scale::ONE);
+        assert_eq!(two.width, TAB_MAX_W);
+        assert_eq!(two.avail, avail);
+        assert!(
+            two.content < two.avail,
+            "two wide tabs do not fill the strip"
+        );
+        // Many tabs: an equal share strictly between the floor and the ceiling.
+        let six = tab_layout(strip, 6, Scale::ONE);
+        assert_eq!(six.width, avail / 6);
+        assert!(six.width > TAB_MIN_W && six.width < TAB_MAX_W);
+        // Too many: pinned at the floor and overflowing, so the strip must scroll.
+        let many = tab_layout(strip, 20, Scale::ONE);
+        assert_eq!(many.width, TAB_MIN_W);
+        assert!(
+            many.content > many.avail,
+            "the run overflows the visible lane"
+        );
+    }
+
+    #[test]
+    fn tab_rects_are_uniform_index_aligned_and_shift_with_the_scroll() {
+        let strip = Rect {
+            x: 100,
+            y: 0,
+            w: 800,
+            h: 30,
+        };
+        let labels: Vec<String> = (0..20).map(|i| format!("note-{i}")).collect();
+        let w = tab_layout(strip, labels.len(), Scale::ONE).width;
+        let unscrolled = tab_rects(strip, &labels, Scale::ONE, 0);
+        // One rect per label (a slot is kept even for a tab scrolled out of view),
+        // all the same width, laid end to end from the strip's left edge.
+        assert_eq!(unscrolled.len(), labels.len());
+        assert!(unscrolled.iter().all(|t| t.rect.w == w));
+        assert_eq!(unscrolled[0].rect.x, strip.x);
+        assert_eq!(unscrolled[3].rect.x, strip.x + 3 * w);
+        // Scrolling shifts every tab left by the offset, keeping the slots aligned.
+        let scrolled = tab_rects(strip, &labels, Scale::ONE, 50);
+        assert!(unscrolled
+            .iter()
+            .zip(&scrolled)
+            .all(|(a, b)| b.rect.x == a.rect.x - 50));
+    }
+
+    #[test]
+    fn the_new_tab_button_follows_the_tabs_then_pins_right_on_overflow() {
+        let strip = Rect {
+            x: 0,
+            y: 0,
+            w: 800,
+            h: 30,
+        };
+        // Fitting: the + sits just past the last tab.
+        let few = tab_layout(strip, 2, Scale::ONE);
+        let plus = new_tab_button_rect(strip, few, Scale::ONE);
+        assert_eq!(plus.x, strip.x + few.content + TAB_CLOSE_GAP);
+        // Overflowing: the + pins to the right of the visible lane and stays inside
+        // the strip, so it is always reachable.
+        let many = tab_layout(strip, 20, Scale::ONE);
+        let plus = new_tab_button_rect(strip, many, Scale::ONE);
+        assert_eq!(plus.x, strip.x + many.avail + TAB_CLOSE_GAP);
+        assert!(plus.x + plus.w <= strip.x + strip.w);
+    }
+
+    #[test]
+    fn a_scrolled_strip_scissors_its_tabs_to_the_visible_lane() {
+        let fonts = Fonts::new(&markdown::all_sizes(FONT_SIZE)).expect("a default font");
+        let top = top_bar_height(fonts.metrics(FONT_SIZE), Scale::ONE);
+        let strip_rect = Rect {
+            x: 0,
+            y: 0,
+            w: 700,
+            h: top,
+        };
+        let labels: Vec<String> = (0..20).map(|i| format!("note-{i}")).collect();
+        let dirty = vec![false; labels.len()];
+        let layout = tab_layout(strip_rect, labels.len(), Scale::ONE);
+        let strips = [
+            Some(TabStrip {
+                rect: strip_rect,
+                labels: &labels,
+                dirty: &dirty,
+                active: 0,
+                hovered: None,
+                close_hover: None,
+                new_hover: false,
+                scroll_x: 40,
+                drag: None,
+            }),
+            None,
+        ];
+        let mut list: DisplayList = Vec::new();
+        let ctx = BarCtx::new(&fonts, Scale::ONE, FONT_SIZE);
+        push_top_bar(
+            &mut list,
+            &ctx,
+            Rect {
+                x: 0,
+                y: 0,
+                w: 700,
+                h: top,
+            },
+            None,
+            strips,
+            &[],
+        );
+        let vr = layout.viewport_right(strip_rect);
+        // Every tab label is scissored between the strip's left edge and, at most,
+        // the visible lane's right; its damage bounds are tightened to that range, so
+        // a scrolled label never spills left of the strip nor past the + button.
+        let mut clipped_labels = 0;
+        for c in &list {
+            if let DrawCmd::Text {
+                bounds,
+                clip_x: Some(cx),
+                ..
+            } = c
+            {
+                clipped_labels += 1;
+                assert_eq!(cx[0], strip_rect.x, "scissored at the strip's left edge");
+                assert!(cx[1] <= vr, "scissor stops at or before the + lane");
+                assert!(
+                    bounds.x >= strip_rect.x,
+                    "bounds do not reach left of the strip"
+                );
+                assert!(
+                    bounds.x + bounds.w <= vr,
+                    "bounds do not reach into the + lane"
+                );
+            }
+        }
+        assert!(clipped_labels > 0, "tab labels are scissored");
+        // The new-tab button is still drawn (pinned), unclipped.
+        assert!(
+            list.iter()
+                .any(|c| matches!(c, DrawCmd::Text { text, clip_x: None, .. } if text == "+")),
+            "pinned new-tab button"
+        );
     }
 
     #[test]

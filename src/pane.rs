@@ -1660,6 +1660,11 @@ impl PaneGroup {
         self.active
     }
 
+    /// The number of open tabs, for laying out and scrolling the tab strip.
+    pub(crate) fn tab_count(&self) -> usize {
+        self.docs.len()
+    }
+
     /// Whether the pane has any open tab. An empty pane paints no content and no
     /// caret, and its title falls back to the app name.
     pub(crate) fn has_tabs(&self) -> bool {

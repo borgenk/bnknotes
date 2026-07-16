@@ -253,6 +253,15 @@ struct State {
     /// What the pointer is over in a tab strip (a tab, its close glyph, or the
     /// new-tab button), for the hover highlights; `None` when off every strip.
     hovered_tab: Option<TabHover>,
+    /// Each pane's horizontal tab-strip scroll, in device pixels, when its tabs
+    /// overflow. The wheel drives it while the pointer is over the strip; it is
+    /// clamped and nudged to keep the active tab in view each frame (see
+    /// [`Self::sync_tab_scroll`]).
+    tab_scroll: [i32; 2],
+    /// The (active index, tab count) each strip's scroll was last reconciled for,
+    /// so a tab switch or an open/close reveals the active tab while free wheeling
+    /// leaves the offset alone.
+    tab_anchor: [(usize, usize); 2],
     /// While a splitter is dragged, which one: 0 = tree|A edge, 1 = A|B edge.
     drag_splitter: Option<usize>,
     /// While a scrollbar thumb is dragged, whose bar it is. The grab's offset inside
@@ -573,6 +582,8 @@ impl State {
                 Focus::Tree => 0,
             },
             hovered_tab: None,
+            tab_scroll: [0, 0],
+            tab_anchor: [(0, 0); 2],
             drag_splitter: None,
             drag_scroll: None,
             drag_tab: None,
@@ -664,6 +675,37 @@ impl State {
     /// The top bar's device-pixel height at the current body size and scale.
     fn top_bar_h(&self) -> i32 {
         top_bar_height(self.fonts.metrics(self.body_size), self.scale())
+    }
+
+    /// Reconcile each pane's tab-strip scroll with the current column layout: clamp
+    /// it into range, and when the active tab or the tab count has changed since the
+    /// last frame, slide it just far enough to bring the active tab into view. Free
+    /// wheeling leaves the anchor unchanged, so the strip stays where the user
+    /// parked it until they switch or open a tab.
+    fn sync_tab_scroll(&mut self, cols: &Columns) {
+        let scale = self.scale();
+        for g in 0..self.editors.len() {
+            let Some(strip) = cols.tab_strips[g] else {
+                self.tab_scroll[g] = 0;
+                self.tab_anchor[g] = (0, 0);
+                continue;
+            };
+            let count = self.editors[g].tab_count();
+            let active = self.editors[g].active_index();
+            let layout = crate::paint::tab_layout(strip, count, scale);
+            if self.tab_anchor[g] != (active, count) {
+                self.tab_scroll[g] = scroll::reveal(
+                    self.tab_scroll[g],
+                    active as i32 * layout.width,
+                    layout.width,
+                    layout.avail,
+                    layout.content,
+                    0,
+                );
+                self.tab_anchor[g] = (active, count);
+            }
+            self.tab_scroll[g] = scroll::clamp(self.tab_scroll[g], layout.content, layout.avail);
+        }
     }
 
     /// The current display scale, derived from the compositor's reported factor.
@@ -1024,6 +1066,7 @@ impl State {
     /// filename; splitters last so they cover the inter-column gaps.
     fn build_frame_list(&mut self) -> Rc<DisplayList> {
         let cols = self.columns();
+        self.sync_tab_scroll(&cols);
         let now = Instant::now();
         let mut list: DisplayList = Vec::new();
         if let Some(rect) = cols.tree {
@@ -1128,6 +1171,7 @@ impl State {
                     hovered: self.hovered_tab.and_then(|h| h.tab_in(g)),
                     close_hover: self.hovered_tab.and_then(|h| h.close_in(g)),
                     new_hover: self.hovered_tab == Some(TabHover::New { pane: g }),
+                    scroll_x: self.tab_scroll[g],
                     // A tab reorder in progress lifts its tab to follow the pointer,
                     // but only once the press has grown into an actual drag.
                     drag: self.drag_tab.filter(|d| d.pane == g && d.moved).map(|d| {

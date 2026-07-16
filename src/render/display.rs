@@ -72,7 +72,10 @@ pub enum DrawCmd {
     Chevron { rect: Rect, color: u32, down: bool },
     /// A run of text drawn from `x` along `baseline`. `bounds` is the run's screen
     /// rectangle padded for glyph ink that overhangs the advance box, so the
-    /// damage diff and the clip test never clip a glyph's edge.
+    /// damage diff and the clip test never clip a glyph's edge. `clip_x`, when set,
+    /// is a window x-range `[left, right)` each glyph is scissored to (adjusting its
+    /// quad and atlas UVs), so a run can slide under a fixed edge, as a scrolled tab
+    /// strip does; `None` draws the whole run.
     Text {
         bounds: Rect,
         x: i32,
@@ -80,6 +83,7 @@ pub enum DrawCmd {
         face: FaceKey,
         color: u32,
         text: String,
+        clip_x: Option<[i32; 2]>,
     },
     /// A cached, display-size image bitmap blitted into `rect`. `path` is the
     /// store key (the raw markdown destination); a not-yet-decoded image draws

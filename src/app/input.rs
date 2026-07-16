@@ -662,21 +662,25 @@ impl State {
                 let _time = r.u32()?;
                 let axis = r.u32()?;
                 let value = r.fixed()?;
-                if axis == wl_pointer::AXIS_VERTICAL_SCROLL {
-                    // The scroll step is authored in logical pixels; scale it so a
-                    // wheel notch moves the same physical distance at any DPI.
-                    let delta = self.scale().scale_f32(value * SCROLL_FACTOR).round() as i32;
-                    let (px, py) = (self.pointer_x, self.pointer_y);
-                    // Scroll whichever pane the pointer is over, not just the focused one.
-                    match self.hit_test(px, py) {
-                        Hit::Editor(i, rect) => {
-                            if self.editors[i].scroll_by(&self.fonts, rect, delta) {
-                                self.flash_scrollbar(Focus::Editor(i));
-                            }
-                        }
-                        Hit::Tree(rect) => self.scroll_tree(rect, delta),
-                        _ => {}
+                // The scroll step is authored in logical pixels; scale it so a wheel
+                // notch moves the same physical distance at any DPI.
+                let delta = self.scale().scale_f32(value * SCROLL_FACTOR).round() as i32;
+                let (px, py) = (self.pointer_x, self.pointer_y);
+                let vertical = axis == wl_pointer::AXIS_VERTICAL_SCROLL;
+                // Scroll whichever region the pointer is over, not just the focused
+                // one. A tab strip slides horizontally on either wheel axis; the panes
+                // and the tree take the vertical wheel only.
+                match self.hit_test(px, py) {
+                    Hit::Tab(g, _) | Hit::TabClose(g, _) | Hit::NewTab(g) | Hit::TabStrip(g) => {
+                        self.scroll_tabs(g, delta);
                     }
+                    Hit::Editor(i, rect) if vertical => {
+                        if self.editors[i].scroll_by(&self.fonts, rect, delta) {
+                            self.flash_scrollbar(Focus::Editor(i));
+                        }
+                    }
+                    Hit::Tree(rect) if vertical => self.scroll_tree(rect, delta),
+                    _ => {}
                 }
             }
             _ => {} // leave, frame, axis_source, and friends
@@ -735,18 +739,24 @@ impl State {
                 continue;
             }
             let labels = self.editors[g].tab_names();
-            let tabs =
-                crate::paint::tab_rects(strip, &labels, &self.fonts, self.body_size, self.scale());
-            for (i, tab) in tabs.iter().enumerate() {
-                if tab.rect.contains(px, py) {
-                    if tab.close.contains(px, py) {
-                        return Hit::TabClose(g, i);
-                    }
-                    return Hit::Tab(g, i);
-                }
-            }
-            if crate::paint::new_tab_button_rect(strip, &tabs, self.scale()).contains(px, py) {
+            let scale = self.scale();
+            let layout = crate::paint::tab_layout(strip, labels.len(), scale);
+            // The pinned + button wins over any tab scrolled beneath it, so it is
+            // tested first; tabs count only within the viewport lane the run is
+            // clipped to, matching what the painter draws.
+            if crate::paint::new_tab_button_rect(strip, layout, scale).contains(px, py) {
                 return Hit::NewTab(g);
+            }
+            let tabs = crate::paint::tab_rects(strip, &labels, scale, self.tab_scroll[g]);
+            if (px as i32) < layout.viewport_right(strip) {
+                for (i, tab) in tabs.iter().enumerate() {
+                    if tab.rect.contains(px, py) {
+                        if tab.close.contains(px, py) {
+                            return Hit::TabClose(g, i);
+                        }
+                        return Hit::Tab(g, i);
+                    }
+                }
             }
             return Hit::TabStrip(g);
         }
@@ -1313,9 +1323,22 @@ impl State {
     fn tab_strip_rects(&self, g: usize) -> Option<(Rect, Vec<crate::paint::TabHit>)> {
         let strip = self.columns().tab_strips[g]?;
         let labels = self.editors[g].tab_names();
-        let tabs =
-            crate::paint::tab_rects(strip, &labels, &self.fonts, self.body_size, self.scale());
+        let tabs = crate::paint::tab_rects(strip, &labels, self.scale(), self.tab_scroll[g]);
         Some((strip, tabs))
+    }
+
+    /// Slide pane `g`'s tab strip horizontally by `delta` device pixels, clamped to
+    /// the overflow, repainting if it moved. A no-op when the tabs already fit.
+    fn scroll_tabs(&mut self, g: usize, delta: i32) {
+        let Some(strip) = self.columns().tab_strips[g] else {
+            return;
+        };
+        let layout = crate::paint::tab_layout(strip, self.editors[g].tab_count(), self.scale());
+        let want = scroll::clamp(self.tab_scroll[g] + delta, layout.content, layout.avail);
+        if want != self.tab_scroll[g] {
+            self.tab_scroll[g] = want;
+            self.dirty = true;
+        }
     }
 
     /// Open a fresh blank tab in pane `g` and focus it (the new-tab button).

@@ -406,8 +406,9 @@ impl Batcher<'_> {
                 face,
                 color,
                 text,
+                clip_x,
                 ..
-            } => self.text(*face, *x, *baseline, text, *color),
+            } => self.text(*face, *x, *baseline, text, *color, *clip_x),
             DrawCmd::Image { rect, path } => self.image(*rect, path),
         }
     }
@@ -505,7 +506,15 @@ impl Batcher<'_> {
     /// Emit a run's glyph quads: the ASCII fast path, then grapheme clusters
     /// routed to the emoji glyph or per-character drawing. The routing mirrors
     /// `shape::text_advance`, so the quads land where layout measured.
-    fn text(&mut self, face_key: FaceKey, x: i32, baseline: i32, text: &str, color: u32) {
+    fn text(
+        &mut self,
+        face_key: FaceKey,
+        x: i32,
+        baseline: i32,
+        text: &str,
+        color: u32,
+        clip_x: Option<[i32; 2]>,
+    ) {
         let face = self.fonts.face_for(face_key);
         // Code runs thin less than prose (their small stems read as faint under the
         // prose gamma), so a code run overrides the push-constant gamma per glyph.
@@ -517,7 +526,7 @@ impl Batcher<'_> {
         let mut pen = x as f32;
         if text.is_ascii() {
             for ch in text.chars() {
-                pen = self.scalar(face, face_key, ch, pen, baseline, color, gamma);
+                pen = self.scalar(face, face_key, ch, pen, baseline, color, gamma, clip_x);
             }
             return;
         }
@@ -525,12 +534,12 @@ impl Batcher<'_> {
             match self.packed_cluster(face, face_key, cluster) {
                 Some(packed) => {
                     // Emoji carry their own color and ignore the mask gamma.
-                    self.emit_glyph(&packed, pen, baseline, MODE_EMOJI, 0, 0.0);
+                    self.emit_glyph(&packed, pen, baseline, MODE_EMOJI, 0, 0.0, clip_x);
                     pen += packed.advance;
                 }
                 None => {
                     for ch in cluster.chars() {
-                        pen = self.scalar(face, face_key, ch, pen, baseline, color, gamma);
+                        pen = self.scalar(face, face_key, ch, pen, baseline, color, gamma, clip_x);
                     }
                 }
             }
@@ -551,9 +560,10 @@ impl Batcher<'_> {
         baseline: i32,
         color: u32,
         gamma: f32,
+        clip_x: Option<[i32; 2]>,
     ) -> f32 {
         let packed = self.packed_scalar(face, face_key, ch);
-        self.emit_glyph(&packed, pen, baseline, MODE_GLYPH, color, gamma);
+        self.emit_glyph(&packed, pen, baseline, MODE_GLYPH, color, gamma, clip_x);
         pen + packed.advance
     }
 
@@ -637,6 +647,7 @@ impl Batcher<'_> {
         mode: u32,
         color: u32,
         gamma: f32,
+        clip_x: Option<[i32; 2]>,
     ) {
         let Some(slot) = packed.slot else {
             return;
@@ -650,6 +661,35 @@ impl Batcher<'_> {
         // extra.x carries the per-glyph mask gamma override (0 = use the push
         // default); the shader reads it only for MODE_GLYPH.
         let extra = [gamma, 0.0, 0.0, 0.0];
+        // A horizontal scissor keeps the glyph's atlas UVs aligned to the pixels it
+        // still covers, so a run slides under a fixed edge without shearing. uv
+        // advances 1:1 with pixels from the slot's top-left, so a clipped left edge
+        // shifts u0 by the same amount the quad's x moved.
+        if let Some([left, right]) = clip_x {
+            let x0 = rect.x.max(left);
+            let x1 = (rect.x + rect.w).min(right);
+            if x1 <= x0 {
+                return;
+            }
+            let u0 = slot.x as f32 + (x0 - rect.x) as f32;
+            let u1 = slot.x as f32 + (x1 - rect.x) as f32;
+            let clipped = Rect {
+                x: x0,
+                y: rect.y,
+                w: x1 - x0,
+                h: rect.h,
+            };
+            let v0 = slot.y as f32;
+            self.quad_uv(
+                clipped,
+                mode,
+                color,
+                [u0, v0, u1, v0 + rect.h as f32],
+                extra,
+                None,
+            );
+            return;
+        }
         self.quad(rect, mode, color, [slot.x as f32, slot.y as f32], extra);
     }
 
@@ -789,6 +829,7 @@ mod tests {
             face,
             color: 0x00ff_ffff,
             text: "xy".to_string(),
+            clip_x: None,
         };
         const CODE_GAMMA: f32 = 1.3;
         let list = vec![
@@ -840,6 +881,7 @@ mod tests {
             },
             color: 0x00ff_ffff,
             text: "abcabc".to_string(),
+            clip_x: None,
         }];
         let f1 = build_frame(&fonts, &[&images], &list, &mut cache, &|_| false, 1.0);
         assert!(f1.glyph_upload.is_some(), "first frame uploads new glyphs");
@@ -883,6 +925,7 @@ mod tests {
                 },
                 color: 0x00ff_ffff,
                 text: "hi".to_string(),
+                clip_x: None,
             },
         ];
         let f = build_frame(&fonts, &[&images], &list, &mut cache, &|_| false, 1.0);
@@ -1010,6 +1053,62 @@ mod tests {
     }
 
     #[test]
+    fn a_clipped_text_run_keeps_every_glyph_quad_inside_the_scissor() {
+        let fonts = Fonts::new(&[16]).expect("default font");
+        let images = ImageStore::new(None);
+        let prose = FaceKey::Prose {
+            size: 16,
+            style: crate::platform::freetype::FontStyle::Regular,
+        };
+        let bounds = Rect {
+            x: 0,
+            y: 0,
+            w: 300,
+            h: 20,
+        };
+        let run = |clip_x| {
+            vec![DrawCmd::Text {
+                bounds,
+                x: 0,
+                baseline: 16,
+                face: prose,
+                color: 0x00ff_ffff,
+                text: "MMMMMMMMMM".to_string(),
+                clip_x,
+            }]
+        };
+        let mut cache = GlyphCache::new();
+        let full = build_frame(&fonts, &[&images], &run(None), &mut cache, &|_| false, 1.0);
+        let clipped = build_frame(
+            &fonts,
+            &[&images],
+            &run(Some([20, 60])),
+            &mut cache,
+            &|_| false,
+            1.0,
+        );
+        // The whole run spills past the scissor window; the clipped run never does,
+        // and it still emits the glyphs that straddle or sit inside the window.
+        assert!(
+            full.vertices
+                .iter()
+                .any(|v| v.pos[0] < 20.0 || v.pos[0] > 60.0),
+            "the unclipped run reaches outside [20, 60]"
+        );
+        assert!(
+            !clipped.vertices.is_empty(),
+            "some glyph quads survive the clip"
+        );
+        assert!(
+            clipped
+                .vertices
+                .iter()
+                .all(|v| v.pos[0] >= 20.0 && v.pos[0] <= 60.0),
+            "every clipped glyph quad stays inside [20, 60]"
+        );
+    }
+
+    #[test]
     fn missing_image_draws_nothing_like_the_cpu_path() {
         let fonts = Fonts::new(&[16]).expect("default font");
         let images = ImageStore::new(None);
@@ -1049,6 +1148,7 @@ mod tests {
             },
             color: 0x00ff_ffff,
             text: "😀".to_string(),
+            clip_x: None,
         }];
         let f = build_frame(&fonts, &[&images], &list, &mut cache, &|_| false, 1.0);
         // With an emoji font installed the cluster takes MODE_EMOJI; without

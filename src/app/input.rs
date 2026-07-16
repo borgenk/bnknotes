@@ -607,6 +607,7 @@ impl State {
                         self.editors[i].update_autoscroll(rect, py);
                     } else {
                         self.update_cursor_shape();
+                        self.update_rail_hover();
                         self.update_tree_hover();
                         self.update_tab_hover();
                         self.update_scrollbar_hover();
@@ -688,15 +689,20 @@ impl State {
         Ok(())
     }
 
-    /// What the window position `(px, py)` lands on. The top bar wins above every
-    /// column; below it, splitters win over columns (they sit in the gaps), and
-    /// each column is full height, so only x decides.
+    /// What the window position `(px, py)` lands on. The vault rail wins first: it
+    /// is the one full-height column, so the bar runs beside it rather than over it.
+    /// The bar wins above every remaining column; below it, splitters win over
+    /// columns (they sit in the gaps), and each column is full height, so only x
+    /// decides.
     pub(super) fn hit_test(&self, px: f32, py: f32) -> Hit {
         let cols = self.columns();
+        let x = px as i32;
+        if x < cols.rail.x + cols.rail.w {
+            return self.rail_hit(cols.rail_chips, px, py);
+        }
         if (py as i32) < self.top_bar_h() {
             return self.top_bar_hit(&cols, px, py);
         }
-        let x = px as i32;
         for (s, rect) in cols.splitters.iter().enumerate() {
             if let Some(r) = rect {
                 if x >= r.x && x < r.x + r.w {
@@ -725,6 +731,19 @@ impl State {
             }
         }
         Hit::None
+    }
+
+    /// What a pointer inside the vault rail lands on: a vault's chip, or the column
+    /// around them, which consumes the click rather than letting it through. Chips
+    /// are measured the same way the painter draws them, from the rail's `chips`
+    /// region, so clicks land true.
+    fn rail_hit(&self, chips: Rect, px: f32, py: f32) -> Hit {
+        for (i, chip) in crate::paint::rail_buttons(chips, self.vaults.len(), self.scale()) {
+            if chip.contains(px, py) {
+                return Hit::Vault(i);
+            }
+        }
+        Hit::Rail
     }
 
     /// What a pointer inside the top bar lands on: a tab, its close box, or the
@@ -769,9 +788,11 @@ impl State {
     pub(super) fn drag_splitter_to(&mut self, s: usize, px: f32) {
         // The pointer, the window size, and the splitter are all device pixels here;
         // the sidebar width is persisted logical, so its edge converts device -> logical
-        // on the way in and the min-width floor scales the other way.
-        let x = px as i32;
-        let w = self.width as i32;
+        // on the way in and the min-width floor scales the other way. Both columns are
+        // measured from the rail's right edge, where they start, not from the window's.
+        let rail = self.columns().rail;
+        let x = px as i32 - (rail.x + rail.w);
+        let w = self.width as i32 - (rail.x + rail.w);
         let scale = self.scale();
         let splitter = scale.px(SPLITTER);
         if s == 0 {
@@ -789,6 +810,19 @@ impl State {
             self.panes.split_ratio = a.clamp(0.1, 0.9);
         }
         self.dirty = true;
+    }
+
+    /// Update which vault chip the pointer is over, repainting if it changed. The
+    /// chip under the pointer lifts toward white.
+    pub(super) fn update_rail_hover(&mut self) {
+        let hovered = match self.hit_test(self.pointer_x, self.pointer_y) {
+            Hit::Vault(i) => Some(i),
+            _ => None,
+        };
+        if hovered != self.hovered_vault {
+            self.hovered_vault = hovered;
+            self.dirty = true;
+        }
     }
 
     /// Update what the pointer is over in the sidebar, a row or the footer's filter
@@ -1000,10 +1034,12 @@ impl State {
                 Hit::Splitter(_) => SHAPE_EW_RESIZE,
                 Hit::Tree(_) => SHAPE_DEFAULT,
                 Hit::Editor(i, rect) => self.editors[i].cursor_shape_at(&self.fonts, rect, px, py),
-                Hit::Tab(..) | Hit::TabClose(..) | Hit::NewTab(_) | Hit::TreeFilter => {
-                    SHAPE_POINTER
-                }
-                Hit::TabStrip(_) | Hit::TreeFooter | Hit::None => SHAPE_DEFAULT,
+                Hit::Tab(..)
+                | Hit::TabClose(..)
+                | Hit::NewTab(_)
+                | Hit::TreeFilter
+                | Hit::Vault(_) => SHAPE_POINTER,
+                Hit::TabStrip(_) | Hit::TreeFooter | Hit::Rail | Hit::None => SHAPE_DEFAULT,
             }
         };
         if shape != self.cursor_shape {
@@ -1166,6 +1202,10 @@ impl State {
             return;
         }
         match self.hit_test(px, py) {
+            Hit::Vault(i) => self.switch_vault(i),
+            // The rail around its chips: a click there acts on nothing, but it must
+            // not reach the column beside it.
+            Hit::Rail => {}
             Hit::Splitter(s) => self.drag_splitter = Some(s),
             Hit::Tree(rect) => self.tree_press(rect, py),
             Hit::TreeFilter => self.toggle_empty_dirs(),

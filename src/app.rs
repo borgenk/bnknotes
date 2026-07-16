@@ -34,8 +34,8 @@ use crate::config::{vault_name, CaretConfig, Config, Vault};
 use crate::file;
 use crate::paint::{
     build_display_list, build_find_paint, conflict_banner_layout, font_sizes, measure_tree,
-    push_conflict_banner, push_splitter, push_top_bar, push_tree, top_bar_height, tree_metrics,
-    BarCtx, CaretPaint, PaintParams, TabStrip,
+    push_conflict_banner, push_rail, push_splitter, push_top_bar, push_tree, top_bar_height,
+    tree_metrics, BarCtx, CaretPaint, PaintParams, TabStrip,
 };
 use crate::pane::{
     restore_group, CaretAnim, CaretFrame, Columns, DiskConflict, Focus, PaneGroup, PaneLayout,
@@ -242,6 +242,14 @@ struct State {
     /// click moves focus (and, on a splitter, starts a drag).
     editors: [PaneGroup; 2],
     tree: TreePane,
+    /// The configured vaults, in the order the rail stacks their chips. Which one is
+    /// active is not held here: it is the file tree's root, so the two can never
+    /// disagree. A root outside this list (a directory argument) simply lights no
+    /// chip.
+    vaults: Vec<Vault>,
+    /// Which vault chip the pointer is over, for the rail's hover lift; `None` when
+    /// off every chip.
+    hovered_vault: Option<usize>,
     /// Every vault's remembered settings (the sidebar's folder filter), kept whole
     /// so saving the active vault's choice leaves the other vaults' alone.
     vault_prefs: store::VaultPrefs,
@@ -574,6 +582,8 @@ impl State {
             xkb: Xkb::new()?,
             editors: [editor_a, editor_b],
             tree,
+            vaults: config.vaults,
+            hovered_vault: None,
             vault_prefs: session.vaults,
             panes,
             focus,
@@ -660,6 +670,14 @@ impl State {
             w: 0,
             h: 0,
         })
+    }
+
+    /// Which configured vault is the one the file tree is rooted at, if any. A vault
+    /// opened from a directory argument need not be configured, in which case the
+    /// rail marks none of its chips as active.
+    fn active_vault(&self) -> Option<usize> {
+        let root = self.tree.tree.root();
+        self.vaults.iter().position(|v| v.path == root)
     }
 
     /// The current column layout for this window size, below the top bar.
@@ -911,22 +929,15 @@ impl State {
         Ok(())
     }
 
-    /// The current layout as a persistable session (see [`crate::store`]).
+    /// The current layout as a persistable session (see [`crate::store`]). The
+    /// active vault's own entry is folded in by [`Self::save_session`] first, so
+    /// this only reads what is already remembered.
     fn current_session(&self) -> store::Session {
         let focus = match self.focus {
             Focus::Tree => store::Focus::Tree,
             Focus::Editor(1) => store::Focus::PaneB,
             Focus::Editor(_) => store::Focus::PaneA,
         };
-        // Fold the active vault's live tabs and expanded folders back into its
-        // entry, leaving every other vault's remembered layout untouched.
-        let root = self.tree.tree.root();
-        let mut vaults = self.vault_prefs.clone();
-        vaults.set_layout(
-            root,
-            self.tree.tree.expanded_dirs(),
-            [self.editors[0].to_session(), self.editors[1].to_session()],
-        );
         store::Session {
             // The persisted window is the logical size (scale-free); the device
             // buffer size lives in width/height.
@@ -936,17 +947,81 @@ impl State {
             tree_visible: self.panes.tree_visible,
             second_open: self.panes.second_open,
             focus,
-            active_vault: Some(root.to_path_buf()),
-            vaults,
+            active_vault: Some(self.tree.tree.root().to_path_buf()),
+            vaults: self.vault_prefs.clone(),
         }
     }
 
     /// Persist the layout, reporting (not failing) if the state file cannot be
-    /// written; a lost layout must never take the editor down.
-    fn save_session(&self) {
+    /// written; a lost layout must never take the editor down. The active vault's
+    /// live tabs and expanded folders are folded back into its entry first, leaving
+    /// every other vault's alone.
+    ///
+    /// Only the active vault's entry reaches the file: a save merges into what is
+    /// already there (see [`crate::store::save`]), which is what keeps an instance
+    /// on one vault from writing its stale idea of another vault over an instance
+    /// live on that one. So a vault's state has to be saved while it is still the
+    /// active one, which is why [`Self::switch_vault`] saves on the way out.
+    fn save_session(&mut self) {
+        self.vault_prefs.set_layout(
+            self.tree.tree.root(),
+            self.tree.tree.expanded_dirs(),
+            [self.editors[0].to_session(), self.editors[1].to_session()],
+        );
         if let Err(e) = store::save(&self.current_session()) {
             eprintln!("bnknotes: could not save layout: {e}");
         }
+    }
+
+    /// Switch the window to configured vault `i`: the file tree re-roots there and
+    /// both panes reopen whatever that vault last had open. Each vault's tabs and
+    /// expanded folders travel with it, so leaving one and coming back restores what
+    /// it was showing, within the session as well as across launches. A click on the
+    /// active vault's own chip changes nothing.
+    pub(super) fn switch_vault(&mut self, i: usize) {
+        let Some(root) = self.vaults.get(i).map(|v| v.path.clone()) else {
+            return;
+        };
+        if root == self.tree.tree.root() {
+            return;
+        }
+        // Save the outgoing vault while it is still the active one: a save carries
+        // only the active vault's entry to disk, so its tabs have to go now. This
+        // also lands them in `vault_prefs`, where switching straight back finds them.
+        self.save_session();
+        let layout = self
+            .vault_prefs
+            .get(&root)
+            .cloned()
+            .unwrap_or_else(|| store::VaultSession::new(root.clone()));
+        let show_empty_dirs = self.vault_prefs.show_empty_dirs(&root);
+        let (scale, body_size) = (self.scale(), self.body_size);
+        for (g, pane) in layout.panes.iter().enumerate() {
+            self.editors[g] = restore_group(&pane.tabs, pane.active as usize, Some(&root));
+            // A restored group starts at scale 1.0, which is the truth only at
+            // startup, before the compositor has reported one. This window already
+            // knows its scale, so the new tabs take it now.
+            self.editors[g].set_scale(scale, body_size);
+        }
+        self.tree.tree = tree::Tree::new(
+            root,
+            layout.expanded.iter().cloned().collect(),
+            show_empty_dirs,
+        );
+        self.tree.scroll_y = 0;
+        self.tree.selected = None;
+        self.tree.hovered = None;
+        // Transients that name a tab or a row of the vault being left.
+        self.tab_scroll = [0, 0];
+        self.tab_anchor = [(0, 0); 2];
+        self.drag_tab = None;
+        self.drag_scroll = None;
+        self.hovered_tab = None;
+        self.focus = Focus::Editor(0);
+        self.last_editor = 0;
+        self.refresh_title();
+        self.save_session();
+        self.dirty = true;
     }
 
     fn roundtrip(&mut self) -> Result<()> {
@@ -1059,16 +1134,25 @@ impl State {
         }
     }
 
-    /// Compose the whole window's display list: the file tree, then each visible
-    /// editor pane built into its column, then the splitter bars. Refreshes each
-    /// pane's layout and clamps its scroll first, so the list matches the current
-    /// column sizes. Tree first so an editor's background covers any overhanging
-    /// filename; splitters last so they cover the inter-column gaps.
+    /// Compose the whole window's display list: the vault rail, the file tree, then
+    /// each visible editor pane built into its column, then the splitter bars.
+    /// Refreshes each pane's layout and clamps its scroll first, so the list matches
+    /// the current column sizes. Left to right, so an editor's background covers any
+    /// overhanging filename; splitters last so they cover the inter-column gaps.
     fn build_frame_list(&mut self) -> Rc<DisplayList> {
         let cols = self.columns();
         self.sync_tab_scroll(&cols);
         let now = Instant::now();
         let mut list: DisplayList = Vec::new();
+        push_rail(
+            &mut list,
+            &BarCtx::new(&self.fonts, self.scale(), self.body_size),
+            cols.rail,
+            cols.rail_chips,
+            &self.vaults,
+            self.active_vault(),
+            self.hovered_vault,
+        );
         if let Some(rect) = cols.tree {
             let (scale, body_size) = (self.scale(), self.body_size);
             let m = tree_metrics(&self.fonts, body_size);
@@ -1154,12 +1238,7 @@ impl State {
         // it occupies the reserved strip above every column.
         let top = self.top_bar_h();
         if top > 0 {
-            let bar = Rect {
-                x: 0,
-                y: 0,
-                w: self.width as i32,
-                h: top,
-            };
+            let bar = cols.bar;
             let labels = [self.editors[0].tab_names(), self.editors[1].tab_names()];
             let dirty = [self.editors[0].tab_dirty(), self.editors[1].tab_dirty()];
             let strip = |g: usize| {
@@ -1759,12 +1838,7 @@ mod tests {
     // `Focus` is not `Debug`, so compare with `==` inside `assert!`.
 
     fn vaults(paths: &[&str]) -> Vec<Vault> {
-        paths
-            .iter()
-            .map(|p| Vault {
-                path: PathBuf::from(p),
-            })
-            .collect()
+        crate::config::vaults(paths.iter().map(PathBuf::from))
     }
 
     #[test]

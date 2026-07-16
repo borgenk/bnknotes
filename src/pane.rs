@@ -17,7 +17,7 @@ use crate::rope::Rope;
 use crate::scale::Scale;
 use crate::store;
 use crate::text::{DragGrain, TextBuffer};
-use crate::theme::{FONT_SIZE, MARGIN};
+use crate::theme::{FONT_SIZE, MARGIN, RAIL_W};
 use crate::tree;
 
 /// Largest file the editor will open, as a guard against mapping a huge file into
@@ -506,6 +506,15 @@ pub(crate) struct PaneLayout {
 /// columns start below the top bar; the bar's own regions (`vault`, `tab_strips`)
 /// span the same x as the columns beneath them, so a pane's tabs sit above it.
 pub(crate) struct Columns {
+    /// The vault rail, the outermost column and the only full-height one: the top
+    /// bar runs beside it, not over it, so it is never `None` and never covered.
+    pub(crate) rail: Rect,
+    /// The rail's chip region: the rail below the bar's height, so the chips line up
+    /// with the tree rows and the pane text rather than with the tabs.
+    pub(crate) rail_chips: Rect,
+    /// The top bar's strip, from the rail's right edge to the window's. Empty
+    /// (`h == 0`) when no bar is reserved.
+    pub(crate) bar: Rect,
     pub(crate) tree: Option<Rect>,
     /// Editor A is always present; editor B only when `second_open`.
     pub(crate) editors: [Option<Rect>; 2],
@@ -523,11 +532,44 @@ impl PaneLayout {
     /// an optional second pane; each column is full height below the bar, so content
     /// stays in its column by construction (no clip). The bar's vault and tab-strip
     /// regions mirror the column x-spans, so a pane's tabs sit directly above it.
+    ///
+    /// The vault rail is the exception to the bar: it is fixed width, always shown,
+    /// and full height, so the bar starts at its right edge and everything else
+    /// follows from there. Its chips still keep the bar's line: they sit in
+    /// `rail_chips`, the rail below `top`, so they start where the columns do.
+    ///
+    /// ```text
+    ///   0    rail                                        width
+    ///   ├─────┼─────────────┬───┬───────────┬───┬──────────┤
+    ///   │     │    vault    │   │  strip A  │   │ strip B  │  ← bar (h = top)
+    ///   │rail ├─────────────┤   ├───────────┤   ├──────────┤
+    ///   │chips│    tree     │ s │ editor A  │ s │ editor B │
+    ///   └─────┴─────────────┴───┴───────────┴───┴──────────┘
+    /// ```
     pub(crate) fn columns(&self, width: i32, height: i32, top: i32, scale: Scale) -> Columns {
         let splitter = scale.px(SPLITTER);
         let tree_width = scale.px(self.tree_width);
         let body = (height - top).max(0);
-        let mut x = 0;
+        // Never wider than the window, so a window squeezed narrower than the rail
+        // leaves the columns beside it empty rather than negative.
+        let rail = Rect {
+            x: 0,
+            y: 0,
+            w: scale.px(RAIL_W).min(width.max(0)),
+            h: height,
+        };
+        let rail_chips = Rect {
+            y: top,
+            h: body,
+            ..rail
+        };
+        let bar = Rect {
+            x: rail.w,
+            y: 0,
+            w: (width - rail.w).max(0),
+            h: top,
+        };
+        let mut x = rail.w;
         let mut tree = None;
         let mut splitters = [None, None];
         if self.tree_visible {
@@ -600,6 +642,9 @@ impl PaneLayout {
             strip(editors[1], splitters[1]),
         ];
         Columns {
+            rail,
+            rail_chips,
+            bar,
             tree,
             editors,
             splitters,
@@ -609,9 +654,15 @@ impl PaneLayout {
 }
 
 /// What a window position lands on, for routing pointer events to the right
-/// region. The top bar is checked first (it sits above every column), then
-/// splitters (they sit in the gaps between columns).
+/// region. The vault rail is checked first (it is full height, so it wins beside
+/// the bar as well as beside the columns), then the top bar (it sits above every
+/// remaining column), then splitters (they sit in the gaps between columns).
 pub(crate) enum Hit {
+    /// The rail's chip for configured vault `i`: switch the window to it.
+    Vault(usize),
+    /// The rest of the vault rail; consumes the click, so a miss between chips does
+    /// not fall through to the column beside it.
+    Rail,
     Splitter(usize),
     /// A row of the sidebar's file tree, carrying the rows' viewport (the column
     /// above the footer), which is what a row index and the scroll clamp measure
@@ -2569,17 +2620,99 @@ mod tests {
             second_open: true,
         };
         let cols = panes.columns(1000, 700, 0, Scale::ONE);
+        // Every column is measured from the rail's right edge, not the window's.
         let tree = cols.tree.expect("tree shown");
-        assert_eq!((tree.x, tree.w, tree.h), (0, 200, 700));
-        assert_eq!(cols.splitters[0].expect("tree splitter").x, 200);
+        assert_eq!((tree.x, tree.w, tree.h), (RAIL_W, 200, 700));
+        assert_eq!(cols.splitters[0].expect("tree splitter").x, RAIL_W + 200);
         let a = cols.editors[0].expect("editor A");
         let b = cols.editors[1].expect("editor B");
-        assert_eq!(a.x, 200 + SPLITTER);
+        assert_eq!(a.x, RAIL_W + 200 + SPLITTER);
         assert_eq!(cols.splitters[1].expect("content splitter").x, a.x + a.w);
         // The content area splits evenly, and every column is full height.
         assert!((a.w - b.w).abs() <= 1);
         assert_eq!(a.h, 700);
         assert_eq!(a.x + a.w + SPLITTER + b.w, 1000);
+    }
+
+    #[test]
+    fn the_rail_is_the_outermost_column_and_the_only_full_height_one() {
+        let panes = PaneLayout {
+            tree_width: 200,
+            split_ratio: 0.5,
+            tree_visible: true,
+            second_open: false,
+        };
+        let cols = panes.columns(1000, 700, 30, Scale::ONE);
+        // The rail runs the whole window height, beside the bar rather than under
+        // it, and the bar starts where the rail ends.
+        assert_eq!(
+            (cols.rail.x, cols.rail.y, cols.rail.w, cols.rail.h),
+            (0, 0, RAIL_W, 700)
+        );
+        assert_eq!(
+            (cols.bar.x, cols.bar.y, cols.bar.w, cols.bar.h),
+            (RAIL_W, 0, 1000 - RAIL_W, 30)
+        );
+        // Nothing else reaches into it: the sidebar starts at its edge, every
+        // column still ends at the window's, and the bar's strip stays clear of it.
+        let tree = cols.tree.expect("tree shown");
+        let a = cols.editors[0].expect("editor A");
+        let strip = cols.tab_strips[0].expect("strip A");
+        assert_eq!(tree.x, cols.rail.x + cols.rail.w);
+        assert!(strip.x >= cols.rail.x + cols.rail.w);
+        assert_eq!(strip.x + strip.w, a.x + a.w);
+        assert_eq!(a.x + a.w, 1000);
+    }
+
+    #[test]
+    fn the_rail_keeps_its_chips_on_the_columns_first_line() {
+        let panes = PaneLayout {
+            tree_width: 200,
+            split_ratio: 0.5,
+            tree_visible: true,
+            second_open: false,
+        };
+        let cols = panes.columns(1000, 700, 30, Scale::ONE);
+        // The rail is drawn full height, but its chips take the column beneath the
+        // bar, so they start where the tree and the editors do.
+        let chips = cols.rail_chips;
+        assert_eq!((chips.x, chips.w), (cols.rail.x, cols.rail.w));
+        assert_eq!((chips.y, chips.h), (30, 670));
+        assert_eq!(chips.y, cols.tree.expect("tree shown").y);
+        assert_eq!(chips.y, cols.editors[0].expect("editor A").y);
+        assert_eq!(chips.y + chips.h, cols.rail.y + cols.rail.h);
+    }
+
+    #[test]
+    fn the_rail_never_outgrows_a_narrow_window() {
+        let panes = PaneLayout {
+            tree_width: 200,
+            split_ratio: 0.5,
+            tree_visible: true,
+            second_open: false,
+        };
+        // A window squeezed narrower than the rail gives it what there is, and the
+        // columns beside it collapse to nothing rather than to a negative width.
+        let cols = panes.columns(20, 700, 30, Scale::ONE);
+        assert_eq!(cols.rail.w, 20);
+        assert_eq!((cols.bar.x, cols.bar.w), (20, 0));
+        let a = cols.editors[0].expect("editor A");
+        assert_eq!(a.w, 0);
+    }
+
+    #[test]
+    fn the_rail_scales_with_the_display() {
+        let panes = PaneLayout {
+            tree_width: 200,
+            split_ratio: 0.5,
+            tree_visible: true,
+            second_open: false,
+        };
+        let scale = Scale::from_120(240);
+        let cols = panes.columns(2000, 1400, 60, scale);
+        assert_eq!(cols.rail.w, scale.px(RAIL_W));
+        assert_eq!(cols.bar.x, scale.px(RAIL_W));
+        assert_eq!(cols.tree.expect("tree shown").x, scale.px(RAIL_W));
     }
 
     #[test]
@@ -2619,7 +2752,7 @@ mod tests {
     }
 
     #[test]
-    fn hidden_sidebar_fills_the_strip_full_width() {
+    fn hidden_sidebar_fills_the_strip_beside_the_rail() {
         let panes = PaneLayout {
             tree_width: 200,
             split_ratio: 0.5,
@@ -2628,7 +2761,7 @@ mod tests {
         };
         let cols = panes.columns(1000, 700, 30, Scale::ONE);
         let strip_a = cols.tab_strips[0].expect("strip A");
-        assert_eq!((strip_a.x, strip_a.w), (0, 1000));
+        assert_eq!((strip_a.x, strip_a.w), (RAIL_W, 1000 - RAIL_W));
         assert!(cols.tab_strips[1].is_none());
     }
 
@@ -2731,7 +2864,8 @@ mod tests {
         assert!(cols.tree.is_none());
         assert!(cols.splitters[0].is_none() && cols.splitters[1].is_none());
         let a = cols.editors[0].expect("editor A");
-        assert_eq!((a.x, a.w), (0, 1000));
+        // Editor A takes everything beside the rail, which is never hidden.
+        assert_eq!((a.x, a.w), (RAIL_W, 1000 - RAIL_W));
         assert!(cols.editors[1].is_none());
     }
 

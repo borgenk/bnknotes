@@ -162,6 +162,53 @@ pub(crate) const TAB_DRAG_THRESHOLD: i32 = 5;
 /// Left padding of the vault label inside its region.
 pub(crate) const VAULT_PAD_X: i32 = 14;
 
+/// The vault rail: the narrow fixed column outside the sidebar, holding one chip
+/// per configured vault. It sits a shade below the sidebar's tone, so the chrome
+/// reads as deepening toward the window edge, and runs the window's full height
+/// (the top bar starts at its right edge rather than crossing it).
+pub(crate) const RAIL_BG: u32 = 0x0010_1317;
+/// The rail's width, and the padding from its edges to a chip. The chip is the
+/// square that is left between them, so these two set its size.
+pub(crate) const RAIL_W: i32 = 50;
+pub(crate) const RAIL_PAD: i32 = 8;
+/// Vertical gap between two chips.
+pub(crate) const RAIL_GAP: i32 = 8;
+/// Corner radius of a chip: rounded enough to read as a badge rather than a tile.
+pub(crate) const RAIL_RADIUS: i32 = 9;
+/// A hovered chip lifts toward this ink by this much. The lift is small on purpose:
+/// a chip's color is the vault's identity, so the pointer brightens it rather than
+/// recoloring it.
+pub(crate) const RAIL_HOVER_INK: u32 = 0x00ff_ffff;
+pub(crate) const RAIL_HOVER_LIFT: f32 = 0.12;
+/// The active vault's marker: a short bar pinned to the rail's left edge, centered
+/// on its chip. Color and identity stay with the chip; this only says "you are
+/// here", the way a tab's fill does for its pane.
+pub(crate) const RAIL_ACTIVE_COLOR: u32 = FOREGROUND;
+pub(crate) const RAIL_ACTIVE_W: i32 = 3;
+/// The active marker's height as a fraction of the chip's, so it reads as an edge
+/// tick against the chip rather than a second block beside it.
+pub(crate) const RAIL_ACTIVE_SPAN: f32 = 0.55;
+/// A chip's initials, inked with whichever of the two contrasts better against its
+/// fill (see [`crate::paint::chip_ink`]), so a vault color of any tone stays
+/// legible. Every color in [`VAULT_COLORS`] takes the dark one.
+pub(crate) const RAIL_INK_LIGHT: u32 = 0x00f5_f7fa;
+pub(crate) const RAIL_INK_DARK: u32 = 0x0016_1a1f;
+
+/// The chip colors a vault takes when its config names none, picked by the hash of
+/// its name (see [`crate::config::vault_color`]) so a vault keeps its color as the
+/// configured list is reordered. One Dark accents, which sit against [`RAIL_BG`] the
+/// way the code panel's do against the editor.
+pub(crate) const VAULT_COLORS: [u32; 8] = [
+    0x005c_9cf6, // blue
+    0x0098_c379, // green
+    0x00c6_78dd, // purple
+    0x00d1_9a66, // orange
+    0x00e0_6c75, // red
+    0x0056_b6c2, // teal
+    0x00e5_b567, // yellow
+    0x00f3_8ba8, // pink
+];
+
 /// File-tree sidebar and splitter colors and metrics.
 pub(crate) const TREE_BG: u32 = 0x0016_1a1f;
 /// Folder and file names. The sidebar is chrome, not content, so it reads a step

@@ -1,3 +1,4 @@
+use crate::config::Vault;
 use crate::find::{self, FindState};
 use crate::layout::{
     aligned_x, backtick_reveal_shift, cell_line_top, face_key, image_button_rect, inline_code_pad,
@@ -21,15 +22,16 @@ use crate::theme::{
     CONFLICT_BUTTON_HOVER_BG, DECOR_TEXT_GAP, FIND_BG, FIND_ERROR_COLOR, FIND_MATCH_COLOR,
     FIND_TICK_COLOR, FOREGROUND, HEADING_COLORS, IMAGE_BORDER_COLOR, IMAGE_BORDER_THICKNESS,
     IMAGE_BUTTON_BG, IMAGE_BUTTON_RADIUS, LINK_COLOR, MARGIN, MARKER_COLOR, QUOTE_BAR_COLOR,
-    QUOTE_BAR_WIDTH, RULE_COLOR, RULE_THICKNESS, SCROLL_INK, SCROLL_INSET, SCROLL_MIN_THUMB,
-    SCROLL_NEAR, SCROLL_THIN, SCROLL_THUMB_COVER, SCROLL_THUMB_HOVER_COVER, SCROLL_TROUGH_COVER,
-    SCROLL_WIDE, SELECTION_COLOR, SPLITTER_COLOR, TABLE_BORDER_COLOR, TABLE_HEADER_BG,
-    TAB_ACTIVE_BG, TAB_ACTIVE_TEXT, TAB_BUTTON_HOVER_BG, TAB_BUTTON_RADIUS, TAB_CLOSE_GAP,
-    TAB_CLOSE_W, TAB_DIRTY_COLOR, TAB_HOVER_BG, TAB_INACTIVE_TEXT, TAB_MAX_W, TAB_MIN_W, TAB_NEW_W,
-    TAB_PAD_X, TAB_VPAD, TICK_HEIGHT, TICK_WIDTH, TOP_BAR_BG, TREE_BG, TREE_CHEVRON_MAX,
-    TREE_FOOTER_GAP, TREE_FOOTER_VPAD, TREE_HOVER_BG, TREE_INDENT, TREE_MARKER_COLOR,
-    TREE_MARKER_W, TREE_PAD, TREE_ROW_INSET_Y, TREE_ROW_PAD, TREE_ROW_RADIUS, TREE_ROW_VPAD,
-    TREE_TEXT_COLOR, VAULT_PAD_X,
+    QUOTE_BAR_WIDTH, RAIL_ACTIVE_COLOR, RAIL_ACTIVE_SPAN, RAIL_ACTIVE_W, RAIL_BG, RAIL_GAP,
+    RAIL_HOVER_INK, RAIL_HOVER_LIFT, RAIL_INK_DARK, RAIL_INK_LIGHT, RAIL_PAD, RAIL_RADIUS,
+    RULE_COLOR, RULE_THICKNESS, SCROLL_INK, SCROLL_INSET, SCROLL_MIN_THUMB, SCROLL_NEAR,
+    SCROLL_THIN, SCROLL_THUMB_COVER, SCROLL_THUMB_HOVER_COVER, SCROLL_TROUGH_COVER, SCROLL_WIDE,
+    SELECTION_COLOR, SPLITTER_COLOR, TABLE_BORDER_COLOR, TABLE_HEADER_BG, TAB_ACTIVE_BG,
+    TAB_ACTIVE_TEXT, TAB_BUTTON_HOVER_BG, TAB_BUTTON_RADIUS, TAB_CLOSE_GAP, TAB_CLOSE_W,
+    TAB_DIRTY_COLOR, TAB_HOVER_BG, TAB_INACTIVE_TEXT, TAB_MAX_W, TAB_MIN_W, TAB_NEW_W, TAB_PAD_X,
+    TAB_VPAD, TICK_HEIGHT, TICK_WIDTH, TOP_BAR_BG, TREE_BG, TREE_CHEVRON_MAX, TREE_FOOTER_GAP,
+    TREE_FOOTER_VPAD, TREE_HOVER_BG, TREE_INDENT, TREE_MARKER_COLOR, TREE_MARKER_W, TREE_PAD,
+    TREE_ROW_INSET_Y, TREE_ROW_PAD, TREE_ROW_RADIUS, TREE_ROW_VPAD, TREE_TEXT_COLOR, VAULT_PAD_X,
 };
 
 /// The per-frame inputs [`build_display_list`] needs beyond the layout itself:
@@ -286,6 +288,147 @@ pub(crate) fn push_splitter(list: &mut DisplayList, rect: Rect, scale: Scale) {
         rect: crate::pane::divider_line(rect, scale),
         color: SPLITTER_COLOR,
     });
+}
+
+/// The vault chips that fit in the rail's `chips` region, top to bottom, each paired
+/// with its index in the configured vaults. A chip is the square left between the
+/// region's edges and its padding; one that would fall past its bottom is dropped, so
+/// the painter and the pointer hit-testing offer exactly the same vaults. Shared by
+/// both, so a click lands on the chip it looks like.
+pub(crate) fn rail_buttons(
+    chips: Rect,
+    count: usize,
+    scale: Scale,
+) -> impl Iterator<Item = (usize, Rect)> {
+    let pad = scale.px(RAIL_PAD);
+    let side = (chips.w - 2 * pad).max(0);
+    let step = side + scale.px(RAIL_GAP);
+    let bottom = chips.y + chips.h;
+    (0..count)
+        .map(move |i| {
+            (
+                i,
+                Rect {
+                    x: chips.x + pad,
+                    y: chips.y + pad + i as i32 * step,
+                    w: side,
+                    h: side,
+                },
+            )
+        })
+        .take_while(move |(_, chip)| chip.y + chip.h <= bottom)
+}
+
+/// A color's relative luminance, the light it puts out once the sRGB gamma is
+/// undone. The channel weights are the eye's: green carries most of the
+/// brightness, blue almost none.
+fn relative_luminance(color: u32) -> f32 {
+    let channel = |shift: u32| {
+        let c = ((color >> shift) & 0xff) as f32 / 255.0;
+        if c <= 0.04045 {
+            c / 12.92
+        } else {
+            ((c + 0.055) / 1.055).powf(2.4)
+        }
+    };
+    0.2126 * channel(16) + 0.7152 * channel(8) + 0.0722 * channel(0)
+}
+
+/// The contrast between two colors, from 1.0 (the same color) to 21.0 (black on
+/// white).
+fn contrast(a: u32, b: u32) -> f32 {
+    let (a, b) = (relative_luminance(a), relative_luminance(b));
+    (a.max(b) + 0.05) / (a.min(b) + 0.05)
+}
+
+/// The ink a chip's initials take over `fill`: whichever of the two reads better on
+/// it, so a vault color of any tone keeps its letters legible. Measuring beats a
+/// brightness cutoff here, which lands a mid-tone fill on the wrong side often
+/// enough to matter: every color the palette deals is one.
+fn chip_ink(fill: u32) -> u32 {
+    if contrast(fill, RAIL_INK_DARK) >= contrast(fill, RAIL_INK_LIGHT) {
+        RAIL_INK_DARK
+    } else {
+        RAIL_INK_LIGHT
+    }
+}
+
+/// Draw the vault rail into its full-height column: a background a shade below the
+/// sidebar's, a divider down its right edge, and one chip per configured vault in
+/// `chips`, the rail below the top bar, so the first chip starts on the line the tree
+/// and the pane text do. The chip carries the vault's color and initials. The
+/// pointer lifts a chip's fill; the active vault is marked by a bar at the rail's
+/// left edge, so a chip's color stays the vault's identity rather than doubling as
+/// its state.
+pub(crate) fn push_rail(
+    list: &mut DisplayList,
+    ctx: &BarCtx,
+    rail: Rect,
+    chips: Rect,
+    vaults: &[Vault],
+    active: Option<usize>,
+    hovered: Option<usize>,
+) {
+    let scale = ctx.scale;
+    list.push(DrawCmd::Fill {
+        rect: rail,
+        color: RAIL_BG,
+    });
+    let divider = scale.px(1).max(1);
+    list.push(DrawCmd::Fill {
+        rect: Rect {
+            x: rail.x + rail.w - divider,
+            w: divider,
+            ..rail
+        },
+        color: SPLITTER_COLOR,
+    });
+    let m = ctx.metrics();
+    let face = ctx.fonts.face(ctx.body_size, FontStyle::Bold);
+    for (i, chip) in rail_buttons(chips, vaults.len(), scale) {
+        let vault = &vaults[i];
+        let fill = if hovered == Some(i) {
+            pixel::tint(vault.color, RAIL_HOVER_INK, RAIL_HOVER_LIFT)
+        } else {
+            vault.color
+        };
+        list.push(DrawCmd::RoundRect {
+            rect: chip,
+            color: fill,
+            radius: scale.px(RAIL_RADIUS),
+            corners: display::RoundedCorners::Both,
+        });
+        // The ink follows the vault's own color, not this frame's fill, so the
+        // hover lift brightens the chip without flipping its letters.
+        let w = shape::text_advance(face, &vault.initials) as i32;
+        let x = chip.x + (chip.w - w) / 2;
+        list.push(text_cmd(
+            FaceKey::Prose {
+                size: ctx.body_size,
+                style: FontStyle::Bold,
+            },
+            x,
+            chip.y + (chip.h - (m.ascent + m.descent)) / 2 + m.ascent,
+            x + w,
+            chip_ink(vault.color),
+            vault.initials.clone(),
+            m,
+        ));
+        if active == Some(i) {
+            let h = (chip.h as f32 * RAIL_ACTIVE_SPAN) as i32;
+            list.push(DrawCmd::RoundRect {
+                rect: Rect {
+                    x: rail.x,
+                    y: chip.y + (chip.h - h) / 2,
+                    w: scale.px(RAIL_ACTIVE_W),
+                    h,
+                },
+                color: RAIL_ACTIVE_COLOR,
+                radius: scale.px(RAIL_ACTIVE_W) / 2,
+                corners: display::RoundedCorners::Both,
+            });
+        }
+    }
 }
 
 /// The sidebar's text size. The sidebar is chrome, not content, so its names read
@@ -729,9 +872,10 @@ pub(crate) fn tab_drop_index(tabs: &[TabHit], dragged: Option<usize>, px: f32) -
     target
 }
 
-/// The shared drawing context for the top bar's helpers: the fonts, display
-/// scale, and body size everything in the bar is measured and drawn at. Bundled
-/// so the helpers thread one context instead of three parallel arguments.
+/// The shared drawing context for the chrome's helpers, the top bar and the vault
+/// rail: the fonts, display scale, and body size everything in them is measured and
+/// drawn at. Bundled so the helpers thread one context instead of three parallel
+/// arguments.
 pub(crate) struct BarCtx<'a> {
     fonts: &'a Fonts,
     scale: Scale,
@@ -2290,7 +2434,121 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use super::*;
-    use crate::theme::FONT_SIZE;
+    use crate::theme::{FONT_SIZE, RAIL_W, VAULT_COLORS};
+
+    /// A rail column the width the theme asks for, at scale 1.0.
+    fn rail(h: i32) -> Rect {
+        Rect {
+            x: 0,
+            y: 0,
+            w: RAIL_W,
+            h,
+        }
+    }
+
+    #[test]
+    fn rail_chips_are_squares_stacked_from_the_top() {
+        let chips: Vec<Rect> = rail_buttons(rail(700), 3, Scale::ONE)
+            .map(|(_, c)| c)
+            .collect();
+        assert_eq!(chips.len(), 3);
+        let side = RAIL_W - 2 * RAIL_PAD;
+        for (i, chip) in chips.iter().enumerate() {
+            // Square, inset from both edges, so the chip is centered in the column.
+            assert_eq!((chip.w, chip.h), (side, side));
+            assert_eq!(chip.x, RAIL_PAD);
+            assert_eq!(RAIL_W - (chip.x + chip.w), RAIL_PAD);
+            assert_eq!(chip.y, RAIL_PAD + i as i32 * (side + RAIL_GAP));
+        }
+        // Stacked with a gap between, never overlapping.
+        assert_eq!(chips[1].y - (chips[0].y + chips[0].h), RAIL_GAP);
+    }
+
+    #[test]
+    fn rail_chips_stack_from_their_regions_top_not_the_windows() {
+        // The chip region starts below the top bar, and the chips follow it down: the
+        // padding is measured from the region, and one that would hang off the rail's
+        // bottom is still dropped.
+        let region = Rect { y: 30, ..rail(670) };
+        let chips: Vec<Rect> = rail_buttons(region, 2, Scale::ONE)
+            .map(|(_, c)| c)
+            .collect();
+        assert_eq!(chips[0].y, 30 + RAIL_PAD);
+        assert_eq!(chips[1].y, chips[0].y + chips[0].h + RAIL_GAP);
+        assert!(chips.iter().all(|c| c.y + c.h <= region.y + region.h));
+    }
+
+    #[test]
+    fn rail_chips_are_indexed_by_their_vault() {
+        let indices: Vec<usize> = rail_buttons(rail(700), 4, Scale::ONE)
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(indices, vec![0, 1, 2, 3]);
+    }
+
+    #[test]
+    fn rail_drops_the_chips_that_do_not_fit() {
+        // A column two chips tall offers two vaults, not the four configured: a chip
+        // hanging off the bottom is neither drawn nor clickable.
+        let side = RAIL_W - 2 * RAIL_PAD;
+        let two = RAIL_PAD + 2 * side + RAIL_GAP;
+        let chips: Vec<Rect> = rail_buttons(rail(two), 4, Scale::ONE)
+            .map(|(_, c)| c)
+            .collect();
+        assert_eq!(chips.len(), 2);
+        assert!(chips.iter().all(|c| c.y + c.h <= two));
+        // One pixel short of the second chip's bottom edge drops it.
+        assert_eq!(rail_buttons(rail(two - 1), 4, Scale::ONE).count(), 1);
+    }
+
+    #[test]
+    fn rail_chips_scale_with_the_display() {
+        let scale = Scale::from_120(240);
+        let column = Rect {
+            w: scale.px(RAIL_W),
+            ..rail(1400)
+        };
+        let (_, chip) = rail_buttons(column, 1, scale).next().expect("one chip");
+        assert_eq!(chip.w, scale.px(RAIL_W) - 2 * scale.px(RAIL_PAD));
+        assert_eq!(chip.x, scale.px(RAIL_PAD));
+    }
+
+    #[test]
+    fn rail_offers_no_chips_without_vaults() {
+        assert_eq!(rail_buttons(rail(700), 0, Scale::ONE).count(), 0);
+    }
+
+    #[test]
+    fn chip_ink_takes_the_side_that_reads_on_the_fill() {
+        // The extremes are unambiguous either way.
+        assert_eq!(chip_ink(0x00ff_ffff), RAIL_INK_DARK);
+        assert_eq!(chip_ink(0x0000_0000), RAIL_INK_LIGHT);
+        // Green carries most of the luminance and blue almost none, so a pure blue
+        // takes light ink while a pure green, no brighter in raw bytes, takes dark.
+        assert_eq!(chip_ink(0x0000_00ff), RAIL_INK_LIGHT);
+        assert_eq!(chip_ink(0x0000_ff00), RAIL_INK_DARK);
+    }
+
+    #[test]
+    fn every_palette_color_carries_legible_initials() {
+        // WCAG's AA floor for text. The palette is tuned to clear it; a color added
+        // to it that cannot is a color the rail should not deal.
+        for color in VAULT_COLORS {
+            let ratio = contrast(color, chip_ink(color));
+            assert!(ratio >= 4.5, "{color:#08x} inks at only {ratio:.2}:1",);
+        }
+    }
+
+    #[test]
+    fn contrast_runs_from_one_to_twenty_one() {
+        assert!((contrast(0x0012_3456, 0x0012_3456) - 1.0).abs() < 0.001);
+        assert!((contrast(0x0000_0000, 0x00ff_ffff) - 21.0).abs() < 0.001);
+        // Symmetric: it is a ratio between two colors, not of one against another.
+        assert_eq!(
+            contrast(0x0000_0000, 0x00ff_ffff),
+            contrast(0x00ff_ffff, 0x0000_0000)
+        );
+    }
 
     /// The tick strip's per-match tops, matching what the app derives from its line
     /// index: each match's line baseline.

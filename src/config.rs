@@ -11,13 +11,55 @@ use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 
 use crate::platform::freetype::{FontConfig, FontFamily};
+use crate::theme::VAULT_COLORS;
 
 /// A notes vault: a root directory the editor roots its file tree and every note
 /// reference (images, wikilink embeds) against. Its name is the last component of
 /// the path.
+///
+/// The chip the vault rail shows for it is the rest: a color and the initials
+/// drawn on it. [`vaults`] derives both, so a configured vault is just a path.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Vault {
     pub path: PathBuf,
+    /// The rail chip's fill (0x00RRGGBB).
+    pub color: u32,
+    /// What the chip says: the first two characters of the vault's name, upper
+    /// case. Derived once here rather than per frame.
+    pub initials: String,
+}
+
+/// The configured vaults for `paths`, each dealt its rail chip: the colors run
+/// through [`VAULT_COLORS`] in list order, and the initials come from each name.
+///
+/// Dealing by position rather than by a hash of the name is what keeps a list of
+/// eight or fewer vaults free of two chips that look alike, which is the whole job
+/// of the color; past eight the palette wraps and two vaults share a color, told
+/// apart by their initials. The cost is that inserting a vault re-colors the ones
+/// below it, so a loader that lets a vault name its own color overwrites the field
+/// after.
+pub fn vaults(paths: impl IntoIterator<Item = PathBuf>) -> Vec<Vault> {
+    paths
+        .into_iter()
+        .enumerate()
+        .map(|(i, path)| Vault {
+            initials: vault_initials(&path),
+            color: VAULT_COLORS[i % VAULT_COLORS.len()],
+            path,
+        })
+        .collect()
+}
+
+/// The initials a vault's chip shows: the first two characters of its name, upper
+/// case. A one-character name gives one letter. A character that upper-cases into
+/// several (the German ß into SS) keeps its first, so two characters in are always
+/// two out and the chip cannot overflow its square.
+pub fn vault_initials(path: &Path) -> String {
+    vault_name(path)
+        .chars()
+        .take(2)
+        .filter_map(|c| c.to_uppercase().next())
+        .collect()
 }
 
 /// The display name for a vault root shown in the top bar: the final path
@@ -139,9 +181,7 @@ impl Default for Config {
             caret: CaretConfig::default(),
             // One vault to start, the notes folder in the user's home. A future
             // loader replaces this list from an on-disk config.
-            vaults: vec![Vault {
-                path: expand_tilde("~/notes"),
-            }],
+            vaults: vaults([expand_tilde("~/notes")]),
         }
     }
 }
@@ -286,5 +326,74 @@ mod tests {
         let config = Config::default();
         assert_eq!(config.vaults.len(), 1);
         assert_eq!(vault_name(&config.vaults[0].path), "notes");
+    }
+
+    #[test]
+    fn vault_initials_are_the_first_two_letters_upper_cased() {
+        assert_eq!(vault_initials(Path::new("/home/user/notes")), "NO");
+        assert_eq!(vault_initials(Path::new("/home/user/Work")), "WO");
+    }
+
+    #[test]
+    fn vault_initials_take_what_a_short_name_has() {
+        assert_eq!(vault_initials(Path::new("/home/user/w")), "W");
+    }
+
+    #[test]
+    fn vault_initials_never_run_past_two_characters() {
+        // ß upper-cases into two letters on its own, which must not push the chip to
+        // three or swallow the second character's own initial.
+        assert_eq!(vault_initials(Path::new("/home/user/ßb")), "SB");
+        assert_eq!(vault_initials(Path::new("/home/user/ßß")), "SS");
+    }
+
+    #[test]
+    fn vault_initials_keep_a_non_latin_name() {
+        // A name with no case of its own passes through, rather than emptying the
+        // chip: two characters in, two out.
+        assert_eq!(vault_initials(Path::new("/home/user/日本語")), "日本");
+    }
+
+    /// The vaults for a list of names under one parent.
+    fn named(names: &[&str]) -> Vec<Vault> {
+        vaults(names.iter().map(|n| PathBuf::from("/home/user").join(n)))
+    }
+
+    #[test]
+    fn a_configured_vault_carries_its_chip() {
+        let vs = named(&["notes"]);
+        assert_eq!(vs[0].path, PathBuf::from("/home/user/notes"));
+        assert_eq!(vs[0].initials, "NO");
+        assert!(VAULT_COLORS.contains(&vs[0].color));
+    }
+
+    #[test]
+    fn a_full_palette_of_vaults_is_all_different_colors() {
+        // The point of the color: no two chips in a configured list look alike, so
+        // the rail is glanceable rather than a column of near-identical squares.
+        let names = [
+            "notes", "work", "journal", "archive", "recipes", "code", "personal", "wiki",
+        ];
+        assert_eq!(names.len(), VAULT_COLORS.len());
+        let colors: std::collections::BTreeSet<u32> =
+            named(&names).iter().map(|v| v.color).collect();
+        assert_eq!(colors.len(), VAULT_COLORS.len());
+    }
+
+    #[test]
+    fn vaults_past_the_palette_wrap_rather_than_run_out() {
+        let names: Vec<String> = (0..VAULT_COLORS.len() + 2)
+            .map(|i| format!("vault{i}"))
+            .collect();
+        let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+        let vs = named(&refs);
+        assert_eq!(vs.len(), VAULT_COLORS.len() + 2);
+        // The ninth vault comes back round to the first color, not off the end.
+        assert_eq!(vs[VAULT_COLORS.len()].color, vs[0].color);
+    }
+
+    #[test]
+    fn vaults_with_no_paths_configure_nothing() {
+        assert!(vaults([]).is_empty());
     }
 }

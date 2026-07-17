@@ -663,6 +663,9 @@ pub(crate) enum Hit {
     /// Anywhere else while a context menu is open: the press dismisses the menu and
     /// goes no further, the way a pop-up's grab swallows the click that closes it.
     Menu,
+    /// Anywhere while a picture is open over the whole window: the press puts it away
+    /// and goes no further.
+    ImageView,
     /// The rail's chip for vault `i`: switch the window to it.
     Vault(usize),
     /// The rest of the vault rail; consumes the click, so a miss between chips does
@@ -749,6 +752,18 @@ pub(crate) enum DiskConflict {
     Changed,
     /// The file the buffer tracks was deleted or moved away on disk.
     Deleted,
+}
+
+/// What a press landed on in a picture's neighborhood, for a caller that has to
+/// treat the picture and its raw-source button differently.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum ImagePress {
+    /// Neither: the press is the text's to deal with.
+    Missed,
+    /// The corner button that pins the picture's raw source open. Toggled.
+    Button,
+    /// The picture itself. Selected, with a drag anchored on its line.
+    Picture,
 }
 
 /// What a call to [`EditorPane::save`] came to. A save is asked for by a keystroke,
@@ -1604,11 +1619,19 @@ impl EditorPane {
 
     /// Handle a press on an image button (toggles its raw source) or picture
     /// (selects it, and anchors a drag on its line so a sweep off the picture
-    /// selects it along with the text it reaches). Returns whether it was consumed.
-    pub(crate) fn image_press(&mut self, fonts: &Fonts, rect: Rect, px: f32, py: f32) -> bool {
+    /// selects it along with the text it reaches), and report which it was: a caller
+    /// counting clicks has to know a second one on the picture from a second one on
+    /// its button, since only the picture opens.
+    pub(crate) fn image_press(
+        &mut self,
+        fonts: &Fonts,
+        rect: Rect,
+        px: f32,
+        py: f32,
+    ) -> ImagePress {
         let (button, image) = {
             let Some((layout, _, y)) = self.layout_at(fonts, rect, py) else {
-                return false;
+                return ImagePress::Missed;
             };
             (
                 layout.image_button_at(fonts, px, y),
@@ -1621,17 +1644,17 @@ impl EditorPane {
             } else {
                 Some(ls)
             };
-            return true;
+            return ImagePress::Button;
         }
         let Some(ls) = image else {
-            return false;
+            return ImagePress::Missed;
         };
         let rope = self.text.rope();
         let line = rope.line_content_range(rope.byte_to_line(ls));
         self.raw_image = None;
         self.select_image(ls);
         self.drag = Some(DragSelect::image(ls, line));
-        true
+        ImagePress::Picture
     }
 
     /// Select the picture on the logical line starting at `ls`, dropping any text
@@ -2700,8 +2723,9 @@ mod tests {
             (60.0, y + 4.0)
         };
 
-        assert!(
+        assert_eq!(
             pane.image_press(&fonts, rect, ix, iy),
+            ImagePress::Picture,
             "the press lands on the picture"
         );
         assert_eq!(pane.selected_image, Some(0), "which the press selects");

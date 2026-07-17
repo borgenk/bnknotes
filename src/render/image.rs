@@ -60,6 +60,99 @@ impl Image {
     }
 }
 
+impl Image {
+    /// The square region `(x, y, side)` of this image, redrawn at `size` square: the
+    /// crop and the resample in one pass, since doing them apart would build a
+    /// full-size copy only to throw almost all of it away.
+    ///
+    /// Every source pixel a destination pixel covers is averaged into it (a box
+    /// filter), which is what keeps a photo shrunk to a chip from breaking into the
+    /// aliased speckle that picking one pixel per cell gives. The crop is clamped
+    /// into the image, so a stored crop still works against a file that has since
+    /// been edited to a different size.
+    pub fn crop_scaled(&self, x: u32, y: u32, side: u32, size: u32) -> Option<Image> {
+        if size == 0 || side == 0 || self.width == 0 || self.height == 0 {
+            return None;
+        }
+        let side = side.min(self.width).min(self.height);
+        let x = x.min(self.width - side);
+        let y = y.min(self.height - side);
+        let mut pixels = Vec::with_capacity((size * size) as usize);
+        for row in 0..size {
+            // The source band this destination row covers, at least one pixel tall.
+            let y0 = y + row * side / size;
+            let y1 = (y + (row + 1) * side / size).max(y0 + 1).min(y + side);
+            for col in 0..size {
+                let x0 = x + col * side / size;
+                let x1 = (x + (col + 1) * side / size).max(x0 + 1).min(x + side);
+                pixels.push(self.average(x0, y0, x1, y1));
+            }
+        }
+        Some(Image {
+            pixels,
+            width: size,
+            height: size,
+        })
+    }
+
+    /// The mean of the pixels in `[x0, x1) x [y0, y1)`, per channel. The box filter's
+    /// inner loop: sums fit a `u32` because a band of one image is at most 8192 wide
+    /// (see [`Limits`]) and each channel is a byte.
+    fn average(&self, x0: u32, y0: u32, x1: u32, y1: u32) -> u32 {
+        let (mut a, mut r, mut g, mut b, mut n) = (0u32, 0u32, 0u32, 0u32, 0u32);
+        for yy in y0..y1 {
+            let row = (yy * self.width) as usize;
+            for xx in x0..x1 {
+                let Some(px) = self.pixels.get(row + xx as usize) else {
+                    continue;
+                };
+                a += (px >> 24) & 0xff;
+                r += (px >> 16) & 0xff;
+                g += (px >> 8) & 0xff;
+                b += px & 0xff;
+                n += 1;
+            }
+        }
+        if n == 0 {
+            return 0;
+        }
+        ((a / n) << 24) | ((r / n) << 16) | ((g / n) << 8) | (b / n)
+    }
+
+    /// Clear the pixels outside a rounded rectangle of `radius` over the whole image,
+    /// so a square picture can be drawn as a rounded one without the renderer knowing
+    /// anything about it. Coverage is antialiased, which is what keeps the corner from
+    /// reading as a staircase beside the crisp corners the GPU draws.
+    pub fn round_corners(&mut self, radius: u32) {
+        if radius == 0 || self.width == 0 || self.height == 0 {
+            return;
+        }
+        let radius = radius.min(self.width / 2).min(self.height / 2) as f32;
+        let (w, h) = (self.width as f32, self.height as f32);
+        for y in 0..self.height {
+            for x in 0..self.width {
+                // Distance from the pixel's center to the rounded rectangle's edge,
+                // the standard rounded-box signed distance: positive is outside.
+                let px = x as f32 + 0.5;
+                let py = y as f32 + 0.5;
+                let dx = (radius - px).max(px - (w - radius)).max(0.0);
+                let dy = (radius - py).max(py - (h - radius)).max(0.0);
+                let d = (dx * dx + dy * dy).sqrt() - radius;
+                // One pixel of falloff across the edge, so the corner is smooth
+                // rather than stepped.
+                let cover = (0.5 - d).clamp(0.0, 1.0);
+                if cover < 1.0 {
+                    let i = (y * self.width + x) as usize;
+                    if let Some(pixel) = self.pixels.get_mut(i) {
+                        let a = ((*pixel >> 24) & 0xff) as f32 * cover;
+                        *pixel = (*pixel & 0x00ff_ffff) | ((a as u32) << 24);
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// The image formats the editor decodes, identified by their leading bytes.
 /// Sniffing the content rather than trusting the path's extension is both more
 /// robust (a mislabeled file still decodes) and the safer default.
@@ -248,6 +341,19 @@ impl ImageStore {
         }
     }
 
+    /// Hold `image` under `key` for the renderer to find, for a picture that was made
+    /// rather than read: a vault chip's baked icon has no file of its own, but it is
+    /// drawn the way every other image is, so it is stored the way every other image
+    /// is. `key` is the caller's to keep unique and to [`remove`](Self::remove).
+    pub fn insert(&mut self, key: String, image: Image) {
+        self.cache.insert(key, Some(image));
+    }
+
+    /// Drop what [`insert`](Self::insert) put under `key`, once nothing draws it.
+    pub fn remove(&mut self, key: &str) {
+        self.cache.remove(key);
+    }
+
     /// Point the store at the vault root, the base for attachment lookups,
     /// so a relative embed name resolves against the vault and its attachment
     /// folders as well as the note's directory. Clears the cache when the root
@@ -356,6 +462,145 @@ mod tests {
     // and a 16x16 solid-red JPEG. See src/render/testdata.
     const TINY_PNG: &[u8] = include_bytes!("testdata/tiny.png");
     const TINY_JPEG: &[u8] = include_bytes!("testdata/tiny.jpg");
+
+    /// A `w` by `h` image whose pixels are `f(x, y)`, opaque unless `f` says
+    /// otherwise.
+    fn built(w: u32, h: u32, f: impl Fn(u32, u32) -> u32) -> Image {
+        let mut pixels = Vec::with_capacity((w * h) as usize);
+        for y in 0..h {
+            for x in 0..w {
+                pixels.push(f(x, y));
+            }
+        }
+        Image {
+            pixels,
+            width: w,
+            height: h,
+        }
+    }
+
+    /// A solid image of one color.
+    fn solid(w: u32, h: u32, color: u32) -> Image {
+        built(w, h, |_, _| color)
+    }
+
+    #[test]
+    fn a_crop_takes_the_square_it_was_asked_for() {
+        // Four quadrants: the crop must bring back the one it names, not a corner of
+        // another. Scaled 1:1, so the pixels are the source's own.
+        let quad = built(4, 4, |x, y| match (x < 2, y < 2) {
+            (true, true) => 0xff11_1111,
+            (false, true) => 0xff22_2222,
+            (true, false) => 0xff33_3333,
+            (false, false) => 0xff44_4444,
+        });
+        let out = quad.crop_scaled(2, 0, 2, 2).expect("a crop");
+        assert_eq!(out.width, 2);
+        assert_eq!(out.height, 2);
+        assert!(
+            out.pixels.iter().all(|p| *p == 0xff22_2222),
+            "the top-right quadrant, whole: {:x?}",
+            out.pixels
+        );
+    }
+
+    #[test]
+    fn a_crop_averages_what_it_shrinks() {
+        // Two halves, black and white, shrunk to one pixel: the pixel is the mean of
+        // both, not whichever one a nearest-neighbor pick happened to land on. This
+        // is what keeps a photo on a 34px chip from turning to speckle.
+        let split = built(4, 4, |x, _| if x < 2 { 0xff00_0000 } else { 0xffff_ffff });
+        let out = split.crop_scaled(0, 0, 4, 1).expect("a crop");
+        assert_eq!(out.pixels.len(), 1);
+        let px = out.pixels[0];
+        for shift in [0, 8, 16] {
+            let channel = (px >> shift) & 0xff;
+            assert!(
+                (0x7e..=0x80).contains(&channel),
+                "channel {shift} averaged to {channel:x}, not the midpoint"
+            );
+        }
+    }
+
+    #[test]
+    fn a_crop_is_clamped_into_the_picture() {
+        // The crop is stored, the file is not: a picture edited to a smaller size
+        // since the roll must still give a chip rather than an error or a panic.
+        let img = solid(4, 4, 0xff30_60c0);
+        let out = img.crop_scaled(3, 3, 999, 2).expect("a clamped crop");
+        assert_eq!((out.width, out.height), (2, 2));
+        assert!(out.pixels.iter().all(|p| *p == 0xff30_60c0));
+    }
+
+    #[test]
+    fn a_crop_of_nothing_is_nothing() {
+        let img = solid(4, 4, 0xffff_ffff);
+        assert!(img.crop_scaled(0, 0, 4, 0).is_none(), "no size");
+        assert!(img.crop_scaled(0, 0, 0, 4).is_none(), "no crop");
+    }
+
+    #[test]
+    fn a_crop_scales_up_as_well_as_down() {
+        // A tight crop of a small picture is the case that stretches: every
+        // destination pixel must still come from inside the crop.
+        let img = built(4, 4, |x, y| if x == 0 && y == 0 { 0xffaa_bbcc } else { 0 });
+        let out = img.crop_scaled(0, 0, 1, 4).expect("a crop");
+        assert_eq!(out.pixels.len(), 16);
+        assert!(
+            out.pixels.iter().all(|p| *p == 0xffaa_bbcc),
+            "one pixel blown up is that pixel"
+        );
+    }
+
+    #[test]
+    fn rounding_clears_the_corners_and_keeps_the_middle() {
+        let mut img = solid(16, 16, 0xffff_ffff);
+        img.round_corners(6);
+        let at = |x: u32, y: u32| img.pixels[(y * 16 + x) as usize] >> 24;
+        assert_eq!(at(0, 0), 0, "the very corner is gone");
+        assert_eq!(at(15, 0), 0);
+        assert_eq!(at(0, 15), 0);
+        assert_eq!(at(15, 15), 0);
+        assert_eq!(at(8, 8), 0xff, "the middle is untouched");
+        assert_eq!(at(8, 0), 0xff, "and so is the middle of an edge");
+        // The color under a cleared corner is left alone; only its alpha goes, so a
+        // blend never pulls a stray color in.
+        assert_eq!(img.pixels[0] & 0x00ff_ffff, 0x00ff_ffff);
+    }
+
+    #[test]
+    fn rounding_is_antialiased() {
+        // A corner that steps rather than fades is the tell that a chip's picture was
+        // masked by hand; somewhere along it there must be a partly-covered pixel.
+        let mut img = solid(32, 32, 0xffff_ffff);
+        img.round_corners(10);
+        let partial = img
+            .pixels
+            .iter()
+            .filter(|p| {
+                let a = *p >> 24;
+                a > 0 && a < 0xff
+            })
+            .count();
+        assert!(partial > 8, "only {partial} pixels along the falloff");
+    }
+
+    #[test]
+    fn rounding_by_nothing_changes_nothing() {
+        let mut img = solid(8, 8, 0xff123456);
+        let before = img.pixels.clone();
+        img.round_corners(0);
+        assert_eq!(img.pixels, before);
+    }
+
+    #[test]
+    fn a_radius_past_the_middle_is_pulled_back_to_a_circle() {
+        // An absurd radius must not wrap round and clear the middle too.
+        let mut img = solid(16, 16, 0xffff_ffff);
+        img.round_corners(999);
+        assert_eq!(img.pixels[(8 * 16 + 8) as usize] >> 24, 0xff);
+        assert_eq!(img.pixels[0] >> 24, 0, "still a corner");
+    }
 
     #[test]
     fn an_extension_comes_from_the_bytes_not_their_source() {

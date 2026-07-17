@@ -24,6 +24,10 @@ use crate::theme::{MENU_ITEM_PAD_X, MENU_ITEM_VPAD, MENU_PAD};
 pub enum MenuAction {
     /// Save rail vault `i` into the config file, so it is a vault at every launch.
     SaveVault(usize),
+    /// Put the clipboard's picture on rail vault `i`'s chip.
+    PasteIcon(usize),
+    /// Take rail vault `i`'s picture away.
+    ClearIcon(usize),
 }
 
 /// One row of a menu: what it says, and what it does.

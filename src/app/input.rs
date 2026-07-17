@@ -2,12 +2,12 @@ use std::os::fd::AsRawFd;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-use super::{State, TabDrag, TabHover};
+use super::{State, TabDrag, TabHover, VaultDrag};
 use crate::find;
 use crate::keymap::{self, KeyAction};
 use crate::menu::{Menu, MenuLayout};
 use crate::paint::{conflict_banner_layout, BannerButton};
-use crate::pane::{CaretAnim, Columns, DiskConflict, EditorPane, Focus, Hit, SPLITTER};
+use crate::pane::{CaretAnim, Columns, DiskConflict, EditorPane, Focus, Hit, ImagePress, SPLITTER};
 use crate::platform::error::{Error, Result};
 use crate::platform::ffi;
 use crate::platform::freetype::{Fonts, Metrics};
@@ -17,7 +17,7 @@ use crate::platform::protocol::{
 };
 use crate::platform::scroll::{self, Scrollbar};
 use crate::platform::wire::{Arg, Reader};
-use crate::theme::{SCROLL_MIN_THUMB, TAB_DRAG_THRESHOLD, TREE_PAD};
+use crate::theme::{DRAG_THRESHOLD, SCROLL_MIN_THUMB, TREE_PAD};
 
 /// What the Tab key inserts: spaces (a "soft tab"), not a literal `'\t'`. This
 /// keeps the buffer free of tab characters and spares the renderer any tab-stop
@@ -288,6 +288,16 @@ impl State {
         // rather than snapping. Set for every action (including non-caret ones); it is
         // only read when the caret's offset actually moves.
         self.caret_from_pointer = false;
+        // A picture over the window is the topmost thing there is, and the keyboard
+        // reaches it first: Escape puts it away and does no more, and any other key
+        // that acts puts it away before acting, since typing under a picture that
+        // covers the window would be typing blind.
+        if self.image_view.is_some() && action != KeyAction::None {
+            self.close_image_view();
+            if action == KeyAction::Escape {
+                return Ok(());
+            }
+        }
         // An open context menu is the pointer's, but it must not outlive the moment:
         // Escape dismisses it and does no more (that is what the key is for here),
         // and any other key that acts drops it first, rather than leaving a panel
@@ -609,6 +619,8 @@ impl State {
                     self.drag_scroll_to(py);
                 } else if self.drag_tab.is_some() {
                     self.drag_tab_to(px);
+                } else if self.drag_vault.is_some() {
+                    self.drag_vault_to(py);
                 } else {
                     let i = self.active_editor();
                     if matches!(self.focus, Focus::Editor(_)) && self.editors[i].dragging() {
@@ -664,6 +676,10 @@ impl State {
                                 self.dirty = true;
                             }
                         }
+                        // A chip is let go of here rather than at press: this is where
+                        // a rail reorder is remembered, and where a chip that never
+                        // moved finally switches vault.
+                        self.release_vault();
                         let i = self.active_editor();
                         let was_selecting = self.editors[i].dragging();
                         self.editors[i].end_drag();
@@ -722,6 +738,12 @@ impl State {
                 Some(i) => Hit::MenuItem(i),
                 None => Hit::Menu,
             };
+        }
+        // A picture over the window covers everything under it, so it takes every
+        // press: the click that lands on what it covers is the click that puts it
+        // away, and nothing beneath is clicked by accident on the way out.
+        if self.image_view.is_some() {
+            return Hit::ImageView;
         }
         let cols = self.columns();
         let x = px as i32;
@@ -850,6 +872,75 @@ impl State {
             self.panes.split_ratio = a.clamp(0.1, 0.9);
         }
         self.dirty = true;
+    }
+
+    /// Take hold of vault chip `i`, pressed at `py`, without acting on it yet: the
+    /// press becomes a reorder if the pointer moves and a vault switch if it does not
+    /// (see [`Self::release_vault`]).
+    fn press_vault(&mut self, i: usize, py: f32) {
+        let grab_dy =
+            crate::paint::rail_buttons(self.columns().rail_chips, self.vaults.len(), self.scale())
+                .find(|(k, _)| *k == i)
+                .map(|(_, chip)| py as i32 - chip.y)
+                .unwrap_or(0);
+        self.drag_vault = Some(VaultDrag {
+            vault: i,
+            grab_y: py,
+            grab_dy,
+            moved: false,
+        });
+    }
+
+    /// Carry a held chip to `py`, reordering the rail as it passes its neighbors.
+    /// The rail is reordered as the drag goes rather than at the drop, so the chips
+    /// show where the drop will land.
+    pub(super) fn drag_vault_to(&mut self, py: f32) {
+        let Some(mut drag) = self.drag_vault else {
+            return;
+        };
+        if !drag.moved {
+            // A press that has not traveled is still a click; a hand is never quite
+            // still, so a chip must not slip out of one on the way to a switch.
+            if (py - drag.grab_y).abs() < self.scale().px(DRAG_THRESHOLD) as f32 {
+                return;
+            }
+            drag.moved = true;
+            // The hover names a chip by index, and a reorder moves the chips out from
+            // under every index; the chip in flight draws its own lift, so the rail
+            // has no use for a stale one until the pointer is free again.
+            self.hovered_vault = None;
+        }
+        let target = crate::paint::rail_drop_index(
+            self.columns().rail_chips,
+            self.vaults.len(),
+            self.scale(),
+            Some(drag.vault),
+            py,
+        );
+        if target != drag.vault && target < self.vaults.len() {
+            let vault = self.vaults.remove(drag.vault);
+            self.vaults.insert(target, vault);
+            drag.vault = target;
+        }
+        self.drag_vault = Some(drag);
+        self.dirty = true;
+    }
+
+    /// Let go of a held chip: a chip that moved leaves the rail in its new order (and
+    /// is remembered there), and one that never moved was a click, so it switches the
+    /// window to its vault.
+    pub(super) fn release_vault(&mut self) {
+        let Some(drag) = self.drag_vault.take() else {
+            return;
+        };
+        if drag.moved {
+            self.save_session();
+            // The pointer is free again, so whatever it came to rest over lights up.
+            self.update_rail_hover();
+            self.dirty = true;
+        } else {
+            self.switch_vault(drag.vault);
+        }
     }
 
     /// Update which item of the open context menu the pointer is over, repainting if
@@ -1095,9 +1186,12 @@ impl State {
                 | Hit::TreeFilter
                 | Hit::MenuItem(_)
                 | Hit::Vault(_) => SHAPE_POINTER,
-                Hit::TabStrip(_) | Hit::TreeFooter | Hit::Rail | Hit::Menu | Hit::None => {
-                    SHAPE_DEFAULT
-                }
+                Hit::TabStrip(_)
+                | Hit::TreeFooter
+                | Hit::Rail
+                | Hit::Menu
+                | Hit::ImageView
+                | Hit::None => SHAPE_DEFAULT,
             }
         };
         if shape != self.cursor_shape {
@@ -1271,7 +1365,15 @@ impl State {
             Hit::Menu => {
                 self.close_menu();
             }
-            Hit::Vault(i) => self.switch_vault(i),
+            // Any press puts an opened picture away: it covers the window, so there
+            // is nothing else the click could have been meant for.
+            Hit::ImageView => {
+                self.close_image_view();
+            }
+            // A chip takes hold of the press without acting on it: what it meant is
+            // only known at release, when the pointer either moved (a reorder) or did
+            // not (a switch).
+            Hit::Vault(i) => self.press_vault(i, py),
             // The rail around its chips: a click there acts on nothing, but it must
             // not reach the column beside it.
             Hit::Rail => {}
@@ -1389,7 +1491,7 @@ impl State {
             return;
         };
         if !drag.moved {
-            if (px - drag.grab_x).abs() < self.scale().px(TAB_DRAG_THRESHOLD) as f32 {
+            if (px - drag.grab_x).abs() < self.scale().px(DRAG_THRESHOLD) as f32 {
                 return;
             }
             drag.moved = true;
@@ -1537,10 +1639,25 @@ impl State {
             return;
         }
         // Image interactions win over text.
-        if self.editors[i].image_press(&self.fonts, rect, px, py) {
-            self.dirty = true;
-            self.bump_caret();
-            return;
+        match self.editors[i].image_press(&self.fonts, rect, px, py) {
+            ImagePress::Button => {
+                self.dirty = true;
+                self.bump_caret();
+                return;
+            }
+            ImagePress::Picture => {
+                // A second click on the picture opens it over the whole window. The
+                // chain is registered here rather than on the way past, since a click
+                // the image path consumes never reaches the text's own counting.
+                let (count, _) = self.editors[i].clicks.register(px, py, Instant::now());
+                if count >= 2 {
+                    self.open_image_view(i);
+                }
+                self.dirty = true;
+                self.bump_caret();
+                return;
+            }
+            ImagePress::Missed => {}
         }
         self.editors[i].selected_image = None;
         self.editors[i].raw_image = None;

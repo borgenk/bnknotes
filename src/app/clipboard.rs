@@ -228,7 +228,7 @@ impl State {
     }
 
     /// Whether the clipboard holds an image this can decode.
-    fn clipboard_offers_image(&self) -> bool {
+    pub(super) fn clipboard_offers_image(&self) -> bool {
         if self.clipboard.source != 0 {
             return self.clipboard.mimes.iter().any(|m| IMAGE_MIMES.contains(m));
         }
@@ -266,7 +266,7 @@ impl State {
     /// [`Self::clipboard_text`], including why our own selection is answered from our
     /// own copy rather than through the compositor: receiving would block on a pipe
     /// only we can fill.
-    fn clipboard_image(&mut self) -> Result<Option<Vec<u8>>> {
+    pub(super) fn clipboard_image(&mut self) -> Result<Option<Vec<u8>>> {
         if self.clipboard.source != 0 {
             if self.clipboard.mimes.iter().any(|m| IMAGE_MIMES.contains(m)) {
                 return Ok(Some(self.clipboard.data.clone()));

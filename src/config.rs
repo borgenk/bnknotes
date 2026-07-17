@@ -28,6 +28,7 @@
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 
+use crate::icon::VaultIcon;
 use crate::platform::error::{Error, Result};
 use crate::platform::freetype::{FontConfig, FontFamily};
 use crate::theme::VAULT_COLORS;
@@ -64,6 +65,25 @@ pub struct Vault {
     /// Whether the config file names this vault, which decides both how the rail
     /// draws its chip and whether the chip offers to save it.
     pub kind: VaultKind,
+    /// The picture the chip wears, if it was given one, and the square of it shown.
+    pub icon: Option<VaultIcon>,
+    /// The keys that picture's baked bitmaps are drawn under, `None` until they are
+    /// baked (see the app's icon syncing). Derived, like the initials, rather than
+    /// worked out per frame: a chip is drawn far more often than its icon changes.
+    pub icon_keys: Option<IconKeys>,
+}
+
+/// What a chip's picture is drawn from: the bitmap it wears, and the one it wears
+/// under the pointer, which is the same square of the same picture taken closer in.
+///
+/// Two bitmaps rather than one sampled two ways, because a chip's rounded corners
+/// are baked into its picture's own alpha: drawing a smaller part of one bitmap
+/// would leave the corners cut flat where the zoom crossed them, so each is rounded
+/// as itself.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct IconKeys {
+    pub rest: String,
+    pub hover: String,
 }
 
 /// Where a vault in the rail came from.
@@ -79,30 +99,55 @@ pub enum VaultKind {
 }
 
 impl Vault {
-    /// The vault at `path`, dealt the rail chip for position `i`: the colors run
-    /// through [`VAULT_COLORS`] in rail order, and the initials come from the name.
-    ///
-    /// Dealing by position rather than by a hash of the name is what keeps a list of
-    /// eight or fewer vaults free of two chips that look alike, which is the whole job
-    /// of the color; past eight the palette wraps and two vaults share a color, told
-    /// apart by their initials. A temporary vault sits at the end of the rail and is
-    /// dealt from the same run, so saving it keeps the color its chip already had.
-    pub fn new(path: PathBuf, i: usize, kind: VaultKind) -> Self {
+    /// The vault at `path`, wearing `color`, with the initials its name gives and no
+    /// picture yet.
+    pub fn new(path: PathBuf, color: u32, kind: VaultKind) -> Self {
         Self {
             initials: vault_initials(&path),
-            color: VAULT_COLORS[i % VAULT_COLORS.len()],
+            color,
             path,
             kind,
+            icon: None,
+            icon_keys: None,
         }
+    }
+
+    /// Give the chip `icon` (or take its picture away with `None`), dropping the
+    /// baked bitmaps' keys so the next frame bakes the new one.
+    pub fn set_icon(&mut self, icon: Option<VaultIcon>) {
+        self.icon = icon;
+        self.icon_keys = None;
     }
 }
 
-/// The saved vaults for `paths`, in rail order.
+/// A color for a new chip: the first in [`VAULT_COLORS`] that no chip in the rail
+/// wears yet, else (once every color is spoken for) the one position `i` lands on.
+///
+/// Handing out the unused colors first is the whole job of the color: a rail of
+/// eight or fewer has no two chips that look alike, so a glance tells them apart.
+/// Past eight the palette wraps and two vaults share a color, told apart by their
+/// initials. A color is dealt once and then remembered (see [`crate::store`]),
+/// because the rail can be dragged into any order and a color re-derived from a
+/// chip's position would repaint every chip a drag passed.
+pub fn deal_color(taken: &[u32], i: usize) -> u32 {
+    VAULT_COLORS
+        .iter()
+        .copied()
+        .find(|c| !taken.contains(c))
+        .unwrap_or(VAULT_COLORS[i % VAULT_COLORS.len()])
+}
+
+/// The saved vaults for `paths`, in the order given, each dealt a color.
 pub fn vaults(paths: impl IntoIterator<Item = PathBuf>) -> Vec<Vault> {
+    let mut taken: Vec<u32> = Vec::new();
     paths
         .into_iter()
         .enumerate()
-        .map(|(i, path)| Vault::new(path, i, VaultKind::Saved))
+        .map(|(i, path)| {
+            let color = deal_color(&taken, i);
+            taken.push(color);
+            Vault::new(path, color, VaultKind::Saved)
+        })
         .collect()
 }
 

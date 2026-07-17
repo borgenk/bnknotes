@@ -30,12 +30,14 @@ use std::time::{Duration, Instant};
 use self::clipboard::{is_text_mime, ClipboardState, CLIPBOARD_MIMES, IMAGE_MIMES};
 use self::input::KeyRepeat;
 use self::present::GpuPresentation;
-use crate::config::{self, vault_name, CaretConfig, Config, Vault, VaultKind};
+use crate::config::{self, vault_name, CaretConfig, Config, IconKeys, Vault, VaultKind};
+use crate::icon;
 use crate::menu::{Menu, MenuAction, MenuItem};
 use crate::paint::{
     build_display_list, build_find_paint, conflict_banner_layout, font_sizes, measure_tree,
-    push_conflict_banner, push_menu, push_rail, push_splitter, push_top_bar, push_tree,
-    top_bar_height, tree_metrics, BarCtx, CaretPaint, PaintParams, TabStrip,
+    push_conflict_banner, push_image_view, push_menu, push_rail, push_splitter, push_top_bar,
+    push_tree, top_bar_height, tree_metrics, BarCtx, CaretPaint, PaintParams, RailDragView,
+    RailView, TabStrip,
 };
 use crate::pane::{
     restore_group, CaretAnim, CaretFrame, Columns, Focus, Hit, PaneGroup, PaneLayout, Saved,
@@ -54,10 +56,11 @@ use crate::platform::protocol::{
 use crate::platform::scroll::{self, Scrollbar};
 use crate::platform::wire::{Arg, Message, Reader};
 use crate::platform::xkb::Xkb;
-use crate::render::display::DisplayList;
+use crate::render::display::{DisplayList, DrawCmd};
+use crate::render::image::{Image, ImageStore, Limits};
 use crate::scale::Scale;
 use crate::store;
-use crate::theme::{CARET_WIDTH, FONT_SIZE};
+use crate::theme::{BACKGROUND, CARET_WIDTH, FONT_SIZE, ICON_HOVER_ZOOM, RAIL_RADIUS};
 use crate::tree;
 use crate::watch::FileWatcher;
 
@@ -206,6 +209,33 @@ struct TabDrag {
     moved: bool,
 }
 
+/// A picture shown over the whole window: which pane's it is (so its file resolves
+/// against that pane's store, the same way the note's own copy of it does), and the
+/// destination it was written with, which is what the store keys it by.
+#[derive(Clone)]
+struct ImageView {
+    pane: usize,
+    raw: String,
+}
+
+/// An in-progress vault drag-to-reorder, the rail's answer to [`TabDrag`] and the
+/// same shape down the y axis: which chip (by its current index, which the reorder
+/// keeps up to date), the pointer y at press, the grab offset within the chip, and
+/// whether the press has crossed the threshold into a drag.
+///
+/// Where it parts from a tab: a tab selects on press and may then be dragged, but a
+/// chip only switches vault on release, and only if it never moved. Switching is not
+/// a selection, it is saving both panes and rebuilding them around another vault's
+/// tabs, and doing that to a chip the user meant to drag would swap the window's
+/// contents out from under the drag.
+#[derive(Clone, Copy)]
+struct VaultDrag {
+    vault: usize,
+    grab_y: f32,
+    grab_dy: i32,
+    moved: bool,
+}
+
 impl TabHover {
     /// The hovered tab index in pane `g` (its body highlight), if any.
     fn tab_in(self, g: usize) -> Option<usize> {
@@ -257,9 +287,24 @@ struct State {
     /// Which vault chip the pointer is over, for the rail's hover lift; `None` when
     /// off every chip.
     hovered_vault: Option<usize>,
+    /// A chip being dragged to a new place in the rail, `None` when none is.
+    drag_vault: Option<VaultDrag>,
+    /// The chips' baked icons, keyed by [`Vault::icon_key`]: a crop of a vault
+    /// picture, resampled to the chip, tinted and rounded, ready for the renderer to
+    /// blit like any other image. Baked by [`Self::sync_icons`].
+    icons: ImageStore,
+    /// The chip side the icons in `icons` were baked for, so a display-scale change
+    /// bakes them again rather than letting the GPU stretch a small one.
+    icon_size: i32,
+    /// The next baked icon's key. A counter, so a newly pasted icon is a key nothing
+    /// has drawn: the damage diff sees a command that changed, and the renderer
+    /// uploads a texture it has not got, both of which a stable key would hide.
+    icon_seq: u64,
     /// The open context menu, `None` when none is. It floats over the chrome and
     /// takes every press while it is up (see [`crate::menu`]).
     menu: Option<Menu>,
+    /// A picture opened over the whole window by a double-click, `None` when none is.
+    image_view: Option<ImageView>,
     /// Every vault's remembered settings (the sidebar's folder filter), kept whole
     /// so saving the active vault's choice leaves the other vaults' alone.
     vault_prefs: store::VaultPrefs,
@@ -483,22 +528,103 @@ fn autosave_deadline(
     current
 }
 
-/// The vaults the rail shows: the saved ones the config names, and after them the
-/// active root as a temporary vault when the config does not name it (`bnknotes .`
-/// in a directory that is not a vault, or a file opened outside every vault).
+/// The rail this window opens with: the vaults the config names, arranged the way
+/// the rail was last left (`stored`), and after them the active `root` as a
+/// temporary vault when the config does not name it (`bnknotes .` in a directory
+/// that is not a vault, or a file opened outside every vault).
 ///
-/// Last is where a temporary vault goes, so the saved chips keep the colors and
-/// the order the config dealt them, and saving one later moves nothing: it is
-/// appended to the config, which is where it already sits in the rail.
-fn rail_vaults(mut vaults: Vec<Vault>, root: &Path) -> Vec<Vault> {
-    if !vaults.iter().any(|v| v.path == root) {
-        vaults.push(Vault::new(
-            root.to_path_buf(),
-            vaults.len(),
-            VaultKind::Temporary,
-        ));
+/// The two lists answer different questions, which is why both are read. The config
+/// says which vaults there are; a vault only in it is new, and joins the end of the
+/// rail wearing the first color no chip wears yet. The stored rail says where the
+/// chips sit and what they wear; an entry only in it names a vault the config no
+/// longer has, and is dropped. So dragging a chip is remembered, hand-editing the
+/// config still adds and removes vaults, and neither undoes the other.
+///
+/// A temporary vault is always last and is never stored: it belongs to this window's
+/// launch, not to the rail's arrangement.
+fn rail_vaults(configured: Vec<Vault>, stored: &[store::RailVault], root: &Path) -> Vec<Vault> {
+    let mut taken: Vec<u32> = Vec::new();
+    let mut arranged: Vec<Vault> = Vec::new();
+    // The stored order first, keeping only the chips the config still names, and only
+    // one chip per vault however a hand-edited file came to name one twice.
+    for chip in stored {
+        let named = configured.iter().any(|v| v.path == chip.root);
+        if !named || arranged.iter().any(|v| v.path == chip.root) {
+            continue;
+        }
+        taken.push(chip.color);
+        let mut vault = Vault::new(chip.root.clone(), chip.color, VaultKind::Saved);
+        vault.icon = chip.icon.clone();
+        arranged.push(vault);
     }
+    // Then whatever the config has that the rail has not shown before.
+    for vault in &configured {
+        if arranged.iter().any(|v| v.path == vault.path) {
+            continue;
+        }
+        let color = config::deal_color(&taken, arranged.len());
+        taken.push(color);
+        arranged.push(Vault::new(vault.path.clone(), color, VaultKind::Saved));
+    }
+    if !arranged.iter().any(|v| v.path == root) {
+        let color = config::deal_color(&taken, arranged.len());
+        arranged.push(Vault::new(root.to_path_buf(), color, VaultKind::Temporary));
+    }
+    arranged
+}
+
+/// Bake `icon` into the two bitmaps a chip of `side` device pixels wears: its square
+/// of the picture at rest, and the same square taken [`ICON_HOVER_ZOOM`] closer in
+/// for under the pointer. Both are resampled to the chip and rounded by `radius` to
+/// the chip's own corners.
+///
+/// The picture is left as it is. A chip wearing one shows no color and no letters
+/// (see the rail's painter), so there is nothing on it for a wash to keep legible,
+/// and a picture worth choosing is worth seeing. The rounding is baked in because an
+/// image is drawn as a plain quad: the alpha carries the corners the renderer would
+/// otherwise square off. That is also why the pointer gets a bitmap of its own
+/// rather than a closer look at this one: sampling inside a bitmap whose corners are
+/// already rounded would cut each of them flat where the zoom crossed it.
+///
+/// One decode, two crops. `None` when the picture cannot be read or decoded, which
+/// is a file that has moved or been deleted since it was pasted.
+fn bake_icon(icon: &icon::VaultIcon, side: i32, radius: i32) -> Option<(Image, Image)> {
+    let size = u32::try_from(side).ok()?;
+    let bytes = std::fs::read(&icon.source).ok()?;
+    let source = Image::decode(&bytes, Limits::default()).ok()?;
+    let radius = u32::try_from(radius).unwrap_or(0);
+    let mut rest = source.crop_scaled(icon.x, icon.y, icon.side, size)?;
+    rest.round_corners(radius);
+    let (hx, hy, hside) = zoomed_square(icon.x, icon.y, icon.side);
+    let mut hover = source.crop_scaled(hx, hy, hside, size)?;
+    hover.round_corners(radius);
+    Some((rest, hover))
+}
+
+/// The square `(x, y, side)` taken [`ICON_HOVER_ZOOM`] closer in, about the same
+/// middle: what a chip shows under the pointer, so the picture pushes toward the
+/// pointer while the chip itself stays exactly where it was and the rail's rhythm
+/// never wobbles.
+fn zoomed_square(x: u32, y: u32, side: u32) -> (u32, u32, u32) {
+    let zoomed = ((side as f32 / ICON_HOVER_ZOOM) as u32).max(1).min(side);
+    let inset = (side - zoomed) / 2;
+    (x + inset, y + inset, zoomed)
+}
+
+/// The rail's arrangement to remember: its saved chips, in order, each with the
+/// color it wears. A temporary vault is left out, since it is gone by the next
+/// launch and a rail full of the directories someone once opened is not an
+/// arrangement worth keeping.
+fn rail_session(vaults: &[Vault]) -> Vec<store::RailVault> {
     vaults
+        .iter()
+        .filter(|v| v.kind == VaultKind::Saved)
+        .map(|v| store::RailVault {
+            root: v.path.clone(),
+            color: v.color,
+            icon: v.icon.clone(),
+        })
+        .collect()
 }
 
 /// The configured vault that holds `file`, if any: the vault whose root is an
@@ -563,9 +689,9 @@ impl State {
             session.active_vault.as_deref(),
             &config.vaults,
         );
-        // A root the config does not name rides along as a temporary vault, so the
-        // rail shows where the window actually is and can offer to save it.
-        let vaults = rail_vaults(config.vaults, &root);
+        // The rail as it was last left, plus a temporary vault for a root the config
+        // does not name, so the rail shows where the window actually is.
+        let vaults = rail_vaults(config.vaults, &session.rail, &root);
 
         // Tabs and expanded folders travel with the vault, not the window: restore
         // the resolved vault's own layout, defaulting to a first-run one (no tabs,
@@ -640,7 +766,12 @@ impl State {
             tree,
             vaults,
             hovered_vault: None,
+            drag_vault: None,
+            icons: ImageStore::new(None),
+            icon_size: 0,
+            icon_seq: 0,
             menu: None,
+            image_view: None,
             vault_prefs: session.vaults,
             panes,
             focus,
@@ -1006,6 +1137,7 @@ impl State {
             focus,
             active_vault: Some(self.tree.tree.root().to_path_buf()),
             vaults: self.vault_prefs.clone(),
+            rail: rail_session(&self.vaults),
         }
     }
 
@@ -1071,7 +1203,10 @@ impl State {
         self.tree.scroll_y = 0;
         self.tree.selected = None;
         self.tree.hovered = None;
-        // Transients that name a tab or a row of the vault being left.
+        // Transients that name a tab or a row of the vault being left. A picture
+        // opened over the window is one of them: it belongs to a note that is no
+        // longer open, and the store it was drawn from goes with the pane.
+        self.close_image_view();
         self.tab_scroll = [0, 0];
         self.tab_anchor = [(0, 0); 2];
         self.drag_tab = None;
@@ -1098,16 +1233,39 @@ impl State {
         self.dirty = true;
     }
 
-    /// What a right-click at `(px, py)` offers. Only a temporary vault's chip offers
-    /// anything so far: the one action that makes it permanent.
+    /// What a right-click at `(px, py)` offers. Only the rail's chips offer anything
+    /// so far: a picture for the chip, and, for a vault the config does not name, the
+    /// one action that makes it permanent.
     fn menu_items_at(&self, px: f32, py: f32) -> Vec<MenuItem> {
-        match self.hit_test(px, py) {
-            Hit::Vault(i) if self.is_temporary_vault(i) => vec![MenuItem {
+        let Hit::Vault(i) = self.hit_test(px, py) else {
+            return Vec::new();
+        };
+        let mut items = Vec::new();
+        if self.is_temporary_vault(i) {
+            items.push(MenuItem {
                 label: "Save as vault",
                 action: MenuAction::SaveVault(i),
-            }],
-            _ => Vec::new(),
+            });
         }
+        let has_icon = self.vaults.get(i).is_some_and(|v| v.icon.is_some());
+        // Offered only while there is a picture to take, so the item is never one that
+        // would do nothing: snip a region with whatever tool puts a picture on the
+        // clipboard, then right-click the chip. It names what it will use rather than
+        // what it will do: "paste" at a chip that already looks like an icon reads as
+        // pasting an icon, and the picture on the clipboard is the part in question.
+        if self.clipboard_offers_image() {
+            items.push(MenuItem {
+                label: "Use image from clipboard",
+                action: MenuAction::PasteIcon(i),
+            });
+        }
+        if has_icon {
+            items.push(MenuItem {
+                label: "Clear icon",
+                action: MenuAction::ClearIcon(i),
+            });
+        }
+        items
     }
 
     /// Whether rail vault `i` is one the config does not name, the only thing the
@@ -1116,6 +1274,27 @@ impl State {
         self.vaults
             .get(i)
             .is_some_and(|v| v.kind == VaultKind::Temporary)
+    }
+
+    /// Open the picture pane `i` has selected over the whole window, the double-click
+    /// on it. A line that is no longer a picture (the source changed under the
+    /// pointer) opens nothing.
+    pub(super) fn open_image_view(&mut self, i: usize) {
+        let Some(ls) = self.editors[i].selected_image else {
+            return;
+        };
+        let Some(raw) = self.image_path_at(i, ls) else {
+            return;
+        };
+        self.image_view = Some(ImageView { pane: i, raw });
+        self.dirty = true;
+    }
+
+    /// Put the full-window picture away, reporting whether one was up.
+    pub(super) fn close_image_view(&mut self) -> bool {
+        let was_open = self.image_view.take().is_some();
+        self.dirty |= was_open;
+        was_open
     }
 
     /// Close the menu if one is open, reporting whether there was one. The caller
@@ -1131,7 +1310,150 @@ impl State {
         self.close_menu();
         match action {
             MenuAction::SaveVault(i) => self.save_vault(i),
+            MenuAction::PasteIcon(i) => self.paste_icon(i),
+            MenuAction::ClearIcon(i) => self.clear_icon(i),
         }
+    }
+
+    /// Put the clipboard's picture on vault `i`'s chip, the menu's "Use image from
+    /// clipboard".
+    ///
+    /// The clipboard is the whole interface: any tool that snips a region of the
+    /// screen chooses the picture and frames it, which is a better judge of what a
+    /// 34px square should show than anything here could be. The chip shows the middle
+    /// square of what was pasted, since that is what the snip was aimed at.
+    pub(super) fn paste_icon(&mut self, i: usize) {
+        let bytes = match self.clipboard_image() {
+            Ok(Some(bytes)) => bytes,
+            // The menu only offers this while the clipboard holds a picture, so
+            // there is nothing to say when it does not: the clipboard changed under
+            // the open menu, and the chip stays as it was.
+            Ok(None) => return,
+            Err(e) => {
+                eprintln!("bnknotes: could not read the clipboard: {e}");
+                return;
+            }
+        };
+        let Some(vault) = self.vaults.get(i) else {
+            return;
+        };
+        let pasted = match icon::paste(&vault.path.clone(), &bytes) {
+            Ok(icon) => icon,
+            Err(e) => {
+                eprintln!("bnknotes: could not set the icon: {e}");
+                return;
+            }
+        };
+        // The picture being replaced is nobody's now: its file goes with it, so the
+        // icons folder holds the icons in use and nothing else.
+        let stale = self.vaults.get(i).and_then(|v| v.icon.clone());
+        if let Some(vault) = self.vaults.get_mut(i) {
+            vault.set_icon(Some(pasted));
+        }
+        if let Some(stale) = stale {
+            self.drop_icon_file(i, &stale);
+        }
+        self.save_session();
+        self.dirty = true;
+    }
+
+    /// Delete `stale`'s file, unless vault `i` still points at it (a picture pasted
+    /// over itself writes the same file, and deleting it would leave a chip pointing
+    /// at nothing).
+    fn drop_icon_file(&self, i: usize, stale: &icon::VaultIcon) {
+        let live = self
+            .vaults
+            .get(i)
+            .and_then(|v| v.icon.as_ref())
+            .is_some_and(|icon| icon.source == stale.source);
+        if !live {
+            icon::discard(stale);
+        }
+    }
+
+    /// Take vault `i`'s picture away, the menu's "Clear icon": the chip goes back to
+    /// the color and letters it had before, and the picture's file goes with it.
+    pub(super) fn clear_icon(&mut self, i: usize) {
+        let Some(vault) = self.vaults.get_mut(i) else {
+            return;
+        };
+        let Some(stale) = vault.icon.clone() else {
+            return;
+        };
+        let keys = vault.icon_keys.clone();
+        vault.set_icon(None);
+        self.drop_icon_bitmaps(keys);
+        self.drop_icon_file(i, &stale);
+        self.save_session();
+        self.dirty = true;
+    }
+
+    /// Bake whatever chip icons are missing, and re-bake all of them when the chip
+    /// size has changed under them (a display-scale change).
+    ///
+    /// Called once per frame build. In the steady state it is a walk of the chips
+    /// comparing two fields, and allocates nothing: only an icon that was just rolled
+    /// (or a scale that just moved) reaches the decoder.
+    fn sync_icons(&mut self, side: i32) {
+        if side <= 0 {
+            return;
+        }
+        if self.icon_size != side {
+            // The chips changed size, so every baked picture is the wrong one: drop
+            // the keys and let the loop below bake them again at the new size.
+            self.icon_size = side;
+            let stale: Vec<Option<IconKeys>> =
+                self.vaults.iter_mut().map(|v| v.icon_keys.take()).collect();
+            for keys in stale {
+                self.drop_icon_bitmaps(keys);
+            }
+        }
+        for i in 0..self.vaults.len() {
+            let Some(vault) = self.vaults.get(i) else {
+                continue;
+            };
+            if vault.icon.is_none() || vault.icon_keys.is_some() {
+                continue;
+            }
+            let Some(icon) = vault.icon.clone() else {
+                continue;
+            };
+            let radius = self.scale().px(RAIL_RADIUS);
+            let Some((rest, hover)) = bake_icon(&icon, side, radius) else {
+                // The picture is gone or no longer decodes: the chip keeps its color,
+                // and the icon goes rather than being retried every frame.
+                if let Some(vault) = self.vaults.get_mut(i) {
+                    vault.set_icon(None);
+                }
+                continue;
+            };
+            let keys = IconKeys {
+                rest: self.next_icon_key(),
+                hover: self.next_icon_key(),
+            };
+            self.icons.insert(keys.rest.clone(), rest);
+            self.icons.insert(keys.hover.clone(), hover);
+            if let Some(vault) = self.vaults.get_mut(i) {
+                vault.icon_keys = Some(keys);
+            }
+        }
+    }
+
+    /// A key nothing has drawn under, for a bitmap about to be baked. A counter, so a
+    /// picture that replaced another is a key the damage diff and the renderer both
+    /// see as new, which a name derived from the vault would hide.
+    fn next_icon_key(&mut self) -> String {
+        self.icon_seq += 1;
+        format!("vault-icon-{}", self.icon_seq)
+    }
+
+    /// Drop the bitmaps `keys` names, once nothing draws them.
+    fn drop_icon_bitmaps(&mut self, keys: Option<IconKeys>) {
+        let Some(keys) = keys else {
+            return;
+        };
+        self.icons.remove(&keys.rest);
+        self.icons.remove(&keys.hover);
     }
 
     /// Save temporary vault `i` into the config file, the rail menu's one item: its
@@ -1153,6 +1475,8 @@ impl State {
             return;
         }
         vault.kind = VaultKind::Saved;
+        // Now that it is a chip the rail keeps, where it sits is worth remembering.
+        self.save_session();
         self.dirty = true;
     }
 
@@ -1281,6 +1605,10 @@ impl State {
     fn build_frame_list(&mut self) -> Rc<DisplayList> {
         let cols = self.columns();
         self.sync_tab_scroll(&cols);
+        // Bake any chip picture the rail is about to ask for, at the size the chips
+        // are this frame.
+        let chip_side = crate::paint::rail_chip_side(cols.rail_chips, self.scale());
+        self.sync_icons(chip_side);
         let now = Instant::now();
         let mut list: DisplayList = Vec::new();
         push_rail(
@@ -1288,9 +1616,17 @@ impl State {
             &BarCtx::new(&self.fonts, self.scale(), self.body_size),
             cols.rail,
             cols.rail_chips,
-            &self.vaults,
-            self.active_vault(),
-            self.hovered_vault,
+            &RailView {
+                vaults: &self.vaults,
+                active: self.active_vault(),
+                hovered: self.hovered_vault,
+                // A press that never crossed the threshold is a click, not a drag, so
+                // it lifts nothing.
+                drag: self.drag_vault.filter(|d| d.moved).map(|d| RailDragView {
+                    vault: d.vault,
+                    top: (self.pointer_y - d.grab_dy as f32).round() as i32,
+                }),
+            },
         );
         if let Some(rect) = cols.tree {
             let (scale, body_size) = (self.scale(), self.body_size);
@@ -1307,8 +1643,15 @@ impl State {
             let Some(rect) = cols.editors[i] else {
                 continue;
             };
-            // An empty pane (no tabs open) paints no content and no caret.
+            // An empty pane (no tabs open) has no content and no caret to paint, but
+            // it still has a surface: without one the window shows whatever the last
+            // frame left in that column, and the sidebar's long names (which are cut
+            // by the pane covering them, not by the sidebar) run on into it.
             if !self.editors[i].has_tabs() {
+                list.push(DrawCmd::Fill {
+                    rect,
+                    color: BACKGROUND,
+                });
                 continue;
             }
             self.editors[i].ensure_layout(&self.fonts, rect);
@@ -1415,6 +1758,19 @@ impl State {
                 (region, name)
             });
             push_top_bar(&mut list, &ctx, bar, vault, [strip(0), strip(1)], &dividers);
+        }
+        // A picture opened over the window covers all of it, chrome included: it is
+        // the one thing being looked at, so everything else gets out of the way.
+        if let Some(view) = &self.image_view {
+            if let Some(size) = self.editors[view.pane].images.dimensions(&view.raw) {
+                push_image_view(
+                    &mut list,
+                    (self.width as i32, self.height as i32),
+                    size,
+                    &view.raw,
+                    scale,
+                );
+            }
         }
         // The context menu floats over everything, so it is pushed after everything.
         if let Some(menu) = &self.menu {
@@ -2036,6 +2392,7 @@ impl State {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::theme::VAULT_COLORS;
 
     // `Focus` is not `Debug`, so compare with `==` inside `assert!`.
 
@@ -2050,6 +2407,29 @@ mod tests {
         let (root, file) = resolve_vault(Some(&dir), None, &vs);
         assert_eq!(root, dir);
         assert_eq!(file, None);
+    }
+
+    #[test]
+    fn the_hover_square_is_the_same_square_closer_in() {
+        // Smaller, so the picture fills the chip more; centered on the same middle, so
+        // it pushes toward the pointer rather than drifting to a corner.
+        let (x, y, side) = zoomed_square(100, 200, 400);
+        assert!(side < 400, "closer in");
+        assert!(side > 300, "not so close the picture is lost");
+        assert_eq!(x + side / 2, 100 + 400 / 2, "the same middle across");
+        assert_eq!(y + side / 2, 200 + 400 / 2, "the same middle down");
+    }
+
+    #[test]
+    fn the_hover_square_stays_inside_the_square_it_zooms() {
+        // It is a crop of the picture, so it cannot reach past what was cropped.
+        for side in [1u32, 2, 3, 34, 400, 4000] {
+            let (x, y, zoomed) = zoomed_square(10, 20, side);
+            assert!(zoomed >= 1, "side {side} keeps a pixel");
+            assert!(zoomed <= side, "side {side} does not grow");
+            assert!(x + zoomed <= 10 + side, "side {side} fits across");
+            assert!(y + zoomed <= 20 + side, "side {side} fits down");
+        }
     }
 
     #[test]
@@ -2098,15 +2478,39 @@ mod tests {
         assert_eq!(autosave_deadline(false, false, None, now), None);
     }
 
+    /// The rail's remembered arrangement for `names` under one parent, each chip
+    /// wearing the color given.
+    fn stored(chips: &[(&str, u32)]) -> Vec<store::RailVault> {
+        chips
+            .iter()
+            .map(|(name, color)| store::RailVault {
+                root: PathBuf::from("/home/user").join(name),
+                color: *color,
+                icon: None,
+            })
+            .collect()
+    }
+
+    /// The rail's vault names in order, which is what the arrangement tests ask.
+    fn names(rail: &[Vault]) -> Vec<String> {
+        rail.iter()
+            .map(|v| vault_name(&v.path).to_string())
+            .collect()
+    }
+
     #[test]
     fn rail_vaults_adds_an_unconfigured_root_as_a_temporary_vault() {
         // `bnknotes .` in a directory the config does not name: the rail shows where
         // the window actually is, as a chip that says it is not written down.
-        let rail = rail_vaults(vaults(&["/home/user/notes"]), Path::new("/tmp/scratch"));
+        let rail = rail_vaults(
+            vaults(&["/home/user/notes"]),
+            &[],
+            Path::new("/tmp/scratch"),
+        );
         assert_eq!(rail.len(), 2);
         assert_eq!(rail[1].path, Path::new("/tmp/scratch"));
         assert_eq!(rail[1].kind, VaultKind::Temporary);
-        // Last, so the saved chips keep the colors and order the config dealt them.
+        // Last, so a saved chip never has to move to make room for a passing one.
         assert_eq!(rail[0].kind, VaultKind::Saved);
         assert_eq!(rail[0].path, Path::new("/home/user/notes"));
     }
@@ -2116,18 +2520,102 @@ mod tests {
         // Launching in a directory that is already a vault activates that chip rather
         // than adding a second one for the same place.
         let vs = vaults(&["/home/user/notes", "/home/user/work"]);
-        let rail = rail_vaults(vs.clone(), Path::new("/home/user/work"));
+        let rail = rail_vaults(vs.clone(), &[], Path::new("/home/user/work"));
         assert_eq!(rail, vs);
     }
 
     #[test]
-    fn a_temporary_vault_is_dealt_the_chip_it_keeps_when_saved() {
-        // Saving appends it to the config, which is where it already sits in the rail:
-        // the same position, so the same color, so the chip does not jump on save.
-        let rail = rail_vaults(vaults(&["/home/user/notes"]), Path::new("/tmp/scratch"));
-        let saved = vaults(&["/home/user/notes", "/tmp/scratch"]);
-        assert_eq!(rail[1].color, saved[1].color);
-        assert_eq!(rail[1].initials, saved[1].initials);
+    fn a_first_run_rail_is_the_config_order() {
+        // Nothing remembered yet: the config's order is the rail's, each chip dealt a
+        // color of its own.
+        let rail = rail_vaults(
+            vaults(&["/home/user/notes", "/home/user/work"]),
+            &[],
+            Path::new("/home/user/notes"),
+        );
+        assert_eq!(names(&rail), ["notes", "work"]);
+        assert_ne!(rail[0].color, rail[1].color);
+    }
+
+    #[test]
+    fn a_dragged_rail_comes_back_in_the_order_it_was_left() {
+        // The whole point of remembering the rail: the config still lists notes first,
+        // but the chips were dragged, and the drag is what the rail shows.
+        let rail = rail_vaults(
+            vaults(&["/home/user/notes", "/home/user/work"]),
+            &stored(&[("work", VAULT_COLORS[1]), ("notes", VAULT_COLORS[0])]),
+            Path::new("/home/user/notes"),
+        );
+        assert_eq!(names(&rail), ["work", "notes"]);
+    }
+
+    #[test]
+    fn a_chip_keeps_the_color_it_was_dealt_wherever_it_sits() {
+        // What makes a drag readable: the chip that was green is still green after it
+        // moves, so its color keeps saying which vault it is.
+        let rail = rail_vaults(
+            vaults(&["/home/user/notes", "/home/user/work"]),
+            &stored(&[("work", VAULT_COLORS[1]), ("notes", VAULT_COLORS[0])]),
+            Path::new("/home/user/notes"),
+        );
+        assert_eq!(rail[0].color, VAULT_COLORS[1], "work kept its color");
+        assert_eq!(rail[1].color, VAULT_COLORS[0], "so did notes");
+    }
+
+    #[test]
+    fn a_vault_added_to_the_config_joins_the_end_of_the_rail() {
+        // Hand-editing the config still adds vaults, and a new one takes a color no
+        // chip is wearing rather than one already spoken for.
+        let rail = rail_vaults(
+            vaults(&["/home/user/notes", "/home/user/work"]),
+            &stored(&[("work", VAULT_COLORS[1])]),
+            Path::new("/home/user/work"),
+        );
+        assert_eq!(names(&rail), ["work", "notes"]);
+        assert_ne!(rail[1].color, VAULT_COLORS[1]);
+    }
+
+    #[test]
+    fn a_vault_dropped_from_the_config_leaves_the_rail() {
+        // The config says which vaults there are; a chip the config no longer names is
+        // gone, however the rail remembered it.
+        let rail = rail_vaults(
+            vaults(&["/home/user/notes"]),
+            &stored(&[("work", VAULT_COLORS[1]), ("notes", VAULT_COLORS[0])]),
+            Path::new("/home/user/notes"),
+        );
+        assert_eq!(names(&rail), ["notes"]);
+    }
+
+    #[test]
+    fn a_temporary_vault_is_not_part_of_the_remembered_rail() {
+        // It belongs to this launch, not to the arrangement: a rail full of the
+        // directories someone once opened is not worth keeping.
+        let rail = rail_vaults(
+            vaults(&["/home/user/notes"]),
+            &[],
+            Path::new("/tmp/scratch"),
+        );
+        let session = rail_session(&rail);
+        assert_eq!(session.len(), 1);
+        assert_eq!(session[0].root, Path::new("/home/user/notes"));
+    }
+
+    #[test]
+    fn the_remembered_rail_round_trips_through_an_arrangement() {
+        // Save the rail, reopen with it, and the chips are where they were left,
+        // wearing what they wore. The arrangement's whole contract, in one pass.
+        let configured = vaults(&["/home/user/notes", "/home/user/work"]);
+        let mut rail = rail_vaults(configured.clone(), &[], Path::new("/home/user/notes"));
+        rail.swap(0, 1);
+        let reopened = rail_vaults(
+            configured,
+            &rail_session(&rail),
+            Path::new("/home/user/notes"),
+        );
+        assert_eq!(names(&reopened), names(&rail));
+        assert_eq!(reopened[0].color, rail[0].color);
+        assert_eq!(reopened[1].color, rail[1].color);
     }
 
     #[test]

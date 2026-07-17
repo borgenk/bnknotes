@@ -21,6 +21,7 @@
 
 use std::path::{Path, PathBuf};
 
+use crate::icon::VaultIcon;
 use crate::platform::error::{Error, Result};
 
 const FILENAME: &str = "state.bin";
@@ -28,7 +29,7 @@ const FILENAME: &str = "state.bin";
 /// bnknotes instances serialize their read-merge-write instead of racing.
 const LOCK_FILENAME: &str = "state.lock";
 const MAGIC: &[u8; 4] = b"BNKN";
-const VERSION: u8 = 4;
+const VERSION: u8 = 6;
 
 /// One vault's remembered state, keyed by its root directory: everything that
 /// belongs to a vault's contents rather than to the window. What was open where
@@ -177,6 +178,31 @@ pub struct Session {
     pub active_vault: Option<PathBuf>,
     /// The per-vault state, the active vault's among them.
     pub vaults: VaultPrefs,
+    /// How the rail is arranged: its chips in order, each with the color it wears.
+    /// Empty until a rail has been shown once.
+    ///
+    /// This sits on the window rather than in the per-vault entries because it is a
+    /// fact about the whole rail, not about any one vault: an instance parked in one
+    /// vault can only write that vault's entry (see [`merged_session`]), and could
+    /// never record where the other chips sit.
+    pub rail: Vec<RailVault>,
+}
+
+/// A chip's arrangement: which vault it is, and the color it wears. Its place in
+/// [`Session::rail`] is its place in the rail.
+///
+/// The color is remembered rather than re-derived because the rail can be dragged
+/// into any order: a color dealt by position would repaint every chip the drag
+/// passed, when a chip's color is the one thing that says which vault it is.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RailVault {
+    pub root: PathBuf,
+    pub color: u32,
+    /// The picture the chip was given, and the square of it shown. Stored rather
+    /// than re-rolled at each launch: the roll is the user's, made once from the
+    /// rail's menu, and a chip that dealt itself a new picture every morning would
+    /// stop being the chip they know.
+    pub icon: Option<VaultIcon>,
 }
 
 /// First-run defaults: sidebar and both content panes shown, an even split, no
@@ -193,6 +219,7 @@ impl Default for Session {
             focus: Focus::PaneA,
             active_vault: None,
             vaults: VaultPrefs::default(),
+            rail: Vec::new(),
         }
     }
 }
@@ -215,6 +242,21 @@ impl Session {
         } else {
             0.5
         };
+        // A chip color is 0x00RRGGBB, so a hand-edited one with anything in the top
+        // byte is masked back to a color the painter can mean.
+        for chip in &mut self.rail {
+            chip.color &= 0x00ff_ffff;
+        }
+        // One vault, one chip: a file naming a vault twice would otherwise arrange two
+        // chips for it, and a rail cannot say which of them the vault is.
+        let mut seen: Vec<PathBuf> = Vec::new();
+        self.rail.retain(|chip| {
+            let fresh = !seen.contains(&chip.root);
+            if fresh {
+                seen.push(chip.root.clone());
+            }
+            fresh
+        });
         self
     }
 }
@@ -294,6 +336,10 @@ fn merged_session(disk: &Session, incoming: &Session) -> Session {
     out.second_open = incoming.second_open;
     out.focus = incoming.focus;
     out.active_vault = incoming.active_vault.clone();
+    // The rail describes the window's own chips, so the saver's arrangement wins
+    // whole. Merging two arrangements has no meaning: they are orderings of the same
+    // list, and half of each is neither.
+    out.rail = incoming.rail.clone();
     if let Some(entry) = incoming
         .active_vault
         .as_deref()
@@ -323,7 +369,43 @@ fn encode(s: &Session) -> Result<Vec<u8>> {
     for vault in &s.vaults.vaults {
         write_vault(&mut out, vault)?;
     }
+
+    let rail = u32::try_from(s.rail.len()).map_err(|_| Error::msg("too many chips to persist"))?;
+    out.extend_from_slice(&rail.to_le_bytes());
+    for chip in &s.rail {
+        write_path(&mut out, &chip.root)?;
+        out.extend_from_slice(&chip.color.to_le_bytes());
+        write_icon(&mut out, chip.icon.as_ref())?;
+    }
     Ok(out)
+}
+
+/// A chip's picture: an optional path, then the square of it, written only when
+/// there is one. Mirror of [`read_icon`].
+fn write_icon(out: &mut Vec<u8>, icon: Option<&VaultIcon>) -> Result<()> {
+    // The path carries the tag: a picture whose path cannot be written (a non-UTF-8
+    // path) is stored as no picture at all, rather than as a square of nothing.
+    let icon = icon.filter(|i| i.source.to_str().is_some());
+    write_opt_path(out, icon.map(|i| i.source.as_path()))?;
+    if let Some(icon) = icon {
+        out.extend_from_slice(&icon.x.to_le_bytes());
+        out.extend_from_slice(&icon.y.to_le_bytes());
+        out.extend_from_slice(&icon.side.to_le_bytes());
+    }
+    Ok(())
+}
+
+/// Mirror of [`write_icon`]: the square follows the path, and only when there is one.
+fn read_icon(r: &mut Reader) -> Result<Option<VaultIcon>> {
+    let Some(source) = r.opt_path()? else {
+        return Ok(None);
+    };
+    Ok(Some(VaultIcon {
+        source,
+        x: r.u32()?,
+        y: r.u32()?,
+        side: r.u32()?,
+    }))
 }
 
 /// One vault's block: its root and filter, then the folders it had expanded and
@@ -382,6 +464,16 @@ fn decode(data: &[u8]) -> Result<Session> {
     for _ in 0..vault_count {
         vaults.push(read_vault(&mut r)?);
     }
+
+    let rail_count = r.u32()? as usize;
+    let mut rail = Vec::with_capacity(rail_count.min(4096));
+    for _ in 0..rail_count {
+        rail.push(RailVault {
+            root: r.path()?,
+            color: r.u32()?,
+            icon: read_icon(&mut r)?,
+        });
+    }
     r.expect_end()?;
     Ok(Session {
         window,
@@ -392,6 +484,7 @@ fn decode(data: &[u8]) -> Result<Session> {
         focus,
         active_vault,
         vaults: VaultPrefs { vaults },
+        rail,
     })
 }
 
@@ -607,6 +700,25 @@ mod tests {
                     },
                 ],
             },
+            // Dragged into the reverse of the config's order, each chip wearing a
+            // color of its own, and one of them a picture.
+            rail: vec![
+                RailVault {
+                    root: PathBuf::from("/home/user/work"),
+                    color: 0x0098_c379,
+                    icon: Some(VaultIcon {
+                        source: PathBuf::from("/home/user/work/@attachment/shot.png"),
+                        x: 120,
+                        y: 48,
+                        side: 300,
+                    }),
+                },
+                RailVault {
+                    root: PathBuf::from("/home/user/notes"),
+                    color: 0x005c_9cf6,
+                    icon: None,
+                },
+            ],
         }
     }
 
@@ -857,6 +969,93 @@ mod tests {
         let merged = merged_session(&disk, &incoming);
         assert_eq!(merged.active_vault, Some(PathBuf::from("/fresh")));
         assert_eq!(tab_of(&merged, "/fresh"), "/fresh/note.md");
+    }
+
+    /// A rail arrangement of `roots`, each chip wearing a color of its own.
+    fn rail_of(roots: &[&str]) -> Vec<RailVault> {
+        roots
+            .iter()
+            .enumerate()
+            .map(|(i, root)| RailVault {
+                root: PathBuf::from(root),
+                color: i as u32,
+                icon: None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_hand_edited_rail_is_sanitized() {
+        // The two ways a hand-edited rail could confuse the painter: a color with
+        // something in the byte the format does not use, and a vault named twice,
+        // which would arrange two chips for one vault.
+        let session = Session {
+            rail: vec![
+                RailVault {
+                    root: PathBuf::from("/x"),
+                    color: 0xffab_cdef,
+                    icon: None,
+                },
+                RailVault {
+                    root: PathBuf::from("/x"),
+                    color: 0x0011_2233,
+                    icon: None,
+                },
+                RailVault {
+                    root: PathBuf::from("/y"),
+                    color: 0x0044_5566,
+                    icon: None,
+                },
+            ],
+            ..Session::default()
+        };
+        let clean = session.sanitized();
+        assert_eq!(clean.rail.len(), 2, "the repeated vault is dropped");
+        assert_eq!(
+            clean.rail[0].color, 0x00ab_cdef,
+            "the top byte is masked off"
+        );
+        assert_eq!(
+            clean.rail[0].root,
+            PathBuf::from("/x"),
+            "the first one stands"
+        );
+        assert_eq!(clean.rail[1].root, PathBuf::from("/y"));
+    }
+
+    #[test]
+    fn merge_takes_the_savers_whole_rail() {
+        // The rail describes the saver's own window, so it crosses whole: half of one
+        // arrangement and half of another is not an arrangement.
+        let disk = Session {
+            rail: rail_of(&["/x", "/y", "/z"]),
+            ..Session::default()
+        };
+        let mut incoming = session_on("/x", vec![]);
+        incoming.rail = rail_of(&["/z", "/y", "/x"]);
+        let merged = merged_session(&disk, &incoming);
+        assert_eq!(merged.rail, incoming.rail);
+    }
+
+    #[test]
+    fn a_rail_survives_a_save_from_an_instance_in_another_vault() {
+        // The reason the rail sits on the window and not in the per-vault entries: an
+        // instance parked in /y still writes the whole rail, so dragging a chip in one
+        // window is not undone by a save from another.
+        let dir = tmp_dir("rail-concurrent");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let path = dir.join(FILENAME);
+
+        let mut dragged = session_on("/x", vec![vault_with("/x", "/x/x1.md")]);
+        dragged.rail = rail_of(&["/y", "/x"]);
+        save_to(&path, &dragged).expect("seed");
+
+        let mut elsewhere = session_on("/y", vec![vault_with("/y", "/y/y1.md")]);
+        elsewhere.rail = rail_of(&["/y", "/x"]);
+        save_to(&path, &elsewhere).expect("save");
+
+        assert_eq!(load_from(&path).rail, rail_of(&["/y", "/x"]));
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// A scratch directory under the system temp dir, unique per test name so the

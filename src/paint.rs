@@ -22,19 +22,19 @@ use crate::theme::{
     CODE_STRING_COLOR, CONFLICT_BANNER_BG, CONFLICT_BANNER_TEXT, CONFLICT_BUTTON_BG,
     CONFLICT_BUTTON_HOVER_BG, DECOR_TEXT_GAP, FIND_BG, FIND_ERROR_COLOR, FIND_MATCH_COLOR,
     FIND_TICK_COLOR, FOREGROUND, HEADING_COLORS, IMAGE_BORDER_COLOR, IMAGE_BORDER_THICKNESS,
-    IMAGE_BUTTON_BG, IMAGE_BUTTON_RADIUS, LINK_COLOR, MARGIN, MARKER_COLOR, MENU_BG, MENU_BORDER,
-    MENU_BORDER_W, MENU_HOVER_BG, MENU_ITEM_PAD_X, MENU_ITEM_RADIUS, MENU_RADIUS, MENU_TEXT,
-    QUOTE_BAR_COLOR, QUOTE_BAR_WIDTH, RAIL_ACTIVE_COLOR, RAIL_ACTIVE_SPAN, RAIL_ACTIVE_W, RAIL_BG,
-    RAIL_GAP, RAIL_HOVER_INK, RAIL_HOVER_LIFT, RAIL_INK_DARK, RAIL_INK_LIGHT, RAIL_PAD,
-    RAIL_RADIUS, RAIL_TEMP_RING, RULE_COLOR, RULE_THICKNESS, SCROLL_INK, SCROLL_INSET,
-    SCROLL_MIN_THUMB, SCROLL_NEAR, SCROLL_THIN, SCROLL_THUMB_COVER, SCROLL_THUMB_HOVER_COVER,
-    SCROLL_TROUGH_COVER, SCROLL_WIDE, SELECTION_COLOR, SPLITTER_COLOR, TABLE_BORDER_COLOR,
-    TABLE_HEADER_BG, TAB_ACTIVE_BG, TAB_ACTIVE_TEXT, TAB_BUTTON_HOVER_BG, TAB_BUTTON_RADIUS,
-    TAB_CLOSE_GAP, TAB_CLOSE_W, TAB_DIRTY_COLOR, TAB_HOVER_BG, TAB_INACTIVE_TEXT, TAB_MAX_W,
-    TAB_MIN_W, TAB_NEW_W, TAB_PAD_X, TAB_VPAD, TICK_HEIGHT, TICK_WIDTH, TOP_BAR_BG, TREE_BG,
-    TREE_CHEVRON_MAX, TREE_FOOTER_GAP, TREE_FOOTER_VPAD, TREE_HOVER_BG, TREE_INDENT,
-    TREE_MARKER_COLOR, TREE_MARKER_W, TREE_PAD, TREE_ROW_INSET_Y, TREE_ROW_PAD, TREE_ROW_RADIUS,
-    TREE_ROW_VPAD, TREE_TEXT_COLOR, VAULT_PAD_X,
+    IMAGE_BUTTON_BG, IMAGE_BUTTON_RADIUS, IMAGE_VIEW_BG, IMAGE_VIEW_PAD, LINK_COLOR, MARGIN,
+    MARKER_COLOR, MENU_BG, MENU_BORDER, MENU_BORDER_W, MENU_HOVER_BG, MENU_ITEM_PAD_X,
+    MENU_ITEM_RADIUS, MENU_RADIUS, MENU_TEXT, QUOTE_BAR_COLOR, QUOTE_BAR_WIDTH, RAIL_ACTIVE_COLOR,
+    RAIL_ACTIVE_SPAN, RAIL_ACTIVE_W, RAIL_BG, RAIL_GAP, RAIL_HOVER_INK, RAIL_HOVER_LIFT,
+    RAIL_INK_DARK, RAIL_INK_LIGHT, RAIL_PAD, RAIL_RADIUS, RAIL_TEMP_RING, RULE_COLOR,
+    RULE_THICKNESS, SCROLL_INK, SCROLL_INSET, SCROLL_MIN_THUMB, SCROLL_NEAR, SCROLL_THIN,
+    SCROLL_THUMB_COVER, SCROLL_THUMB_HOVER_COVER, SCROLL_TROUGH_COVER, SCROLL_WIDE,
+    SELECTION_COLOR, SPLITTER_COLOR, TABLE_BORDER_COLOR, TABLE_HEADER_BG, TAB_ACTIVE_BG,
+    TAB_ACTIVE_TEXT, TAB_BUTTON_HOVER_BG, TAB_BUTTON_RADIUS, TAB_CLOSE_GAP, TAB_CLOSE_W,
+    TAB_DIRTY_COLOR, TAB_HOVER_BG, TAB_INACTIVE_TEXT, TAB_MAX_W, TAB_MIN_W, TAB_NEW_W, TAB_PAD_X,
+    TAB_VPAD, TICK_HEIGHT, TICK_WIDTH, TOP_BAR_BG, TREE_BG, TREE_CHEVRON_MAX, TREE_FOOTER_GAP,
+    TREE_FOOTER_VPAD, TREE_HOVER_BG, TREE_INDENT, TREE_MARKER_COLOR, TREE_MARKER_W, TREE_PAD,
+    TREE_ROW_INSET_Y, TREE_ROW_PAD, TREE_ROW_RADIUS, TREE_ROW_VPAD, TREE_TEXT_COLOR, VAULT_PAD_X,
 };
 
 /// The per-frame inputs [`build_display_list`] needs beyond the layout itself:
@@ -293,6 +293,12 @@ pub(crate) fn push_splitter(list: &mut DisplayList, rect: Rect, scale: Scale) {
     });
 }
 
+/// A chip's side in device pixels: the square left between the rail's edges and its
+/// padding. What the chips are laid out on, and what an icon is baked at.
+pub(crate) fn rail_chip_side(chips: Rect, scale: Scale) -> i32 {
+    (chips.w - 2 * scale.px(RAIL_PAD)).max(0)
+}
+
 /// The vault chips that fit in the rail's `chips` region, top to bottom, each paired
 /// with its index in the configured vaults. A chip is the square left between the
 /// region's edges and its padding; one that would fall past its bottom is dropped, so
@@ -304,7 +310,7 @@ pub(crate) fn rail_buttons(
     scale: Scale,
 ) -> impl Iterator<Item = (usize, Rect)> {
     let pad = scale.px(RAIL_PAD);
-    let side = (chips.w - 2 * pad).max(0);
+    let side = rail_chip_side(chips, scale);
     let step = side + scale.px(RAIL_GAP);
     let bottom = chips.y + chips.h;
     (0..count)
@@ -356,6 +362,48 @@ fn chip_ink(fill: u32) -> u32 {
     }
 }
 
+/// A chip lifted out of the rail by a drag, following the pointer. `top` is where
+/// its top edge wants to be, before the clamp that keeps it in the rail.
+#[derive(Clone, Copy)]
+pub(crate) struct RailDragView {
+    pub vault: usize,
+    pub top: i32,
+}
+
+/// What the rail draws this frame: its vaults, which is active, which the pointer is
+/// over, and any chip in flight. Bundled because the rail's painter had run out of
+/// room for another positional argument, the way the tab strip's did.
+pub(crate) struct RailView<'a> {
+    pub vaults: &'a [Vault],
+    pub active: Option<usize>,
+    pub hovered: Option<usize>,
+    pub drag: Option<RailDragView>,
+}
+
+/// The place a chip dropped at pointer `py` lands, given the chips' resting slots:
+/// the number of other chips whose midpoint the pointer has passed. `dragged` is the
+/// chip in flight, skipped so its own slot never counts against itself, which is
+/// what keeps a drag from oscillating between two indices. The rail's mirror of
+/// [`tab_drop_index`], down the y axis.
+pub(crate) fn rail_drop_index(
+    chips: Rect,
+    count: usize,
+    scale: Scale,
+    dragged: Option<usize>,
+    py: f32,
+) -> usize {
+    let mut target = 0;
+    for (k, chip) in rail_buttons(chips, count, scale) {
+        if dragged == Some(k) {
+            continue;
+        }
+        if py > chip.y as f32 + chip.h as f32 / 2.0 {
+            target += 1;
+        }
+    }
+    target
+}
+
 /// Draw the vault rail into its full-height column: a background a shade below the
 /// sidebar's, a divider down its right edge, and one chip per vault in `chips`, the
 /// rail below the top bar, so the first chip starts on the line the tree and the
@@ -363,15 +411,18 @@ fn chip_ink(fill: u32) -> u32 {
 /// saved vault and an outline for a temporary one. The pointer lifts a chip's fill;
 /// the active vault is marked by a bar at the rail's left edge, so a chip's color
 /// stays the vault's identity rather than doubling as its state.
+///
+/// A chip being dragged is left out of the stack and drawn last, under the pointer:
+/// the gap it leaves is its own slot, which the reorder has already moved, so the
+/// chips it passes settle into place as it goes rather than waiting for the drop.
 pub(crate) fn push_rail(
     list: &mut DisplayList,
     ctx: &BarCtx,
     rail: Rect,
     chips: Rect,
-    vaults: &[Vault],
-    active: Option<usize>,
-    hovered: Option<usize>,
+    view: &RailView,
 ) {
+    let (vaults, active, hovered) = (view.vaults, view.active, view.hovered);
     let scale = ctx.scale;
     list.push(DrawCmd::Fill {
         rect: rail,
@@ -386,39 +437,116 @@ pub(crate) fn push_rail(
         },
         color: SPLITTER_COLOR,
     });
+    let dragged = view.drag.map(|d| d.vault);
+    let mut lifted = None;
+    for (i, chip) in rail_buttons(chips, vaults.len(), scale) {
+        // The chip in flight leaves its slot empty and is drawn after the rest, so it
+        // passes over its neighbors rather than under them.
+        if dragged == Some(i) {
+            lifted = Some(chip);
+            continue;
+        }
+        push_chip(
+            list,
+            ctx,
+            rail,
+            chip,
+            &vaults[i],
+            active == Some(i),
+            hovered == Some(i),
+        );
+    }
+    if let (Some(drag), Some(resting)) = (view.drag, lifted) {
+        // Clamped to the chips' own region: a chip dragged past the ends of the rail
+        // stops there rather than following the pointer out of the column.
+        let top = drag
+            .top
+            .clamp(chips.y, (chips.y + chips.h - resting.h).max(chips.y));
+        let chip = Rect { y: top, ..resting };
+        if let Some(vault) = vaults.get(drag.vault) {
+            // Drawn active-styled the way a lifted tab is: the chip under the pointer
+            // is the one being acted on, whichever vault the window is showing.
+            push_chip(list, ctx, rail, chip, vault, false, true);
+        }
+    }
+}
+
+/// Draw one vault chip at `chip`: its color, its initials, and, for the active
+/// vault, the marker at the rail's left edge. Shared by the chips at rest and the
+/// one in flight, so a dragged chip is the same chip, moved.
+fn push_chip(
+    list: &mut DisplayList,
+    ctx: &BarCtx,
+    rail: Rect,
+    chip: Rect,
+    vault: &Vault,
+    active: bool,
+    hovered: bool,
+) {
+    let scale = ctx.scale;
     let m = ctx.metrics();
     let face = ctx.fonts.face(ctx.body_size, FontStyle::Bold);
-    for (i, chip) in rail_buttons(chips, vaults.len(), scale) {
-        let vault = &vaults[i];
-        let fill = if hovered == Some(i) {
-            pixel::tint(vault.color, RAIL_HOVER_INK, RAIL_HOVER_LIFT)
-        } else {
-            vault.color
-        };
-        let radius = scale.px(RAIL_RADIUS);
-        list.push(DrawCmd::RoundRect {
-            rect: chip,
-            color: fill,
-            radius,
+    let fill = if hovered {
+        pixel::tint(vault.color, RAIL_HOVER_INK, RAIL_HOVER_LIFT)
+    } else {
+        vault.color
+    };
+    let radius = scale.px(RAIL_RADIUS);
+    let temporary = vault.kind == VaultKind::Temporary;
+    // The ring the chip's color shows around its middle says one thing only: this
+    // vault is not written down. A saved chip is filled (or pictured) edge to edge.
+    let ring = if temporary {
+        scale.px(RAIL_TEMP_RING).max(1)
+    } else {
+        0
+    };
+    let inner = Rect {
+        x: chip.x + ring,
+        y: chip.y + ring,
+        w: (chip.w - 2 * ring).max(0),
+        h: (chip.h - 2 * ring).max(0),
+    };
+    list.push(DrawCmd::RoundRect {
+        rect: chip,
+        color: fill,
+        radius,
+        corners: display::RoundedCorners::Both,
+    });
+    // A chip wearing a picture is the picture: it goes where the fill would be, corners
+    // already rounded into it, and nothing is drawn over it. A picture chosen for a
+    // chip is what the chip is for, and a color washed through it or two letters sat
+    // on it would be the editor talking over it. The color is still the vault's, and
+    // still says so: on the marker beside it, on a temporary chip's ring, and on the
+    // chip again the moment the picture is cleared.
+    //
+    // Under the pointer it swaps to the same picture taken closer in, which is the
+    // thumbnail's answer to a hover: the picture pushes forward while the chip stays
+    // exactly where it is, so a rail of them never wobbles under the pointer.
+    //
+    // A chip with no picture (or one whose bake has not landed, which lasts a frame)
+    // keeps the flat fill and its initials, and a temporary one has the rail's own
+    // background punched back out of it, leaving its color as the outline.
+    match &vault.icon_keys {
+        Some(keys) => list.push(DrawCmd::Image {
+            rect: inner,
+            path: if hovered {
+                keys.hover.clone()
+            } else {
+                keys.rest.clone()
+            },
+        }),
+        None if temporary => list.push(DrawCmd::RoundRect {
+            rect: inner,
+            color: RAIL_BG,
+            radius: (radius - ring).max(0),
             corners: display::RoundedCorners::Both,
-        });
-        // A temporary vault's chip is a ring: the fill above, with the rail's own
-        // background punched back out of it, leaving the color as an outline. Its
-        // initials then take that color, since there is no badge left to sit on.
-        let temporary = vault.kind == VaultKind::Temporary;
+        }),
+        None => {}
+    }
+    if vault.icon_keys.is_none() {
+        // The initials read against the vault's color behind them. A hollow temporary
+        // chip is the exception, since what is behind them there is the rail.
         let ink = if temporary {
-            let ring = scale.px(RAIL_TEMP_RING).max(1);
-            list.push(DrawCmd::RoundRect {
-                rect: Rect {
-                    x: chip.x + ring,
-                    y: chip.y + ring,
-                    w: (chip.w - 2 * ring).max(0),
-                    h: (chip.h - 2 * ring).max(0),
-                },
-                color: RAIL_BG,
-                radius: (radius - ring).max(0),
-                corners: display::RoundedCorners::Both,
-            });
             fill
         } else {
             // The ink follows the vault's own color, not this frame's fill, so the
@@ -439,21 +567,76 @@ pub(crate) fn push_rail(
             vault.initials.clone(),
             m,
         ));
-        if active == Some(i) {
-            let h = (chip.h as f32 * RAIL_ACTIVE_SPAN) as i32;
-            list.push(DrawCmd::RoundRect {
-                rect: Rect {
-                    x: rail.x,
-                    y: chip.y + (chip.h - h) / 2,
-                    w: scale.px(RAIL_ACTIVE_W),
-                    h,
-                },
-                color: RAIL_ACTIVE_COLOR,
-                radius: scale.px(RAIL_ACTIVE_W) / 2,
-                corners: display::RoundedCorners::Both,
-            });
-        }
     }
+    if active {
+        let h = (chip.h as f32 * RAIL_ACTIVE_SPAN) as i32;
+        list.push(DrawCmd::RoundRect {
+            rect: Rect {
+                x: rail.x,
+                y: chip.y + (chip.h - h) / 2,
+                w: scale.px(RAIL_ACTIVE_W),
+                h,
+            },
+            color: RAIL_ACTIVE_COLOR,
+            radius: scale.px(RAIL_ACTIVE_W) / 2,
+            corners: display::RoundedCorners::Both,
+        });
+    }
+}
+
+/// Where a `w` by `h` picture sits when shown full-window: centered in `window`, with
+/// [`IMAGE_VIEW_PAD`] of clear space around it, scaled down to fit but never scaled
+/// up past its own pixels.
+///
+/// Never up: a picture blown past its size is a picture of its own pixels, and the
+/// point of showing it big is to see what is in it. One that is already small enough
+/// is simply shown, in the middle, at the size it is.
+pub(crate) fn image_view_rect(window: (i32, i32), size: (u32, u32), scale: Scale) -> Rect {
+    let pad = scale.px(IMAGE_VIEW_PAD);
+    let (avail_w, avail_h) = ((window.0 - 2 * pad).max(1), (window.1 - 2 * pad).max(1));
+    let (w, h) = (size.0.max(1) as i64, size.1.max(1) as i64);
+    // The picture's size in window pixels, shrunk by whichever axis runs out first.
+    // Compared as fractions cross-multiplied, so the fit is exact rather than a float
+    // that rounds a pixel off one edge.
+    let (fit_w, fit_h) = if w <= avail_w as i64 && h <= avail_h as i64 {
+        (w, h)
+    } else if w * avail_h as i64 > h * avail_w as i64 {
+        (avail_w as i64, (h * avail_w as i64 / w).max(1))
+    } else {
+        ((w * avail_h as i64 / h).max(1), avail_h as i64)
+    };
+    let (fit_w, fit_h) = (fit_w as i32, fit_h as i32);
+    Rect {
+        x: (window.0 - fit_w) / 2,
+        y: (window.1 - fit_h) / 2,
+        w: fit_w,
+        h: fit_h,
+    }
+}
+
+/// Draw a picture over the whole window: a backdrop that covers what it is over,
+/// then the picture itself, centered. Pushed after the rest of the frame, so nothing
+/// the editor was showing shows through.
+pub(crate) fn push_image_view(
+    list: &mut DisplayList,
+    window: (i32, i32),
+    size: (u32, u32),
+    raw: &str,
+    scale: Scale,
+) {
+    list.push(DrawCmd::Fill {
+        rect: Rect {
+            x: 0,
+            y: 0,
+            w: window.0,
+            h: window.1,
+        },
+        color: IMAGE_VIEW_BG,
+    });
+    list.push(DrawCmd::Image {
+        rect: image_view_rect(window, size, scale),
+        path: raw.to_string(),
+    });
 }
 
 /// Draw an open context menu: a bordered panel with one row per item, the row under
@@ -606,8 +789,8 @@ pub(crate) fn measure_tree(tree: &mut TreePane, rect: Rect, m: Metrics, scale: S
 /// Draw the file-tree sidebar into its column `rect`: a darker background, then
 /// each visible row (a folder chevron plus the name), indented by depth and
 /// offset by the tree's own scroll, then its scrollbar, and finally the footer over
-/// the column's bottom. Rows do not wrap; a long name that overhangs is covered by
-/// the editor's own background, which is drawn after this.
+/// the column's bottom. Rows do not wrap; a long name is scissored at the column's
+/// edge, so nothing the sidebar draws lands outside it.
 pub(crate) fn push_tree(
     list: &mut DisplayList,
     fonts: &Fonts,
@@ -679,14 +862,22 @@ pub(crate) fn push_tree(
                 down: row.expanded,
             });
         }
-        list.push(text_cmd(
-            face,
-            content_x + marker_w,
-            top + text_offset,
+        // A name longer than the column is cut at its edge rather than run on into
+        // whatever is beside it. The pane to the right does paint over an overhang,
+        // but only when it has something to paint: an empty one has no background of
+        // its own, and a name is not the sidebar's to put there either way.
+        list.push(clip_text_x(
+            text_cmd(
+                face,
+                content_x + marker_w,
+                top + text_offset,
+                text_right,
+                TREE_TEXT_COLOR,
+                row.name.clone(),
+                m,
+            ),
+            rect.x,
             text_right,
-            TREE_TEXT_COLOR,
-            row.name.clone(),
-            m,
         ));
     }
     // The sidebar's own scrollbar, over the rows it scrolls (never over the footer,
@@ -2711,6 +2902,236 @@ mod tests {
         assert_eq!(tab_drop_index(&tabs, None, 30.0), 0);
         assert_eq!(tab_drop_index(&tabs, None, 130.0), 2);
         assert_eq!(tab_drop_index(&tabs, None, 260.0), 3);
+    }
+
+    /// Whether `r` sits inside a `window`-sized window, padding included.
+    fn within(r: Rect, window: (i32, i32)) -> bool {
+        let pad = IMAGE_VIEW_PAD;
+        r.x >= pad && r.y >= pad && r.x + r.w <= window.0 - pad && r.y + r.h <= window.1 - pad
+    }
+
+    /// How far `r`'s aspect is from `w`/`h`'s, as a fraction.
+    fn aspect_error(r: Rect, w: u32, h: u32) -> f32 {
+        let want = w as f32 / h as f32;
+        let got = r.w as f32 / r.h as f32;
+        (got - want).abs() / want
+    }
+
+    #[test]
+    fn a_picture_too_big_for_the_window_is_shrunk_to_fit() {
+        let window = (1000, 800);
+        let r = image_view_rect(window, (4000, 2000), Scale::ONE);
+        assert!(within(r, window), "{r:?}");
+        assert!(aspect_error(r, 4000, 2000) < 0.01, "{r:?}");
+        // Wider than it is tall, so the width is what runs out: it uses all of it.
+        assert_eq!(r.w, window.0 - 2 * IMAGE_VIEW_PAD);
+    }
+
+    #[test]
+    fn a_tall_picture_is_fitted_by_its_height() {
+        let window = (1000, 800);
+        let r = image_view_rect(window, (500, 4000), Scale::ONE);
+        assert!(within(r, window), "{r:?}");
+        assert!(aspect_error(r, 500, 4000) < 0.01, "{r:?}");
+        assert_eq!(r.h, window.1 - 2 * IMAGE_VIEW_PAD);
+    }
+
+    #[test]
+    fn a_small_picture_is_shown_at_its_own_size() {
+        // Never blown up: a picture past its own pixels is a picture of its pixels,
+        // and the point of opening it is to see what is in it.
+        let window = (1000, 800);
+        let r = image_view_rect(window, (64, 48), Scale::ONE);
+        assert_eq!((r.w, r.h), (64, 48));
+        // And centered in the window, not in the padded box.
+        assert_eq!(r.x, (1000 - 64) / 2);
+        assert_eq!(r.y, (800 - 48) / 2);
+    }
+
+    #[test]
+    fn a_picture_is_centered_whichever_way_it_fits() {
+        let window = (1000, 800);
+        for size in [(4000u32, 2000u32), (500, 4000), (64, 48), (900, 700)] {
+            let r = image_view_rect(window, size, Scale::ONE);
+            assert_eq!(r.x, (window.0 - r.w) / 2, "{size:?} across");
+            assert_eq!(r.y, (window.1 - r.h) / 2, "{size:?} down");
+        }
+    }
+
+    #[test]
+    fn a_picture_exactly_the_padded_size_is_left_alone() {
+        let window = (1000, 800);
+        let (w, h) = (
+            (window.0 - 2 * IMAGE_VIEW_PAD) as u32,
+            (window.1 - 2 * IMAGE_VIEW_PAD) as u32,
+        );
+        let r = image_view_rect(window, (w, h), Scale::ONE);
+        assert_eq!((r.w as u32, r.h as u32), (w, h), "no shrink, no growth");
+    }
+
+    #[test]
+    fn a_picture_in_a_window_smaller_than_its_padding_still_has_a_size() {
+        // A window shrunk to nothing must not give a rectangle of nothing (or of a
+        // negative something the renderer would refuse).
+        let r = image_view_rect((10, 10), (4000, 2000), Scale::ONE);
+        assert!(r.w >= 1 && r.h >= 1, "{r:?}");
+    }
+
+    #[test]
+    fn a_picture_with_no_size_still_has_a_rectangle() {
+        let r = image_view_rect((1000, 800), (0, 0), Scale::ONE);
+        assert!(r.w >= 1 && r.h >= 1, "{r:?}");
+    }
+
+    #[test]
+    fn the_view_covers_the_window_and_then_draws_the_picture() {
+        // The backdrop is what makes it a view rather than a picture floating over the
+        // text: it covers everything, and the picture goes on top of it.
+        let mut list = Vec::new();
+        push_image_view(&mut list, (1000, 800), (4000, 2000), "shot.png", Scale::ONE);
+        assert_eq!(list.len(), 2);
+        match &list[0] {
+            DrawCmd::Fill { rect, .. } => {
+                assert_eq!((rect.x, rect.y, rect.w, rect.h), (0, 0, 1000, 800));
+            }
+            other => panic!("the backdrop is a fill, not {other:?}"),
+        }
+        match &list[1] {
+            DrawCmd::Image { rect, path } => {
+                assert_eq!(path, "shot.png");
+                assert_eq!(
+                    *rect,
+                    image_view_rect((1000, 800), (4000, 2000), Scale::ONE)
+                );
+            }
+            other => panic!("the picture is an image, not {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rail_drop_index_tracks_the_chips_the_pointer_has_passed() {
+        let chips = rail(700);
+        let stack: Vec<Rect> = rail_buttons(chips, 3, Scale::ONE).map(|(_, r)| r).collect();
+        let mid = |i: usize| stack[i].y as f32 + stack[i].h as f32 / 2.0;
+
+        // Dragging the first chip down: it holds its slot until it passes the chip
+        // below's midpoint, then takes that slot, and so on.
+        assert_eq!(rail_drop_index(chips, 3, Scale::ONE, Some(0), mid(0)), 0);
+        assert_eq!(
+            rail_drop_index(chips, 3, Scale::ONE, Some(0), mid(1) + 1.0),
+            1
+        );
+        assert_eq!(
+            rail_drop_index(chips, 3, Scale::ONE, Some(0), mid(2) + 1.0),
+            2
+        );
+
+        // Dragging the last chip up: its own slot is skipped, so only the chips above
+        // it count and it can reach the top.
+        assert_eq!(
+            rail_drop_index(chips, 3, Scale::ONE, Some(2), mid(2) + 1.0),
+            2
+        );
+        assert_eq!(rail_drop_index(chips, 3, Scale::ONE, Some(2), mid(0)), 0);
+    }
+
+    #[test]
+    fn rail_drop_index_never_leaves_the_rail() {
+        // A pointer dragged off the top or the bottom of the window still names a slot
+        // the rail has, so a chip cannot be dropped out of it.
+        let chips = rail(700);
+        assert_eq!(rail_drop_index(chips, 3, Scale::ONE, Some(1), -500.0), 0);
+        assert_eq!(rail_drop_index(chips, 3, Scale::ONE, Some(1), 5000.0), 2);
+    }
+
+    /// Three vaults and the fonts to draw their chips, for the rail-drag tests.
+    fn rail_test_vaults() -> Vec<Vault> {
+        crate::config::vaults(
+            ["/home/user/notes", "/home/user/work", "/home/user/journal"]
+                .iter()
+                .map(std::path::PathBuf::from),
+        )
+    }
+
+    #[test]
+    fn a_dragged_chip_leaves_a_gap_and_is_drawn_over_the_rest() {
+        // The chip in flight is not in the stack (its slot is the gap the drop will
+        // fill) and is drawn last, so it passes over its neighbors.
+        let fonts = Fonts::new(&markdown::all_sizes(FONT_SIZE)).expect("a default font");
+        let ctx = BarCtx::new(&fonts, Scale::ONE, FONT_SIZE);
+        let vaults = rail_test_vaults();
+        let chips = rail(700);
+        let resting: Vec<Rect> = rail_buttons(chips, 3, Scale::ONE).map(|(_, r)| r).collect();
+
+        let mut list = Vec::new();
+        push_rail(
+            &mut list,
+            &ctx,
+            chips,
+            chips,
+            &RailView {
+                vaults: &vaults,
+                active: Some(0),
+                hovered: None,
+                drag: Some(RailDragView { vault: 0, top: 400 }),
+            },
+        );
+        // The chip bodies drawn, in the order they were pushed.
+        let bodies: Vec<Rect> = list
+            .iter()
+            .filter_map(|cmd| match cmd {
+                DrawCmd::RoundRect { rect, radius, .. }
+                    if *radius == Scale::ONE.px(RAIL_RADIUS) && rect.w == resting[0].w =>
+                {
+                    Some(*rect)
+                }
+                _ => None,
+            })
+            .collect();
+        // Two chips at rest (1 and 2), then the dragged one last, at the pointer.
+        assert_eq!(bodies.len(), 3);
+        assert_eq!(bodies[0].y, resting[1].y);
+        assert_eq!(bodies[1].y, resting[2].y);
+        assert_eq!(bodies[2].y, 400, "the chip in flight follows the pointer");
+        // Nothing was drawn in the dragged chip's own slot: that gap is where it lands.
+        assert!(!bodies[..2].iter().any(|r| r.y == resting[0].y));
+    }
+
+    #[test]
+    fn a_dragged_chip_stops_at_the_ends_of_the_rail() {
+        // Dragged past the rail's ends, the chip stops there rather than following the
+        // pointer out of the column.
+        let fonts = Fonts::new(&markdown::all_sizes(FONT_SIZE)).expect("a default font");
+        let ctx = BarCtx::new(&fonts, Scale::ONE, FONT_SIZE);
+        let vaults = rail_test_vaults();
+        let chips = rail(700);
+        for (top, expect_within) in [(-9999, true), (9999, true)] {
+            let mut list = Vec::new();
+            push_rail(
+                &mut list,
+                &ctx,
+                chips,
+                chips,
+                &RailView {
+                    vaults: &vaults,
+                    active: None,
+                    hovered: None,
+                    drag: Some(RailDragView { vault: 0, top }),
+                },
+            );
+            let drawn = list
+                .iter()
+                .find_map(|cmd| match cmd {
+                    DrawCmd::RoundRect { rect, .. } => Some(*rect),
+                    _ => None,
+                })
+                .expect("the chip is drawn");
+            assert_eq!(
+                drawn.y >= chips.y && drawn.y + drawn.h <= chips.y + chips.h,
+                expect_within,
+                "a chip dragged to {top} stays in the rail"
+            );
+        }
     }
 
     #[test]

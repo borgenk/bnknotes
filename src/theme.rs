@@ -156,9 +156,11 @@ pub(crate) const TAB_NEW_W: i32 = 24;
 /// the close box, scissored by the painter, with no ellipsis.
 pub(crate) const TAB_MIN_W: i32 = 58;
 pub(crate) const TAB_MAX_W: i32 = 220;
-/// How far the pointer must travel from a tab press before it counts as a drag to
-/// reorder rather than a plain click that selects the tab.
-pub(crate) const TAB_DRAG_THRESHOLD: i32 = 5;
+/// How far the pointer must travel from a press before it counts as a drag to
+/// reorder rather than a plain click. A hand is never quite still, so a click must
+/// survive a few pixels of it. Shared by the tab strip and the vault rail, each
+/// measuring along its own axis.
+pub(crate) const DRAG_THRESHOLD: i32 = 5;
 /// Left padding of the vault label inside its region.
 pub(crate) const VAULT_PAD_X: i32 = 14;
 
@@ -180,6 +182,12 @@ pub(crate) const RAIL_RADIUS: i32 = 9;
 /// recoloring it.
 pub(crate) const RAIL_HOVER_INK: u32 = 0x00ff_ffff;
 pub(crate) const RAIL_HOVER_LIFT: f32 = 0.12;
+/// How much closer in a chip's picture is taken under the pointer: the thumbnail's
+/// answer to a hover, where the picture pushes forward inside a frame that does not
+/// move. A chip that grew instead would jostle the rail, and a picture cannot lift
+/// toward white the way a flat fill does, so this is what a chip wearing one says
+/// back. Small: enough to notice, not enough to lose what the picture was of.
+pub(crate) const ICON_HOVER_ZOOM: f32 = 1.09;
 /// The active vault's marker: a short bar pinned to the rail's left edge, centered
 /// on its chip. Color and identity stay with the chip; this only says "you are
 /// here", the way a tab's fill does for its pane.
@@ -234,6 +242,13 @@ pub(crate) const MENU_ITEM_VPAD: i32 = 6;
 pub(crate) const MENU_ITEM_PAD_X: i32 = 12;
 /// Corner radius of a hovered item's fill, the tab buttons' rounding.
 pub(crate) const MENU_ITEM_RADIUS: i32 = TAB_BUTTON_RADIUS;
+
+/// The full-window picture view: what a double-clicked image opens into. The
+/// backdrop covers the whole window rather than dimming it, since the point is the
+/// picture and everything else is in the way of it; near-black, so a picture's own
+/// edges are where it ends. The padding is the clear space left around it.
+pub(crate) const IMAGE_VIEW_BG: u32 = 0x0007_090b;
+pub(crate) const IMAGE_VIEW_PAD: i32 = 28;
 
 /// File-tree sidebar and splitter colors and metrics.
 pub(crate) const TREE_BG: u32 = 0x0016_1a1f;

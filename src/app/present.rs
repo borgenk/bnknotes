@@ -469,7 +469,13 @@ impl State {
         // on the bridge path, or when the driver could not export one). Inline
         // images resolve against both panes' stores, so a picture renders in
         // whichever pane it belongs to.
-        let images = [&self.editors[0].images, &self.editors[1].images];
+        // The chips' baked icons resolve here too: an icon is a picture the editor
+        // made rather than read, but the renderer draws it like any other.
+        let images = [
+            &self.editors[0].images,
+            &self.editors[1].images,
+            &self.icons,
+        ];
         let glyph_gamma = self.glyph_gamma;
         let render_done = {
             let Some(gpu) = self.presentation.backend.as_mut() else {

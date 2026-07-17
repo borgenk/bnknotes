@@ -344,6 +344,16 @@ pub struct Face {
     /// face-only tests, in which case emoji clusters take the per-character
     /// path (tofu, exactly the pre-emoji behavior).
     emoji: Option<Rc<EmojiFont>>,
+    /// The faces consulted, in order, for a scalar this one has no glyph for, at
+    /// this face's own size; [`Fonts::with_config`] attaches the size's chain to
+    /// every face it opens there. Empty on a fallback face itself (the chain is one
+    /// deep, so resolving cannot recurse) and in face-only tests, where a missing
+    /// scalar draws the `.notdef` box.
+    ///
+    /// A face holds its own chain so that [`Self::glyph_face`] can answer which face
+    /// draws a scalar from a `&Face` alone, which is what lets measuring and drawing
+    /// route through one decision (see [`Self::advance`]).
+    fallback: Vec<Rc<Face>>,
 }
 
 /// A snapshot of a glyph cache's hit and miss tallies. Summing these across every
@@ -432,6 +442,7 @@ impl Face {
             misses: Cell::new(0),
             pixel_size: Cell::new(0),
             emoji: None,
+            fallback: Vec::new(),
         })
     }
 
@@ -533,9 +544,16 @@ impl Face {
     /// Pen advance of a character at the current pixel size, in pixels, cached on
     /// the face. The first measurement loads the glyph's metrics through FreeType;
     /// every later one is a map hit. Zero on a load failure.
+    ///
+    /// The advance is the drawing face's, so a scalar this face lacks measures as the
+    /// fallback that inks it will draw it: this is the measuring twin of
+    /// [`Self::glyph_face`], and the two must route the same way or the pen advances
+    /// by one face while the ink comes from another, and the glyph collides with (or
+    /// leaves a gap before) whatever follows.
     pub fn advance(&self, ch: char) -> f32 {
         // `measure_advance` reads only FreeType state, never this cache, so filling
-        // a miss while the cache is borrowed cannot reenter this borrow.
+        // a miss while the cache is borrowed cannot reenter this borrow. The
+        // resolution it does is paid once per character; every later ask is a hit.
         *self
             .advances
             .borrow_mut()
@@ -543,10 +561,35 @@ impl Face {
             .or_insert_with(|| self.measure_advance(ch))
     }
 
-    /// Load a character's pen advance from FreeType, metrics only (no
-    /// rasterization), so measuring a run never pays for scan conversion. The
-    /// uncached primitive behind [`Self::advance`]. Zero on a load failure.
+    /// The face that draws `ch`: this one when its character map covers the scalar,
+    /// else the first face in the fallback chain that does, else this one again (so a
+    /// scalar absent everywhere draws its own `.notdef` box). The single routing
+    /// decision the measure and draw paths share, the way [`Self::emoji_cluster`] is
+    /// for color clusters.
+    ///
+    /// The keyed face's own map is consulted first and answers every ASCII and Latin
+    /// glyph without touching the chain, so the common case pays one
+    /// [`FT_Get_Char_Index`] and only a genuine miss walks the (short) chain.
+    pub fn glyph_face(&self, ch: char) -> &Face {
+        if self.has_scalar(ch) {
+            return self;
+        }
+        self.fallback
+            .iter()
+            .find(|f| f.has_scalar(ch))
+            .map_or(self, |f| f.as_ref())
+    }
+
+    /// Load `ch`'s pen advance, from whichever face draws it. The uncached primitive
+    /// behind [`Self::advance`]. Zero on a load failure.
     fn measure_advance(&self, ch: char) -> f32 {
+        self.glyph_face(ch).load_advance(ch)
+    }
+
+    /// Load a character's pen advance from this face through FreeType, metrics only
+    /// (no rasterization), so measuring a run never pays for scan conversion. Zero on
+    /// a load failure.
+    fn load_advance(&self, ch: char) -> f32 {
         // SAFETY: face is valid; FT_LOAD_DEFAULT loads metrics into the glyph
         // slot without rendering. The advance is read out immediately.
         let err =
@@ -712,11 +755,22 @@ struct SizedFaces {
     /// The code family's regular face at this size, or `None` when no distinct
     /// code family is installed (code then falls back to `regular`).
     code: Option<Face>,
-    /// The fallback chain at this size ([`FontConfig::fallback`]), in priority
-    /// order, holding only the faces whose files exist. Consulted by
-    /// [`Fonts::glyph_face`] for a scalar the keyed face cannot draw; empty when
-    /// the config lists none.
-    fallback: Vec<Face>,
+    /// The fallback chain at this size ([`FontConfig::fallback`]), in priority order,
+    /// holding only the faces whose files exist; empty when the config lists none.
+    /// Every face above shares it (see [`Face::fallback`]), which is how a scalar the
+    /// keyed face lacks resolves to the face that draws it.
+    ///
+    /// A fallback face carries no emoji font of its own: it draws only scalars the
+    /// primary lacks and never routes a color cluster.
+    ///
+    /// It opens at the primary `size` and its glyphs rasterize at the font's own
+    /// natural proportions; a fallback face is deliberately NOT scaled down to the
+    /// primary's em. Nerd Font's non-"Mono" cut draws icons wider than a monospace
+    /// column, so an icon glyph (a git-branch mark, a Powerline separator) comes out
+    /// big and crisp. Proportional text advances by the drawing face's own advance,
+    /// so a natively wide glyph takes the room it needs rather than overrunning what
+    /// follows.
+    fallback: Vec<Rc<Face>>,
     metrics: Metrics,
 }
 
@@ -730,7 +784,7 @@ impl SizedFaces {
             .chain(self.italic.as_ref())
             .chain(self.bold_italic.as_ref())
             .chain(self.code.as_ref())
-            .chain(self.fallback.iter())
+            .chain(self.fallback.iter().map(|f| f.as_ref()))
     }
 }
 
@@ -772,33 +826,27 @@ impl Fonts {
             if size == 0 || sized.iter().any(|s| s.size == size) {
                 continue;
             }
-            let regular = open_face(&family.regular, size, emoji.as_ref())?;
+            // The chain opens first: every face at this size carries it, so each can
+            // resolve a scalar it lacks on its own.
+            let fallback: Vec<Rc<Face>> = config
+                .fallback
+                .iter()
+                .filter_map(|p| open_variant(p, size, None, &[]).map(Rc::new))
+                .collect();
+            let regular = open_face(&family.regular, size, emoji.as_ref(), &fallback)?;
             let mut metrics = regular.metrics();
             // Grow the line box to the requested multiple of the size, keeping
             // the font's own line height as the floor so lines never overlap.
             // Ascent and descent stay the glyph metrics; the extra sits below.
             let target = (line_height_scale * size as f32).round() as i32;
             metrics.line_height = metrics.line_height.max(target);
-            // Fallback faces draw only scalars the primary lacks and never route
-            // emoji clusters themselves, so they carry no emoji font.
-            //
-            // They open at the primary `size` and their glyphs rasterize at the
-            // font's own natural proportions: we deliberately do NOT scale a fallback
-            // face down to the primary's em. Nerd Font's non-"Mono" cut draws icons
-            // wider than a monospace column, so an icon glyph (a git-branch mark, a
-            // Powerline separator) comes out big and crisp.
-            let fallback = config
-                .fallback
-                .iter()
-                .filter_map(|p| open_variant(p, size, None))
-                .collect();
             sized.push(SizedFaces {
                 size,
                 regular,
-                bold: open_variant(&family.bold, size, emoji.as_ref()),
-                italic: open_variant(&family.italic, size, emoji.as_ref()),
-                bold_italic: open_variant(&family.bold_italic, size, emoji.as_ref()),
-                code: code_path.and_then(|p| open_variant(p, size, emoji.as_ref())),
+                bold: open_variant(&family.bold, size, emoji.as_ref(), &fallback),
+                italic: open_variant(&family.italic, size, emoji.as_ref(), &fallback),
+                bold_italic: open_variant(&family.bold_italic, size, emoji.as_ref(), &fallback),
+                code: code_path.and_then(|p| open_variant(p, size, emoji.as_ref(), &fallback)),
                 fallback,
                 metrics,
             });
@@ -852,31 +900,19 @@ impl Fonts {
         }
     }
 
-    /// The physical face to rasterize `ch` in for `key`: the keyed face when its
-    /// character map covers `ch`, otherwise the first fallback face at that size
-    /// that does, otherwise the keyed face again (so a scalar absent everywhere
-    /// still draws its `.notdef` box, the pre-fallback behavior). This is how a
-    /// Nerd Font / Powerline icon reaches its glyph in a symbols font even though
-    /// the prose or code family has no glyph for it.
+    /// The physical face to rasterize `ch` in for `key`: [`Face::glyph_face`] on the
+    /// keyed face, which is also what [`Face::advance`] measures through, so the pen
+    /// advances by the face the ink came from. This is how a Nerd Font / Powerline
+    /// icon, or an arrow a note contains, reaches its glyph in a symbols font
+    /// even though the prose or code family has no glyph for it.
     ///
-    /// Emoji never arrive here: a color cluster is resolved through the emoji
-    /// cluster path before any scalar is drawn. The keyed face's own cmap is
-    /// consulted first and answers every ASCII and Latin glyph without touching a
-    /// fallback face, so the common case pays a single [`FT_Get_Char_Index`], and
-    /// only a genuine miss walks the (short) chain. The GPU batcher caches the
-    /// resolved raster by `(key, ch)`, so this runs once per new glyph, never per
-    /// frame. With an empty [`FontConfig::fallback`] the chain is empty and this
-    /// always returns the keyed face.
+    /// Emoji never arrive here: a color cluster is resolved through the emoji cluster
+    /// path before any scalar is drawn. The GPU batcher caches the resolved raster by
+    /// `(key, ch)`, so this runs once per new glyph, never per frame. With an empty
+    /// [`FontConfig::fallback`] the chain is empty and this always returns the keyed
+    /// face.
     pub fn glyph_face(&self, key: FaceKey, ch: char) -> &Face {
-        let primary = self.face_for(key);
-        if primary.has_scalar(ch) {
-            return primary;
-        }
-        self.entry(key.size())
-            .fallback
-            .iter()
-            .find(|f| f.has_scalar(ch))
-            .unwrap_or(primary)
+        self.face_for(key).glyph_face(ch)
     }
 
     /// The metrics for `size`, or the fallback's metrics if `size` was not opened.
@@ -903,21 +939,32 @@ impl Fonts {
 /// Open `path` at `size` with the shared `emoji` font attached: the three-step
 /// face open (read the file, fix the pixel size, share the emoji font) that
 /// both the required regular face and the optional variants go through.
-fn open_face(path: &str, size: u32, emoji: Option<&Rc<EmojiFont>>) -> Result<Face> {
+fn open_face(
+    path: &str,
+    size: u32,
+    emoji: Option<&Rc<EmojiFont>>,
+    fallback: &[Rc<Face>],
+) -> Result<Face> {
     let mut face = Face::from_path(path)?;
     face.set_pixel_size(size)?;
     face.emoji = emoji.cloned();
+    face.fallback = fallback.to_vec();
     Ok(face)
 }
 
 /// Open a style variant at `size`, or `None` if the file is absent or fails to
 /// load, leaving the caller to fall back to the regular face. Keeps a family
 /// that ships only some weights from being a hard error.
-fn open_variant(path: &str, size: u32, emoji: Option<&Rc<EmojiFont>>) -> Option<Face> {
+fn open_variant(
+    path: &str,
+    size: u32,
+    emoji: Option<&Rc<EmojiFont>>,
+    fallback: &[Rc<Face>],
+) -> Option<Face> {
     if !std::path::Path::new(path).exists() {
         return None;
     }
-    open_face(path, size, emoji).ok()
+    open_face(path, size, emoji, fallback).ok()
 }
 
 /// Copy a FreeType bitmap into a tightly packed top-down coverage buffer of
@@ -1220,5 +1267,89 @@ mod tests {
                 "the arrow should ink from a fallback face"
             );
         }
+    }
+
+    #[test]
+    fn a_fallback_scalar_advances_by_the_face_that_draws_it() {
+        // The invariant the whole fallback path rests on: the pen moves by the width
+        // of the glyph that was inked. Measured on the primary instead, the ink comes
+        // from a 1em arrow while the pen steps a narrow .notdef box, and the arrow
+        // runs into whatever follows it.
+        const ARROW: char = '→';
+        let fonts = Fonts::new(&[16]).expect("a default font");
+        let key = FaceKey::Prose {
+            size: 16,
+            style: FontStyle::Regular,
+        };
+        let primary = fonts.face_for(key);
+        let drawn = fonts.glyph_face(key, ARROW);
+        if std::ptr::eq(primary, drawn) {
+            return; // No symbols fallback on this machine: nothing to check.
+        }
+        assert_eq!(
+            primary.advance(ARROW),
+            drawn.load_advance(ARROW),
+            "the pen should advance by the drawing face's own advance"
+        );
+    }
+
+    #[test]
+    fn a_scalar_the_primary_owns_is_measured_by_the_primary() {
+        // The fallback chain must not touch the common path: an ASCII letter resolves
+        // to the primary and measures there, chain or no chain.
+        let fonts = Fonts::new(&[16]).expect("a default font");
+        let key = FaceKey::Prose {
+            size: 16,
+            style: FontStyle::Regular,
+        };
+        let primary = fonts.face_for(key);
+        assert!(std::ptr::eq(fonts.glyph_face(key, 'a'), primary));
+        assert_eq!(primary.advance('a'), primary.load_advance('a'));
+    }
+
+    #[test]
+    fn a_scalar_no_face_has_still_measures_the_notdef_box_it_draws() {
+        // A private-use scalar nothing covers: resolution comes back to the primary,
+        // so the tofu box it draws is the width the pen steps. Skipped on a machine
+        // whose symbols fallback happens to map it.
+        const UNMAPPED: char = '\u{E000}';
+        let fonts = Fonts::new(&[16]).expect("a default font");
+        let key = FaceKey::Prose {
+            size: 16,
+            style: FontStyle::Regular,
+        };
+        let primary = fonts.face_for(key);
+        if fonts.glyph_face(key, UNMAPPED).has_scalar(UNMAPPED) {
+            return;
+        }
+        assert!(std::ptr::eq(fonts.glyph_face(key, UNMAPPED), primary));
+        assert_eq!(primary.advance(UNMAPPED), primary.load_advance(UNMAPPED));
+    }
+
+    #[test]
+    fn a_run_measures_as_the_sum_of_the_glyphs_it_draws() {
+        // What the collision looked like from the layout's side: `text_advance` over a
+        // run holding a fallback scalar has to account for that glyph's real width, or
+        // every glyph after it is placed too far left.
+        const ARROW: char = '→';
+        let fonts = Fonts::new(&[16]).expect("a default font");
+        let key = FaceKey::Prose {
+            size: 16,
+            style: FontStyle::Regular,
+        };
+        let face = fonts.face_for(key);
+        if std::ptr::eq(fonts.glyph_face(key, ARROW), face) {
+            return; // No symbols fallback on this machine.
+        }
+        let with = crate::platform::shape::text_advance(face, "a→b");
+        let without = crate::platform::shape::text_advance(face, "ab");
+        assert_eq!(
+            with - without,
+            face.advance(ARROW),
+            "the run should grow by exactly the arrow's own advance"
+        );
+        // And the arrow is genuinely wider than the box the primary would have
+        // stepped, which is the drift this guards.
+        assert!(face.advance(ARROW) > face.load_advance(ARROW));
     }
 }

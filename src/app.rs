@@ -27,7 +27,7 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
-use self::clipboard::{is_text_mime, ClipboardState, CLIPBOARD_MIMES};
+use self::clipboard::{is_text_mime, ClipboardState, CLIPBOARD_MIMES, IMAGE_MIMES};
 use self::input::KeyRepeat;
 use self::present::GpuPresentation;
 use crate::config::{self, vault_name, CaretConfig, Config, Vault, VaultKind};
@@ -1737,6 +1737,17 @@ impl State {
                 && (self.clipboard.incoming_text_mime.is_none() || mime == CLIPBOARD_MIMES[0])
             {
                 self.clipboard.incoming_text_mime = Some(mime.to_string());
+            }
+            // An offer lists every flavor its source can produce, so a screenshot's
+            // image/png and a browser's image-plus-markup both land here; which one a
+            // paste takes is decided at the paste (see `State::paste`). The first
+            // image type we accept is kept unless the preferred one turns up later.
+            if let Some(image) = IMAGE_MIMES.iter().find(|m| **m == mime) {
+                let have_preferred =
+                    self.clipboard.incoming_image_mime.as_deref() == Some(IMAGE_MIMES[0]);
+                if !have_preferred {
+                    self.clipboard.incoming_image_mime = Some((*image).to_string());
+                }
             }
             return Ok(());
         }

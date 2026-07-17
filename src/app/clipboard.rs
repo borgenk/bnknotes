@@ -1,4 +1,5 @@
 use std::os::fd::AsRawFd;
+use std::path::{Path, PathBuf};
 
 use super::State;
 use crate::file;
@@ -9,10 +10,22 @@ use crate::platform::protocol::{
     wl_data_device, wl_data_device_manager, wl_data_offer, wl_data_source,
 };
 use crate::platform::wire::{Arg, Reader};
+use crate::render::image;
 
 /// MIME types we advertise when putting text on the clipboard, and accept when
 /// pasting. The charset variant is listed first as the preferred form.
 pub(super) const CLIPBOARD_MIMES: &[&str] = &["text/plain;charset=utf-8", "text/plain"];
+
+/// The image types a paste accepts, in preference order: what the editor's decoder
+/// reads, since a picture it cannot draw is one it should not file in the vault.
+/// PNG first, the lossless form a screenshot tool and a browser both offer.
+pub(super) const IMAGE_MIMES: &[&str] = &["image/png", "image/jpeg"];
+
+/// Largest clipboard payload a paste will take. Another app decides what it puts on
+/// the clipboard and how big it is, so the read is bounded; this is the same ceiling
+/// the editor opens a file at, since a paste lands in the same rope (and, for an
+/// image, the same vault) that a file would.
+const MAX_PASTE_BYTES: usize = 64 * 1024 * 1024;
 
 /// Clipboard state. When we own the selection, `source` is our live
 /// `wl_data_source`; `data` is the bytes it serves and `mimes` the types it
@@ -24,8 +37,11 @@ pub(super) struct ClipboardState {
     pub(super) mimes: Vec<&'static str>,
     pub(super) incoming_offer: u32,
     pub(super) incoming_text_mime: Option<String>,
+    /// The image type this offer carries, if it carries one we decode.
+    pub(super) incoming_image_mime: Option<String>,
     pub(super) selection_offer: u32,
     pub(super) selection_text_mime: Option<String>,
+    pub(super) selection_image_mime: Option<String>,
 }
 
 impl ClipboardState {
@@ -36,8 +52,10 @@ impl ClipboardState {
             mimes: Vec::new(),
             incoming_offer: 0,
             incoming_text_mime: None,
+            incoming_image_mime: None,
             selection_offer: 0,
             selection_text_mime: None,
+            selection_image_mime: None,
         }
     }
 }
@@ -49,6 +67,7 @@ impl State {
                 // The compositor introduces a new offer; its MIME types follow.
                 self.clipboard.incoming_offer = r.u32()?;
                 self.clipboard.incoming_text_mime = None;
+                self.clipboard.incoming_image_mime = None;
             }
             wl_data_device::EV_SELECTION => {
                 let offer = r.u32()?;
@@ -57,12 +76,13 @@ impl State {
                         .request(self.clipboard.selection_offer, wl_data_offer::DESTROY, &[]);
                 }
                 self.clipboard.selection_offer = offer;
-                self.clipboard.selection_text_mime =
-                    if offer != 0 && offer == self.clipboard.incoming_offer {
-                        self.clipboard.incoming_text_mime.clone()
-                    } else {
-                        None
-                    };
+                let current = offer != 0 && offer == self.clipboard.incoming_offer;
+                self.clipboard.selection_text_mime = current
+                    .then(|| self.clipboard.incoming_text_mime.clone())
+                    .flatten();
+                self.clipboard.selection_image_mime = current
+                    .then(|| self.clipboard.incoming_image_mime.clone())
+                    .flatten();
             }
             _ => {}
         }
@@ -182,12 +202,146 @@ impl State {
         self.clipboard.mimes = mimes;
     }
 
-    /// Insert the clipboard's text at the cursor.
+    /// Insert the clipboard at the cursor: its text, or an image filed into the
+    /// vault and embedded.
+    ///
+    /// Which one is not simply "an image if there is one". A source offers every
+    /// flavor it can produce, so the flavors together say what was copied better
+    /// than any one does: plain text alongside an image means text was copied and the
+    /// image is a rendering of it (a spreadsheet cell, a formatted quote), while an
+    /// image alongside only markup means the image was copied and the markup is a tag
+    /// pointing at it (a browser's "Copy Image"). So plain text wins over an image,
+    /// and an image wins over rich text alone.
     pub(super) fn paste(&mut self) -> Result<()> {
+        if self.clipboard_offers_image() && !self.clipboard_offers_plain_text() {
+            // A paste that cannot be filed says so and stops, rather than quietly
+            // pasting an <img> tag's markup instead of the picture it names.
+            if let Err(e) = self.paste_image() {
+                eprintln!("bnknotes: could not paste the image: {e}");
+            }
+            return Ok(());
+        }
         if let Some(text) = self.clipboard_text()? {
             self.insert_clipboard(&text);
         }
         Ok(())
+    }
+
+    /// Whether the clipboard holds an image this can decode.
+    fn clipboard_offers_image(&self) -> bool {
+        if self.clipboard.source != 0 {
+            return self.clipboard.mimes.iter().any(|m| IMAGE_MIMES.contains(m));
+        }
+        self.clipboard.selection_image_mime.is_some() && self.clipboard.selection_offer != 0
+    }
+
+    /// Whether the clipboard holds plain text, as opposed to the rich text a source
+    /// offers alongside an image to describe it.
+    fn clipboard_offers_plain_text(&self) -> bool {
+        if self.clipboard.source != 0 {
+            return self.clipboard.mimes.iter().any(|m| is_plain_text_mime(m));
+        }
+        self.clipboard
+            .selection_text_mime
+            .as_deref()
+            .is_some_and(is_plain_text_mime)
+    }
+
+    /// File the clipboard's image in the vault's attachment folder and embed it at
+    /// the cursor.
+    fn paste_image(&mut self) -> Result<()> {
+        let Some(bytes) = self.clipboard_image()? else {
+            return Ok(());
+        };
+        // Decode before writing: the vault gets a picture the editor can draw back,
+        // or nothing. This also runs the bytes past the dimension limits, so a
+        // hostile or absurd image is refused here rather than at every later layout.
+        image::Image::decode(&bytes, image::Limits::default())?;
+        let name = self.write_attachment(&bytes)?;
+        self.insert_embed(&name);
+        Ok(())
+    }
+
+    /// The clipboard's image bytes, if it holds an image. Mirrors
+    /// [`Self::clipboard_text`], including why our own selection is answered from our
+    /// own copy rather than through the compositor: receiving would block on a pipe
+    /// only we can fill.
+    fn clipboard_image(&mut self) -> Result<Option<Vec<u8>>> {
+        if self.clipboard.source != 0 {
+            if self.clipboard.mimes.iter().any(|m| IMAGE_MIMES.contains(m)) {
+                return Ok(Some(self.clipboard.data.clone()));
+            }
+            return Ok(None);
+        }
+        let (Some(mime), true) = (
+            self.clipboard.selection_image_mime.clone(),
+            self.clipboard.selection_offer != 0,
+        ) else {
+            return Ok(None);
+        };
+        let (read_end, write_end) = ffi::pipe()?;
+        self.conn.request_with_fd(
+            self.clipboard.selection_offer,
+            wl_data_offer::RECEIVE,
+            &[Arg::Str(&mime)],
+            write_end.as_raw_fd(),
+        )?;
+        drop(write_end);
+        Ok(Some(ffi::read_to_end(
+            read_end.as_raw_fd(),
+            MAX_PASTE_BYTES,
+        )?))
+    }
+
+    /// Write `bytes` into the active vault's attachment folder, under a fresh name,
+    /// and report that name for the embed to point at.
+    ///
+    /// The name is `Pasted image <local timestamp>.<ext>`, the usual name for a pasted
+    /// attachment, and the folder is whichever attachment folder the vault already
+    /// keeps (see [`image::attachment_dir`]), so the file lands beside the vault's
+    /// other pasted images.
+    fn write_attachment(&mut self, bytes: &[u8]) -> Result<String> {
+        let ext = image::extension(bytes)
+            .ok_or_else(|| Error::msg("the clipboard's image is not a PNG or a JPEG"))?;
+        let dir = image::attachment_dir(self.tree.tree.root());
+        std::fs::create_dir_all(&dir)?;
+        let stamp = timestamp()?;
+        let (name, path) = free_attachment_name(&dir, &stamp, ext)
+            .ok_or_else(|| Error::msg("no free name for the pasted image"))?;
+        file::save_atomic(&path, bytes)?;
+        Ok(name)
+    }
+
+    /// Insert an embed of `name` at the cursor, on a line of its own: a picture only
+    /// renders when nothing shares its line, so this opens a line for it when the
+    /// cursor is mid-text and leaves the caret on the next one, ready to keep typing
+    /// under the image.
+    fn insert_embed(&mut self, name: &str) {
+        let i = self.active_editor();
+        let lead = if self.active_line_is_blank_before_cursor(i) {
+            ""
+        } else {
+            "\n"
+        };
+        self.editors[i]
+            .text
+            .insert_str(&format!("{lead}![[{name}]]\n"));
+        self.after_edit();
+    }
+
+    /// Whether the cursor in editor `i` has nothing but blanks before it on its line,
+    /// so an embed can start where it stands rather than on a new line.
+    fn active_line_is_blank_before_cursor(&self, i: usize) -> bool {
+        let text = &self.editors[i].text;
+        let cursor = text.cursor();
+        let rope = text.rope();
+        let start = rope.line_to_byte(rope.byte_to_line(cursor));
+        // Borrowed: the run before a cursor is one line's head, and a single-leaf
+        // range hands back a `&str` without copying it.
+        rope.slice(start..cursor)
+            .as_cow()
+            .chars()
+            .all(char::is_whitespace)
     }
 
     /// The clipboard's text, if it holds any. If we own the clipboard, our own
@@ -219,7 +373,7 @@ impl State {
             write_end.as_raw_fd(),
         )?;
         drop(write_end);
-        let bytes = ffi::read_to_end(read_end.as_raw_fd())?;
+        let bytes = ffi::read_to_end(read_end.as_raw_fd(), MAX_PASTE_BYTES)?;
         Ok(String::from_utf8(bytes).ok())
     }
 
@@ -233,12 +387,144 @@ impl State {
         let text = file::normalize_newlines(text);
         let i = self.active_editor();
         self.editors[i].text.insert_str(&text);
-        self.dirty = true;
-        self.reveal_active_caret();
+        // A paste is an edit like any other: the same settling every keystroke gets,
+        // so the title's modified marker is not left reading clean over pasted text.
+        self.after_edit();
     }
 }
 
 /// Whether a clipboard MIME type carries text we can paste.
 pub(super) fn is_text_mime(mime: &str) -> bool {
     mime.starts_with("text/") || mime == "UTF8_STRING"
+}
+
+/// Whether a clipboard MIME type carries text as text, rather than as markup
+/// describing something else. What separates a copied paragraph from the `<img>` tag
+/// a browser offers beside a copied image.
+fn is_plain_text_mime(mime: &str) -> bool {
+    mime.starts_with("text/plain") || mime == "UTF8_STRING"
+}
+
+/// The local wall-clock stamp a pasted image is named with: `YYYYMMDDHHMMSS`, to the
+/// second. Local rather than UTC because the name is read by a person looking for
+/// what they pasted this morning.
+fn timestamp() -> Result<String> {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|_| Error::msg("the system clock is before 1970"))?
+        .as_secs();
+    let now = i64::try_from(secs)
+        .ok()
+        .and_then(ffi::local_time)
+        .ok_or_else(|| Error::msg("cannot read the local time"))?;
+    Ok(format!(
+        "{:04}{:02}{:02}{:02}{:02}{:02}",
+        now.year, now.month, now.day, now.hour, now.minute, now.second
+    ))
+}
+
+/// A name no file in `dir` has yet, and the path to write it at: `Pasted image
+/// <stamp>.<ext>`, then the same with a counter. The stamp only counts to the
+/// second, so a counter is what a second paste inside one second needs; past
+/// [`MAX_ATTACHMENT_TRIES`] of them, `None`.
+fn free_attachment_name(dir: &Path, stamp: &str, ext: &str) -> Option<(String, PathBuf)> {
+    (0..MAX_ATTACHMENT_TRIES)
+        .map(|n| match n {
+            0 => format!("Pasted image {stamp}.{ext}"),
+            _ => format!("Pasted image {stamp} {n}.{ext}"),
+        })
+        .map(|name| {
+            let path = dir.join(&name);
+            (name, path)
+        })
+        .find(|(_, path)| !path.exists())
+}
+
+/// How many same-second names a paste tries before giving up. A second paste inside
+/// one second takes the first counter; a hundred of them is not a person pasting.
+const MAX_ATTACHMENT_TRIES: u32 = 100;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn plain_text_is_told_from_the_markup_beside_an_image() {
+        // What decides whether a paste takes the picture or the words: a source
+        // offering plain text was copied as text, one offering only markup beside an
+        // image was not.
+        assert!(is_plain_text_mime("text/plain"));
+        assert!(is_plain_text_mime("text/plain;charset=utf-8"));
+        assert!(is_plain_text_mime("UTF8_STRING"));
+        assert!(!is_plain_text_mime("text/html"));
+        assert!(!is_plain_text_mime("image/png"));
+        // Every plain flavor is still a text flavor.
+        assert!(CLIPBOARD_MIMES.iter().all(|m| is_plain_text_mime(m)));
+        assert!(CLIPBOARD_MIMES.iter().all(|m| is_text_mime(m)));
+    }
+
+    #[test]
+    fn rich_text_is_text_but_not_plain_text() {
+        // text/html still pastes as text when it is all there is, so it must stay a
+        // text mime while losing to an image.
+        assert!(is_text_mime("text/html"));
+        assert!(!is_plain_text_mime("text/html"));
+    }
+
+    /// A scratch attachment folder, unique per test name.
+    fn tmp_dir(name: &str) -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("bnknotes-paste-{}-{}", std::process::id(), name));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        dir
+    }
+
+    #[test]
+    fn an_attachment_is_named_pasted_image_and_a_stamp() {
+        let dir = tmp_dir("name");
+        let (name, path) =
+            free_attachment_name(&dir, "20260717041530", "png").expect("a free name");
+        assert_eq!(name, "Pasted image 20260717041530.png");
+        assert_eq!(path, dir.join(&name));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_second_paste_in_the_same_second_takes_a_counter() {
+        // The stamp only counts to the second, so two quick pastes would otherwise
+        // write the same name twice and the first picture would be gone.
+        let dir = tmp_dir("counter");
+        std::fs::write(dir.join("Pasted image 20260717041530.png"), b"first").expect("write");
+        let (name, _) = free_attachment_name(&dir, "20260717041530", "png").expect("a free name");
+        assert_eq!(name, "Pasted image 20260717041530 1.png");
+
+        std::fs::write(dir.join(&name), b"second").expect("write");
+        let (name, _) = free_attachment_name(&dir, "20260717041530", "png").expect("a free name");
+        assert_eq!(name, "Pasted image 20260717041530 2.png");
+        // The first paste is still there under its own name.
+        assert_eq!(
+            std::fs::read(dir.join("Pasted image 20260717041530.png")).expect("read"),
+            b"first"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_name_carries_the_images_own_extension() {
+        let dir = tmp_dir("ext");
+        let (name, _) = free_attachment_name(&dir, "20260717041530", "jpg").expect("a free name");
+        assert!(name.ends_with(".jpg"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn the_timestamp_is_fourteen_digits() {
+        // YYYYMMDDHHMMSS, so attachments sort by when they were pasted.
+        let stamp = timestamp().expect("the local time");
+        assert_eq!(stamp.len(), 14);
+        assert!(stamp.chars().all(|c| c.is_ascii_digit()));
+        // A plausible year, zero-padded rather than truncated.
+        let year: i32 = stamp[..4].parse().expect("a year");
+        assert!((2000..2200).contains(&year), "year was {year}");
+    }
 }

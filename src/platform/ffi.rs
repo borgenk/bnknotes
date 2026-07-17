@@ -2,7 +2,7 @@
 //! links libc, so these symbols resolve without a `#[link]` attribute; we
 //! declare only the handful we need.
 //!
-//! Four jobs live here:
+//! Five jobs live here:
 //!   1. mapping the keyboard keymap fd the compositor sends: `mmap`/`munmap`.
 //!   2. fd-passing on the Wayland socket: `sendmsg`/`recvmsg` with SCM_RIGHTS
 //!      ancillary data, which is how the compositor hands us the keyboard
@@ -13,11 +13,13 @@
 //!   4. the dma-buf sync-file ioctls, the implicit-sync bridge between the
 //!      GPU backend's explicit fences and the fences other dmabuf users (the
 //!      compositor) observe. Kernel dma-buf core, driver-independent.
+//!   5. local wall-clock time (`localtime_r`), for the timestamp a pasted image's
+//!      filename carries: the zone rules are the system's, not ours to model.
 //!
 //! Struct layouts (`msghdr`, `iovec`, `cmsghdr`) mirror the Linux x86_64/arm64
 //! ABI; this targets Linux/Wayland and nothing else.
 
-use core::ffi::{c_char, c_int, c_short, c_uint, c_ulong, c_void, CStr};
+use core::ffi::{c_char, c_int, c_long, c_short, c_uint, c_ulong, c_void, CStr};
 use std::mem;
 use std::os::fd::{FromRawFd, OwnedFd, RawFd};
 use std::time::Duration;
@@ -131,6 +133,65 @@ extern "C" {
     fn dlsym(handle: *mut c_void, symbol: *const c_char) -> *mut c_void;
     fn dlclose(handle: *mut c_void) -> c_int;
     fn ioctl(fd: c_int, request: c_ulong, ...) -> c_int;
+    fn localtime_r(time: *const i64, result: *mut Tm) -> *mut Tm;
+}
+
+/// `struct tm`, the Linux/glibc layout. Only the civil fields below are read; the
+/// rest are here to size the struct correctly, since `localtime_r` writes all of it.
+#[repr(C)]
+struct Tm {
+    tm_sec: c_int,
+    tm_min: c_int,
+    tm_hour: c_int,
+    tm_mday: c_int,
+    tm_mon: c_int,
+    tm_year: c_int,
+    tm_wday: c_int,
+    tm_yday: c_int,
+    tm_isdst: c_int,
+    tm_gmtoff: c_long,
+    tm_zone: *const c_char,
+}
+
+/// A wall-clock date and time, broken into the parts a person reads. Fields are as
+/// written rather than as C stores them: a full year, and months and days from 1.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LocalTime {
+    pub year: i32,
+    /// 1..=12.
+    pub month: u32,
+    /// 1..=31.
+    pub day: u32,
+    pub hour: u32,
+    pub minute: u32,
+    pub second: u32,
+}
+
+/// The local wall-clock time for a unix timestamp: the zone and its daylight rules
+/// come from the system (`TZ`, else `/etc/localtime`), which is what makes a
+/// timestamp written into a filename read as the time the user was at.
+///
+/// `None` when the conversion fails, which for a plausible timestamp it does not.
+pub fn local_time(unix_seconds: i64) -> Option<LocalTime> {
+    let mut tm = mem::MaybeUninit::<Tm>::uninit();
+    // SAFETY: `localtime_r` fills the caller's `struct tm` and returns it, or null
+    // on failure; the timestamp is passed by pointer and only read. On success the
+    // struct is initialized, so reading it is defined.
+    let tm = unsafe {
+        if localtime_r(&unix_seconds, tm.as_mut_ptr()).is_null() {
+            return None;
+        }
+        tm.assume_init()
+    };
+    Some(LocalTime {
+        // C counts years from 1900 and months from 0; a reader does not.
+        year: tm.tm_year.checked_add(1900)?,
+        month: u32::try_from(tm.tm_mon.checked_add(1)?).ok()?,
+        day: u32::try_from(tm.tm_mday).ok()?,
+        hour: u32::try_from(tm.tm_hour).ok()?,
+        minute: u32::try_from(tm.tm_min).ok()?,
+        second: u32::try_from(tm.tm_sec).ok()?,
+    })
 }
 
 fn errno() -> c_int {
@@ -448,9 +509,11 @@ pub fn write_all(fd: RawFd, bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
-/// Read `fd` to end-of-file, returning all bytes. Used to pull a paste payload
-/// out of the pipe the compositor writes into.
-pub fn read_to_end(fd: RawFd) -> Result<Vec<u8>> {
+/// Read `fd` to end-of-file, returning all bytes, or an error once they would pass
+/// `cap`. Used to pull a paste payload out of the pipe the compositor writes into:
+/// the payload is another app's, of a size it chooses, so the cap is the caller's
+/// statement of what it is willing to hold.
+pub fn read_to_end(fd: RawFd, cap: usize) -> Result<Vec<u8>> {
     let mut out = Vec::new();
     let mut buf = [0u8; 4096];
     loop {
@@ -465,6 +528,11 @@ pub fn read_to_end(fd: RawFd) -> Result<Vec<u8>> {
         }
         if n == 0 {
             break;
+        }
+        // What the far end sends is its choice, not ours, so the read is bounded:
+        // refuse past the cap rather than grow a buffer until the editor dies.
+        if out.len() + n as usize > cap {
+            return Err(Error::msg(format!("more than {cap} bytes to read")));
         }
         out.extend_from_slice(&buf[..n as usize]);
     }

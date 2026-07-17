@@ -7,6 +7,7 @@ use crate::layout::{
 };
 use crate::markdown;
 use crate::menu::{Menu, MenuLayout};
+use crate::palette::{self, Palette, PaletteLayout};
 use crate::pane::{DiskConflict, TreePane};
 use crate::platform::freetype::{Face, FaceKey, FontStyle, Fonts, Metrics};
 use crate::platform::geom::Rect;
@@ -24,7 +25,9 @@ use crate::theme::{
     FIND_TICK_COLOR, FOREGROUND, HEADING_COLORS, IMAGE_BORDER_COLOR, IMAGE_BORDER_THICKNESS,
     IMAGE_BUTTON_BG, IMAGE_BUTTON_RADIUS, IMAGE_VIEW_BG, IMAGE_VIEW_PAD, LINK_COLOR, MARGIN,
     MARKER_COLOR, MENU_BG, MENU_BORDER, MENU_BORDER_W, MENU_HOVER_BG, MENU_ITEM_PAD_X,
-    MENU_ITEM_RADIUS, MENU_RADIUS, MENU_TEXT, QUOTE_BAR_COLOR, QUOTE_BAR_WIDTH, RAIL_ACTIVE_COLOR,
+    MENU_ITEM_RADIUS, MENU_RADIUS, MENU_TEXT, PALETTE_BG, PALETTE_BORDER, PALETTE_BORDER_W,
+    PALETTE_HINT, PALETTE_MATCH, PALETTE_RADIUS, PALETTE_ROW_PAD_X, PALETTE_ROW_RADIUS,
+    PALETTE_SELECTED_BG, PALETTE_TEXT, QUOTE_BAR_COLOR, QUOTE_BAR_WIDTH, RAIL_ACTIVE_COLOR,
     RAIL_ACTIVE_SPAN, RAIL_ACTIVE_W, RAIL_BG, RAIL_GAP, RAIL_HOVER_INK, RAIL_HOVER_LIFT,
     RAIL_INK_DARK, RAIL_INK_LIGHT, RAIL_PAD, RAIL_RADIUS, RAIL_TEMP_RING, RULE_COLOR,
     RULE_THICKNESS, SCROLL_INK, SCROLL_INSET, SCROLL_MIN_THUMB, SCROLL_NEAR, SCROLL_THIN,
@@ -637,6 +640,167 @@ pub(crate) fn push_image_view(
         rect: image_view_rect(window, size, scale),
         path: raw.to_string(),
     });
+}
+
+/// Draw the open palette: a bordered panel holding the query and the rows it matched,
+/// with the row Enter would take filled. Pushed after the rest of the frame, so the
+/// panel covers what it floats over.
+///
+/// The border is the panel drawn twice, the inner one inset by its thickness, the way
+/// the context menu's is.
+pub(crate) fn push_palette(
+    list: &mut DisplayList,
+    ctx: &BarCtx,
+    palette: &Palette,
+    layout: &PaletteLayout,
+) {
+    let scale = ctx.scale;
+    let radius = scale.px(PALETTE_RADIUS);
+    let border = scale.px(PALETTE_BORDER_W).max(1);
+    list.push(DrawCmd::RoundRect {
+        rect: layout.panel,
+        color: PALETTE_BORDER,
+        radius,
+        corners: display::RoundedCorners::Both,
+    });
+    list.push(DrawCmd::RoundRect {
+        rect: Rect {
+            x: layout.panel.x + border,
+            y: layout.panel.y + border,
+            w: (layout.panel.w - 2 * border).max(0),
+            h: (layout.panel.h - 2 * border).max(0),
+        },
+        color: PALETTE_BG,
+        radius: (radius - border).max(0),
+        corners: display::RoundedCorners::Both,
+    });
+
+    let m = ctx.metrics();
+    let face = ctx.fonts.face(ctx.body_size, FontStyle::Regular);
+    let pad_x = scale.px(PALETTE_ROW_PAD_X);
+    let text_h = m.ascent + m.descent;
+
+    // The query and, after it, a steady caret (no blink): it marks where typing goes
+    // while the palette holds the keyboard, the way the find bar's does. An empty
+    // query puts the caret at the field's start and the prompt beyond it, so the
+    // prompt reads as the space the text will fill rather than as text already there.
+    let caret_w = scale.px(CARET_WIDTH);
+    let query_w = shape::text_advance(face, palette.query()).ceil() as i32;
+    let pen = layout.field.x + pad_x;
+    if !palette.query().is_empty() {
+        list.push(text_cmd(
+            ctx.regular(),
+            pen,
+            layout.field_baseline,
+            pen + query_w,
+            PALETTE_TEXT,
+            palette.query().to_string(),
+            m,
+        ));
+    }
+    list.push(DrawCmd::Fill {
+        rect: Rect {
+            x: pen + query_w + 1,
+            y: layout.field_baseline - m.ascent,
+            w: caret_w,
+            h: text_h,
+        },
+        color: CARET_COLOR,
+    });
+    if palette.query().is_empty() {
+        let x = pen + caret_w + 1 + pad_x / 2;
+        let w = shape::text_advance(face, palette.prompt()).ceil() as i32;
+        list.push(text_cmd(
+            ctx.regular(),
+            x,
+            layout.field_baseline,
+            x + w,
+            PALETTE_HINT,
+            palette.prompt().to_string(),
+            m,
+        ));
+    }
+
+    // What the rows cost, right-aligned in the field the way the find bar's counter
+    // is: a capped search shows a fraction of what it found, and the panel is the only
+    // place that can say so.
+    if !palette.note().is_empty() {
+        let w = shape::text_advance(face, palette.note()).ceil() as i32;
+        let x = layout.field.x + layout.field.w - pad_x - w;
+        list.push(text_cmd(
+            ctx.regular(),
+            x,
+            layout.field_baseline,
+            x + w,
+            PALETTE_HINT,
+            palette.note().to_string(),
+            m,
+        ));
+    }
+
+    if layout.rule.h > 0 {
+        list.push(DrawCmd::Fill {
+            rect: layout.rule,
+            color: PALETTE_BORDER,
+        });
+    }
+
+    // One row is lit, the selected one, whether the keyboard or the pointer put the
+    // selection there: what Enter takes and what a click takes are the same row, so
+    // they are the same fill.
+    for (vis, (pos, row)) in palette.visible().enumerate() {
+        let rect = layout.row_rect(vis);
+        if palette.selected() == pos {
+            list.push(DrawCmd::RoundRect {
+                rect,
+                color: PALETTE_SELECTED_BG,
+                radius: scale.px(PALETTE_ROW_RADIUS),
+                corners: display::RoundedCorners::Both,
+            });
+        }
+        // A row's label is whatever it names: a search hit carries a path and the line
+        // it found, which readily outruns the panel. Clipped to the row rather than
+        // shortened, so what is there reads as running on rather than as all there is.
+        let x = rect.x + pad_x;
+        let right = rect.x + rect.w - pad_x;
+        // Behind the label, a gold fill under each place the query occurs, so a row
+        // shows what it matched. Same mark the find bar puts on a match; the label
+        // draws once on top, so clipping and measurement stay simple. An empty query
+        // (a vault palette before anything is typed) yields no spans and no fills.
+        let top = layout.baseline(vis) - m.ascent;
+        let text_h = m.ascent + m.descent;
+        for (start, end) in palette::match_spans(&row.label, palette.query()) {
+            let mx = x + shape::text_advance(face, &row.label[..start]).round() as i32;
+            let mw = shape::text_advance(face, &row.label[start..end]).round() as i32;
+            let x0 = mx.max(x);
+            let x1 = (mx + mw).min(right);
+            if x1 > x0 {
+                list.push(DrawCmd::Fill {
+                    rect: Rect {
+                        x: x0,
+                        y: top,
+                        w: x1 - x0,
+                        h: text_h,
+                    },
+                    color: PALETTE_MATCH,
+                });
+            }
+        }
+        let w = shape::text_advance(face, &row.label) as i32;
+        list.push(clip_text_x(
+            text_cmd(
+                ctx.regular(),
+                x,
+                layout.baseline(vis),
+                x + w,
+                PALETTE_TEXT,
+                row.label.clone(),
+                m,
+            ),
+            x,
+            right,
+        ));
+    }
 }
 
 /// Draw an open context menu: a bordered panel with one row per item, the row under

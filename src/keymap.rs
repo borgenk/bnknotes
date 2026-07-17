@@ -60,6 +60,11 @@ pub enum KeyAction {
     Save,
     /// Open (or, while open, close) the find bar (Ctrl+F).
     Find,
+    /// Open (or, while open, close) the palette (Ctrl+K).
+    Palette,
+    /// Open (or, while open, close) the palette on the vault's contents
+    /// (Ctrl+Shift+F).
+    SearchVault,
     /// Open the find bar with its replace row (Ctrl+H).
     Replace,
     /// Leave a transient mode such as the find bar (Escape).
@@ -130,20 +135,22 @@ fn ctrl_action_for_sym(sym: u32, shift: bool) -> KeyAction {
         sym
     };
     match sym {
-        0x61 => KeyAction::SelectAll,           // a
-        0x63 => KeyAction::Copy,                // c
-        0x66 => KeyAction::Find,                // f
-        0x68 => KeyAction::Replace,             // h
-        0x73 => KeyAction::Save,                // s
-        0x78 => KeyAction::Cut,                 // x
-        0x76 => KeyAction::Paste,               // v
-        0x6B if shift => KeyAction::DeleteLine, // Ctrl+Shift+K
-        0x62 => KeyAction::ToggleTree,          // b: toggle sidebar
-        0x77 => KeyAction::CloseTab,            // w: close the active tab
-        0x5C => KeyAction::ToggleSecondPane,    // backslash: split
-        0x30 => KeyAction::FocusTree,           // 0: focus tree
-        0x31 => KeyAction::FocusPaneA,          // 1: focus editor A
-        0x32 => KeyAction::FocusPaneB,          // 2: focus editor B
+        0x61 => KeyAction::SelectAll,            // a
+        0x63 => KeyAction::Copy,                 // c
+        0x66 if shift => KeyAction::SearchVault, // Ctrl+Shift+F: search the vault
+        0x66 => KeyAction::Find,                 // f
+        0x68 => KeyAction::Replace,              // h
+        0x73 => KeyAction::Save,                 // s
+        0x78 => KeyAction::Cut,                  // x
+        0x76 => KeyAction::Paste,                // v
+        0x6B if shift => KeyAction::DeleteLine,  // Ctrl+Shift+K
+        0x6B => KeyAction::Palette,              // k: open the palette
+        0x62 => KeyAction::ToggleTree,           // b: toggle sidebar
+        0x77 => KeyAction::CloseTab,             // w: close the active tab
+        0x5C => KeyAction::ToggleSecondPane,     // backslash: split
+        0x30 => KeyAction::FocusTree,            // 0: focus tree
+        0x31 => KeyAction::FocusPaneA,           // 1: focus editor A
+        0x32 => KeyAction::FocusPaneB,           // 2: focus editor B
         // Ctrl+Z undoes; Ctrl+Shift+Z and Ctrl+Y redo.
         0x7A if shift => KeyAction::Redo, // Z
         0x7A => KeyAction::Undo,          // z
@@ -218,15 +225,19 @@ mod tests {
         // Where shift does mean something, it selects the shifted action.
         assert_eq!(ctrl_action_for_sym(sym('z'), false), KeyAction::Undo);
         assert_eq!(ctrl_action_for_sym(sym('Z'), true), KeyAction::Redo);
-        assert_eq!(ctrl_action_for_sym(sym('k'), false), KeyAction::None);
+        assert_eq!(ctrl_action_for_sym(sym('k'), false), KeyAction::Palette);
         assert_eq!(ctrl_action_for_sym(sym('K'), true), KeyAction::DeleteLine);
+        // Ctrl+F finds in the document, Ctrl+Shift+F across the vault. The shifted arm
+        // comes first, since the shifted key would otherwise fall through to the find bar.
+        assert_eq!(ctrl_action_for_sym(sym('f'), false), KeyAction::Find);
+        assert_eq!(ctrl_action_for_sym(sym('F'), true), KeyAction::SearchVault);
     }
 
     #[test]
     fn every_bound_ctrl_letter_is_distinct() {
         // A duplicate keysym in the table would silently shadow the earlier arm, so a
         // rebind that collides fails here rather than in the user's hands.
-        let bound: Vec<KeyAction> = "acfhsxvbw\\012zy"
+        let bound: Vec<KeyAction> = "acfhksxvbw\\012zy"
             .chars()
             .map(|c| ctrl_action_for_sym(c as u32, false))
             .collect();

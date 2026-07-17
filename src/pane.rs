@@ -658,6 +658,14 @@ impl PaneLayout {
 /// the bar as well as beside the columns), then the top bar (it sits above every
 /// remaining column), then splitters (they sit in the gaps between columns).
 pub(crate) enum Hit {
+    /// A row of the open palette, by its position in the palette's matches: go there.
+    PaletteRow(usize),
+    /// The open palette's panel, off its rows: the press belongs to the field, so it
+    /// consumes the click and leaves the palette up.
+    Palette,
+    /// Anywhere outside the open palette: the press puts it away and goes no further,
+    /// the way a press off the context menu dismisses that.
+    PaletteOutside,
     /// An item of the open context menu: run it.
     MenuItem(usize),
     /// Anywhere else while a context menu is open: the press dismisses the menu and
@@ -1845,6 +1853,12 @@ impl PaneGroup {
     /// each for one.
     pub(crate) fn docs_mut(&mut self) -> impl Iterator<Item = &mut EditorPane> {
         self.docs.iter_mut()
+    }
+
+    /// The group's open documents, for a reader that needs more of one than its path
+    /// (a search wanting the buffer's text, which is what is on screen).
+    pub(crate) fn docs(&self) -> impl Iterator<Item = &EditorPane> {
+        self.docs.iter()
     }
 
     /// Re-check every open tab against its file on disk, reloading clean buffers

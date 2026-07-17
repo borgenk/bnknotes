@@ -35,10 +35,11 @@ use crate::icon;
 use crate::menu::{Menu, MenuAction, MenuItem};
 use crate::paint::{
     build_display_list, build_find_paint, conflict_banner_layout, font_sizes, measure_tree,
-    push_conflict_banner, push_image_view, push_menu, push_rail, push_splitter, push_top_bar,
-    push_tree, top_bar_height, tree_metrics, BarCtx, CaretPaint, PaintParams, RailDragView,
-    RailView, TabStrip,
+    push_conflict_banner, push_image_view, push_menu, push_palette, push_rail, push_splitter,
+    push_top_bar, push_tree, top_bar_height, tree_metrics, BarCtx, CaretPaint, PaintParams,
+    RailDragView, RailView, TabStrip,
 };
+use crate::palette::{Palette, PaletteAction, PaletteRow, Rows};
 use crate::pane::{
     restore_group, CaretAnim, CaretFrame, Columns, Focus, Hit, PaneGroup, PaneLayout, Saved,
     TreePane,
@@ -59,6 +60,7 @@ use crate::platform::xkb::Xkb;
 use crate::render::display::{DisplayList, DrawCmd};
 use crate::render::image::{Image, ImageStore, Limits};
 use crate::scale::Scale;
+use crate::search;
 use crate::store;
 use crate::theme::{BACKGROUND, CARET_WIDTH, FONT_SIZE, ICON_HOVER_ZOOM, RAIL_RADIUS};
 use crate::tree;
@@ -303,6 +305,18 @@ struct State {
     /// The open context menu, `None` when none is. It floats over the chrome and
     /// takes every press while it is up (see [`crate::menu`]).
     menu: Option<Menu>,
+    /// The open palette, `None` when none is. It floats over the window and takes
+    /// every key while it is up (see [`crate::palette`]).
+    palette: Option<Palette>,
+    /// The last search's answer, kept so a query that only grew can narrow to the
+    /// notes its prefix already matched rather than walking the vault again. Reset
+    /// when a search palette opens; meaningless while none is.
+    search: search::Results,
+    /// The vault the window was rooted at before the active one, so the palette can
+    /// offer going back first. Set by [`Self::switch_vault`] and so within this run
+    /// only: a "where I just was" that outlived the session would be answering a
+    /// question nobody asked.
+    last_vault: Option<PathBuf>,
     /// A picture opened over the whole window by a double-click, `None` when none is.
     image_view: Option<ImageView>,
     /// Every vault's remembered settings (the sidebar's folder filter), kept whole
@@ -526,6 +540,79 @@ fn autosave_deadline(
         return Some(now + AUTOSAVE_IDLE);
     }
     current
+}
+
+/// The rail's vaults as palette rows, `active` left out: a row that goes where the
+/// window already is would do nothing.
+///
+/// The vault the window was at before (`last`) comes first, so opening the palette
+/// and pressing Enter is "back to where I just was". The rest hold the rail's order,
+/// which is the order the chips were dragged into.
+fn vault_rows(vaults: &[Vault], active: Option<usize>, last: Option<&Path>) -> Vec<PaletteRow> {
+    let mut rows: Vec<(bool, PaletteRow)> = vaults
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| Some(*i) != active)
+        .map(|(i, vault)| {
+            // A vault's name is the last component of its path, the same name the
+            // chip takes its initials from.
+            let name = vault.path.file_name().unwrap_or(vault.path.as_os_str());
+            (
+                Some(vault.path.as_path()) == last,
+                PaletteRow {
+                    label: format!("vault: {}", name.to_string_lossy()),
+                    action: PaletteAction::SwitchVault(i),
+                },
+            )
+        })
+        .collect();
+    // A stable sort by "was this the last one" leaves the rail's order standing under
+    // the one row that jumps it.
+    rows.sort_by_key(|(recent, _)| !recent);
+    rows.into_iter().map(|(_, row)| row).collect()
+}
+
+/// A search's hits as palette rows, in the order the scan found them: the note and
+/// line a match is on, then the line itself. The note is named relative to the vault,
+/// which is the only part of the path that says anything the user did not choose.
+///
+/// The rows are the query's answer, so the palette shows them as given
+/// ([`Rows::AsGiven`]) rather than ranking a hit by how its own label reads.
+fn search_rows(results: &search::Results, root: &Path) -> Vec<PaletteRow> {
+    results
+        .hits
+        .iter()
+        .map(|hit| PaletteRow {
+            label: format!(
+                "{}:{}  {}",
+                search::relative(&hit.path, root).display(),
+                hit.line,
+                hit.text
+            ),
+            action: PaletteAction::OpenMatch {
+                path: hit.path.clone(),
+                offset: hit.offset,
+            },
+        })
+        .collect()
+}
+
+/// What a search's rows cost, for the field's right-hand corner: how many matches
+/// there are, and whether the cap stopped the count short of them. A query too short
+/// to scan says what it is waiting for; one that found nothing says that, since an
+/// empty panel alone does not distinguish "no matches" from "not looking yet".
+fn search_note(results: &search::Results, query: &str) -> String {
+    if query.chars().count() < search::MIN_QUERY {
+        return format!("type {} characters", search::MIN_QUERY);
+    }
+    match (results.hits.len(), results.truncated) {
+        (0, _) => "no matches".to_string(),
+        (1, false) => "1 line".to_string(),
+        (n, false) => format!("{n} lines"),
+        // The rows are the first `n` of more than `n`: say so rather than let the list
+        // read as the whole answer.
+        (n, true) => format!("first {n} lines"),
+    }
 }
 
 /// The rail this window opens with: the vaults the config names, arranged the way
@@ -771,6 +858,9 @@ impl State {
             icon_size: 0,
             icon_seq: 0,
             menu: None,
+            palette: None,
+            search: search::Results::default(),
+            last_vault: None,
             image_view: None,
             vault_prefs: session.vaults,
             panes,
@@ -1174,6 +1264,8 @@ impl State {
         if root == self.tree.tree.root() {
             return;
         }
+        // Where the window is leaving, for the palette to offer coming back to.
+        self.last_vault = Some(self.tree.tree.root().to_path_buf());
         // Switching replaces both panes' documents wholesale, so the outgoing vault's
         // notes are written before its tabs are let go of.
         self.save_all();
@@ -1303,6 +1395,107 @@ impl State {
         let was_open = self.menu.take().is_some();
         self.dirty |= was_open;
         was_open
+    }
+
+    /// Open the palette over the window, or close an open one: Ctrl+K is the way in
+    /// and the way back out.
+    pub(super) fn toggle_palette(&mut self) {
+        if self.close_palette() {
+            return;
+        }
+        let rows = vault_rows(
+            &self.vaults,
+            self.active_vault(),
+            self.last_vault.as_deref(),
+        );
+        // A window with nowhere else to go opens nothing rather than an empty panel.
+        if rows.is_empty() {
+            return;
+        }
+        self.palette = Some(Palette::new("Go to vault", Rows::Ranked, rows));
+        self.dirty = true;
+    }
+
+    /// Open the palette on the active vault's contents, or close an open one:
+    /// Ctrl+Shift+F. It opens with no rows, since a search with no query has no
+    /// answer.
+    pub(super) fn toggle_search(&mut self) {
+        if self.close_palette() {
+            return;
+        }
+        self.search = search::Results::default();
+        self.palette = Some(Palette::new("Search this vault", Rows::AsGiven, Vec::new()));
+        self.dirty = true;
+    }
+
+    /// Answer the search palette's query again, after it changed.
+    ///
+    /// The scan is synchronous: a vault of a few hundred notes reads and scans in
+    /// about a frame, and a query that only grew narrows to the notes its prefix
+    /// already matched, so every keystroke after the first scans a handful of files.
+    pub(super) fn refresh_search(&mut self) {
+        let Some(palette) = &self.palette else {
+            return;
+        };
+        let query = palette.query().to_string();
+        let root = self.tree.tree.root().to_path_buf();
+        // A tab's buffer is what is on screen, so a hit in a note with unsaved edits
+        // has to come from the buffer, not from the file those edits have not reached.
+        let open: Vec<(PathBuf, String)> = self
+            .editors
+            .iter()
+            .flat_map(|group| group.docs())
+            .filter(|doc| doc.text.is_modified())
+            .filter_map(|doc| doc.path.clone().map(|p| (p, doc.text.text())))
+            .collect();
+        let notes = search::OpenNotes { notes: &open };
+        let narrow = if self.search.can_narrow(&query) {
+            search::Narrow::Files(&self.search.files)
+        } else {
+            search::Narrow::Vault
+        };
+        let results = search::search(&root, &query, &notes, narrow);
+        let rows = search_rows(&results, &root);
+        let note = search_note(&results, &query);
+        self.search = results;
+        if let Some(palette) = &mut self.palette {
+            palette.set_rows(rows);
+            palette.set_note(note);
+        }
+        self.dirty = true;
+    }
+
+    /// Close the palette if one is open, reporting whether there was one.
+    pub(super) fn close_palette(&mut self) -> bool {
+        let was_open = self.palette.take().is_some();
+        self.dirty |= was_open;
+        was_open
+    }
+
+    /// Run a palette row's action and close the palette behind it.
+    pub(super) fn run_palette_action(&mut self, action: PaletteAction) {
+        self.close_palette();
+        match action {
+            PaletteAction::SwitchVault(i) => self.switch_vault(i),
+            PaletteAction::OpenMatch { path, offset } => self.open_match(&path, offset),
+        }
+    }
+
+    /// Open `path` and select the match at `offset`, the way the find bar lands on
+    /// one: the caret goes there and the view scrolls to show it.
+    fn open_match(&mut self, path: &Path, offset: usize) {
+        self.open_file(path);
+        let i = self.active_editor();
+        // The hit was measured against the note as it was scanned; the buffer it lands
+        // in is that same text (an open tab was searched as its buffer), but a note
+        // that changed under the scan could still be shorter, so the offset is clamped
+        // rather than trusted.
+        let end = self.editors[i].text.rope().len();
+        let at = offset.min(end);
+        self.editors[i].text.set_cursor(at, false);
+        self.bump_caret();
+        self.reveal_active_caret();
+        self.dirty = true;
     }
 
     /// Run a menu item's action and close the menu behind it.
@@ -1776,6 +1969,12 @@ impl State {
         if let Some(menu) = &self.menu {
             let ctx = BarCtx::new(&self.fonts, scale, self.body_size);
             push_menu(&mut list, &ctx, menu, &self.menu_layout(menu));
+        }
+        // The palette floats over the menu too: it takes the keyboard, and a menu
+        // cannot be open under it (opening one closes any that was up).
+        if let Some(palette) = &self.palette {
+            let ctx = BarCtx::new(&self.fonts, scale, self.body_size);
+            push_palette(&mut list, &ctx, palette, &self.palette_layout(palette));
         }
         Rc::new(list)
     }
@@ -2496,6 +2695,98 @@ mod tests {
         rail.iter()
             .map(|v| vault_name(&v.path).to_string())
             .collect()
+    }
+
+    /// The labels of the rows the palette would list, in order.
+    fn row_labels(rows: &[PaletteRow]) -> Vec<&str> {
+        rows.iter().map(|r| r.label.as_str()).collect()
+    }
+
+    /// A result of `n` hits, `truncated` or not, which is all the note reads.
+    fn results(n: usize, truncated: bool) -> search::Results {
+        search::Results {
+            hits: (0..n)
+                .map(|i| search::Hit {
+                    path: PathBuf::from("a.md"),
+                    offset: i,
+                    line: 1,
+                    heading: None,
+                    text: "x".into(),
+                })
+                .collect(),
+            truncated,
+            ..search::Results::default()
+        }
+    }
+
+    #[test]
+    fn the_search_note_counts_the_matching_lines() {
+        // A row is a line, so the count is lines: calling them matches would overcount
+        // a line the query hits twice.
+        assert_eq!(search_note(&results(1, false), "gamma"), "1 line");
+        assert_eq!(search_note(&results(64, false), "gamma"), "64 lines");
+    }
+
+    #[test]
+    fn the_search_note_says_when_the_cap_cut_the_answer_short() {
+        // A capped list would otherwise read as the whole answer, which is the one
+        // thing a silent cap must never do.
+        assert_eq!(search_note(&results(2000, true), "the"), "first 2000 lines");
+    }
+
+    #[test]
+    fn the_search_note_tells_a_short_query_what_it_is_waiting_for() {
+        // An empty panel cannot say the difference between "nothing matched" and
+        // "not scanning yet" on its own.
+        assert_eq!(search_note(&results(0, false), "g"), "type 2 characters");
+        assert_eq!(search_note(&results(0, false), ""), "type 2 characters");
+        assert_eq!(search_note(&results(0, false), "gamma"), "no matches");
+    }
+
+    #[test]
+    fn vault_rows_leave_out_the_vault_the_window_is_already_at() {
+        let v = vaults(&["/home/user/notes", "/home/user/work", "/home/user/wiki"]);
+        let rows = vault_rows(&v, Some(1), None);
+        assert_eq!(row_labels(&rows), ["vault: notes", "vault: wiki"]);
+        // Each row still carries its own vault's index, not its place in the list.
+        assert_eq!(rows[1].action, PaletteAction::SwitchVault(2));
+    }
+
+    #[test]
+    fn vault_rows_keep_the_rails_order_when_there_is_nowhere_to_go_back_to() {
+        // Nothing switched yet this run, so the rail's own order is all there is.
+        let v = vaults(&["/home/user/notes", "/home/user/work", "/home/user/wiki"]);
+        let rows = vault_rows(&v, None, None);
+        assert_eq!(
+            row_labels(&rows),
+            ["vault: notes", "vault: work", "vault: wiki"]
+        );
+    }
+
+    #[test]
+    fn the_vault_the_window_came_from_is_the_first_row() {
+        // Ctrl+K then Enter goes back where you just were, whatever the rail's order.
+        let v = vaults(&["/home/user/notes", "/home/user/work", "/home/user/wiki"]);
+        let rows = vault_rows(&v, Some(0), Some(Path::new("/home/user/wiki")));
+        assert_eq!(row_labels(&rows), ["vault: wiki", "vault: work"]);
+        assert_eq!(rows[0].action, PaletteAction::SwitchVault(2));
+    }
+
+    #[test]
+    fn a_rail_of_one_vault_offers_no_rows_at_all() {
+        // The only vault is the active one, so there is nowhere to go and the palette
+        // has nothing to open with.
+        let v = vaults(&["/home/user/notes"]);
+        assert!(vault_rows(&v, Some(0), None).is_empty());
+    }
+
+    #[test]
+    fn a_vault_named_by_a_root_path_still_gets_a_label() {
+        // A root directory has no last component to name it, so the label falls back
+        // to the path rather than coming out empty.
+        let v = vaults(&["/"]);
+        let rows = vault_rows(&v, None, None);
+        assert_eq!(row_labels(&rows), ["vault: /"]);
     }
 
     #[test]

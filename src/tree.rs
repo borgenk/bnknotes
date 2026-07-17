@@ -205,8 +205,9 @@ fn is_markdown(path: &Path) -> bool {
         .is_some_and(|e| e.eq_ignore_ascii_case("md"))
 }
 
-/// A dotfile or dot-directory (.git): never listed, never scanned.
-fn is_hidden(name: &str) -> bool {
+/// A dotfile or dot-directory (.git, .trash): never listed by the tree,
+/// and never walked by a vault search either, so the two agree on what a vault holds.
+pub(crate) fn is_hidden(name: &str) -> bool {
     name.starts_with('.')
 }
 

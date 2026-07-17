@@ -7,6 +7,7 @@ use crate::find;
 use crate::keymap::{self, KeyAction};
 use crate::menu::{Menu, MenuLayout};
 use crate::paint::{conflict_banner_layout, BannerButton};
+use crate::palette::{Palette, PaletteLayout, Rows};
 use crate::pane::{CaretAnim, Columns, DiskConflict, EditorPane, Focus, Hit, ImagePress, SPLITTER};
 use crate::platform::error::{Error, Result};
 use crate::platform::ffi;
@@ -162,13 +163,15 @@ fn apply_editor_action(
                 false
             }
         }
-        // Routed elsewhere by `apply_action` (window/pane, find bar, clipboard,
-        // and save); listed for exhaustiveness.
+        // Routed elsewhere by `apply_action` (window/pane, the palette, find bar,
+        // clipboard, and save); listed for exhaustiveness.
         KeyAction::Copy
         | KeyAction::Cut
         | KeyAction::Paste
         | KeyAction::Save
         | KeyAction::Find
+        | KeyAction::Palette
+        | KeyAction::SearchVault
         | KeyAction::Replace
         | KeyAction::ToggleTree
         | KeyAction::ToggleSecondPane
@@ -309,6 +312,21 @@ impl State {
                 return Ok(());
             }
         }
+        // The palette holds the keyboard while it is up, the way the find bar does:
+        // its query takes the keys, so a shortcut cannot toggle a pane or reach a
+        // document from under it. Ctrl+K (and Escape) is how it gives them back.
+        if self.palette.is_some() {
+            self.handle_palette_key(action);
+            return Ok(());
+        }
+        if action == KeyAction::Palette {
+            self.toggle_palette();
+            return Ok(());
+        }
+        if action == KeyAction::SearchVault {
+            self.toggle_search();
+            return Ok(());
+        }
         // Window-level pane management, handled before any editor routing: toggle the
         // sidebar/second pane, or move focus between regions.
         match action {
@@ -448,6 +466,93 @@ impl State {
             self.after_edit();
         }
         Ok(())
+    }
+
+    /// One key while the palette is open. Characters and Backspace edit the query,
+    /// the arrows move the selection (Home and End jump to its ends), Ctrl+V pastes
+    /// into the query, Enter goes where the selected row says, and Escape or Ctrl+K
+    /// puts the palette away.
+    pub(super) fn handle_palette_key(&mut self, action: KeyAction) {
+        // The arms that need more of the app than the palette, taken before it is
+        // borrowed.
+        match action {
+            KeyAction::Enter => {
+                if let Some(target) = self.palette.as_ref().and_then(Palette::activate) {
+                    self.run_palette_action(target);
+                }
+                // Enter on a query that matches nothing leaves the palette up: an
+                // empty list is a typo to fix, not a reason to start over.
+                return;
+            }
+            KeyAction::Escape | KeyAction::Palette | KeyAction::SearchVault => {
+                self.close_palette();
+                return;
+            }
+            KeyAction::Paste => {
+                let pasted = match self.clipboard_text() {
+                    Ok(Some(pasted)) => pasted,
+                    Ok(None) => return,
+                    Err(e) => {
+                        eprintln!("bnknotes: paste failed: {e}");
+                        return;
+                    }
+                };
+                if let Some(palette) = &mut self.palette {
+                    palette.push_str(&pasted);
+                }
+                self.answer_palette_query();
+                self.dirty = true;
+                return;
+            }
+            _ => {}
+        }
+        // Whether the query changed, decided while the palette is borrowed and acted
+        // on once it is not: answering a query needs the rest of the app.
+        let typed = {
+            let Some(palette) = &mut self.palette else {
+                return;
+            };
+            match action {
+                KeyAction::Char(c) => {
+                    palette.push(c);
+                    true
+                }
+                KeyAction::Backspace => {
+                    palette.pop();
+                    true
+                }
+                KeyAction::Up => {
+                    palette.move_selection(-1);
+                    false
+                }
+                KeyAction::Down => {
+                    palette.move_selection(1);
+                    false
+                }
+                KeyAction::Home | KeyAction::DocStart => {
+                    palette.move_selection(i32::MIN);
+                    false
+                }
+                KeyAction::End | KeyAction::DocEnd => {
+                    palette.move_selection(i32::MAX);
+                    false
+                }
+                _ => return,
+            }
+        };
+        if typed {
+            self.answer_palette_query();
+        }
+        self.dirty = true;
+    }
+
+    /// Re-answer the palette's query, for a palette whose rows are an answer rather
+    /// than a list to rank. A ranked palette (the vaults) filters its own rows and has
+    /// nothing to ask the app for.
+    fn answer_palette_query(&mut self) {
+        if self.palette.as_ref().map(Palette::mode) == Some(Rows::AsGiven) {
+            self.refresh_search();
+        }
     }
 
     /// One key while the find bar is open. Characters and Backspace edit the
@@ -635,6 +740,7 @@ impl State {
                         self.editors[i].update_autoscroll(rect, py);
                     } else {
                         self.update_cursor_shape();
+                        self.update_palette_hover();
                         self.update_menu_hover();
                         self.update_rail_hover();
                         self.update_tree_hover();
@@ -733,6 +839,19 @@ impl State {
     /// wins above every remaining column; below it, splitters win over columns (they
     /// sit in the gaps), and each column is full height, so only x decides.
     pub(super) fn hit_test(&self, px: f32, py: f32) -> Hit {
+        // The palette floats above everything, the menu included, and takes every
+        // press: one on a row goes there, one on the panel is the field's, and one
+        // outside puts the palette away without reaching what it covers.
+        if let Some(palette) = &self.palette {
+            let layout = self.palette_layout(palette);
+            if !layout.panel.contains(px, py) {
+                return Hit::PaletteOutside;
+            }
+            return match layout.row_at(px, py).and_then(|vis| palette.row_pos(vis)) {
+                Some(pos) => Hit::PaletteRow(pos),
+                None => Hit::Palette,
+            };
+        }
         if let Some(menu) = &self.menu {
             return match self.menu_layout(menu).item_at(px, py) {
                 Some(i) => Hit::MenuItem(i),
@@ -788,6 +907,17 @@ impl State {
     /// geometry and a window resized under an open menu has no stale rectangle.
     pub(super) fn menu_layout(&self, menu: &Menu) -> MenuLayout {
         menu.layout(
+            &self.fonts,
+            self.body_size,
+            self.scale(),
+            (self.width as i32, self.height as i32),
+        )
+    }
+
+    /// Where `palette` is on screen this frame, measured on demand for the reason the
+    /// menu's is.
+    pub(super) fn palette_layout(&self, palette: &Palette) -> PaletteLayout {
+        palette.layout(
             &self.fonts,
             self.body_size,
             self.scale(),
@@ -940,6 +1070,28 @@ impl State {
             self.dirty = true;
         } else {
             self.switch_vault(drag.vault);
+        }
+    }
+
+    /// Move the open palette's selection to the row the pointer is over, repainting if
+    /// that changed anything. Nothing to do when no palette is open, which is the
+    /// common case.
+    ///
+    /// The pointer moves the selection rather than lighting a row of its own: the row
+    /// under the pointer is the row a click takes, which is what the selection means.
+    /// Off the rows it leaves the selection where it was, so crossing the field on the
+    /// way to the keyboard does not throw away what the arrows had picked.
+    pub(super) fn update_palette_hover(&mut self) {
+        let Some(palette) = &self.palette else {
+            return;
+        };
+        let pos = self
+            .palette_layout(palette)
+            .row_at(self.pointer_x, self.pointer_y)
+            .and_then(|vis| palette.row_pos(vis));
+        // Re-borrowed mutably only now: the layout above reads the palette it measures.
+        if let (Some(pos), Some(palette)) = (pos, &mut self.palette) {
+            self.dirty |= palette.select(pos);
         }
     }
 
@@ -1185,11 +1337,14 @@ impl State {
                 | Hit::NewTab(_)
                 | Hit::TreeFilter
                 | Hit::MenuItem(_)
+                | Hit::PaletteRow(_)
                 | Hit::Vault(_) => SHAPE_POINTER,
                 Hit::TabStrip(_)
                 | Hit::TreeFooter
                 | Hit::Rail
                 | Hit::Menu
+                | Hit::Palette
+                | Hit::PaletteOutside
                 | Hit::ImageView
                 | Hit::None => SHAPE_DEFAULT,
             }
@@ -1351,10 +1506,23 @@ impl State {
     /// takes focus and then handles the click as a text press.
     pub(super) fn on_left_press(&mut self) {
         let (px, py) = (self.pointer_x, self.pointer_y);
-        if self.menu.is_none() && self.scrollbar_press(px, py) {
+        // A scrollbar takes a press before the column under it, but not before a
+        // pop-up over it: a press while one is open belongs to the pop-up.
+        if self.menu.is_none() && self.palette.is_none() && self.scrollbar_press(px, py) {
             return;
         }
         match self.hit_test(px, py) {
+            Hit::PaletteRow(pos) => {
+                if let Some(target) = self.palette.as_ref().and_then(|p| p.action_at(pos)) {
+                    self.run_palette_action(target);
+                }
+            }
+            // The panel's own field and padding: the press is the palette's, and
+            // there is nothing there to act on.
+            Hit::Palette => {}
+            Hit::PaletteOutside => {
+                self.close_palette();
+            }
             Hit::MenuItem(i) => {
                 if let Some(action) = self.menu.as_ref().and_then(|m| m.action(i)) {
                     self.run_menu_action(action);

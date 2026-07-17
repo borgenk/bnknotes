@@ -12,6 +12,7 @@ mod layout;
 mod markdown;
 mod menu;
 mod paint;
+mod palette;
 mod pane;
 // The platform layer is written as a library, so it carries surface the editor
 // does not call, such as a raw key char. That is library surface, not dead
@@ -22,6 +23,7 @@ mod regex;
 mod render;
 mod rope;
 mod scale;
+mod search;
 mod store;
 mod syntax;
 mod table;

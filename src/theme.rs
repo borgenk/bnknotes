@@ -243,6 +243,38 @@ pub(crate) const MENU_ITEM_PAD_X: i32 = 12;
 /// Corner radius of a hovered item's fill, the tab buttons' rounding.
 pub(crate) const MENU_ITEM_RADIUS: i32 = TAB_BUTTON_RADIUS;
 
+/// The palette: the searchable panel Ctrl+K opens to jump between vaults. It is the
+/// context menu's surface at a larger size, so a panel floating over the window reads
+/// the same wherever it came from, and the selected row takes the accent the editor
+/// selects text with. A hairline divides the query from the matches, so the field
+/// reads as a field rather than as the first row.
+pub(crate) const PALETTE_BG: u32 = MENU_BG;
+pub(crate) const PALETTE_BORDER: u32 = MENU_BORDER;
+pub(crate) const PALETTE_TEXT: u32 = MENU_TEXT;
+pub(crate) const PALETTE_SELECTED_BG: u32 = SELECTION_COLOR;
+/// The prompt shown in place of an empty query, in the muted chrome tone an inactive
+/// tab's label takes: it is there to say what to type, not to be read.
+pub(crate) const PALETTE_HINT: u32 = TAB_INACTIVE_TEXT;
+/// The fill behind the query where it occurs in a row, so a search row shows what it
+/// matched. The gold the find bar marks a match with, so a match reads the same in the
+/// palette as in the document.
+pub(crate) const PALETTE_MATCH: u32 = FIND_MATCH_COLOR;
+/// The panel's width and the gap above it, and its corner radius, border thickness,
+/// and the padding between its edge and what is inside it.
+pub(crate) const PALETTE_WIDTH: i32 = 520;
+pub(crate) const PALETTE_TOP: i32 = 96;
+pub(crate) const PALETTE_RADIUS: i32 = 8;
+pub(crate) const PALETTE_BORDER_W: i32 = 1;
+pub(crate) const PALETTE_PAD: i32 = 6;
+/// Padding above and below the query and a row's label. With the line height these
+/// set the field's height and a row's (and so its hit area); the query sits in the
+/// taller of the two, which is what makes it look like the field it is.
+pub(crate) const PALETTE_FIELD_VPAD: i32 = 9;
+pub(crate) const PALETTE_ROW_VPAD: i32 = 6;
+/// From a row's edge to its label, and the rounding of the selected row's fill.
+pub(crate) const PALETTE_ROW_PAD_X: i32 = 10;
+pub(crate) const PALETTE_ROW_RADIUS: i32 = MENU_ITEM_RADIUS;
+
 /// The full-window picture view: what a double-clicked image opens into. The
 /// backdrop covers the whole window rather than dimming it, since the point is the
 /// picture and everything else is in the way of it; near-black, so a picture's own

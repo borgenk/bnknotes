@@ -751,6 +751,24 @@ pub(crate) enum DiskConflict {
     Deleted,
 }
 
+/// What a call to [`EditorPane::save`] came to. A save is asked for by a keystroke,
+/// by the idle autosave, and by everything that lets a document go (a tab closing,
+/// a vault switching, the window shutting), so most of these are the ordinary
+/// answers to "save this" rather than failures: only the caller knows which are
+/// worth a word to the user.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Saved {
+    /// The buffer is on disk now.
+    Written,
+    /// Nothing to write: the buffer has not changed since it was last saved.
+    Unchanged,
+    /// The buffer has no file to write to (a blank tab), so it stays put.
+    NoPath,
+    /// The file changed on disk since the buffer last agreed with it, so it was
+    /// left alone and a conflict was raised for the user.
+    Conflict,
+}
+
 pub(crate) struct EditorPane {
     pub(crate) text: TextBuffer,
     pub(crate) path: Option<PathBuf>,
@@ -799,6 +817,8 @@ pub(crate) struct EditorPane {
     /// [`FONT_SIZE`] and every geometry constant is its authored value.
     scale: Scale,
     body_size: u32,
+    /// The buffer version the autosave last looked at, for [`Self::poll_edited`].
+    autosave_seen: u64,
 }
 
 impl EditorPane {
@@ -831,6 +851,7 @@ impl EditorPane {
             link_scratch: markdown::InlineScratch::default(),
             scale: Scale::ONE,
             body_size: FONT_SIZE,
+            autosave_seen: 0,
         }
     }
 
@@ -862,6 +883,49 @@ impl EditorPane {
             images: ImageStore::new(image_dir),
             ..Self::empty()
         })
+    }
+
+    /// Whether the buffer changed since this was last asked, latching the version it
+    /// reports on. The autosave's idle window re-arms on this rather than on each
+    /// edit's own call site: it watches the buffer itself, so a typed character, a
+    /// paste, a replace-all, and a table edit all count without every one of them
+    /// having to remember to say so.
+    pub(crate) fn poll_edited(&mut self) -> bool {
+        let version = self.text.version();
+        let edited = version != self.autosave_seen;
+        self.autosave_seen = version;
+        edited
+    }
+
+    /// Write the buffer to its backing file, atomically and in the file's original
+    /// on-disk format, and report what that came to. Saving is the document's own
+    /// business (the text, the path, the format, and the disk snapshot are all
+    /// here), so a caller only has to decide which documents to ask and what to say
+    /// about the answer.
+    ///
+    /// A file that changed on disk since this buffer last agreed with it is not
+    /// overwritten: another writer's version is sitting there, so this raises a
+    /// conflict for the user instead. A missing file is safe to recreate, and an
+    /// unchanged snapshot is our own last save.
+    pub(crate) fn save(&mut self) -> Result<Saved> {
+        let Some(path) = self.path.clone() else {
+            return Ok(Saved::NoPath);
+        };
+        if !self.text.is_modified() {
+            return Ok(Saved::Unchanged);
+        }
+        let current = file::DiskSnapshot::of(&path);
+        if current.is_some() && current != self.disk {
+            self.conflict = Some(DiskConflict::Changed);
+            return Ok(Saved::Conflict);
+        }
+        let bytes = file::encode(&self.text.text(), &self.format);
+        file::save_atomic(&path, &bytes)?;
+        self.text.mark_saved();
+        // Record the just-written file as the new synced state, so its own change
+        // events (and any conflict) clear rather than bounce back as external.
+        self.sync_disk();
+        Ok(Saved::Written)
     }
 
     /// Record the file's current on-disk identity as the last-synced state and
@@ -1753,6 +1817,13 @@ impl PaneGroup {
         self.docs.iter().filter_map(|d| d.path.as_deref())
     }
 
+    /// Every open tab, for what the whole group has to answer for rather than just
+    /// the tab on top: saving each document that has unsaved edits, and watching
+    /// each for one.
+    pub(crate) fn docs_mut(&mut self) -> impl Iterator<Item = &mut EditorPane> {
+        self.docs.iter_mut()
+    }
+
     /// Re-check every open tab against its file on disk, reloading clean buffers
     /// and flagging conflicts on dirty ones. Returns whether any tab changed.
     pub(crate) fn recheck_disk(&mut self) -> bool {
@@ -2112,6 +2183,131 @@ mod tests {
         assert!(!ed.recheck_disk(), "a standing conflict is not re-raised");
         assert_eq!(ed.conflict, Some(DiskConflict::Changed));
 
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn save_writes_the_buffer_and_marks_it_clean() {
+        let path = tmp_note("save-writes", "before\n");
+        let mut ed = EditorPane::open(&path).unwrap();
+        ed.text.insert_str("after ");
+        assert!(ed.text.is_modified());
+
+        assert_eq!(ed.save().unwrap(), Saved::Written);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "after before\n");
+        assert!(!ed.text.is_modified(), "a written buffer is clean");
+        // The file it just wrote is the synced state, so its own change does not
+        // come back as an external one.
+        assert!(!ed.recheck_disk());
+        assert!(ed.conflict.is_none());
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn save_is_nothing_to_do_for_an_unchanged_buffer() {
+        // What makes an autosave on a timer affordable: an idle document costs a
+        // version compare, not a write.
+        let path = tmp_note("save-clean", "steady\n");
+        let mut ed = EditorPane::open(&path).unwrap();
+        assert_eq!(ed.save().unwrap(), Saved::Unchanged);
+
+        // Nothing was rewritten: the file's identity is untouched.
+        let before = file::DiskSnapshot::of(&path);
+        assert_eq!(ed.save().unwrap(), Saved::Unchanged);
+        assert_eq!(file::DiskSnapshot::of(&path), before);
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn save_refuses_a_file_that_changed_underneath_it() {
+        // The guard the autosave leans on hardest: firing on a timer must never be
+        // how another writer's edit gets clobbered.
+        let path = tmp_note("save-conflict", "v1\n");
+        let mut ed = EditorPane::open(&path).unwrap();
+        ed.text.insert_str("mine ");
+        std::fs::write(&path, "theirs\n").unwrap();
+
+        assert_eq!(ed.save().unwrap(), Saved::Conflict);
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "theirs\n",
+            "the other writer's file stands"
+        );
+        assert_eq!(ed.conflict, Some(DiskConflict::Changed));
+        assert!(ed.text.is_modified(), "the buffer keeps its edits");
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn save_recreates_a_file_deleted_underneath_it() {
+        // A missing file is not another writer's version, so saving puts it back.
+        let path = tmp_note("save-deleted", "v1\n");
+        let mut ed = EditorPane::open(&path).unwrap();
+        ed.text.insert_str("kept ");
+        std::fs::remove_file(&path).unwrap();
+
+        assert_eq!(ed.save().unwrap(), Saved::Written);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "kept v1\n");
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn save_has_nowhere_to_put_a_blank_tab() {
+        let mut ed = EditorPane::empty();
+        ed.text.insert_str("scratch");
+        assert_eq!(ed.save().unwrap(), Saved::NoPath);
+        assert!(ed.text.is_modified(), "it stays put, and stays dirty");
+    }
+
+    #[test]
+    fn save_keeps_the_files_own_line_endings() {
+        // The autosave writes as often as the typing pauses, so it must not be what
+        // silently rewrites a CRLF file to LF.
+        let path = tmp_note("save-crlf", "one\r\ntwo\r\n");
+        let mut ed = EditorPane::open(&path).unwrap();
+        ed.text.insert_str("zero\n");
+        assert_eq!(ed.save().unwrap(), Saved::Written);
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "zero\r\none\r\ntwo\r\n"
+        );
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn poll_edited_reports_an_edit_once() {
+        // The autosave's idle window re-arms on this: an edit pushes it back, and a
+        // pass with no edit lets it run out.
+        let mut ed = EditorPane::empty();
+        assert!(!ed.poll_edited(), "a fresh buffer has not been edited");
+        ed.text.insert_str("hello");
+        assert!(ed.poll_edited(), "the edit is reported");
+        assert!(!ed.poll_edited(), "and only once");
+    }
+
+    #[test]
+    fn poll_edited_sees_every_kind_of_change() {
+        // Watching the buffer rather than the edit call sites is the point: an undo
+        // and a reload move the text too, and each re-arms the window.
+        let mut ed = EditorPane::empty();
+        ed.text.insert_str("hello");
+        assert!(ed.poll_edited());
+        ed.text.undo();
+        assert!(ed.poll_edited(), "an undo is a change like any other");
+        ed.text.reload("from disk".to_string());
+        assert!(ed.poll_edited(), "so is a reload");
+    }
+
+    #[test]
+    fn poll_edited_ignores_a_save() {
+        // A save does not move the text, so it must not re-arm the window it just
+        // satisfied (which would autosave on a loop forever).
+        let path = tmp_note("poll-save", "note\n");
+        let mut ed = EditorPane::open(&path).unwrap();
+        ed.text.insert_str("edit ");
+        assert!(ed.poll_edited());
+        assert_eq!(ed.save().unwrap(), Saved::Written);
+        assert!(!ed.poll_edited(), "the save is not itself an edit");
         std::fs::remove_dir_all(path.parent().unwrap()).ok();
     }
 

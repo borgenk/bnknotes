@@ -31,7 +31,6 @@ use self::clipboard::{is_text_mime, ClipboardState, CLIPBOARD_MIMES};
 use self::input::KeyRepeat;
 use self::present::GpuPresentation;
 use crate::config::{self, vault_name, CaretConfig, Config, Vault, VaultKind};
-use crate::file;
 use crate::menu::{Menu, MenuAction, MenuItem};
 use crate::paint::{
     build_display_list, build_find_paint, conflict_banner_layout, font_sizes, measure_tree,
@@ -39,7 +38,7 @@ use crate::paint::{
     top_bar_height, tree_metrics, BarCtx, CaretPaint, PaintParams, TabStrip,
 };
 use crate::pane::{
-    restore_group, CaretAnim, CaretFrame, Columns, DiskConflict, Focus, Hit, PaneGroup, PaneLayout,
+    restore_group, CaretAnim, CaretFrame, Columns, Focus, Hit, PaneGroup, PaneLayout, Saved,
     TreePane,
 };
 use crate::platform::conn::{Connection, Fill};
@@ -70,6 +69,13 @@ const MAX_DIMENSION: u32 = 16384;
 /// First object id in Wayland's server-allocated range. Client-created ids stay
 /// below this; the free list only ever recycles client ids.
 const SERVER_ID_BASE: u32 = 0xff00_0000;
+
+/// How long a document sits unsaved before the autosave writes it. The clock
+/// restarts on every edit, so this is time since the typing stopped, not time since
+/// it started: a save lands in the pause between sentences rather than mid-word.
+/// Short enough that "did that save?" never comes up, and long enough that a fast
+/// typist's pauses do not each cost a write.
+const AUTOSAVE_IDLE: Duration = Duration::from_secs(2);
 
 /// A compositor scale of 1.0, in the fractional-scale protocol's 120ths unit. The
 /// scale is unknown until the compositor reports it, so the window opens at unity.
@@ -348,6 +354,10 @@ struct State {
     /// `leave`). The caret only blinks (and only wakes the loop on its timer)
     /// while focused; an unfocused window hides the caret and stays idle.
     focused: bool,
+    /// When the idle autosave is due, `None` when no document has unsaved edits
+    /// waiting on it. Pushed back by every edit (see [`Self::poll_autosave`]), so it
+    /// comes due once the typing stops.
+    autosave_at: Option<Instant>,
 
     /// Key auto-repeat timers (delay, interval, held key, next deadline).
     key_repeat: KeyRepeat,
@@ -444,6 +454,33 @@ fn resolve_vault(
             None,
         ),
     }
+}
+
+/// When the idle autosave is due, given what a loop pass found: `edited` is whether
+/// any document changed since the last pass, `pending` whether any still holds
+/// unsaved edits it has a file to write them to, and `current` the deadline standing
+/// before this pass.
+///
+/// An edit pushes the window out to `now + AUTOSAVE_IDLE`, so a save lands once the
+/// typing stops rather than during it. Nothing pending drops the deadline, which is
+/// what an undo back to the saved text does, and what leaves an idle editor with no
+/// timer waking the loop. A pass with no edit leaves the deadline alone to run out.
+///
+/// Pure, so the rules are tested without a window: the timer is the part of an
+/// autosave that is easy to get subtly wrong and hard to notice.
+fn autosave_deadline(
+    edited: bool,
+    pending: bool,
+    current: Option<Instant>,
+    now: Instant,
+) -> Option<Instant> {
+    if !pending {
+        return None;
+    }
+    if edited {
+        return Some(now + AUTOSAVE_IDLE);
+    }
+    current
 }
 
 /// The vaults the rail shows: the saved ones the config names, and after them the
@@ -644,6 +681,7 @@ impl State {
             pointer_y: 0.0,
             caret_visible: true,
             caret_blink_at: None,
+            autosave_at: None,
             caret_from_pointer: false,
             focused: false,
             key_repeat: KeyRepeat::new(),
@@ -938,6 +976,10 @@ impl State {
             }
         }
         self.run_until(|s| s.closed)?;
+        // The last word on the way out: whatever the idle window was still holding
+        // goes to disk before the documents do, so closing the window is never how
+        // the last sentence is lost.
+        self.save_all();
         // Remember the layout for next launch: column sizes, tree root and open
         // folders, and each pane's file with its caret and scroll.
         self.save_session();
@@ -1000,6 +1042,9 @@ impl State {
         if root == self.tree.tree.root() {
             return;
         }
+        // Switching replaces both panes' documents wholesale, so the outgoing vault's
+        // notes are written before its tabs are let go of.
+        self.save_all();
         // Save the outgoing vault while it is still the active one: a save carries
         // only the active vault's entry to disk, so its tabs have to go now. This
         // also lands them in `vault_prefs`, where switching straight back finds them.
@@ -1134,6 +1179,13 @@ impl State {
             self.fire_caret_blink();
             self.fire_caret_anim();
             self.fire_scrollbar_anim();
+            // After the events this pass carried are in the buffers: an edit among
+            // them pushes the idle window back, and the pass the window runs out on
+            // writes. Both cost a version compare per open tab when nothing is
+            // pending, which is the idle case.
+            let now = Instant::now();
+            self.poll_autosave(now);
+            self.fire_autosave(now);
             // Pace to the compositor's clock: only draw when no frame callback is
             // outstanding, so a burst of edits or held keys between refreshes
             // collapses into a single repaint instead of racing both buffers.
@@ -1786,34 +1838,80 @@ impl State {
         self.refresh_title();
     }
 
-    /// Write the buffer to its backing file, atomically and in the file's
-    /// original on-disk format. A buffer with no file (started without a path)
-    /// has nowhere to go yet, so it reports that and stays put.
+    /// Save the focused document now, the Ctrl+S. The autosave already writes it
+    /// seconds after the typing stops, so this is the "now, and I mean it" (and the
+    /// way to force a write while the idle window is still running).
+    ///
+    /// A buffer with no file (a blank tab) has nowhere to go yet, and this is the
+    /// one place a user asked in so many words, so it is the one place that says so.
     fn save(&mut self) -> Result<()> {
         let i = self.active_editor();
-        let Some(path) = self.editors[i].path.clone() else {
+        let saved = self.editors[i].active_doc_mut().save()?;
+        if saved == Saved::NoPath {
             eprintln!("bnknotes: no file to save to; start bnknotes with a path");
-            return Ok(());
-        };
-        // Refuse to overwrite a file that changed on disk since we last synced
-        // with it: another writer's version sits there now. Raise a conflict for
-        // the user rather than clobber it. A missing file is safe to recreate, and
-        // an unchanged snapshot is our own last save.
-        let current = file::DiskSnapshot::of(&path);
-        if current.is_some() && current != self.editors[i].disk {
-            // The banner this raises says so in the window, where the user is.
-            self.editors[i].active_doc_mut().conflict = Some(DiskConflict::Changed);
-            self.dirty = true;
-            return Ok(());
         }
-        let bytes = file::encode(&self.editors[i].text.text(), &self.editors[i].format);
-        file::save_atomic(&path, &bytes)?;
-        self.editors[i].text.mark_saved();
-        // Record the just-written file as the new synced state, so its own change
-        // events (and any conflict) clear rather than bounce back as external.
-        self.editors[i].active_doc_mut().sync_disk();
-        self.refresh_title();
+        self.after_save(saved);
         Ok(())
+    }
+
+    /// Save every open document with unsaved edits, across both panes and all their
+    /// tabs, and report whether anything reached the disk.
+    ///
+    /// Everything that lets a document go calls this: the idle autosave, a tab
+    /// closing, a vault switching, the window shutting, the focus leaving. A
+    /// background tab can hold unsaved edits (typing in one pane while the other is
+    /// focused, a replace-all across tabs), and the point of an autosave is that no
+    /// document is ever the one that quietly did not get written.
+    fn save_all(&mut self) -> bool {
+        let mut wrote = false;
+        for group in &mut self.editors {
+            for doc in group.docs_mut() {
+                match doc.save() {
+                    Ok(saved) => wrote |= saved == Saved::Written,
+                    // One unwritable document must not stop the rest from being
+                    // saved, nor take the editor down on the way out of a vault.
+                    Err(e) => eprintln!("bnknotes: could not save: {e}"),
+                }
+            }
+        }
+        if wrote {
+            self.after_save(Saved::Written);
+        }
+        wrote
+    }
+
+    /// Settle the window after a save: a conflict raised by one needs painting, and
+    /// a write clears the title's modified marker.
+    fn after_save(&mut self, saved: Saved) {
+        if matches!(saved, Saved::Written | Saved::Conflict) {
+            self.dirty = true;
+            self.refresh_title();
+        }
+    }
+
+    /// Re-time the idle autosave against what the documents look like now.
+    ///
+    /// Called once per loop pass, so it watches the buffers rather than the edits:
+    /// every mutation reaches it (a keystroke, a paste, a replace-all, a table edit)
+    /// without each having to arm the timer itself.
+    fn poll_autosave(&mut self, now: Instant) {
+        let mut edited = false;
+        let mut pending = false;
+        for group in &mut self.editors {
+            for doc in group.docs_mut() {
+                edited |= doc.poll_edited();
+                pending |= doc.text.is_modified() && doc.path.is_some();
+            }
+        }
+        self.autosave_at = autosave_deadline(edited, pending, self.autosave_at, now);
+    }
+
+    /// Write the pending documents once the typing has stopped for [`AUTOSAVE_IDLE`].
+    fn fire_autosave(&mut self, now: Instant) {
+        if self.autosave_at.is_some_and(|at| now >= at) {
+            self.autosave_at = None;
+            self.save_all();
+        }
     }
 
     /// The toplevel title: the focused editor's file name (or just the app name
@@ -1884,12 +1982,17 @@ impl State {
             .then(|| self.scrollbar_retry_at())
             .flatten()
             .map(until);
+        // The idle autosave wakes the loop even on an unfocused window: focus leaving
+        // is itself a save, but a window left dirty some other way (the pointer
+        // dragging text into it, a find-replace as focus goes) must still land.
+        let autosave = self.autosave_at.map(until);
         [
             self.repeat_timeout(),
             autoscroll,
             caret,
             caret_anim,
             scrollbar,
+            autosave,
         ]
         .into_iter()
         .flatten()
@@ -1936,6 +2039,52 @@ mod tests {
         let (root, file) = resolve_vault(Some(&dir), None, &vs);
         assert_eq!(root, dir);
         assert_eq!(file, None);
+    }
+
+    #[test]
+    fn autosave_waits_out_the_typing() {
+        // Each edit pushes the window out, so a run of typing writes once it stops,
+        // not on every keystroke.
+        let now = Instant::now();
+        let armed = autosave_deadline(true, true, None, now);
+        assert_eq!(armed, Some(now + AUTOSAVE_IDLE));
+        let later = now + Duration::from_millis(500);
+        assert_eq!(
+            autosave_deadline(true, true, armed, later),
+            Some(later + AUTOSAVE_IDLE),
+            "a second keystroke moves the deadline with it"
+        );
+    }
+
+    #[test]
+    fn autosave_lets_a_quiet_pass_run_the_window_down() {
+        // A pass that carried no edit (a repaint, a pointer move) must not keep
+        // pushing the save away, or an idle document would never be written.
+        let now = Instant::now();
+        let armed = Some(now + AUTOSAVE_IDLE);
+        assert_eq!(
+            autosave_deadline(false, true, armed, now + Duration::from_millis(500)),
+            armed
+        );
+    }
+
+    #[test]
+    fn autosave_disarms_when_there_is_nothing_to_save() {
+        // Undoing back to the saved text leaves nothing pending: the deadline goes
+        // rather than firing a write of a file that is already what it was. This is
+        // also what keeps an idle editor's loop asleep, since the deadline is a
+        // wake-up.
+        let now = Instant::now();
+        let armed = Some(now + AUTOSAVE_IDLE);
+        assert_eq!(autosave_deadline(true, false, armed, now), None);
+        assert_eq!(autosave_deadline(false, false, armed, now), None);
+    }
+
+    #[test]
+    fn autosave_stays_disarmed_with_nothing_pending() {
+        // The idle case: no timer, so nothing wakes the loop.
+        let now = Instant::now();
+        assert_eq!(autosave_deadline(false, false, None, now), None);
     }
 
     #[test]

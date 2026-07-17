@@ -258,6 +258,10 @@ impl State {
                 self.caret_visible = false;
                 self.caret_blink_at = None;
                 self.dirty = true;
+                // Turning to another window is the user done with this one for now,
+                // so it does not wait out the idle window: what they typed is on
+                // disk by the time they are reading it somewhere else.
+                self.save_all();
             }
             _ => {}
         }
@@ -1456,7 +1460,16 @@ impl State {
 
     /// Close tab `i` of pane `g` (a blank tab remains if it was the last) and focus
     /// that pane on its now-active tab.
+    ///
+    /// Closing drops the document, so its edits go to disk first, on the same terms
+    /// as everything else: nothing typed is lost by being closed, and the idle window
+    /// is not a race against Ctrl+W.
     fn close_tab(&mut self, g: usize, i: usize) {
+        if let Some(doc) = self.editors[g].docs_mut().nth(i) {
+            if let Err(e) = doc.save() {
+                eprintln!("bnknotes: could not save the closing tab: {e}");
+            }
+        }
         self.editors[g].close(i);
         self.hovered_tab = None;
         self.focus_pane(g);

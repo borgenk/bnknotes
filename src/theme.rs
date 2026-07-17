@@ -193,11 +193,16 @@ pub(crate) const RAIL_ACTIVE_SPAN: f32 = 0.55;
 /// legible. Every color in [`VAULT_COLORS`] takes the dark one.
 pub(crate) const RAIL_INK_LIGHT: u32 = 0x00f5_f7fa;
 pub(crate) const RAIL_INK_DARK: u32 = 0x0016_1a1f;
+/// A temporary vault's chip (a directory opened from the command line that the
+/// config does not name) is drawn as a ring of its color this thick, with the
+/// initials in that color rather than on a solid badge. An outline is the shape of
+/// the thing: the vault is here for the session, not written down, and it reads as
+/// provisional beside the saved chips without spending a second color to say so.
+pub(crate) const RAIL_TEMP_RING: i32 = 2;
 
-/// The chip colors a vault takes when its config names none, picked by the hash of
-/// its name (see [`crate::config::vault_color`]) so a vault keeps its color as the
-/// configured list is reordered. One Dark accents, which sit against [`RAIL_BG`] the
-/// way the code panel's do against the editor.
+/// The chip colors, dealt to the vaults by their position in the rail (see
+/// [`crate::config::Vault::new`]). One Dark accents, which sit against [`RAIL_BG`]
+/// the way the code panel's do against the editor.
 pub(crate) const VAULT_COLORS: [u32; 8] = [
     0x005c_9cf6, // blue
     0x0098_c379, // green
@@ -208,6 +213,27 @@ pub(crate) const VAULT_COLORS: [u32; 8] = [
     0x00e5_b567, // yellow
     0x00f3_8ba8, // pink
 ];
+
+/// The context menu: the panel a right-click opens (today over a temporary vault's
+/// chip). It floats over the chrome in the find bar's panel tone, the editor's one
+/// other floating surface, lifted off what it covers by a hairline border a step
+/// lighter than the panel. A hovered item takes the accent the editor selects text
+/// with, so "this is what the click will act on" reads the same everywhere.
+pub(crate) const MENU_BG: u32 = FIND_BG;
+pub(crate) const MENU_BORDER: u32 = 0x0045_4a5e;
+pub(crate) const MENU_TEXT: u32 = FOREGROUND;
+pub(crate) const MENU_HOVER_BG: u32 = SELECTION_COLOR;
+/// The panel's corner radius, its border thickness, and the padding between its
+/// edge and the items inside it.
+pub(crate) const MENU_RADIUS: i32 = 6;
+pub(crate) const MENU_BORDER_W: i32 = 1;
+pub(crate) const MENU_PAD: i32 = 4;
+/// Padding inside one item: above and below its label (with the line height, this
+/// sets the row height and so the hit area), and from the row's edge to its text.
+pub(crate) const MENU_ITEM_VPAD: i32 = 6;
+pub(crate) const MENU_ITEM_PAD_X: i32 = 12;
+/// Corner radius of a hovered item's fill, the tab buttons' rounding.
+pub(crate) const MENU_ITEM_RADIUS: i32 = TAB_BUTTON_RADIUS;
 
 /// File-tree sidebar and splitter colors and metrics.
 pub(crate) const TREE_BG: u32 = 0x0016_1a1f;

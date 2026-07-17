@@ -30,15 +30,16 @@ use std::time::{Duration, Instant};
 use self::clipboard::{is_text_mime, ClipboardState, CLIPBOARD_MIMES};
 use self::input::KeyRepeat;
 use self::present::GpuPresentation;
-use crate::config::{vault_name, CaretConfig, Config, Vault};
+use crate::config::{self, vault_name, CaretConfig, Config, Vault, VaultKind};
 use crate::file;
+use crate::menu::{Menu, MenuAction, MenuItem};
 use crate::paint::{
     build_display_list, build_find_paint, conflict_banner_layout, font_sizes, measure_tree,
-    push_conflict_banner, push_rail, push_splitter, push_top_bar, push_tree, top_bar_height,
-    tree_metrics, BarCtx, CaretPaint, PaintParams, TabStrip,
+    push_conflict_banner, push_menu, push_rail, push_splitter, push_top_bar, push_tree,
+    top_bar_height, tree_metrics, BarCtx, CaretPaint, PaintParams, TabStrip,
 };
 use crate::pane::{
-    restore_group, CaretAnim, CaretFrame, Columns, DiskConflict, Focus, PaneGroup, PaneLayout,
+    restore_group, CaretAnim, CaretFrame, Columns, DiskConflict, Focus, Hit, PaneGroup, PaneLayout,
     TreePane,
 };
 use crate::platform::conn::{Connection, Fill};
@@ -242,14 +243,17 @@ struct State {
     /// click moves focus (and, on a splitter, starts a drag).
     editors: [PaneGroup; 2],
     tree: TreePane,
-    /// The configured vaults, in the order the rail stacks their chips. Which one is
-    /// active is not held here: it is the file tree's root, so the two can never
-    /// disagree. A root outside this list (a directory argument) simply lights no
-    /// chip.
+    /// The vaults in the order the rail stacks their chips: the config's, then the
+    /// temporary one this window was launched in when the config does not name it
+    /// (see [`rail_vaults`]). Which one is active is not held here: it is the file
+    /// tree's root, so the two can never disagree.
     vaults: Vec<Vault>,
     /// Which vault chip the pointer is over, for the rail's hover lift; `None` when
     /// off every chip.
     hovered_vault: Option<usize>,
+    /// The open context menu, `None` when none is. It floats over the chrome and
+    /// takes every press while it is up (see [`crate::menu`]).
+    menu: Option<Menu>,
     /// Every vault's remembered settings (the sidebar's folder filter), kept whole
     /// so saving the active vault's choice leaves the other vaults' alone.
     vault_prefs: store::VaultPrefs,
@@ -442,12 +446,22 @@ fn resolve_vault(
     }
 }
 
-/// Make a CLI path argument absolute so a relative one (notably ".") roots the
-/// vault at a real directory with a proper name, rather than at the literal
-/// argument. A path that cannot be resolved (a not-yet-created file) is returned
-/// unchanged, so opening a new file still works.
-fn absolute_arg(path: &Path) -> PathBuf {
-    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+/// The vaults the rail shows: the saved ones the config names, and after them the
+/// active root as a temporary vault when the config does not name it (`bnknotes .`
+/// in a directory that is not a vault, or a file opened outside every vault).
+///
+/// Last is where a temporary vault goes, so the saved chips keep the colors and
+/// the order the config dealt them, and saving one later moves nothing: it is
+/// appended to the config, which is where it already sits in the rail.
+fn rail_vaults(mut vaults: Vec<Vault>, root: &Path) -> Vec<Vault> {
+    if !vaults.iter().any(|v| v.path == root) {
+        vaults.push(Vault::new(
+            root.to_path_buf(),
+            vaults.len(),
+            VaultKind::Temporary,
+        ));
+    }
+    vaults
 }
 
 /// The configured vault that holds `file`, if any: the vault whose root is an
@@ -484,10 +498,11 @@ fn initial_focus(
 impl State {
     fn new(path: Option<PathBuf>) -> Result<Self> {
         let conn = Connection::connect()?;
-        // Font selection lives in the app config (defaults for now; no on-disk
-        // config yet). Open every size the styles use so headings render larger
+        // The user's config (the vault list; the rest is still defaults in the
+        // source), or the built-in defaults when there is no file. Font selection
+        // lives here too: open every size the styles use so headings render larger
         // than body text without re-opening mid-frame.
-        let config = Config::default();
+        let config = Config::load();
         // The window opens at scale 1.0 (the compositor reports the real scale
         // after the first configure), so the body size starts at the logical
         // FONT_SIZE unless BNKNOTES_FONT_SIZE pins it.
@@ -502,14 +517,18 @@ impl State {
         // falls back to the first-run default without failing.
         let session = store::load();
 
-        // A CLI path is made absolute up front, so `bnknotes .` roots at the real
-        // current directory (named after its folder) instead of the literal ".".
-        let arg = path.as_deref().map(absolute_arg);
+        // A CLI path is resolved up front, so `bnknotes .` roots at the real current
+        // directory (named after its folder) instead of the literal ".", and matches
+        // a configured vault that is the same directory reached another way.
+        let arg = path.as_deref().map(config::resolve_path);
         let (root, cli_file) = resolve_vault(
             arg.as_deref(),
             session.active_vault.as_deref(),
             &config.vaults,
         );
+        // A root the config does not name rides along as a temporary vault, so the
+        // rail shows where the window actually is and can offer to save it.
+        let vaults = rail_vaults(config.vaults, &root);
 
         // Tabs and expanded folders travel with the vault, not the window: restore
         // the resolved vault's own layout, defaulting to a first-run one (no tabs,
@@ -582,8 +601,9 @@ impl State {
             xkb: Xkb::new()?,
             editors: [editor_a, editor_b],
             tree,
-            vaults: config.vaults,
+            vaults,
             hovered_vault: None,
+            menu: None,
             vault_prefs: session.vaults,
             panes,
             focus,
@@ -672,9 +692,10 @@ impl State {
         })
     }
 
-    /// Which configured vault is the one the file tree is rooted at, if any. A vault
-    /// opened from a directory argument need not be configured, in which case the
-    /// rail marks none of its chips as active.
+    /// Which vault in the rail the file tree is rooted at. Every root reaches the
+    /// rail, a directory argument the config does not name as a temporary vault, so
+    /// this resolves in practice; it stays an option rather than an assumption the
+    /// rail's marker would have to trust.
     fn active_vault(&self) -> Option<usize> {
         let root = self.tree.tree.root();
         self.vaults.iter().position(|v| v.path == root)
@@ -1024,6 +1045,78 @@ impl State {
         self.dirty = true;
     }
 
+    /// Open the context menu for whatever is at window point `(px, py)`, the
+    /// right-click. A spot with nothing to offer (which is most of the window today)
+    /// opens no menu, and closes any that was up.
+    pub(super) fn open_menu(&mut self, px: f32, py: f32) {
+        // Hit-test with any open menu out of the way: a right-click while one is up
+        // is aimed at what is under it, not at the menu itself.
+        self.close_menu();
+        let items = self.menu_items_at(px, py);
+        if !items.is_empty() {
+            self.menu = Some(Menu::new(items, (px as i32, py as i32)));
+        }
+        self.dirty = true;
+    }
+
+    /// What a right-click at `(px, py)` offers. Only a temporary vault's chip offers
+    /// anything so far: the one action that makes it permanent.
+    fn menu_items_at(&self, px: f32, py: f32) -> Vec<MenuItem> {
+        match self.hit_test(px, py) {
+            Hit::Vault(i) if self.is_temporary_vault(i) => vec![MenuItem {
+                label: "Save as vault",
+                action: MenuAction::SaveVault(i),
+            }],
+            _ => Vec::new(),
+        }
+    }
+
+    /// Whether rail vault `i` is one the config does not name, the only thing the
+    /// menu has an offer for.
+    fn is_temporary_vault(&self, i: usize) -> bool {
+        self.vaults
+            .get(i)
+            .is_some_and(|v| v.kind == VaultKind::Temporary)
+    }
+
+    /// Close the menu if one is open, reporting whether there was one. The caller
+    /// repaints: the panel has to leave the frame it was drawn into.
+    pub(super) fn close_menu(&mut self) -> bool {
+        let was_open = self.menu.take().is_some();
+        self.dirty |= was_open;
+        was_open
+    }
+
+    /// Run a menu item's action and close the menu behind it.
+    pub(super) fn run_menu_action(&mut self, action: MenuAction) {
+        self.close_menu();
+        match action {
+            MenuAction::SaveVault(i) => self.save_vault(i),
+        }
+    }
+
+    /// Save temporary vault `i` into the config file, the rail menu's one item: its
+    /// chip stops being an outline and it is in the rail at every launch from here.
+    ///
+    /// The chip keeps its place and its color, since a temporary vault already sits
+    /// where the config will name it, last. A config that cannot be written leaves
+    /// the vault temporary and says so, rather than showing a saved chip the next
+    /// launch would not have.
+    pub(super) fn save_vault(&mut self, i: usize) {
+        if !self.is_temporary_vault(i) {
+            return;
+        }
+        let Some(vault) = self.vaults.get_mut(i) else {
+            return;
+        };
+        if let Err(e) = config::add_vault(&vault.path) {
+            eprintln!("bnknotes: could not save vault: {e}");
+            return;
+        }
+        vault.kind = VaultKind::Saved;
+        self.dirty = true;
+    }
+
     fn roundtrip(&mut self) -> Result<()> {
         let callback = self.alloc_id();
         self.conn.request(
@@ -1276,6 +1369,11 @@ impl State {
                 (region, name)
             });
             push_top_bar(&mut list, &ctx, bar, vault, [strip(0), strip(1)], &dividers);
+        }
+        // The context menu floats over everything, so it is pushed after everything.
+        if let Some(menu) = &self.menu {
+            let ctx = BarCtx::new(&self.fonts, scale, self.body_size);
+            push_menu(&mut list, &ctx, menu, &self.menu_layout(menu));
         }
         Rc::new(list)
     }
@@ -1851,6 +1949,38 @@ mod tests {
     }
 
     #[test]
+    fn rail_vaults_adds_an_unconfigured_root_as_a_temporary_vault() {
+        // `bnknotes .` in a directory the config does not name: the rail shows where
+        // the window actually is, as a chip that says it is not written down.
+        let rail = rail_vaults(vaults(&["/home/user/notes"]), Path::new("/tmp/scratch"));
+        assert_eq!(rail.len(), 2);
+        assert_eq!(rail[1].path, Path::new("/tmp/scratch"));
+        assert_eq!(rail[1].kind, VaultKind::Temporary);
+        // Last, so the saved chips keep the colors and order the config dealt them.
+        assert_eq!(rail[0].kind, VaultKind::Saved);
+        assert_eq!(rail[0].path, Path::new("/home/user/notes"));
+    }
+
+    #[test]
+    fn rail_vaults_leaves_a_configured_root_alone() {
+        // Launching in a directory that is already a vault activates that chip rather
+        // than adding a second one for the same place.
+        let vs = vaults(&["/home/user/notes", "/home/user/work"]);
+        let rail = rail_vaults(vs.clone(), Path::new("/home/user/work"));
+        assert_eq!(rail, vs);
+    }
+
+    #[test]
+    fn a_temporary_vault_is_dealt_the_chip_it_keeps_when_saved() {
+        // Saving appends it to the config, which is where it already sits in the rail:
+        // the same position, so the same color, so the chip does not jump on save.
+        let rail = rail_vaults(vaults(&["/home/user/notes"]), Path::new("/tmp/scratch"));
+        let saved = vaults(&["/home/user/notes", "/tmp/scratch"]);
+        assert_eq!(rail[1].color, saved[1].color);
+        assert_eq!(rail[1].initials, saved[1].initials);
+    }
+
+    #[test]
     fn resolve_vault_roots_a_file_argument_at_its_containing_vault() {
         // A note deep inside a configured vault roots at the whole vault, not just
         // the note's own folder, so its embeds resolve vault-wide.
@@ -1899,23 +2029,6 @@ mod tests {
         let (root, file) = resolve_vault(None, Some(&stale), &vs);
         assert_eq!(root, Path::new("/home/user/notes"));
         assert_eq!(file, None);
-    }
-
-    #[test]
-    fn absolute_arg_resolves_an_existing_directory_to_an_absolute_named_path() {
-        // A real directory canonicalizes to an absolute path that still has a final
-        // component, so a vault rooted there gets a name (not "." or "").
-        let abs = absolute_arg(&std::env::temp_dir());
-        assert!(abs.is_absolute());
-        assert!(abs.file_name().is_some());
-    }
-
-    #[test]
-    fn absolute_arg_passes_through_an_unresolvable_path() {
-        // A not-yet-created file cannot be canonicalized, so it is left as given and
-        // opening a new file still works.
-        let p = Path::new("/no/such/path/here.md");
-        assert_eq!(absolute_arg(p), p);
     }
 
     #[test]

@@ -1,7 +1,25 @@
-//! App configuration, gathered in one place so it can grow a loader without
-//! touching call sites. For now it is defaults only (no on-disk config yet);
-//! [`Config::default`] holds the built-in values, and a future file loader
-//! replaces them at startup.
+//! App configuration, gathered in one place. [`Config::default`] holds the
+//! built-in values and [`Config::load`] replaces what the config file names at
+//! startup.
+//!
+//! The file is `$XDG_CONFIG_HOME/bnknotes/config` (else `~/.config/bnknotes/config`),
+//! in a line-based format: one `field value` per line, `#` comments and blank
+//! lines ignored, an unknown field skipped rather than refused so a config
+//! written for a later version still loads, and a repeating field accumulating.
+//! Today one field is read:
+//!
+//! ```text
+//! # bnknotes config
+//! vault ~/notes
+//! vault ~/work/journal
+//! ```
+//!
+//! Nothing here is fatal: a missing, oversized, or unreadable file leaves the
+//! defaults standing, because a bad config must never stop the editor opening.
+//!
+//! [`add_vault`] is the one write, for the rail's "Save as vault". It appends a
+//! line to the file as it is on disk rather than re-encoding the config, so the
+//! comments, the ordering, and any field this version does not know all survive.
 //!
 //! This module also owns the [`Default`] for the portable [`FontConfig`] type:
 //! the concrete font paths are this app's choice, so they live here rather than
@@ -10,15 +28,31 @@
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 
+use crate::platform::error::{Error, Result};
 use crate::platform::freetype::{FontConfig, FontFamily};
 use crate::theme::VAULT_COLORS;
+
+const FILENAME: &str = "config";
+/// Sibling of the config file, flock'd for the duration of an [`add_vault`] so two
+/// bnknotes saving a vault at once serialize their read-append-write.
+const LOCK_FILENAME: &str = "config.lock";
+
+/// Largest config file read or appended to. The config is a handful of short
+/// lines; anything this size is not one, and refusing to load it beats reading a
+/// pasted note into memory line by line.
+const CONFIG_MAX_BYTES: u64 = 64 * 1024;
+
+/// Most vaults the config can name. The rail draws them in one column, and the
+/// list is input-fed, so it is bounded on the way in rather than truncated after.
+const MAX_VAULTS: usize = 64;
 
 /// A notes vault: a root directory the editor roots its file tree and every note
 /// reference (images, wikilink embeds) against. Its name is the last component of
 /// the path.
 ///
 /// The chip the vault rail shows for it is the rest: a color and the initials
-/// drawn on it. [`vaults`] derives both, so a configured vault is just a path.
+/// drawn on it. [`Vault::new`] derives both, so a vault is a path plus where it
+/// came from.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Vault {
     pub path: PathBuf,
@@ -27,26 +61,48 @@ pub struct Vault {
     /// What the chip says: the first two characters of the vault's name, upper
     /// case. Derived once here rather than per frame.
     pub initials: String,
+    /// Whether the config file names this vault, which decides both how the rail
+    /// draws its chip and whether the chip offers to save it.
+    pub kind: VaultKind,
 }
 
-/// The configured vaults for `paths`, each dealt its rail chip: the colors run
-/// through [`VAULT_COLORS`] in list order, and the initials come from each name.
-///
-/// Dealing by position rather than by a hash of the name is what keeps a list of
-/// eight or fewer vaults free of two chips that look alike, which is the whole job
-/// of the color; past eight the palette wraps and two vaults share a color, told
-/// apart by their initials. The cost is that inserting a vault re-colors the ones
-/// below it, so a loader that lets a vault name its own color overwrites the field
-/// after.
+/// Where a vault in the rail came from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VaultKind {
+    /// The config file names it: it is in the rail at every launch, and its chip
+    /// is drawn solid.
+    Saved,
+    /// A directory opened from the command line (`bnknotes .`) that the config
+    /// does not name. It rides in the rail for this session only, drawn as an
+    /// outline, until its context menu saves it into the config.
+    Temporary,
+}
+
+impl Vault {
+    /// The vault at `path`, dealt the rail chip for position `i`: the colors run
+    /// through [`VAULT_COLORS`] in rail order, and the initials come from the name.
+    ///
+    /// Dealing by position rather than by a hash of the name is what keeps a list of
+    /// eight or fewer vaults free of two chips that look alike, which is the whole job
+    /// of the color; past eight the palette wraps and two vaults share a color, told
+    /// apart by their initials. A temporary vault sits at the end of the rail and is
+    /// dealt from the same run, so saving it keeps the color its chip already had.
+    pub fn new(path: PathBuf, i: usize, kind: VaultKind) -> Self {
+        Self {
+            initials: vault_initials(&path),
+            color: VAULT_COLORS[i % VAULT_COLORS.len()],
+            path,
+            kind,
+        }
+    }
+}
+
+/// The saved vaults for `paths`, in rail order.
 pub fn vaults(paths: impl IntoIterator<Item = PathBuf>) -> Vec<Vault> {
     paths
         .into_iter()
         .enumerate()
-        .map(|(i, path)| Vault {
-            initials: vault_initials(&path),
-            color: VAULT_COLORS[i % VAULT_COLORS.len()],
-            path,
-        })
+        .map(|(i, path)| Vault::new(path, i, VaultKind::Saved))
         .collect()
 }
 
@@ -72,9 +128,175 @@ pub fn vault_name(path: &Path) -> &str {
         .unwrap_or("vault")
 }
 
+/// The directory holding everything bnknotes keeps for the user: the config file
+/// here, the state file beside it (see [`crate::store`]). `$XDG_CONFIG_HOME/bnknotes`
+/// when that is set, else `~/.config/bnknotes`. `None` when neither variable
+/// resolves, and then nothing is loaded or persisted.
+pub fn config_dir() -> Option<PathBuf> {
+    if let Some(xdg) = std::env::var_os("XDG_CONFIG_HOME").filter(|s| !s.is_empty()) {
+        return Some(PathBuf::from(xdg).join("bnknotes"));
+    }
+    let home = std::env::var_os("HOME").filter(|s| !s.is_empty())?;
+    Some(PathBuf::from(home).join(".config").join("bnknotes"))
+}
+
+/// Path to the config file, `None` when the config directory does not resolve.
+pub fn config_path() -> Option<PathBuf> {
+    Some(config_dir()?.join(FILENAME))
+}
+
+/// Resolve a path from the config file or the command line to the absolute one the
+/// vault list compares against, so a vault named two ways (a relative ".", a
+/// symlink, a trailing slash) is one entry and not two. A path that does not
+/// resolve, a vault or file that does not exist yet, is returned unchanged: naming
+/// a vault before creating it, and opening a new file, both still work.
+pub fn resolve_path(path: &Path) -> PathBuf {
+    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
+impl Config {
+    /// The configuration for this run: the built-in defaults with whatever the
+    /// config file names laid over them. Never fails, and says why when it falls
+    /// back, since the editor has to open either way.
+    pub fn load() -> Self {
+        match config_path() {
+            Some(path) => load_from(&path),
+            None => Config::default(),
+        }
+    }
+}
+
+/// Read and parse the config at `path`. A file that is not there is the common
+/// case and stays silent; one that cannot be read, or is too big to be a config,
+/// logs and leaves the defaults standing.
+fn load_from(path: &Path) -> Config {
+    match read_config(path) {
+        Ok(Some(text)) => parse(&text),
+        Ok(None) => Config::default(),
+        Err(e) => {
+            eprintln!("bnknotes: ignoring config {}: {e}", path.display());
+            Config::default()
+        }
+    }
+}
+
+/// The config file's text, `None` when there is no file yet. The size is checked
+/// against [`CONFIG_MAX_BYTES`] before the read allocates, so a huge file (a note
+/// saved over the config by accident) is refused rather than read in.
+fn read_config(path: &Path) -> Result<Option<String>> {
+    match std::fs::metadata(path) {
+        Ok(meta) if meta.len() > CONFIG_MAX_BYTES => {
+            return Err(Error::msg("config file is too large to be a config"))
+        }
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e.into()),
+    }
+    match std::fs::read_to_string(path) {
+        Ok(text) => Ok(Some(text)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// Parse config text over the built-in defaults: a field the file does not name
+/// keeps the value [`Config::default`] gave it, so a config naming one thing does
+/// not blank the rest.
+fn parse(text: &str) -> Config {
+    let mut config = Config::default();
+    let paths = vault_paths(text);
+    if !paths.is_empty() {
+        config.vaults = vaults(paths);
+    }
+    config
+}
+
+/// The vault paths a config's text names, in file order: resolved, deduplicated,
+/// and capped at [`MAX_VAULTS`]. Shared by [`parse`] and [`add_vault_to`], which
+/// has to know whether a vault is already named before it appends one.
+fn vault_paths(text: &str) -> Vec<PathBuf> {
+    let mut paths: Vec<PathBuf> = Vec::new();
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        // The first whitespace run splits the field name from its value, so a vault
+        // path may hold spaces of its own.
+        let Some((field, value)) = line.split_once(char::is_whitespace) else {
+            continue;
+        };
+        let value = value.trim();
+        if value.is_empty() {
+            continue;
+        }
+        // Unknown fields are skipped, not refused: a config written for a later
+        // version, or for a knob still living in the source, still loads.
+        if field != "vault" {
+            continue;
+        }
+        let path = resolve_path(&expand_tilde(value));
+        if paths.len() < MAX_VAULTS && !paths.contains(&path) {
+            paths.push(path);
+        }
+    }
+    paths
+}
+
+/// Name `vault` in the config file, the rail's "Save as vault", creating the file
+/// and its directory when this is the first one. `vault` is a resolved path (see
+/// [`resolve_path`]), which is what makes "the config already names it" answerable;
+/// a vault it does name is left alone rather than repeated.
+///
+/// The line is appended to the file as it is on disk, so the user's comments,
+/// ordering, and any field this version does not read survive untouched; a save
+/// that re-encoded the config would quietly eat all three.
+pub fn add_vault(vault: &Path) -> Result<()> {
+    let path =
+        config_path().ok_or_else(|| Error::msg("no XDG_CONFIG_HOME or HOME to save into"))?;
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    add_vault_to(&path, vault)
+}
+
+/// The core of [`add_vault`], taking the config path so it can be tested against a
+/// temp file. The read, append, and atomic write run under the lock, so a second
+/// bnknotes saving a vault at the same moment does not lose one of the two.
+fn add_vault_to(path: &Path, vault: &Path) -> Result<()> {
+    let line = vault_line(vault)?;
+    let _lock = crate::file::FileLock::acquire(&path.with_file_name(LOCK_FILENAME));
+    let mut text = read_config(path)?.unwrap_or_default();
+    if vault_paths(&text).iter().any(|p| p == vault) {
+        return Ok(());
+    }
+    // A config whose last line has no break of its own would otherwise swallow the
+    // new field onto the end of it.
+    if !text.is_empty() && !text.ends_with('\n') {
+        text.push('\n');
+    }
+    text.push_str(&line);
+    crate::file::save_atomic(path, text.as_bytes())
+}
+
+/// The `vault <path>` line for `vault`, or an error when the path cannot survive a
+/// round trip through the line format: the format has no escaping, so a path that
+/// is not UTF-8, or that a newline or edge whitespace would break or trim, has no
+/// line that reads back as the same path.
+fn vault_line(vault: &Path) -> Result<String> {
+    let path = vault
+        .to_str()
+        .ok_or_else(|| Error::msg("cannot save a vault whose path is not valid UTF-8"))?;
+    if path.is_empty() || path.trim() != path || path.contains('\n') {
+        return Err(Error::msg(
+            "cannot save a vault whose path holds a line break or leading/trailing spaces",
+        ));
+    }
+    Ok(format!("vault {path}\n"))
+}
+
 /// Expand a leading `~/` (or a bare `~`) to the user's home directory; any other
-/// path passes through unchanged. Keeps configured vault paths short and stays
-/// ready for a future config-file loader that reads them as text.
+/// path passes through unchanged. Keeps the vault paths in the config file short.
 pub fn expand_tilde(path: &str) -> PathBuf {
     expand_tilde_in(
         path,
@@ -97,7 +319,8 @@ fn expand_tilde_in(path: &str, home: Option<&OsStr>) -> PathBuf {
     }
 }
 
-/// The editor's configurable settings, the seam a config-file loader fills in.
+/// The editor's configurable settings: the built-in defaults, with what the config
+/// file names laid over them by [`Config::load`].
 #[derive(Clone, Debug)]
 pub struct Config {
     /// Which fonts the editor opens for prose and code.
@@ -179,9 +402,12 @@ impl Default for Config {
             code_glyph_coverage_gamma: 1.0,
             line_height_scale: 1.5,
             caret: CaretConfig::default(),
-            // One vault to start, the notes folder in the user's home. A future
-            // loader replaces this list from an on-disk config.
-            vaults: vaults([expand_tilde("~/notes")]),
+            // One vault to start, the notes folder in the user's home, for a config
+            // file that names none (or is not there yet). A config's `vault` lines
+            // replace this list; the rail's "Save as vault" writes the first one.
+            // Resolved like a configured line, so every path in the vault list has
+            // been through the same door and comparing two of them means something.
+            vaults: vaults([resolve_path(&expand_tilde("~/notes"))]),
         }
     }
 }
@@ -325,7 +551,13 @@ mod tests {
     fn default_config_has_a_notes_vault() {
         let config = Config::default();
         assert_eq!(config.vaults.len(), 1);
-        assert_eq!(vault_name(&config.vaults[0].path), "notes");
+        // The home notes folder, resolved the way a config line is (asserting the
+        // name instead would depend on whether ~/notes is a symlink where the test runs).
+        assert_eq!(
+            config.vaults[0].path,
+            resolve_path(&expand_tilde("~/notes"))
+        );
+        assert_eq!(config.vaults[0].kind, VaultKind::Saved);
     }
 
     #[test]
@@ -395,5 +627,239 @@ mod tests {
     #[test]
     fn vaults_with_no_paths_configure_nothing() {
         assert!(vaults([]).is_empty());
+    }
+
+    #[test]
+    fn a_configured_vault_is_saved_not_temporary() {
+        assert_eq!(named(&["notes"])[0].kind, VaultKind::Saved);
+    }
+
+    /// The vault paths a parsed config names, which is what every parse test is
+    /// really asking about.
+    fn parsed(text: &str) -> Vec<PathBuf> {
+        parse(text).vaults.into_iter().map(|v| v.path).collect()
+    }
+
+    /// The paths the built-in defaults name: what a config that names no vault of
+    /// its own leaves standing.
+    fn default_vault_paths() -> Vec<PathBuf> {
+        Config::default()
+            .vaults
+            .into_iter()
+            .map(|v| v.path)
+            .collect()
+    }
+
+    #[test]
+    fn parse_reads_the_vaults_in_file_order() {
+        assert_eq!(
+            parsed("vault /home/user/notes\nvault /home/user/work\n"),
+            [
+                PathBuf::from("/home/user/notes"),
+                PathBuf::from("/home/user/work")
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_ignores_blank_and_comment_lines() {
+        assert_eq!(
+            parsed("\n# my vaults\n   \nvault /home/user/notes\n"),
+            [PathBuf::from("/home/user/notes")]
+        );
+    }
+
+    #[test]
+    fn parse_tolerates_unknown_fields() {
+        // A config written for a later version (or for a knob still living in the
+        // source) loads rather than being refused.
+        assert_eq!(
+            parsed("future_option whatever\nvault /home/user/notes\nmystery 42\n"),
+            [PathBuf::from("/home/user/notes")]
+        );
+    }
+
+    #[test]
+    fn parse_tolerates_extra_whitespace() {
+        assert_eq!(
+            parsed("   vault    /home/user/notes   \n"),
+            [PathBuf::from("/home/user/notes")]
+        );
+    }
+
+    #[test]
+    fn parse_keeps_a_vault_path_with_spaces_in_it() {
+        // Only the first whitespace run splits the field from its value, so a folder
+        // named like prose survives.
+        assert_eq!(
+            parsed("vault /home/user/My Notes\n"),
+            [PathBuf::from("/home/user/My Notes")]
+        );
+    }
+
+    #[test]
+    fn parse_skips_a_vault_field_with_no_path() {
+        // Nothing named means nothing configured, so the defaults stand.
+        assert_eq!(parsed("vault\nvault   \n"), default_vault_paths());
+    }
+
+    #[test]
+    fn parse_drops_a_repeated_vault() {
+        assert_eq!(
+            parsed("vault /home/user/notes\nvault /home/user/notes\n"),
+            [PathBuf::from("/home/user/notes")]
+        );
+    }
+
+    #[test]
+    fn parse_expands_a_tilde_path() {
+        let Some(home) = std::env::var_os("HOME").filter(|s| !s.is_empty()) else {
+            return;
+        };
+        assert_eq!(
+            parsed("vault ~/notes\n"),
+            [resolve_path(&PathBuf::from(home).join("notes"))]
+        );
+    }
+
+    #[test]
+    fn parse_caps_the_vault_list() {
+        // The list is input-fed, so it is bounded on the way in: a config naming a
+        // thousand vaults cannot grow the rail past the cap.
+        let text: String = (0..MAX_VAULTS + 10)
+            .map(|i| format!("vault /home/user/v{i}\n"))
+            .collect();
+        assert_eq!(parsed(&text).len(), MAX_VAULTS);
+    }
+
+    #[test]
+    fn parse_with_no_vaults_keeps_the_default_ones() {
+        // A field absent from the file keeps its default, so a config about something
+        // else does not empty the rail.
+        assert_eq!(parsed("# nothing here\n"), default_vault_paths());
+        assert_eq!(parsed(""), default_vault_paths());
+    }
+
+    #[test]
+    fn resolve_path_makes_an_existing_directory_absolute_and_named() {
+        // A real directory canonicalizes to an absolute path that still has a final
+        // component, so a vault rooted there gets a name (not "." or "").
+        let abs = resolve_path(&std::env::temp_dir());
+        assert!(abs.is_absolute());
+        assert!(abs.file_name().is_some());
+    }
+
+    #[test]
+    fn resolve_path_passes_through_an_unresolvable_path() {
+        // A not-yet-created vault or file cannot be canonicalized, so it is left as
+        // given and both still work.
+        let p = Path::new("/no/such/path/here.md");
+        assert_eq!(resolve_path(p), p);
+    }
+
+    /// A scratch directory under the system temp dir, unique per test name so the
+    /// parallel test runner does not collide two file-backed configs.
+    fn tmp_dir(name: &str) -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("bnknotes-config-{}-{}", std::process::id(), name));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        dir
+    }
+
+    /// Write `text` as the config in a scratch dir, returning its path.
+    fn config_with(name: &str, text: &str) -> PathBuf {
+        let path = tmp_dir(name).join(FILENAME);
+        std::fs::write(&path, text).expect("write config");
+        path
+    }
+
+    #[test]
+    fn add_vault_writes_the_first_one_into_a_config_that_is_not_there_yet() {
+        let path = tmp_dir("first").join(FILENAME);
+        let _ = std::fs::remove_file(&path);
+        add_vault_to(&path, Path::new("/home/user/notes")).expect("add");
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("read"),
+            "vault /home/user/notes\n"
+        );
+    }
+
+    #[test]
+    fn add_vault_appends_and_leaves_the_rest_of_the_file_alone() {
+        // The whole point of appending: a user's comments, their ordering, and a
+        // field this version does not read all survive being written to.
+        let before = "# my vaults\nvault /home/user/notes\n\nfuture_option whatever\n";
+        let path = config_with("append", before);
+        add_vault_to(&path, Path::new("/home/user/work")).expect("add");
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("read"),
+            format!("{before}vault /home/user/work\n")
+        );
+    }
+
+    #[test]
+    fn add_vault_does_not_run_onto_a_last_line_without_a_break() {
+        let path = config_with("nobreak", "vault /home/user/notes");
+        add_vault_to(&path, Path::new("/home/user/work")).expect("add");
+        assert_eq!(
+            parsed(&std::fs::read_to_string(&path).expect("read")),
+            [
+                PathBuf::from("/home/user/notes"),
+                PathBuf::from("/home/user/work")
+            ]
+        );
+    }
+
+    #[test]
+    fn add_vault_leaves_a_vault_the_config_already_names() {
+        let before = "vault /home/user/notes\n";
+        let path = config_with("dup", before);
+        add_vault_to(&path, Path::new("/home/user/notes")).expect("add");
+        assert_eq!(std::fs::read_to_string(&path).expect("read"), before);
+    }
+
+    #[test]
+    fn add_vault_then_load_reads_it_back() {
+        let path = tmp_dir("roundtrip").join(FILENAME);
+        let _ = std::fs::remove_file(&path);
+        add_vault_to(&path, Path::new("/home/user/notes")).expect("add");
+        add_vault_to(&path, Path::new("/home/user/work")).expect("add");
+        let vaults = load_from(&path).vaults;
+        assert_eq!(
+            vaults.iter().map(|v| v.path.clone()).collect::<Vec<_>>(),
+            [
+                PathBuf::from("/home/user/notes"),
+                PathBuf::from("/home/user/work")
+            ]
+        );
+        // Read back from the config, both are saved vaults, not temporary ones.
+        assert!(vaults.iter().all(|v| v.kind == VaultKind::Saved));
+    }
+
+    #[test]
+    fn add_vault_refuses_a_path_the_line_format_cannot_hold() {
+        // No escaping in the format, so a path a parse could not read back is an
+        // error rather than a line that silently names another directory.
+        let path = tmp_dir("unwritable").join(FILENAME);
+        let _ = std::fs::remove_file(&path);
+        assert!(add_vault_to(&path, Path::new("/home/user/two\nlines")).is_err());
+        assert!(add_vault_to(&path, Path::new("/home/user/padded ")).is_err());
+        assert!(add_vault_to(&path, Path::new("")).is_err());
+        // None of them left a config behind.
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn load_from_a_missing_config_is_the_defaults() {
+        let path = tmp_dir("missing").join("not-written");
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(load_from(&path).vaults, Config::default().vaults);
+    }
+
+    #[test]
+    fn load_from_an_oversized_config_is_the_defaults() {
+        // A note saved over the config by accident is refused, not read in.
+        let path = config_with("huge", &"# padding\n".repeat(CONFIG_MAX_BYTES as usize));
+        assert_eq!(load_from(&path).vaults, Config::default().vaults);
     }
 }

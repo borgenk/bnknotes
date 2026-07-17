@@ -658,7 +658,12 @@ impl PaneLayout {
 /// the bar as well as beside the columns), then the top bar (it sits above every
 /// remaining column), then splitters (they sit in the gaps between columns).
 pub(crate) enum Hit {
-    /// The rail's chip for configured vault `i`: switch the window to it.
+    /// An item of the open context menu: run it.
+    MenuItem(usize),
+    /// Anywhere else while a context menu is open: the press dismisses the menu and
+    /// goes no further, the way a pop-up's grab swallows the click that closes it.
+    Menu,
+    /// The rail's chip for vault `i`: switch the window to it.
     Vault(usize),
     /// The rest of the vault rail; consumes the click, so a miss between chips does
     /// not fall through to the column beside it.

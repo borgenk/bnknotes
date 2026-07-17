@@ -100,6 +100,9 @@ pub mod wl_pointer {
     pub const EV_AXIS: u16 = 4;
     /// The left mouse button (Linux input-event-codes `BTN_LEFT`).
     pub const BTN_LEFT: u32 = 0x110;
+    /// The right mouse button (Linux input-event-codes `BTN_RIGHT`), the one a
+    /// context menu opens on.
+    pub const BTN_RIGHT: u32 = 0x111;
     /// wl_pointer.button_state: a press (vs 0 = release).
     pub const BUTTON_STATE_PRESSED: u32 = 1;
     /// wl_pointer.axis: the vertical scroll axis (vs 1 = horizontal).

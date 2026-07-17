@@ -1,4 +1,4 @@
-use crate::config::Vault;
+use crate::config::{Vault, VaultKind};
 use crate::find::{self, FindState};
 use crate::layout::{
     aligned_x, backtick_reveal_shift, cell_line_top, face_key, image_button_rect, inline_code_pad,
@@ -6,6 +6,7 @@ use crate::layout::{
     TABLE_CELL_PAD_Y,
 };
 use crate::markdown;
+use crate::menu::{Menu, MenuLayout};
 use crate::pane::{DiskConflict, TreePane};
 use crate::platform::freetype::{Face, FaceKey, FontStyle, Fonts, Metrics};
 use crate::platform::geom::Rect;
@@ -21,17 +22,19 @@ use crate::theme::{
     CODE_STRING_COLOR, CONFLICT_BANNER_BG, CONFLICT_BANNER_TEXT, CONFLICT_BUTTON_BG,
     CONFLICT_BUTTON_HOVER_BG, DECOR_TEXT_GAP, FIND_BG, FIND_ERROR_COLOR, FIND_MATCH_COLOR,
     FIND_TICK_COLOR, FOREGROUND, HEADING_COLORS, IMAGE_BORDER_COLOR, IMAGE_BORDER_THICKNESS,
-    IMAGE_BUTTON_BG, IMAGE_BUTTON_RADIUS, LINK_COLOR, MARGIN, MARKER_COLOR, QUOTE_BAR_COLOR,
-    QUOTE_BAR_WIDTH, RAIL_ACTIVE_COLOR, RAIL_ACTIVE_SPAN, RAIL_ACTIVE_W, RAIL_BG, RAIL_GAP,
-    RAIL_HOVER_INK, RAIL_HOVER_LIFT, RAIL_INK_DARK, RAIL_INK_LIGHT, RAIL_PAD, RAIL_RADIUS,
-    RULE_COLOR, RULE_THICKNESS, SCROLL_INK, SCROLL_INSET, SCROLL_MIN_THUMB, SCROLL_NEAR,
-    SCROLL_THIN, SCROLL_THUMB_COVER, SCROLL_THUMB_HOVER_COVER, SCROLL_TROUGH_COVER, SCROLL_WIDE,
-    SELECTION_COLOR, SPLITTER_COLOR, TABLE_BORDER_COLOR, TABLE_HEADER_BG, TAB_ACTIVE_BG,
-    TAB_ACTIVE_TEXT, TAB_BUTTON_HOVER_BG, TAB_BUTTON_RADIUS, TAB_CLOSE_GAP, TAB_CLOSE_W,
-    TAB_DIRTY_COLOR, TAB_HOVER_BG, TAB_INACTIVE_TEXT, TAB_MAX_W, TAB_MIN_W, TAB_NEW_W, TAB_PAD_X,
-    TAB_VPAD, TICK_HEIGHT, TICK_WIDTH, TOP_BAR_BG, TREE_BG, TREE_CHEVRON_MAX, TREE_FOOTER_GAP,
-    TREE_FOOTER_VPAD, TREE_HOVER_BG, TREE_INDENT, TREE_MARKER_COLOR, TREE_MARKER_W, TREE_PAD,
-    TREE_ROW_INSET_Y, TREE_ROW_PAD, TREE_ROW_RADIUS, TREE_ROW_VPAD, TREE_TEXT_COLOR, VAULT_PAD_X,
+    IMAGE_BUTTON_BG, IMAGE_BUTTON_RADIUS, LINK_COLOR, MARGIN, MARKER_COLOR, MENU_BG, MENU_BORDER,
+    MENU_BORDER_W, MENU_HOVER_BG, MENU_ITEM_PAD_X, MENU_ITEM_RADIUS, MENU_RADIUS, MENU_TEXT,
+    QUOTE_BAR_COLOR, QUOTE_BAR_WIDTH, RAIL_ACTIVE_COLOR, RAIL_ACTIVE_SPAN, RAIL_ACTIVE_W, RAIL_BG,
+    RAIL_GAP, RAIL_HOVER_INK, RAIL_HOVER_LIFT, RAIL_INK_DARK, RAIL_INK_LIGHT, RAIL_PAD,
+    RAIL_RADIUS, RAIL_TEMP_RING, RULE_COLOR, RULE_THICKNESS, SCROLL_INK, SCROLL_INSET,
+    SCROLL_MIN_THUMB, SCROLL_NEAR, SCROLL_THIN, SCROLL_THUMB_COVER, SCROLL_THUMB_HOVER_COVER,
+    SCROLL_TROUGH_COVER, SCROLL_WIDE, SELECTION_COLOR, SPLITTER_COLOR, TABLE_BORDER_COLOR,
+    TABLE_HEADER_BG, TAB_ACTIVE_BG, TAB_ACTIVE_TEXT, TAB_BUTTON_HOVER_BG, TAB_BUTTON_RADIUS,
+    TAB_CLOSE_GAP, TAB_CLOSE_W, TAB_DIRTY_COLOR, TAB_HOVER_BG, TAB_INACTIVE_TEXT, TAB_MAX_W,
+    TAB_MIN_W, TAB_NEW_W, TAB_PAD_X, TAB_VPAD, TICK_HEIGHT, TICK_WIDTH, TOP_BAR_BG, TREE_BG,
+    TREE_CHEVRON_MAX, TREE_FOOTER_GAP, TREE_FOOTER_VPAD, TREE_HOVER_BG, TREE_INDENT,
+    TREE_MARKER_COLOR, TREE_MARKER_W, TREE_PAD, TREE_ROW_INSET_Y, TREE_ROW_PAD, TREE_ROW_RADIUS,
+    TREE_ROW_VPAD, TREE_TEXT_COLOR, VAULT_PAD_X,
 };
 
 /// The per-frame inputs [`build_display_list`] needs beyond the layout itself:
@@ -354,12 +357,12 @@ fn chip_ink(fill: u32) -> u32 {
 }
 
 /// Draw the vault rail into its full-height column: a background a shade below the
-/// sidebar's, a divider down its right edge, and one chip per configured vault in
-/// `chips`, the rail below the top bar, so the first chip starts on the line the tree
-/// and the pane text do. The chip carries the vault's color and initials. The
-/// pointer lifts a chip's fill; the active vault is marked by a bar at the rail's
-/// left edge, so a chip's color stays the vault's identity rather than doubling as
-/// its state.
+/// sidebar's, a divider down its right edge, and one chip per vault in `chips`, the
+/// rail below the top bar, so the first chip starts on the line the tree and the
+/// pane text do. The chip carries the vault's color and initials, solid for a
+/// saved vault and an outline for a temporary one. The pointer lifts a chip's fill;
+/// the active vault is marked by a bar at the rail's left edge, so a chip's color
+/// stays the vault's identity rather than doubling as its state.
 pub(crate) fn push_rail(
     list: &mut DisplayList,
     ctx: &BarCtx,
@@ -392,14 +395,36 @@ pub(crate) fn push_rail(
         } else {
             vault.color
         };
+        let radius = scale.px(RAIL_RADIUS);
         list.push(DrawCmd::RoundRect {
             rect: chip,
             color: fill,
-            radius: scale.px(RAIL_RADIUS),
+            radius,
             corners: display::RoundedCorners::Both,
         });
-        // The ink follows the vault's own color, not this frame's fill, so the
-        // hover lift brightens the chip without flipping its letters.
+        // A temporary vault's chip is a ring: the fill above, with the rail's own
+        // background punched back out of it, leaving the color as an outline. Its
+        // initials then take that color, since there is no badge left to sit on.
+        let temporary = vault.kind == VaultKind::Temporary;
+        let ink = if temporary {
+            let ring = scale.px(RAIL_TEMP_RING).max(1);
+            list.push(DrawCmd::RoundRect {
+                rect: Rect {
+                    x: chip.x + ring,
+                    y: chip.y + ring,
+                    w: (chip.w - 2 * ring).max(0),
+                    h: (chip.h - 2 * ring).max(0),
+                },
+                color: RAIL_BG,
+                radius: (radius - ring).max(0),
+                corners: display::RoundedCorners::Both,
+            });
+            fill
+        } else {
+            // The ink follows the vault's own color, not this frame's fill, so the
+            // hover lift brightens the chip without flipping its letters.
+            chip_ink(vault.color)
+        };
         let w = shape::text_advance(face, &vault.initials) as i32;
         let x = chip.x + (chip.w - w) / 2;
         list.push(text_cmd(
@@ -410,7 +435,7 @@ pub(crate) fn push_rail(
             x,
             chip.y + (chip.h - (m.ascent + m.descent)) / 2 + m.ascent,
             x + w,
-            chip_ink(vault.color),
+            ink,
             vault.initials.clone(),
             m,
         ));
@@ -428,6 +453,64 @@ pub(crate) fn push_rail(
                 corners: display::RoundedCorners::Both,
             });
         }
+    }
+}
+
+/// Draw an open context menu: a bordered panel with one row per item, the row under
+/// the pointer filled. Pushed after the rest of the frame, so the panel covers the
+/// chrome it floats over.
+///
+/// The border is the panel drawn twice, the inner one inset by its thickness, which
+/// is what gives a rounded panel a rounded outline (there is no stroked-rect
+/// command, and a hairline needs none).
+pub(crate) fn push_menu(list: &mut DisplayList, ctx: &BarCtx, menu: &Menu, layout: &MenuLayout) {
+    let scale = ctx.scale;
+    let radius = scale.px(MENU_RADIUS);
+    let border = scale.px(MENU_BORDER_W).max(1);
+    list.push(DrawCmd::RoundRect {
+        rect: layout.panel,
+        color: MENU_BORDER,
+        radius,
+        corners: display::RoundedCorners::Both,
+    });
+    list.push(DrawCmd::RoundRect {
+        rect: Rect {
+            x: layout.panel.x + border,
+            y: layout.panel.y + border,
+            w: (layout.panel.w - 2 * border).max(0),
+            h: (layout.panel.h - 2 * border).max(0),
+        },
+        color: MENU_BG,
+        radius: (radius - border).max(0),
+        corners: display::RoundedCorners::Both,
+    });
+
+    let m = ctx.metrics();
+    let face = ctx.fonts.face(ctx.body_size, FontStyle::Regular);
+    for (i, item) in menu.items().iter().enumerate() {
+        let row = layout.item_rect(i);
+        if menu.hovered() == Some(i) {
+            list.push(DrawCmd::RoundRect {
+                rect: row,
+                color: MENU_HOVER_BG,
+                radius: scale.px(MENU_ITEM_RADIUS),
+                corners: display::RoundedCorners::Both,
+            });
+        }
+        let x = row.x + scale.px(MENU_ITEM_PAD_X);
+        let w = shape::text_advance(face, item.label) as i32;
+        list.push(text_cmd(
+            FaceKey::Prose {
+                size: ctx.body_size,
+                style: FontStyle::Regular,
+            },
+            x,
+            layout.baseline(i),
+            x + w,
+            MENU_TEXT,
+            item.label.to_string(),
+            m,
+        ));
     }
 }
 

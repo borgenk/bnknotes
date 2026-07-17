@@ -9,6 +9,7 @@ mod find;
 mod keymap;
 mod layout;
 mod markdown;
+mod menu;
 mod paint;
 mod pane;
 // The platform layer is written as a library, so it carries surface the editor

@@ -12,6 +12,8 @@
 //! - [`save_atomic`] writes bytes durably, by writing a sibling temp file,
 //!   flushing it, and renaming it over the target. A crash mid-write leaves
 //!   either the old file or the complete new one, never a half-written file.
+//! - [`FileLock`] serializes a read-modify-write against another instance, for
+//!   the files two bnknotes share (the state file, the config's vault list).
 //!
 //! `decode`/`encode` are pure functions of bytes, so they are exhaustively unit
 //! tested without touching the filesystem; only `save_atomic` does real I/O.
@@ -200,6 +202,26 @@ pub fn save_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
             let _ = std::fs::remove_file(&tmp);
             Err(e)
         }
+    }
+}
+
+/// An exclusive advisory lock over `path`, held across one read-modify-write so
+/// two instances rewriting the same file serialize rather than clobber each
+/// other. It guards a sibling lock file rather than the file being written, whose
+/// inode [`save_atomic`] replaces by rename; the kernel releases the lock when the
+/// file closes, so a crashed holder never wedges the others. Best-effort: if the
+/// lock cannot be taken (no parent directory, or a filesystem without flock), the
+/// caller proceeds unlocked rather than not at all.
+pub struct FileLock {
+    _file: File,
+}
+
+impl FileLock {
+    /// Take the lock at `path`, creating the lock file if it is not there.
+    pub fn acquire(path: &Path) -> Option<Self> {
+        let file = File::create(path).ok()?;
+        file.lock().ok()?;
+        Some(Self { _file: file })
     }
 }
 

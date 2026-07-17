@@ -219,19 +219,11 @@ impl Session {
     }
 }
 
-/// Path to the state file, `None` when neither `XDG_CONFIG_HOME` nor `HOME`
-/// resolves (then state simply is not persisted).
+/// Path to the state file, `None` when the config directory does not resolve
+/// (then state simply is not persisted). The state file sits beside the config
+/// file; [`crate::config::config_dir`] is where that directory is decided.
 pub fn session_path() -> Option<PathBuf> {
-    if let Some(xdg) = std::env::var_os("XDG_CONFIG_HOME").filter(|s| !s.is_empty()) {
-        return Some(PathBuf::from(xdg).join("bnknotes").join(FILENAME));
-    }
-    let home = std::env::var_os("HOME").filter(|s| !s.is_empty())?;
-    Some(
-        PathBuf::from(home)
-            .join(".config")
-            .join("bnknotes")
-            .join(FILENAME),
-    )
+    Some(crate::config::config_dir()?.join(FILENAME))
 }
 
 /// Load the saved layout, or the first-run default when there is none or it is
@@ -283,7 +275,7 @@ pub fn save(session: &Session) -> Result<()> {
 /// the window fields and this instance's own active vault are taken from `session`;
 /// every other vault keeps what is on disk. See [`merged_session`].
 fn save_to(path: &Path, session: &Session) -> Result<()> {
-    let _lock = FileLock::acquire(path);
+    let _lock = crate::file::FileLock::acquire(&path.with_file_name(LOCK_FILENAME));
     let merged = merged_session(&load_from(path), session);
     crate::file::save_atomic(path, &encode(&merged)?)
 }
@@ -310,26 +302,6 @@ fn merged_session(disk: &Session, incoming: &Session) -> Session {
         out.vaults.insert(entry.clone());
     }
     out
-}
-
-/// An exclusive advisory lock over the state file, held across one read-merge-write
-/// so two instances saving at once serialize rather than clobber each other. It
-/// guards a sibling `state.lock` rather than the state file itself, whose inode a
-/// save replaces by rename; the kernel releases the lock when the file closes, so a
-/// crashed holder never wedges the others. Best-effort: if the lock cannot be taken
-/// (no parent directory, or a filesystem without flock), the save proceeds unlocked
-/// rather than not at all.
-struct FileLock {
-    _file: std::fs::File,
-}
-
-impl FileLock {
-    fn acquire(state_path: &Path) -> Option<Self> {
-        let lock_path = state_path.with_file_name(LOCK_FILENAME);
-        let file = std::fs::File::create(&lock_path).ok()?;
-        file.lock().ok()?;
-        Some(Self { _file: file })
-    }
 }
 
 fn encode(s: &Session) -> Result<Vec<u8>> {

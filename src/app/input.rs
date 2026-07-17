@@ -5,6 +5,7 @@ use std::time::{Duration, Instant};
 use super::{State, TabDrag, TabHover};
 use crate::find;
 use crate::keymap::{self, KeyAction};
+use crate::menu::{Menu, MenuLayout};
 use crate::paint::{conflict_banner_layout, BannerButton};
 use crate::pane::{CaretAnim, Columns, DiskConflict, EditorPane, Focus, Hit, SPLITTER};
 use crate::platform::error::{Error, Result};
@@ -283,6 +284,17 @@ impl State {
         // rather than snapping. Set for every action (including non-caret ones); it is
         // only read when the caret's offset actually moves.
         self.caret_from_pointer = false;
+        // An open context menu is the pointer's, but it must not outlive the moment:
+        // Escape dismisses it and does no more (that is what the key is for here),
+        // and any other key that acts drops it first, rather than leaving a panel
+        // floating over text that has moved on. A key that does nothing on its own (a
+        // bare modifier) leaves it up.
+        if self.menu.is_some() && action != KeyAction::None {
+            self.close_menu();
+            if action == KeyAction::Escape {
+                return Ok(());
+            }
+        }
         // Window-level pane management, handled before any editor routing: toggle the
         // sidebar/second pane, or move focus between regions.
         match action {
@@ -607,6 +619,7 @@ impl State {
                         self.editors[i].update_autoscroll(rect, py);
                     } else {
                         self.update_cursor_shape();
+                        self.update_menu_hover();
                         self.update_rail_hover();
                         self.update_tree_hover();
                         self.update_tab_hover();
@@ -619,7 +632,11 @@ impl State {
                 let _time = r.u32()?;
                 let button = r.u32()?;
                 let state = r.u32()?;
-                if button == wl_pointer::BTN_LEFT {
+                if button == wl_pointer::BTN_RIGHT {
+                    if state == wl_pointer::BUTTON_STATE_PRESSED {
+                        self.open_menu(self.pointer_x, self.pointer_y);
+                    }
+                } else if button == wl_pointer::BTN_LEFT {
                     if state == wl_pointer::BUTTON_STATE_PRESSED {
                         self.on_left_press();
                     } else {
@@ -689,12 +706,19 @@ impl State {
         Ok(())
     }
 
-    /// What the window position `(px, py)` lands on. The vault rail wins first: it
-    /// is the one full-height column, so the bar runs beside it rather than over it.
-    /// The bar wins above every remaining column; below it, splitters win over
-    /// columns (they sit in the gaps), and each column is full height, so only x
-    /// decides.
+    /// What the window position `(px, py)` lands on. An open context menu wins over
+    /// the whole window: it floats above every column, and a press off it dismisses
+    /// it rather than reaching what it covers. The vault rail is next: it is the one
+    /// full-height column, so the bar runs beside it rather than over it. The bar
+    /// wins above every remaining column; below it, splitters win over columns (they
+    /// sit in the gaps), and each column is full height, so only x decides.
     pub(super) fn hit_test(&self, px: f32, py: f32) -> Hit {
+        if let Some(menu) = &self.menu {
+            return match self.menu_layout(menu).item_at(px, py) {
+                Some(i) => Hit::MenuItem(i),
+                None => Hit::Menu,
+            };
+        }
         let cols = self.columns();
         let x = px as i32;
         if x < cols.rail.x + cols.rail.w {
@@ -731,6 +755,18 @@ impl State {
             }
         }
         Hit::None
+    }
+
+    /// Where `menu` is on screen this frame. Measured on demand, the way the tab
+    /// strips and the conflict banner are, so the painter and the pointer read one
+    /// geometry and a window resized under an open menu has no stale rectangle.
+    pub(super) fn menu_layout(&self, menu: &Menu) -> MenuLayout {
+        menu.layout(
+            &self.fonts,
+            self.body_size,
+            self.scale(),
+            (self.width as i32, self.height as i32),
+        )
     }
 
     /// What a pointer inside the vault rail lands on: a vault's chip, or the column
@@ -810,6 +846,21 @@ impl State {
             self.panes.split_ratio = a.clamp(0.1, 0.9);
         }
         self.dirty = true;
+    }
+
+    /// Update which item of the open context menu the pointer is over, repainting if
+    /// it changed. Nothing to do when no menu is open, which is the common case.
+    pub(super) fn update_menu_hover(&mut self) {
+        let Some(menu) = &self.menu else {
+            return;
+        };
+        let item = self
+            .menu_layout(menu)
+            .item_at(self.pointer_x, self.pointer_y);
+        // Re-borrowed mutably only now: the layout above reads the menu it measures.
+        if let Some(menu) = &mut self.menu {
+            self.dirty |= menu.set_hovered(item);
+        }
     }
 
     /// Update which vault chip the pointer is over, repainting if it changed. The
@@ -1038,8 +1089,11 @@ impl State {
                 | Hit::TabClose(..)
                 | Hit::NewTab(_)
                 | Hit::TreeFilter
+                | Hit::MenuItem(_)
                 | Hit::Vault(_) => SHAPE_POINTER,
-                Hit::TabStrip(_) | Hit::TreeFooter | Hit::Rail | Hit::None => SHAPE_DEFAULT,
+                Hit::TabStrip(_) | Hit::TreeFooter | Hit::Rail | Hit::Menu | Hit::None => {
+                    SHAPE_DEFAULT
+                }
             }
         };
         if shape != self.cursor_shape {
@@ -1192,16 +1246,27 @@ impl State {
         }
     }
 
-    /// Handle a left-button press: route it to whatever it landed on. A scrollbar takes
-    /// the press before the column under it, a splitter starts a drag-resize, a tree row
-    /// expands a folder or opens a file, and an editor column takes focus and then
-    /// handles the click as a text press.
+    /// Handle a left-button press: route it to whatever it landed on. An open context
+    /// menu takes the press before anything else, a scrollbar's own band included; a
+    /// scrollbar takes the press before the column under it, a splitter starts a
+    /// drag-resize, a tree row expands a folder or opens a file, and an editor column
+    /// takes focus and then handles the click as a text press.
     pub(super) fn on_left_press(&mut self) {
         let (px, py) = (self.pointer_x, self.pointer_y);
-        if self.scrollbar_press(px, py) {
+        if self.menu.is_none() && self.scrollbar_press(px, py) {
             return;
         }
         match self.hit_test(px, py) {
+            Hit::MenuItem(i) => {
+                if let Some(action) = self.menu.as_ref().and_then(|m| m.action(i)) {
+                    self.run_menu_action(action);
+                }
+            }
+            // A press anywhere else while the menu is open only dismisses it: the
+            // click that closes a menu belongs to the menu, not to what is under it.
+            Hit::Menu => {
+                self.close_menu();
+            }
             Hit::Vault(i) => self.switch_vault(i),
             // The rail around its chips: a click there acts on nothing, but it must
             // not reach the column beside it.

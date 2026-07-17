@@ -928,20 +928,14 @@ impl State {
         self.conn.request(self.surface, wl_surface::COMMIT, &[]);
         self.run_until(|s| s.configured)?;
 
-        eprintln!(
-            "bnknotes: type to edit; Enter, Tab, arrows/Home/End, PageUp/Down, \
-             Ctrl+arrows by word, Ctrl+Home/End to ends, Shift selects; \
-             click/drag, Shift+click extends, double/triple-click select word/line; \
-             Ctrl+Backspace/Delete delete a word, Ctrl+Shift+K deletes a line; \
-             Ctrl+A/C/X/V select-all/copy/cut/paste, \
-             Ctrl+Z/Y undo/redo, Ctrl+S save; \
-             Ctrl+B toggle tree, Ctrl+\\ toggle 2nd pane, Ctrl+0/1/2 focus tree/A/B, \
-             drag splitters to resize; held keys repeat; close to exit"
-        );
-        // Name the GPU device, so "which GPU?" never needs a probe. The backend
-        // is mandatory (bring_up exits above if it is missing), so it is present.
-        if let Some(gpu) = &self.presentation.backend {
-            eprintln!("bnknotes: renderer: gpu ({})", gpu.name());
+        // Name the GPU device under BNKNOTES_STATS, beside the per-frame stats it
+        // belongs with. `--gpu-probe` reports the same thing without a window, so a
+        // quiet startup costs nothing. The backend is mandatory (bring_up exits above
+        // if it is missing), so it is present.
+        if self.stats {
+            if let Some(gpu) = &self.presentation.backend {
+                eprintln!("bnknotes: renderer: gpu ({})", gpu.name());
+            }
         }
         self.run_until(|s| s.closed)?;
         // Remember the layout for next launch: column sizes, tree root and open
@@ -1807,12 +1801,9 @@ impl State {
         // an unchanged snapshot is our own last save.
         let current = file::DiskSnapshot::of(&path);
         if current.is_some() && current != self.editors[i].disk {
+            // The banner this raises says so in the window, where the user is.
             self.editors[i].active_doc_mut().conflict = Some(DiskConflict::Changed);
             self.dirty = true;
-            eprintln!(
-                "bnknotes: {} changed on disk; not overwriting",
-                path.display()
-            );
             return Ok(());
         }
         let bytes = file::encode(&self.editors[i].text.text(), &self.editors[i].format);
@@ -1822,7 +1813,6 @@ impl State {
         // events (and any conflict) clear rather than bounce back as external.
         self.editors[i].active_doc_mut().sync_disk();
         self.refresh_title();
-        eprintln!("bnknotes: saved {}", path.display());
         Ok(())
     }
 

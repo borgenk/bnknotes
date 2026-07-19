@@ -106,6 +106,13 @@ struct Base {
 pub fn run(args: &[String]) -> Result<()> {
     let save = args.iter().any(|a| a == "--save");
     eprintln!("bnknotes perf: measuring (build --release for meaningful numbers)...");
+    // Measure on one fixed core. On a hybrid CPU an unpinned run lands on either a
+    // performance or an efficiency core and the spread between runs swamps the ratio
+    // below, so without this the gate reports regressions that are only scheduling.
+    match sys::pin_to_measuring_core() {
+        Some(cpu) => eprintln!("  pinned to cpu{cpu}"),
+        None => eprintln!("  could not pin to a core; numbers will be noisier"),
+    }
     if !alloc::ENABLED {
         eprintln!(
             "  allocations unmeasured; build --features perf-alloc (or `make perf`) to gate them"
@@ -209,8 +216,26 @@ fn measure() -> Result<Vec<Sample>> {
     }));
 
     // Hit-test the pointer against the layout: the per-motion cost of a drag.
+    //
+    // Aimed at a visual line rather than a fixed pixel. `offset_at` resolves the
+    // line by walking from the top, so the work is set by how many lines it passes,
+    // and a fixed pixel would silently change that whenever a block's height changed
+    // (heading spacing did exactly this, quietly turning the scenario into a no-op
+    // that measured nothing). Halfway down the document is a representative walk.
+    // Halfway down, then on to the first line carrying text: the midpoint of this
+    // fixture is a blank line, which would leave the scenario measuring the line
+    // search alone and never the run walk that resolves the offset within it.
+    let hit_y = {
+        let lines = layout.lines();
+        lines[lines.len() / 2..]
+            .iter()
+            .find(|l| !layout.run_slice(l).is_empty())
+            .or_else(|| lines.last())
+            .map_or((HEIGHT / 2) as f32, |l| l.baseline as f32)
+    };
+    let hit_x = (WIDTH / 2) as f32;
     out.push(sample("offset_at", 2000, || {
-        layout.offset_at(&fonts, &rope, (WIDTH / 2) as f32, (HEIGHT / 2) as f32)
+        layout.offset_at(&fonts, &rope, hit_x, hit_y)
     }));
 
     // A decoded image the editor sizes and uploads to the GPU, reused by the image

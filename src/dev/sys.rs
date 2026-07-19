@@ -1,10 +1,11 @@
-//! Thin FFI over `getrusage(2)`, `sysconf(3)`, and `/proc/self/statm` for the
-//! performance lab: CPU time consumed and resident memory. Linux-only, like the
-//! rest of the app; std already links libc so the symbols resolve without a
-//! `#[link]`. CPU-seconds per workload is the battery metric without a battery:
-//! lower CPU time is longer battery, directly.
+//! Thin FFI over `getrusage(2)`, `sysconf(3)`, `sched_setaffinity(2)`, and
+//! `/proc/self/statm` for the performance harness: CPU time consumed, resident
+//! memory, and which core the measuring runs on. Linux-only, like the rest of the
+//! app; std already links libc so the symbols resolve without a `#[link]`.
+//! CPU-seconds per workload is the battery metric without a battery: lower CPU
+//! time is longer battery, directly.
 
-use core::ffi::{c_int, c_long};
+use core::ffi::{c_int, c_long, c_ulong};
 use std::time::Duration;
 
 /// `getrusage` target: this process (self), not its children.
@@ -30,9 +31,70 @@ struct Rusage {
     rest: [c_long; 15],
 }
 
+/// `cpu_set_t` as glibc sizes it: a bitmask of 1024 CPUs, one bit per CPU. The
+/// kernel accepts any size; this is the conventional one.
+#[repr(C)]
+struct CpuSet {
+    words: [c_ulong; 16],
+}
+
+impl CpuSet {
+    /// A mask naming `cpu` alone. `None` if the CPU is past what the mask holds.
+    fn only(cpu: usize) -> Option<Self> {
+        let bits = c_ulong::BITS as usize;
+        let mut words = [0 as c_ulong; 16];
+        *words.get_mut(cpu / bits)? |= 1 << (cpu % bits);
+        Some(Self { words })
+    }
+}
+
 extern "C" {
     fn getrusage(who: c_int, usage: *mut Rusage) -> c_int;
     fn sysconf(name: c_int) -> c_long;
+    fn sched_setaffinity(pid: c_int, cpusetsize: usize, mask: *const CpuSet) -> c_int;
+}
+
+/// Pin this process to a single CPU and report which, so a measurement is not at
+/// the mercy of where the scheduler puts it. `None` if the machine names no CPUs
+/// or the kernel refuses the affinity call (a restricted cpuset), which costs
+/// noise, not correctness.
+///
+/// A hybrid CPU is the reason this exists. Since Alder Lake, Intel parts mix
+/// performance and efficiency cores, and the same single-threaded work runs far
+/// slower on an efficiency core: the editor's full-relayout scenario takes 1.8x
+/// as long there. Left to the scheduler a run lands on either kind, and the spread
+/// between runs comes out wider than the ratio the gate calls a regression, so the
+/// gate fires at random on an unchanged tree. Pinning collapses that spread from
+/// around 14% to around 1%.
+///
+/// The performance cores are the CPUs the kernel lists under the `cpu_core` PMU.
+/// This takes the highest-numbered one: any fixed choice makes runs comparable,
+/// and the high end stays clear of CPU 0, which carries interrupt duty and
+/// measures consistently slower. A machine that lists no `cpu_core` is either not
+/// hybrid or too old to say so, and falls back to the highest CPU online, which is
+/// still one fixed core to measure on.
+pub fn pin_to_measuring_core() -> Option<usize> {
+    let cpu = highest_cpu_in("/sys/devices/cpu_core/cpus")
+        .or_else(|| highest_cpu_in("/sys/devices/system/cpu/online"))?;
+    let mask = CpuSet::only(cpu)?;
+    // SAFETY: pid 0 is this process; the mask is a live, fully initialized CpuSet
+    // and the kernel only reads `cpusetsize` bytes of it.
+    let rc = unsafe { sched_setaffinity(0, std::mem::size_of::<CpuSet>(), &mask) };
+    (rc == 0).then_some(cpu)
+}
+
+/// The highest CPU number in a sysfs cpu list ("0-15", "0-7,16-23", "3"), or
+/// `None` when the file is absent or names nothing.
+fn highest_cpu_in(path: &str) -> Option<usize> {
+    let list = std::fs::read_to_string(path).ok()?;
+    list.trim()
+        .split(',')
+        .filter_map(|part| {
+            // A range's end is its highest; a bare number is its own.
+            let end = part.split('-').next_back()?;
+            end.trim().parse::<usize>().ok()
+        })
+        .max()
 }
 
 fn rusage() -> Option<Rusage> {

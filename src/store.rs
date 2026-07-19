@@ -29,7 +29,16 @@ const FILENAME: &str = "state.bin";
 /// bnknotes instances serialize their read-merge-write instead of racing.
 const LOCK_FILENAME: &str = "state.lock";
 const MAGIC: &[u8; 4] = b"BNKN";
-const VERSION: u8 = 6;
+/// The version written. Older versions still readable are listed in
+/// [`MIN_VERSION`]; a decode fills anything they predate with its default, so a
+/// schema addition costs the user nothing.
+const VERSION: u8 = 7;
+/// The oldest version [`decode`] understands. v6 is v7 without the per-tab fold
+/// list; anything older is refused and the session falls back to defaults.
+const MIN_VERSION: u8 = 6;
+/// Cap on folded headings persisted per tab, matching the in-memory cap so a
+/// state file cannot ask for a set the editor would not build.
+const MAX_FOLDS: usize = crate::fold::MAX_FOLDS;
 
 /// One vault's remembered state, keyed by its root directory: everything that
 /// belongs to a vault's contents rather than to the window. What was open where
@@ -118,12 +127,18 @@ impl VaultPrefs {
     }
 }
 
-/// One open tab: its file and where the caret and viewport sat in it.
+/// One open tab: its file, where the caret and viewport sat in it, and which
+/// heading sections were folded.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct PaneSession {
     pub path: Option<PathBuf>,
     pub cursor: u64,
     pub scroll_y: i32,
+    /// The logical line numbers of the folded headings, ascending. Like `cursor`,
+    /// these are positions into the file as it was last seen: a line that no longer
+    /// holds a heading is dropped when the document is re-indexed, so an external
+    /// edit degrades to fewer folds rather than to nonsense.
+    pub folds: Vec<u32>,
 }
 
 /// A content pane's remembered stack of open tabs and which one was active. An
@@ -435,6 +450,12 @@ fn write_pane_group(out: &mut Vec<u8>, pane: &PaneGroupSession) -> Result<()> {
         write_opt_path(out, tab.path.as_deref())?;
         out.extend_from_slice(&tab.cursor.to_le_bytes());
         out.extend_from_slice(&tab.scroll_y.to_le_bytes());
+        let folds = u32::try_from(tab.folds.len().min(MAX_FOLDS))
+            .map_err(|_| Error::msg("too many folds to persist"))?;
+        out.extend_from_slice(&folds.to_le_bytes());
+        for line in tab.folds.iter().take(MAX_FOLDS) {
+            out.extend_from_slice(&line.to_le_bytes());
+        }
     }
     out.extend_from_slice(&pane.active.to_le_bytes());
     Ok(())
@@ -446,11 +467,12 @@ fn decode(data: &[u8]) -> Result<Session> {
         return Err(Error::msg("not a bnknotes state file (bad magic)"));
     }
     let version = r.u8()?;
-    if version != VERSION {
+    if !(MIN_VERSION..=VERSION).contains(&version) {
         return Err(Error::msg(format!(
-            "unsupported state version {version} (expected {VERSION})"
+            "unsupported state version {version} (expected {MIN_VERSION}..={VERSION})"
         )));
     }
+    r.version = version;
     let window = (r.u32()?, r.u32()?);
     let tree_width = r.u32()?;
     let split_ratio = r.f32()?;
@@ -516,10 +538,26 @@ fn read_pane_group(r: &mut Reader) -> Result<PaneGroupSession> {
 }
 
 fn read_pane(r: &mut Reader) -> Result<PaneSession> {
+    let path = r.opt_path()?;
+    let cursor = r.u64()?;
+    let scroll_y = r.i32()?;
+    // v6 predates folds, so a tab restored from one simply opens unfolded.
+    let mut folds = Vec::new();
+    if r.version >= 7 {
+        let count = r.u32()? as usize;
+        folds.reserve(count.min(MAX_FOLDS));
+        for _ in 0..count {
+            let line = r.u32()?;
+            if folds.len() < MAX_FOLDS {
+                folds.push(line);
+            }
+        }
+    }
     Ok(PaneSession {
-        path: r.opt_path()?,
-        cursor: r.u64()?,
-        scroll_y: r.i32()?,
+        path,
+        cursor,
+        scroll_y,
+        folds,
     })
 }
 
@@ -555,12 +593,16 @@ fn write_string(out: &mut Vec<u8>, s: &str) -> Result<()> {
 /// format is fixed little-endian, independent of the host).
 struct Reader<'a> {
     cursor: crate::platform::bytes::Cursor<'a>,
+    /// The version of the file being read, set once the header is parsed, so a
+    /// nested reader knows which fields the format it is reading actually carries.
+    version: u8,
 }
 
 impl<'a> Reader<'a> {
     fn new(data: &'a [u8]) -> Self {
         Self {
             cursor: crate::platform::bytes::Cursor::new(data),
+            version: VERSION,
         }
     }
 
@@ -661,6 +703,7 @@ mod tests {
                                         path: Some(PathBuf::from("/home/user/notes/todo.md")),
                                         cursor: 42,
                                         scroll_y: 128,
+                                        folds: vec![3, 17, 40],
                                     },
                                     PaneSession {
                                         path: Some(PathBuf::from(
@@ -668,6 +711,7 @@ mod tests {
                                         )),
                                         cursor: 7,
                                         scroll_y: 0,
+                                        folds: Vec::new(),
                                     },
                                 ],
                                 active: 1,
@@ -677,6 +721,7 @@ mod tests {
                                     path: None,
                                     cursor: 0,
                                     scroll_y: -5,
+                                    folds: Vec::new(),
                                 }],
                                 active: 0,
                             },
@@ -692,6 +737,7 @@ mod tests {
                                     path: Some(PathBuf::from("/home/user/work/spec.md")),
                                     cursor: 3,
                                     scroll_y: 12,
+                                    folds: vec![0],
                                 }],
                                 active: 0,
                             },
@@ -837,6 +883,111 @@ mod tests {
             work.panes[0].tabs[0].path,
             Some(PathBuf::from("/home/user/work/spec.md"))
         );
+    }
+
+    /// Encode a session the way v6 did: identical to [`encode`] except that a tab
+    /// carries no fold list. Kept as a literal transcription of the old writer so
+    /// the migration is tested against the real historical bytes, not against a
+    /// guess at them, and so a later change to `encode` cannot quietly redefine
+    /// what "a v6 file" means.
+    fn encode_v6(s: &Session) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(MAGIC);
+        out.push(6);
+        out.extend_from_slice(&s.window.0.to_le_bytes());
+        out.extend_from_slice(&s.window.1.to_le_bytes());
+        out.extend_from_slice(&s.tree_width.to_le_bytes());
+        out.extend_from_slice(&s.split_ratio.to_le_bytes());
+        out.push(u8::from(s.tree_visible));
+        out.push(u8::from(s.second_open));
+        out.push(s.focus.tag());
+        write_opt_path(&mut out, s.active_vault.as_deref()).expect("path");
+        out.extend_from_slice(&(s.vaults.vaults.len() as u32).to_le_bytes());
+        for vault in &s.vaults.vaults {
+            write_path(&mut out, &vault.root).expect("path");
+            out.push(u8::from(vault.show_empty_dirs));
+            out.extend_from_slice(&(vault.expanded.len() as u32).to_le_bytes());
+            for dir in &vault.expanded {
+                write_path(&mut out, dir).expect("path");
+            }
+            for pane in &vault.panes {
+                out.extend_from_slice(&(pane.tabs.len() as u32).to_le_bytes());
+                for tab in &pane.tabs {
+                    write_opt_path(&mut out, tab.path.as_deref()).expect("path");
+                    out.extend_from_slice(&tab.cursor.to_le_bytes());
+                    out.extend_from_slice(&tab.scroll_y.to_le_bytes());
+                }
+                out.extend_from_slice(&pane.active.to_le_bytes());
+            }
+        }
+        out.extend_from_slice(&(s.rail.len() as u32).to_le_bytes());
+        for chip in &s.rail {
+            write_path(&mut out, &chip.root).expect("path");
+            out.extend_from_slice(&chip.color.to_le_bytes());
+            write_icon(&mut out, chip.icon.as_ref()).expect("icon");
+        }
+        out
+    }
+
+    #[test]
+    fn a_v6_state_file_still_loads_and_opens_unfolded() {
+        // Adding folds must not cost anyone their session. A v6 file decodes with
+        // every field it did carry intact, and its tabs simply open unfolded.
+        let mut want = sample();
+        for vault in &mut want.vaults.vaults {
+            for pane in &mut vault.panes {
+                for tab in &mut pane.tabs {
+                    tab.folds.clear();
+                }
+            }
+        }
+        let loaded = decode(&encode_v6(&sample())).expect("a v6 file must still decode");
+        assert_eq!(loaded, want);
+    }
+
+    #[test]
+    fn a_v6_file_rewrites_as_v7() {
+        // Reading old and writing new: what a v6 file becomes after one save.
+        let loaded = decode(&encode_v6(&sample())).expect("decode v6");
+        let rewritten = encode(&loaded).expect("encode");
+        assert_eq!(rewritten[4], VERSION, "saves write the current version");
+        assert_eq!(decode(&rewritten).expect("decode v7"), loaded);
+    }
+
+    #[test]
+    fn a_version_outside_the_supported_range_is_refused() {
+        // Too old to understand and newer than this build: both fall back to
+        // defaults rather than misreading the bytes.
+        let mut old = encode(&sample()).expect("encode");
+        old[4] = MIN_VERSION - 1;
+        assert!(decode(&old).is_err());
+        let mut future = encode(&sample()).expect("encode");
+        future[4] = VERSION + 1;
+        assert!(decode(&future).is_err());
+    }
+
+    #[test]
+    fn a_tabs_folds_survive_the_codec() {
+        let loaded = decode(&encode(&sample()).expect("encode")).expect("decode");
+        let notes = loaded
+            .vaults
+            .get(Path::new("/home/user/notes"))
+            .expect("vault");
+        assert_eq!(notes.panes[0].tabs[0].folds, vec![3, 17, 40]);
+        assert!(notes.panes[0].tabs[1].folds.is_empty());
+    }
+
+    #[test]
+    fn a_persisted_fold_list_is_capped() {
+        // A state file cannot make a tab carry an unbounded fold set.
+        let mut s = sample();
+        s.vaults.vaults[0].panes[0].tabs[0].folds = (0..MAX_FOLDS as u32 * 2).collect();
+        let loaded = decode(&encode(&s).expect("encode")).expect("decode");
+        let notes = loaded
+            .vaults
+            .get(Path::new("/home/user/notes"))
+            .expect("vault");
+        assert_eq!(notes.panes[0].tabs[0].folds.len(), MAX_FOLDS);
     }
 
     #[test]

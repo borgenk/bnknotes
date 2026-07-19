@@ -35,9 +35,9 @@ use crate::theme::{
     SELECTION_COLOR, SPLITTER_COLOR, TABLE_BORDER_COLOR, TABLE_HEADER_BG, TAB_ACTIVE_BG,
     TAB_ACTIVE_TEXT, TAB_BUTTON_HOVER_BG, TAB_BUTTON_RADIUS, TAB_CLOSE_GAP, TAB_CLOSE_W,
     TAB_DIRTY_COLOR, TAB_HOVER_BG, TAB_INACTIVE_TEXT, TAB_MAX_W, TAB_MIN_W, TAB_NEW_W, TAB_PAD_X,
-    TAB_VPAD, TICK_HEIGHT, TICK_WIDTH, TOP_BAR_BG, TREE_BG, TREE_CHEVRON_MAX, TREE_FOOTER_GAP,
-    TREE_FOOTER_VPAD, TREE_HOVER_BG, TREE_INDENT, TREE_MARKER_COLOR, TREE_MARKER_W, TREE_PAD,
-    TREE_ROW_INSET_Y, TREE_ROW_PAD, TREE_ROW_RADIUS, TREE_ROW_VPAD, TREE_TEXT_COLOR, VAULT_PAD_X,
+    TAB_VPAD, TICK_HEIGHT, TICK_WIDTH, TOP_BAR_BG, TREE_BG, TREE_FOOTER_GAP, TREE_FOOTER_VPAD,
+    TREE_HOVER_BG, TREE_INDENT, TREE_MARKER_COLOR, TREE_MARKER_W, TREE_PAD, TREE_ROW_INSET_Y,
+    TREE_ROW_PAD, TREE_ROW_RADIUS, TREE_TEXT_COLOR, VAULT_PAD_X,
 };
 
 /// The per-frame inputs [`build_display_list`] needs beyond the layout itself:
@@ -73,6 +73,10 @@ pub(crate) struct PaintParams<'a> {
     /// The table add-row / add-column strip under the pointer, drawn as a hover
     /// affordance; `None` when the pointer is not over one.
     pub table_hover: Option<crate::layout::TableButton>,
+    /// The logical-line start of the heading whose fold chevron the pointer is
+    /// over. An open section shows its chevron only here; a folded one shows it
+    /// regardless, so this only ever adds a chevron.
+    pub fold_hover: Option<usize>,
 }
 
 /// The caret reduced to what the painter draws: its content-space (pre-scroll)
@@ -891,7 +895,7 @@ pub(crate) fn font_sizes(body_size: u32) -> Vec<u32> {
 /// padding above and below, so items get breathing room and a taller hit area.
 /// Shared by the painter and the pointer/scroll hit-testing so they agree.
 pub(crate) fn tree_row_height(m: Metrics, scale: Scale) -> i32 {
-    (m.line_height + 2 * scale.px(TREE_ROW_VPAD)).max(1)
+    crate::theme::row_height(m.line_height, scale)
 }
 
 /// The sidebar column split into the rows that scroll and the footer pinned to its
@@ -1014,7 +1018,7 @@ pub(crate) fn push_tree(
         // dimmer than the name it points at.
         let content_x = rect.x + tree_pad + row_pad + row.depth as i32 * tree_indent;
         if row.is_dir {
-            let chev = (row_h * 9 / 16).clamp(scale.px(8), scale.px(TREE_CHEVRON_MAX));
+            let chev = crate::theme::chevron_side(row_h, scale);
             list.push(DrawCmd::Chevron {
                 rect: Rect {
                     x: content_x,
@@ -1684,6 +1688,8 @@ struct Painter<'a> {
     scale: Scale,
     /// Device-pixel body font size, for chrome sized off the body.
     body_size: u32,
+    /// The heading whose fold chevron the pointer is over, by logical-line start.
+    fold_hover: Option<usize>,
 }
 
 impl<'a> Painter<'a> {
@@ -1706,6 +1712,7 @@ impl<'a> Painter<'a> {
             left: layout.left(),
             scale: p.scale,
             body_size: p.body_size,
+            fold_hover: p.fold_hover,
         }
     }
 
@@ -1922,6 +1929,27 @@ impl<'a> Painter<'a> {
             // rasterizes what is on screen.
             if baseline + m.descent <= top || baseline - m.ascent >= bottom {
                 continue;
+            }
+            // A heading that owns a section draws a fold chevron in the margin, the
+            // same shape and color the file tree marks a folder with: down while
+            // the section is open, right once it is folded. An open one appears only
+            // under the pointer, so a document at rest is not lined with chevrons; a
+            // folded one always shows, since it is the only sign that content is
+            // hidden there. The chevron sits left of the text column, so it never
+            // shifts a glyph.
+            if let Some(folded) = line.fold {
+                if folded || self.fold_hover == Some(line.start) {
+                    if let Some(rect) = self.layout.fold_rect(fonts, line, self.body_size) {
+                        self.list.push(DrawCmd::Chevron {
+                            rect: Rect {
+                                y: rect.y - scroll_y,
+                                ..rect
+                            },
+                            color: MARKER_COLOR,
+                            down: !folded,
+                        });
+                    }
+                }
             }
             // A blockquote draws a bar down its gutter, on every wrapped line.
             if matches!(line.gutter, Gutter::QuoteBar { .. }) {
@@ -3025,6 +3053,7 @@ mod tests {
             caret: None,
             find: None,
             table_hover: None,
+            fold_hover: None,
         }
     }
 

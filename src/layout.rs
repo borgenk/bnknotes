@@ -58,6 +58,7 @@
 
 use std::ops::Range;
 
+use crate::fold::FoldMap;
 use crate::markdown;
 use crate::platform::freetype::{Face, FaceKey, FontStyle, Fonts, Metrics};
 use crate::platform::geom::Rect;
@@ -95,6 +96,16 @@ const IMAGE_PAD_Y: i32 = 8;
 /// Extra pixels around a drawn task checkbox that still count as clicking it,
 /// so the small square is comfortable to hit.
 const CHECKBOX_HIT_PAD: i32 = 3;
+
+/// The same slack around a heading's fold chevron. It is more generous: the
+/// chevron is smaller, and it sits alone in the margin where a stray hit costs
+/// nothing.
+const FOLD_HIT_PAD: i32 = 6;
+
+/// The gap the fold chevron keeps between itself and the text column. Small
+/// enough that it plus the chevron stay well inside [`crate::theme::MARGIN`], so
+/// the chevron always has margin to hang in.
+const FOLD_CHEVRON_GAP: i32 = 8;
 
 /// Horizontal padding between a table cell's border and its text, on each side of
 /// the content; vertical padding above and below a row's text; and the width of a
@@ -159,6 +170,11 @@ pub struct VisualLine {
     /// app colors heading text by level, and the pixel `size` already carries the
     /// heading's scale.
     pub heading: Option<u8>,
+    /// Whether this heading's section is folded, on the first visual row of a
+    /// heading that owns one. `None` on every other row, and on a heading with an
+    /// empty section: the margin draws a chevron exactly where this is `Some`, so a
+    /// heading with nothing under it offers no fold to click.
+    pub fold: Option<bool>,
     /// `Some(checked)` when this line belongs to a task-list item, on every
     /// visual line the item wraps into. A checked item's text renders dim; the
     /// checkbox itself is the first line's [`Gutter::Checkbox`]. `None` off task
@@ -208,6 +224,7 @@ impl VisualLine {
             gutter: Gutter::None,
             code_block: false,
             heading: None,
+            fold: None,
             task: None,
             rule: false,
             image: Some(image),
@@ -595,6 +612,9 @@ pub struct LayoutCtx<'a> {
     active: (usize, usize),
     images: &'a ImageStore,
     image_ui: ImageUi,
+    /// The sections folded away right now. A build skips their lines outright; the
+    /// index paths hold this empty so base geometry stays fold-free.
+    folds: &'a FoldMap,
     /// The display scale, so the layout's pixel constants (indents, paddings,
     /// table borders) land at the right device size. Identity at [`Scale::ONE`].
     scale: Scale,
@@ -610,6 +630,7 @@ impl<'a> LayoutCtx<'a> {
         active: (usize, usize),
         images: &'a ImageStore,
         image_ui: ImageUi,
+        folds: &'a FoldMap,
         scale: Scale,
     ) -> Self {
         Self {
@@ -620,6 +641,7 @@ impl<'a> LayoutCtx<'a> {
             active,
             images,
             image_ui,
+            folds,
             scale,
         }
     }
@@ -629,9 +651,9 @@ impl<'a> LayoutCtx<'a> {
     }
 
     /// A ctx for base-geometry measurement (the [`LineIndex`] paths): reveal forced
-    /// off ([`NO_REVEAL`], no image UI), so the geometry it feeds stays a pure
-    /// function of `(version, width)` by construction rather than by each caller
-    /// remembering to pass the no-reveal inputs.
+    /// off ([`NO_REVEAL`], no image UI) and folds forced empty, so the geometry it
+    /// feeds stays a pure function of `(version, width)` by construction rather than
+    /// by each caller remembering to pass the neutral inputs.
     pub fn for_index(
         fonts: &'a Fonts,
         rope: &'a Rope,
@@ -648,6 +670,7 @@ impl<'a> LayoutCtx<'a> {
             NO_REVEAL,
             images,
             ImageUi::default(),
+            FoldMap::NONE,
             scale,
         )
     }
@@ -715,6 +738,15 @@ impl LineCarry {
         Self { fence, list_depth }
     }
 
+    /// The carry in the form [`LineIndex::entry_packed`] hands back, so a build
+    /// that jumps a folded span resumes in the state its lines would have left.
+    fn from_packed((fence, depth): (u16, i16)) -> Self {
+        Self {
+            fence: Fence::unpack(fence),
+            list_depth: (depth >= 0).then_some(depth as usize),
+        }
+    }
+
     fn pair(self) -> (Option<Fence>, Option<usize>) {
         (self.fence, self.list_depth)
     }
@@ -754,6 +786,7 @@ impl Layout {
             active,
             &images,
             ImageUi::default(),
+            FoldMap::NONE,
             Scale::ONE,
         );
         Self::build_with_images(&ctx, left, top)
@@ -821,11 +854,22 @@ impl Layout {
         let mut box_top = box_top_seed;
         let mut pool = LayoutScratch::default();
         let mut lines = Vec::new();
-        for i in start..end {
+        let mut i = start;
+        while i < end {
+            // A folded section is jumped whole: its lines emit nothing and take no
+            // height. The carry comes from the index's record for the line after the
+            // span, so a code fence or list that opened inside the fold still governs
+            // the visible lines below it.
+            if let Some((skip_to, exit)) = ctx.folds.skip_from(i) {
+                carry = LineCarry::from_packed(exit);
+                i = skip_to.max(i + 1);
+                continue;
+            }
             let line = LogicalLine::at(ctx.rope, i, n);
             box_top += lay_line(
                 ctx, line, i, box_top, &mut carry, &mut pool, false, &mut lines,
             );
+            i += 1;
         }
         Self {
             lines,
@@ -1075,6 +1119,56 @@ impl Layout {
         let line = self.line_for_y(fonts, y);
         let rect = self.checkbox_rect(fonts, rope, line)?;
         let pad = self.scale.px(CHECKBOX_HIT_PAD);
+        let target = Rect {
+            x: rect.x - pad,
+            y: rect.y - pad,
+            w: rect.w + 2 * pad,
+            h: rect.h + 2 * pad,
+        };
+        rect_contains(&target, x, y).then_some(line.start)
+    }
+
+    /// The fold chevron's rectangle in content space for a heading that owns a
+    /// section: a square hanging in the left margin, right-anchored a gap short of
+    /// the text column and centered on the heading's ascent band. It sits entirely
+    /// left of `left`, so showing or hiding it never moves a glyph. `None` on every
+    /// line that offers no fold. The painter draws here and [`Self::fold_at`]
+    /// hit-tests against it, so the two always agree.
+    pub(crate) fn fold_rect(
+        &self,
+        fonts: &Fonts,
+        line: &VisualLine,
+        body_size: u32,
+    ) -> Option<Rect> {
+        line.fold?;
+        // The size the file tree marks a folder with: the shared sizing rule over
+        // the row a line of body text would make, so the two controls come out
+        // alike. Sized off the body rather than the heading, so every level's
+        // chevron matches and they line up in the margin.
+        let row = crate::theme::row_height(fonts.metrics(body_size).line_height, self.scale);
+        let side = crate::theme::chevron_side(row, self.scale);
+        let gap = self.scale.px(FOLD_CHEVRON_GAP);
+        // Centered on the heading's glyphs, the band from its ascent to its descent,
+        // which is what the eye reads as the middle of the line. The full line box
+        // is not that band: its surplus is leading, and leading all falls below the
+        // text, so centering on the box would sit the chevron low.
+        let m = fonts.metrics(line.size);
+        let glyph_top = line.baseline - m.ascent;
+        Some(Rect {
+            x: self.left - gap - side,
+            y: glyph_top + (m.ascent + m.descent - side) / 2,
+            w: side,
+            h: side,
+        })
+    }
+
+    /// The buffer offset of the heading whose fold chevron contains content-space
+    /// `(x, y)`, or `None`. The target is padded past the drawn shape, which is
+    /// small and sits in the margin where nothing competes for the click.
+    pub fn fold_at(&self, fonts: &Fonts, x: f32, y: f32, body_size: u32) -> Option<usize> {
+        let line = self.row_at(fonts, y)?;
+        let rect = self.fold_rect(fonts, line, body_size)?;
+        let pad = self.scale.px(FOLD_HIT_PAD);
         let target = Rect {
             x: rect.x - pad,
             y: rect.y - pad,
@@ -2060,6 +2154,28 @@ fn lay_line(
     } = class;
     let metrics = ctx.fonts.metrics(size);
     let heading = class.heading();
+    // Space above a heading, so a section reads as starting rather than as more of
+    // what came before. It shows most where nothing else separates two headings:
+    // collapse a run of sections and their headings would otherwise stack flush.
+    //
+    // The space belongs to the heading's own logical line, measured down from its
+    // top, so it is part of the height `lay_line` returns and the windowed build
+    // reproduces it from the index like any other. It depends only on the line's
+    // classification, never on reveal or on what is folded, which is what keeps the
+    // index's base geometry a pure function of content and width. The document's
+    // first line is exempt: there is nothing above it to separate from.
+    let pad_above = match heading {
+        Some(_) if line_no > 0 => {
+            (metrics.line_height as f32 * crate::theme::HEADING_SPACE_ABOVE).round() as i32
+        }
+        _ => 0,
+    };
+    y += pad_above;
+    // A heading offers a fold only where it owns a section; the marker rides its
+    // first visual row, so a wrapped heading shows one chevron rather than one per
+    // row.
+    let fold = heading.filter(|&level| crate::fold::owns_section(ctx.rope, line_no, level));
+    let fold = fold.map(|_| ctx.folds.is_folded(line_no));
     let task = class.task();
     let rule = class.rule();
     let block_indent = class.block_indent(ctx.fonts, &line);
@@ -2125,6 +2241,7 @@ fn lay_line(
             gutter,
             code_block,
             heading,
+            fold: if k == 0 { fold } else { None },
             task,
             rule,
             image: None,
@@ -2208,6 +2325,10 @@ struct LineRec {
     fence_in: u16,
     /// List nesting depth entering this line (-1 = not in a list).
     depth_in: i16,
+    /// ATX heading level 1..=6, or 0 on a line that is not a heading. Recorded
+    /// with the carry state in hand, so a `#` inside a code fence reads as the
+    /// code it is. [`crate::fold`] resolves heading sections from this.
+    heading: u8,
 }
 
 /// A ≤2-line overlay of the extra height revealed image sources add on top of the
@@ -2245,6 +2366,23 @@ impl RevealAdjust {
     }
 }
 
+/// The query-time overlay on a [`LineIndex`]'s base geometry: the image sources
+/// revealed right now, and the sections folded away. The index measures a document
+/// as if nothing were revealed and nothing folded, which is what keeps it a pure
+/// function of content and width; both deltas are applied here instead, so a
+/// reveal or a fold toggle costs a query rather than a re-measure.
+#[derive(Clone, Copy)]
+pub struct Adjust<'a> {
+    pub reveal: RevealAdjust,
+    pub folds: &'a FoldMap,
+}
+
+impl<'a> Adjust<'a> {
+    pub fn new(reveal: RevealAdjust, folds: &'a FoldMap) -> Self {
+        Self { reveal, folds }
+    }
+}
+
 /// The document's vertical geometry as a per-logical-line index: each line's base
 /// pixel height and the cross-line carry state entering it. Built by measuring
 /// every line once via [`lay_line`], it computes total content height, maps a
@@ -2276,6 +2414,9 @@ impl LineIndex {
         let carry_in = *carry;
         scratch.clear();
         let height = lay_line(ctx, logical, i, 0, carry, pool, true, scratch);
+        // Read the heading level off the measured rows before the reveal pass
+        // below reuses `scratch`. A wrapped heading repeats its level on every row.
+        let heading_level = scratch.iter().find_map(|v| v.heading).unwrap_or(0);
         // Only a decoded standalone image changes height when revealed; measure
         // that once here. Re-running from the pre-line carry reproduces the same
         // state mutation (an image forces list_depth=None, fence must be None), so
@@ -2303,6 +2444,7 @@ impl LineIndex {
             reveal_extra,
             fence_in: carry_in.fence.map_or(0, |f| f.packed()),
             depth_in: carry_in.list_depth.map_or(-1, |d| d as i16),
+            heading: heading_level,
         }
     }
 
@@ -2551,22 +2693,30 @@ impl LineIndex {
             + self.tops.capacity() * std::mem::size_of::<i32>()
     }
 
-    /// Total content height, including any image sources the overlay reveals.
-    pub fn content_height(&self, adjust: &RevealAdjust) -> i32 {
-        self.tops[self.recs.len()] + adjust.total()
+    /// Total content height, less what the overlay's folds hide and plus any image
+    /// sources it reveals.
+    pub fn content_height(&self, adjust: Adjust) -> i32 {
+        self.tops[self.recs.len()] - adjust.folds.hidden_total() + adjust.reveal.total()
     }
 
-    /// Content-space top of logical line `line` (0-relative), pushed down by any
-    /// earlier revealed image.
-    pub fn logical_top(&self, line: usize, adjust: &RevealAdjust) -> i32 {
+    /// Content-space top of logical line `line` (0-relative), pulled up by every
+    /// fold above it and pushed down by any earlier revealed image. A line inside a
+    /// fold resolves to the position the fold itself occupies, so all of a hidden
+    /// section shares one top and the result stays monotonic in `line` (which is
+    /// what lets [`Self::line_at_y`] binary search it).
+    pub fn logical_top(&self, line: usize, adjust: Adjust) -> i32 {
         let line = line.min(self.recs.len());
-        self.tops[line] + adjust.before(line)
+        let base = match adjust.folds.collapsed_top(line) {
+            Some((start, hidden_above)) => self.tops[start] - hidden_above,
+            None => self.tops[line] - adjust.folds.hidden_before(line),
+        };
+        base + adjust.reveal.before(line)
     }
 
     /// The logical line whose row band contains content-space `y`: the last line
     /// whose top is `<= y`, clamped into range. Turns a scroll offset into a window
     /// band edge. `logical_top` is monotonic in `line`, so a binary search finds it.
-    pub fn line_at_y(&self, y: i32, adjust: &RevealAdjust) -> usize {
+    pub fn line_at_y(&self, y: i32, adjust: Adjust) -> usize {
         let n = self.recs.len();
         if n == 0 {
             return 0;
@@ -2600,6 +2750,32 @@ impl LineIndex {
             ),
             None => (None, None),
         }
+    }
+
+    /// [`Self::entry_state`] in its stored form, for a [`crate::fold::FoldMap`] to
+    /// carry across a span it hides and hand back to the layout walk.
+    pub fn entry_packed(&self, line: usize) -> (u16, i16) {
+        self.recs
+            .get(line)
+            .map_or((0, -1), |rec| (rec.fence_in, rec.depth_in))
+    }
+
+    /// The ATX heading level of logical line `line`, or `None` where it is not a
+    /// heading. Measured with the fence carry in hand, so a `#` inside a code block
+    /// is not one.
+    pub fn heading_at(&self, line: usize) -> Option<u8> {
+        self.recs
+            .get(line)
+            .map(|rec| rec.heading)
+            .filter(|&l| l > 0)
+    }
+
+    /// Base height of logical lines `[start, end)`, the pixels a fold over that
+    /// range removes from the document.
+    pub fn span_height(&self, start: usize, end: usize) -> i32 {
+        let n = self.recs.len();
+        let (start, end) = (start.min(n), end.min(n));
+        self.tops[end.max(start)] - self.tops[start]
     }
 }
 
@@ -3141,6 +3317,7 @@ fn lay_table_row(
             gutter: Gutter::None,
             code_block: false,
             heading: None,
+            fold: None,
             task: None,
             rule: false,
             image: None,
@@ -3309,11 +3486,19 @@ fn cell_line_width(ctx: &LayoutCtx, size: u32, runs: &[Run], header: bool) -> i3
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::fold::Folds;
     use crate::markdown::LineStyle;
+    use crate::theme::MARGIN;
 
     const BODY: u32 = 32;
     const LEFT: i32 = 40;
     const TOP: i32 = 10;
+
+    /// The geometry overlay with nothing revealed, so a test reads base heights
+    /// under `folds` alone.
+    fn base_adjust(folds: &FoldMap) -> Adjust<'_> {
+        Adjust::new(RevealAdjust::default(), folds)
+    }
 
     fn fonts() -> Fonts {
         Fonts::new(&markdown::all_sizes(BODY)).expect("a default font")
@@ -3376,6 +3561,7 @@ mod tests {
                 (0, 0),
                 &images,
                 ImageUi::default(),
+                FoldMap::NONE,
                 scale,
             );
             Layout::build_with_images(&ctx, LEFT, TOP)
@@ -3572,18 +3758,21 @@ mod tests {
                 let idx = LineIndex::build(&f, &r, w, BODY, &no_images, Scale::ONE);
                 assert_eq!(idx.len(), r.len_lines(), "one record per logical line");
                 assert_eq!(
-                    idx.content_height(&RevealAdjust::default()),
+                    idx.content_height(base_adjust(FoldMap::NONE)),
                     full.text_height(),
                     "content height (width {w})"
                 );
-                // The first visual row of each logical line sits at the index's top.
+                // The first visual row of each logical line sits at the index's top,
+                // less any space the line opens above itself (a heading's), which is
+                // part of the logical line's extent but sits above its text box.
                 let mut last = None;
                 for v in full.lines() {
                     let li = r.byte_to_line(v.start);
                     if Some(li) != last {
-                        let top = v.baseline - f.metrics(v.size).ascent - TOP;
+                        let top =
+                            v.baseline - f.metrics(v.size).ascent - heading_pad(&f, v, li) - TOP;
                         assert_eq!(
-                            idx.logical_top(li, &RevealAdjust::default()),
+                            idx.logical_top(li, base_adjust(FoldMap::NONE)),
                             top,
                             "top of logical line {li} (width {w})"
                         );
@@ -3591,6 +3780,369 @@ mod tests {
                     }
                 }
             }
+        }
+    }
+
+    /// Build the whole document with `map`'s sections folded away.
+    fn folded_layout(f: &Fonts, r: &Rope, w: i32, map: &FoldMap) -> Layout {
+        let images = ImageStore::new(None);
+        let ctx = LayoutCtx::new(
+            f,
+            r,
+            w,
+            BODY,
+            NO_REVEAL,
+            &images,
+            ImageUi::default(),
+            map,
+            Scale::ONE,
+        );
+        Layout::build_with_images(&ctx, LEFT, TOP)
+    }
+
+    /// The space a heading on logical line `li` should open above itself, recomputed
+    /// from the theme rule so a test checks the value rather than trusting the code.
+    fn heading_pad(f: &Fonts, v: &VisualLine, li: usize) -> i32 {
+        match v.heading {
+            Some(_) if li > 0 => (f.metrics(v.size).line_height as f32
+                * crate::theme::HEADING_SPACE_ABOVE)
+                .round() as i32,
+            _ => 0,
+        }
+    }
+
+    /// The blank pixels between visual row `i`'s box and the one above it: what the
+    /// reader actually sees as a gap. `0` for the first row.
+    fn gap_above(f: &Fonts, l: &Layout, i: usize) -> i32 {
+        if i == 0 {
+            return 0;
+        }
+        let (prev, cur) = (&l.lines()[i - 1], &l.lines()[i]);
+        let pm = f.metrics(prev.size);
+        let prev_bottom = prev.baseline - pm.ascent + pm.line_height;
+        (cur.baseline - f.metrics(cur.size).ascent) - prev_bottom
+    }
+
+    /// Every heading in a document, for a test that wants to fold them all (maximal
+    /// nesting, so spans merge) or a thinned-out subset.
+    fn heading_lines(idx: &LineIndex, every: usize) -> Vec<usize> {
+        (0..idx.len())
+            .filter(|&l| idx.heading_at(l).is_some())
+            .step_by(every)
+            .collect()
+    }
+
+    #[test]
+    fn a_folded_build_is_the_unfolded_build_less_its_hidden_lines() {
+        // The fold oracle. Folding must not re-flow anything: every row the folded
+        // build emits is byte-for-byte the row the unfolded build emitted for that
+        // logical line, only lifted by the height hidden above it. And no row for a
+        // hidden line survives. Checked across the corpora, both wrap widths, and
+        // two anchor sets (every heading, so spans nest and merge; every third, so
+        // folded and open sections interleave).
+        let f = fonts();
+        let no_images = ImageStore::new(None);
+        for r in oracle_docs() {
+            for &w in ORACLE_WIDTHS {
+                let idx = LineIndex::build(&f, &r, w, BODY, &no_images, Scale::ONE);
+                let unfolded = folded_layout(&f, &r, w, FoldMap::NONE);
+                for every in [1, 3] {
+                    let anchors = heading_lines(&idx, every);
+                    if anchors.is_empty() {
+                        continue;
+                    }
+                    let map = FoldMap::build(&Folds::from_lines(anchors), &idx);
+                    let folded = folded_layout(&f, &r, w, &map);
+
+                    // The document loses exactly the height of what it hides.
+                    assert_eq!(
+                        folded.text_height(),
+                        unfolded.text_height() - map.hidden_total(),
+                        "folded height (width {w}, every {every})"
+                    );
+
+                    // The surviving rows, with each baseline lifted by the height
+                    // hidden above its logical line.
+                    let mut want = Vec::new();
+                    for fp in fingerprint(&unfolded) {
+                        let li = r.byte_to_line(fp.start);
+                        if map.hides(li) {
+                            continue;
+                        }
+                        want.push(LineFp {
+                            baseline: fp.baseline - map.hidden_before(li),
+                            ..fp
+                        });
+                    }
+                    assert_eq!(
+                        fingerprint(&folded),
+                        want,
+                        "folded rows (width {w}, every {every})"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_folded_window_matches_the_folded_full_build() {
+        // The windowed path jumps a hidden span whole and resumes its cross-line
+        // carry from the index, so a code fence or list that opened inside a fold
+        // still governs the visible lines below it. Every band of a folded document
+        // must therefore reproduce the folded full build's rows over that band.
+        let f = fonts();
+        let no_images = ImageStore::new(None);
+        for r in oracle_docs() {
+            for w in [300, 1_000_000] {
+                let idx = LineIndex::build(&f, &r, w, BODY, &no_images, Scale::ONE);
+                let anchors = heading_lines(&idx, 2);
+                if anchors.is_empty() {
+                    continue;
+                }
+                let map = FoldMap::build(&Folds::from_lines(anchors), &idx);
+                let full = folded_layout(&f, &r, w, &map);
+                let full_fp = fingerprint(&full);
+                let adjust = base_adjust(&map);
+                let n = idx.len();
+                let images = ImageStore::new(None);
+                let ctx = LayoutCtx::new(
+                    &f,
+                    &r,
+                    w,
+                    BODY,
+                    NO_REVEAL,
+                    &images,
+                    ImageUi::default(),
+                    &map,
+                    Scale::ONE,
+                );
+                for (start, end) in [(0, n / 3), (n / 3, 2 * n / 3), (2 * n / 3, n)] {
+                    if start >= end {
+                        continue;
+                    }
+                    let seed = TOP + idx.logical_top(start, adjust);
+                    let win = Layout::build_window(&ctx, LEFT, seed, &idx, start, end);
+                    // The full build's rows over the same logical band.
+                    let want: Vec<LineFp> = full_fp
+                        .iter()
+                        .filter(|fp| (start..end).contains(&r.byte_to_line(fp.start)))
+                        .cloned()
+                        .collect();
+                    assert_eq!(
+                        fingerprint(&win),
+                        want,
+                        "folded window {start}..{end} (width {w})"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_fence_opened_inside_a_fold_still_closes_the_lines_below_it() {
+        // The carry hazard, pinned on its own so a failure names it. The fence opens
+        // inside `## Hidden`'s section and never closes, so every line after it is
+        // code. Folding that section skips those lines entirely; without the span's
+        // recorded exit carry the build would resume thinking no fence was open and
+        // render the tail as prose.
+        let f = fonts();
+        let no_images = ImageStore::new(None);
+        let text = "# Doc\n## Hidden\n```rust\nlet x = 1;\n## still code\ntail code\n";
+        let r = rope(text);
+        let w = 1_000_000;
+        let idx = LineIndex::build(&f, &r, w, BODY, &no_images, Scale::ONE);
+        // The `##` on line 4 is inside the fence, so it is code, not a heading, and
+        // does not end the section: `## Hidden` runs to the end of the document.
+        assert_eq!(idx.heading_at(4), None);
+        let map = FoldMap::build(&Folds::from_lines([1]), &idx);
+        assert!(map.hides(2) && map.hides(5));
+
+        // Nothing is left to check below the fold in this document, so verify the
+        // carry directly: a window seeded past the span sees the open fence.
+        let unfolded = folded_layout(&f, &r, w, FoldMap::NONE);
+        assert!(
+            unfolded
+                .lines()
+                .iter()
+                .filter(|v| r.byte_to_line(v.start) >= 3)
+                .all(|v| v.code_block),
+            "every line after the fence is code"
+        );
+        let folded = folded_layout(&f, &r, w, &map);
+        assert_eq!(
+            folded.lines().len(),
+            2,
+            "only `# Doc` and the folded `## Hidden` survive"
+        );
+        assert_eq!(
+            folded.lines()[1].fold,
+            Some(true),
+            "the heading reads folded"
+        );
+    }
+
+    #[test]
+    fn a_heading_carries_a_fold_marker_only_where_it_owns_a_section() {
+        let f = fonts();
+        // `## Empty` is followed by a sibling, so it owns nothing and offers no
+        // fold; `## Full` owns the body line under it.
+        let r = rope("# Top\n## Empty\n## Full\nbody\n");
+        let l = folded_layout(&f, &r, 1_000_000, FoldMap::NONE);
+        let marks: Vec<Option<bool>> = l.lines().iter().map(|v| v.fold).collect();
+        assert_eq!(
+            marks,
+            // The trailing newline leaves a final empty line, which is what `## Full`
+            // owns and why it offers a fold at all.
+            vec![Some(false), None, Some(false), None, None],
+            "a chevron only where there is a section to collapse"
+        );
+    }
+
+    #[test]
+    fn a_fold_chevron_sits_left_of_the_text_column() {
+        // The no-reflow invariant for the margin affordance: the chevron hangs
+        // entirely left of `left`, so showing or hiding it never moves a glyph.
+        let f = fonts();
+        let r = rope("# Heading\nbody\n");
+        let l = folded_layout(&f, &r, 1_000_000, FoldMap::NONE);
+        let heading = &l.lines()[0];
+        let rect = l.fold_rect(&f, heading, BODY).expect("a foldable heading");
+        assert!(
+            rect.x + rect.w <= l.left(),
+            "chevron right edge {} must not reach the text column at {}",
+            rect.x + rect.w,
+            l.left()
+        );
+        assert!(
+            rect.x >= l.left() - MARGIN,
+            "chevron stays inside the margin"
+        );
+        // A body line offers none.
+        assert!(l.fold_rect(&f, &l.lines()[1], BODY).is_none());
+    }
+
+    #[test]
+    fn a_fold_chevron_is_centered_in_the_heading_line() {
+        // It must sit on the line's middle, not the middle of its ascent, which
+        // rides high because the line box also carries the descent and the leading.
+        // Checked at a line-height scale where the two visibly differ.
+        let f = fonts_scaled(1.5);
+        let r = rope("# Heading\nbody\n");
+        let l = folded_layout(&f, &r, 1_000_000, FoldMap::NONE);
+        let heading = &l.lines()[0];
+        let rect = l.fold_rect(&f, heading, BODY).expect("a foldable heading");
+        let m = f.metrics(heading.size);
+        let glyph_top = heading.baseline - m.ascent;
+        // Equal slack above and below the glyphs, to the pixel integer division
+        // allows. The glyph band, not the line box: the box's surplus is leading,
+        // which all falls below the text, so centering on it would sit low.
+        let above = rect.y - glyph_top;
+        let below = (heading.baseline + m.descent) - (rect.y + rect.h);
+        assert!(
+            (above - below).abs() <= 1,
+            "chevron off center: {above}px above the glyphs, {below}px below"
+        );
+        // And that is genuinely above the box's own middle, so the two rules cannot
+        // be confused for one another at this line height.
+        assert!(
+            rect.y + rect.h / 2 < glyph_top + m.line_height / 2,
+            "leading falls below the text, so the glyph center sits above the box center"
+        );
+    }
+
+    #[test]
+    fn a_heading_opens_space_above_itself() {
+        // Every heading but the document's first separates itself from what came
+        // before, and the space scales with the heading, so an H1 gets more air
+        // than an H4.
+        let f = fonts();
+        let r = rope("# First\nbody\n## Second\n#### Fourth\n");
+        let l = folded_layout(&f, &r, 1_000_000, FoldMap::NONE);
+        let gaps: Vec<i32> = (0..l.lines().len()).map(|i| gap_above(&f, &l, i)).collect();
+        assert_eq!(gaps[0], 0, "the first line has nothing above it to clear");
+        assert_eq!(gaps[1], 0, "body text opens no space");
+        assert!(gaps[2] > 0 && gaps[3] > 0, "later headings do");
+        assert!(
+            gaps[2] > gaps[3],
+            "an H2 takes more space than an H4: {} vs {}",
+            gaps[2],
+            gaps[3]
+        );
+    }
+
+    #[test]
+    fn collapsed_headings_do_not_stack_flush() {
+        // The case the spacing exists for. Fold two sections and only their headings
+        // remain, with every blank line that used to separate them hidden inside the
+        // folds. Without the space above a heading they would butt together.
+        let f = fonts();
+        let no_images = ImageStore::new(None);
+        let w = 1_000_000;
+        let r = rope("# Guide\n\n## Setup\ninstall\n\n## Usage\nrun\n");
+        let idx = LineIndex::build(&f, &r, w, BODY, &no_images, Scale::ONE);
+        // `## Setup` is line 2 and `## Usage` line 5.
+        let map = FoldMap::build(&Folds::from_lines([2, 5]), &idx);
+        let l = folded_layout(&f, &r, w, &map);
+
+        let headings: Vec<&VisualLine> =
+            l.lines().iter().filter(|v| v.heading == Some(2)).collect();
+        assert_eq!(headings.len(), 2, "both folded headings still draw");
+        // The two are adjacent rows now, so the only thing between them is the
+        // second's own space above.
+        let first = headings[0];
+        let second = headings[1];
+        let first_bottom =
+            first.baseline - f.metrics(first.size).ascent + f.metrics(first.size).line_height;
+        let second_top = second.baseline - f.metrics(second.size).ascent;
+        let gap = second_top - first_bottom;
+        assert!(gap > 0, "collapsed headings must not butt together");
+        assert_eq!(
+            gap,
+            heading_pad(&f, second, 5),
+            "the gap is the space the second heading opens above itself"
+        );
+    }
+
+    #[test]
+    fn a_hash_inside_a_code_fence_opens_no_space() {
+        // The space keys off the line's classification, so a `#` that is code gets
+        // none and a fenced block keeps its even line rhythm.
+        let f = fonts();
+        let r = rope("text\n```rust\n# a comment\n# another\n```\n");
+        let l = folded_layout(&f, &r, 1_000_000, FoldMap::NONE);
+        assert!(
+            (1..l.lines().len()).all(|i| gap_above(&f, &l, i) == 0),
+            "no line in a fenced block opens space"
+        );
+    }
+
+    #[test]
+    fn every_heading_level_gets_the_same_chevron() {
+        // Sized off the body, so the chevrons line up in a column down the margin
+        // rather than growing with the heading they mark, and each is the size the
+        // file tree marks a folder with.
+        let f = fonts();
+        let r = rope("# One\ntext\n## Two\ntext\n###### Six\ntext\n");
+        let l = folded_layout(&f, &r, 1_000_000, FoldMap::NONE);
+        let boxes: Vec<Rect> = l
+            .lines()
+            .iter()
+            .filter_map(|v| l.fold_rect(&f, v, BODY))
+            .collect();
+        assert_eq!(boxes.len(), 3, "one chevron per heading");
+        // The size the file tree draws for a row in this font, derived through the
+        // tree's own helper so the claim is checked against the tree, not restated.
+        let want = crate::theme::chevron_side(
+            crate::paint::tree_row_height(f.metrics(BODY), Scale::ONE),
+            Scale::ONE,
+        );
+        for b in &boxes {
+            assert_eq!((b.w, b.h), (want, want), "the tree's chevron size");
+            assert_eq!(
+                b.x + b.w,
+                boxes[0].x + boxes[0].w,
+                "right-aligned against the text column, so they form a column"
+            );
         }
     }
 
@@ -3622,7 +4174,7 @@ mod tests {
         let base_ctx = LayoutCtx::for_index(&f, &r, w, BODY, &s, Scale::ONE);
         let base = Layout::build_with_images(&base_ctx, LEFT, TOP);
         assert_eq!(
-            idx.content_height(&RevealAdjust::default()),
+            idx.content_height(base_adjust(FoldMap::NONE)),
             base.text_height()
         );
 
@@ -3638,12 +4190,16 @@ mod tests {
             (ls, le),
             &s,
             ImageUi::default(),
+            FoldMap::NONE,
             Scale::ONE,
         );
         let revealed = Layout::build_with_images(&revealed_ctx, LEFT, TOP);
         let mut adj = RevealAdjust::default();
         adj.push(img_line, idx.reveal_extra(img_line));
-        assert_eq!(idx.content_height(&adj), revealed.text_height());
+        assert_eq!(
+            idx.content_height(Adjust::new(adj, FoldMap::NONE)),
+            revealed.text_height()
+        );
     }
 
     #[test]
@@ -3667,7 +4223,7 @@ mod tests {
                     (n / 2, n / 2), // empty band
                 ];
                 for (bs, be) in bands {
-                    let seed = TOP + idx.logical_top(bs, &RevealAdjust::default());
+                    let seed = TOP + idx.logical_top(bs, base_adjust(FoldMap::NONE));
                     let win_ctx = LayoutCtx::for_index(&f, &r, w, BODY, &no_images, Scale::ONE);
                     let win = Layout::build_window(&win_ctx, LEFT, seed, &idx, bs, be);
                     let expected: Vec<_> = full_fp
@@ -5407,7 +5963,17 @@ mod tests {
         s: &ImageStore,
         ui: ImageUi,
     ) -> Layout {
-        let ctx = LayoutCtx::new(f, r, 1_000_000, BODY, active, s, ui, Scale::ONE);
+        let ctx = LayoutCtx::new(
+            f,
+            r,
+            1_000_000,
+            BODY,
+            active,
+            s,
+            ui,
+            FoldMap::NONE,
+            Scale::ONE,
+        );
         Layout::build_with_images(&ctx, LEFT, TOP)
     }
 

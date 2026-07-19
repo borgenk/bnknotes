@@ -134,8 +134,11 @@ fn apply_editor_action(
         KeyAction::DeleteWordBack => ed.text.delete_word_back(),
         KeyAction::DeleteWordForward => ed.text.delete_word_forward(),
         KeyAction::DeleteLine => ed.text.delete_line(),
-        KeyAction::Left => ed.text.move_left(extend),
-        KeyAction::Right => ed.text.move_right(extend),
+        // A horizontal step is a pure buffer move, so it can walk into a folded
+        // section; stepping clear of one afterwards makes the arrow cross the whole
+        // section, which is what the collapsed heading implies on screen.
+        KeyAction::Left => ed.text.move_left(extend) | ed.step_over_folds(false, extend),
+        KeyAction::Right => ed.text.move_right(extend) | ed.step_over_folds(true, extend),
         KeyAction::WordLeft => ed.text.move_word_left(extend),
         KeyAction::WordRight => ed.text.move_word_right(extend),
         KeyAction::Up => ed.move_vertical(fonts, rect, -1, extend),
@@ -152,6 +155,8 @@ fn apply_editor_action(
         }
         KeyAction::Undo => ed.text.undo(),
         KeyAction::Redo => ed.text.redo(),
+        KeyAction::ToggleFold => ed.toggle_fold_at_cursor(fonts, rect),
+        KeyAction::UnfoldAll => ed.unfold_all(),
         // With no find bar, Escape collapses a selection to a bare cursor; with
         // nothing selected there is nothing to leave.
         KeyAction::Escape => {
@@ -1800,6 +1805,17 @@ impl State {
             self.dirty = true;
         }
         self.editors[i].goal_x = None;
+        // A click on a heading's fold chevron collapses or opens its section. The
+        // chevron sits in the margin, left of the text, so this never competes with
+        // placing the caret.
+        if let Some(ls) = self.editors[i].fold_under_pointer(&self.fonts, rect, px, py) {
+            if self.editors[i].toggle_fold_at(&self.fonts, rect, ls) {
+                self.dirty = true;
+                self.save_session();
+            }
+            self.bump_caret();
+            return;
+        }
         // A click on a table's add-row / add-column hover strip grows the table.
         if self.editors[i].press_table_button(&self.fonts, rect, px, py) {
             self.dirty = true;

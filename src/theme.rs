@@ -1,3 +1,25 @@
+use crate::scale::Scale;
+
+/// The side of a disclosure chevron on a row `row_h` pixels tall: a little over
+/// half the row, floored so it stays legible and capped so it stays a marker.
+/// Shared by the file tree's folder rows and a heading's fold chevron, so the two
+/// read as one control wherever they appear.
+pub(crate) fn chevron_side(row_h: i32, scale: Scale) -> i32 {
+    (row_h * 9 / 16).clamp(scale.px(CHEVRON_MIN), scale.px(CHEVRON_MAX))
+}
+
+/// Vertical padding above and below a row's text, so it gets more breathing room
+/// and a taller hit area than the bare line height.
+pub(crate) const ROW_VPAD: i32 = 3;
+
+/// The height of a row holding one line of `line_height` text, with breathing
+/// room above and below. The file tree's rows are built from this, and a heading's
+/// fold chevron is sized against the row a line of body text would make, so the
+/// tree's marker and the editor's come out the same size.
+pub(crate) fn row_height(line_height: i32, scale: Scale) -> i32 {
+    (line_height + 2 * scale.px(ROW_VPAD)).max(1)
+}
+
 /// Background, text, and selection colors (0x00RRGGBB), and the pixel size: a
 /// dark palette on base hue ~212.
 pub(crate) const BACKGROUND: u32 = 0x001c_2127;
@@ -80,6 +102,12 @@ pub(crate) const QUOTE_BAR_WIDTH: i32 = 3;
 /// text ascent short of the first character, so it reads as inset from the words
 /// rather than crowding them. Shared by the bullet and the checkbox.
 pub(crate) const DECOR_TEXT_GAP: f32 = 0.4;
+/// Space opened above a heading, as a fraction of that heading's own line height,
+/// so a section reads as starting rather than as more of what came before. Scaling
+/// it off the heading rather than the body gives an H1 more air than an H6, the
+/// way a document's own hierarchy does. This is the knob to turn if headings feel
+/// crowded or too loose.
+pub(crate) const HEADING_SPACE_ABOVE: f32 = 0.4;
 /// A thematic break (`---`) renders as a thin horizontal line across the content
 /// width once the cursor leaves it, in a muted line tone.
 pub(crate) const RULE_COLOR: u32 = 0x003f_444b;
@@ -302,9 +330,6 @@ pub(crate) const SPLITTER_COLOR: u32 = 0x002a_2f36;
 pub(crate) const TREE_PAD: i32 = 8;
 /// Horizontal padding inside a row highlight, from its edge to the chevron.
 pub(crate) const TREE_ROW_PAD: i32 = 8;
-/// Vertical padding added above and below each row's text, so items get more
-/// breathing room and a taller hit area than the bare line height.
-pub(crate) const TREE_ROW_VPAD: i32 = 3;
 /// Corner radius of a row's selection/hover highlight.
 pub(crate) const TREE_ROW_RADIUS: i32 = 5;
 /// Vertical inset of the highlight within its row, so background shows above and
@@ -314,9 +339,11 @@ pub(crate) const TREE_ROW_INSET_Y: i32 = 2;
 /// folder names align in one column whether or not a chevron is drawn. Wider
 /// than the chevron itself, so the label sits a little clear of the icon.
 pub(crate) const TREE_MARKER_W: i32 = 18;
-/// Largest a chevron's box grows to; capped below the reserved column so a gap to
-/// the label always remains, even at large font sizes.
-pub(crate) const TREE_CHEVRON_MAX: i32 = 15;
+/// Smallest and largest a disclosure chevron's box grows to. The cap sits below
+/// the tree's reserved column so a gap to the label always remains, even at large
+/// font sizes.
+pub(crate) const CHEVRON_MIN: i32 = 8;
+pub(crate) const CHEVRON_MAX: i32 = 15;
 /// Per-depth indent step for nested rows.
 pub(crate) const TREE_INDENT: i32 = 14;
 

@@ -6,6 +6,7 @@ mod config;
 mod dev;
 mod file;
 mod find;
+mod fold;
 mod icon;
 mod keymap;
 mod layout;

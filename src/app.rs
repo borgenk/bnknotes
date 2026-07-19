@@ -1866,13 +1866,23 @@ impl State {
                 && px < (rect.x + rect.w) as f32
                 && py >= rect.y as f32
                 && py < (rect.y + rect.h) as f32;
-            let table_hover = if over && !ed.dragging() && self.drag_splitter.is_none() {
+            let hovering = over && !ed.dragging() && self.drag_splitter.is_none();
+            let table_hover = if hovering {
                 ed.layout_cache.as_ref().and_then(|l| {
                     l.table_button_at(&self.fonts, ed.text.rope(), px, ed.content_y(py))
                 })
             } else {
                 None
             };
+            // The fold chevron under the pointer, recomputed the same way, so it
+            // cannot go stale after a scroll or an edit moved the heading.
+            let fold_hover = hovering
+                .then(|| {
+                    ed.layout_cache
+                        .as_ref()
+                        .and_then(|l| l.fold_at(&self.fonts, px, ed.content_y(py), self.body_size))
+                })
+                .flatten();
             let params = PaintParams {
                 view: rect,
                 scale: self.scale(),
@@ -1884,6 +1894,7 @@ impl State {
                 caret,
                 find: build_find_paint(&ed.find, &tick_tops),
                 table_hover,
+                fold_hover,
             };
             if let Some(layout) = ed.layout_cache.as_ref() {
                 list.append(&mut build_display_list(

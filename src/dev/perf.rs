@@ -32,6 +32,7 @@ use crate::dev::alloc;
 use crate::dev::corpus;
 use crate::dev::sys;
 use crate::find::FindState;
+use crate::fold::FoldMap;
 use crate::layout::{ImageUi, Layout, LayoutCtx, LineIndex};
 use crate::markdown;
 use crate::paint::{build_display_list, CaretPaint, PaintParams};
@@ -186,6 +187,7 @@ fn measure() -> Result<Vec<Sample>> {
         (0, 0),
         &images,
         ImageUi::default(),
+        FoldMap::NONE,
         Scale::ONE,
     );
     out.push(sample("layout_window", 500, || {
@@ -231,6 +233,7 @@ fn measure() -> Result<Vec<Sample>> {
         (0, 0),
         &image_store,
         ImageUi::default(),
+        FoldMap::NONE,
         Scale::ONE,
     );
     let image_layout = Layout::build_with_images(&image_ctx, MARGIN, MARGIN);
@@ -295,6 +298,7 @@ fn measure() -> Result<Vec<Sample>> {
         (0, 0),
         &image_store,
         ImageUi::default(),
+        FoldMap::NONE,
         Scale::ONE,
     );
     out.push(sample("layout_reflow_image", 200, || {
@@ -333,6 +337,7 @@ fn params(scroll_y: i32, selection: Option<(usize, usize)>) -> PaintParams<'stat
         body_size: FONT_SIZE,
         selection,
         table_hover: None,
+        fold_hover: None,
         // A settled caret bar: one Fill command, matching the app's steady state so
         // the batch benchmark counts the caret exactly as a live frame does.
         caret: Some(CaretPaint {
@@ -632,6 +637,7 @@ pub fn run_lab(args: &[String]) -> Result<()> {
             (0, 0),
             &images,
             ImageUi::default(),
+            FoldMap::NONE,
             Scale::ONE,
         );
         let update_ctx =
@@ -1081,6 +1087,7 @@ pub fn run_load_bench(args: &[String]) -> Result<()> {
         (0, 0),
         &images,
         ImageUi::default(),
+        FoldMap::NONE,
         Scale::ONE,
     );
     let (window, window_ns) =

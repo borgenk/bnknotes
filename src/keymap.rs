@@ -78,6 +78,10 @@ pub enum KeyAction {
     FocusPaneA,
     FocusPaneB,
     CloseTab,
+    /// Fold or unfold the heading section the cursor sits in (Ctrl+period), and
+    /// unfold every section in the document (Ctrl+Shift+period).
+    ToggleFold,
+    UnfoldAll,
     None,
 }
 
@@ -148,9 +152,15 @@ fn ctrl_action_for_sym(sym: u32, shift: bool) -> KeyAction {
         0x62 => KeyAction::ToggleTree,           // b: toggle sidebar
         0x77 => KeyAction::CloseTab,             // w: close the active tab
         0x5C => KeyAction::ToggleSecondPane,     // backslash: split
-        0x30 => KeyAction::FocusTree,            // 0: focus tree
-        0x31 => KeyAction::FocusPaneA,           // 1: focus editor A
-        0x32 => KeyAction::FocusPaneB,           // 2: focus editor B
+        // Period folds the section at the cursor.
+        // Shifted it unfolds the whole document, which most layouts report as the
+        // `>` keysym rather than a shifted period, so both spellings bind.
+        0x3E => KeyAction::UnfoldAll,          // '>'
+        0x2E if shift => KeyAction::UnfoldAll, // period, where shift leaves it alone
+        0x2E => KeyAction::ToggleFold,         // period
+        0x30 => KeyAction::FocusTree,          // 0: focus tree
+        0x31 => KeyAction::FocusPaneA,         // 1: focus editor A
+        0x32 => KeyAction::FocusPaneB,         // 2: focus editor B
         // Ctrl+Z undoes; Ctrl+Shift+Z and Ctrl+Y redo.
         0x7A if shift => KeyAction::Redo, // Z
         0x7A => KeyAction::Undo,          // z
@@ -237,7 +247,7 @@ mod tests {
     fn every_bound_ctrl_letter_is_distinct() {
         // A duplicate keysym in the table would silently shadow the earlier arm, so a
         // rebind that collides fails here rather than in the user's hands.
-        let bound: Vec<KeyAction> = "acfhksxvbw\\012zy"
+        let bound: Vec<KeyAction> = "acfhksxvbw\\012zy."
             .chars()
             .map(|c| ctrl_action_for_sym(c as u32, false))
             .collect();

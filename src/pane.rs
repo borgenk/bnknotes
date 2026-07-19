@@ -5,7 +5,8 @@ use std::time::{Duration, Instant};
 use crate::config::CaretConfig;
 use crate::file::{self, FileFormat};
 use crate::find::FindState;
-use crate::layout::{ImageUi, Layout, LayoutCtx, LineIndex, RevealAdjust};
+use crate::fold::{self, FoldMap, Folds};
+use crate::layout::{Adjust, ImageUi, Layout, LayoutCtx, LineIndex, RevealAdjust};
 use crate::markdown;
 use crate::platform::error::{Error, Result};
 use crate::platform::freetype::Fonts;
@@ -437,8 +438,9 @@ fn load(path: &Path) -> Result<(String, FileFormat)> {
 /// size), the active range's logical line span (the marker reveal depends only on
 /// which lines the range touches, not the exact byte offsets), the selected /
 /// raw-pinned image (by line-start offset), and whether a drag is in progress
-/// (which holds image sources collapsed). A scroll, idle redraw, or cursor move
-/// within one line leaves all of these unchanged and reuses the cached layout.
+/// (which holds image sources collapsed), and the fold revision (folding removes
+/// lines from the build). A scroll, idle redraw, or cursor move within one line
+/// leaves all of these unchanged and reuses the cached layout.
 type LayoutKey = (
     u64,
     i32,
@@ -450,6 +452,7 @@ type LayoutKey = (
     Option<usize>,
     Option<usize>,
     bool,
+    u64,
 );
 
 /// The inputs the line-metrics index depends on: content version, column x and
@@ -819,6 +822,13 @@ pub(crate) struct EditorPane {
     /// The logical-line range `[start, end)` the cached window covers, so a caller
     /// can tell whether an offset (the cursor, a click) falls inside it.
     pub(crate) layout_band: (usize, usize),
+    /// The headings this document has folded, persisted with the tab.
+    pub(crate) folds: Folds,
+    /// What those folds hide, resolved against the current index. Rebuilt by
+    /// [`Self::ensure_index`] whenever `fold_map_key` goes stale.
+    fold_map: FoldMap,
+    /// The content version and fold revision `fold_map` was resolved at.
+    fold_map_key: Option<(u64, u64)>,
     pub(crate) goal_x: Option<f32>,
     /// The live pointer drag-selection, or `None` when no drag is in flight.
     drag: Option<DragSelect>,
@@ -865,6 +875,9 @@ impl EditorPane {
             layout_cache: None,
             layout_key: None,
             layout_band: (0, 0),
+            folds: Folds::default(),
+            fold_map: FoldMap::default(),
+            fold_map_key: None,
             goal_x: None,
             drag: None,
             clicks: ClickChain::new(),
@@ -1065,9 +1078,17 @@ impl EditorPane {
         }
     }
 
+    /// The overlay the index's geometry queries run under: the image sources
+    /// revealed right now, over the sections currently folded away. Both are cheap
+    /// and empty in the common case.
+    fn adjust(&self) -> Adjust<'_> {
+        Adjust::new(self.reveal_adjust(), &self.fold_map)
+    }
+
     /// The ≤2-line overlay of image sources revealed right now (the reveal range's
     /// ends and the raw-pinned line), so the index reports heights and positions
     /// under the current reveal. Empty (and free) for the common no-image case.
+    /// A source inside a folded section is skipped: it is not on screen to reveal.
     fn reveal_adjust(&self) -> RevealAdjust {
         let mut adjust = RevealAdjust::default();
         let Some(index) = self.line_index.as_ref() else {
@@ -1078,18 +1099,19 @@ impl EditorPane {
         // pointer stays put (matching the window build's `image_ui.dragging`); only
         // a corner-pinned source below still expands. Off a drag the reveal range's
         // ends expand their image sources.
+        let mut expand = |off: usize| {
+            let line = rope.byte_to_line(off);
+            if !self.fold_map.hides(line) {
+                adjust.push(line, index.reveal_extra(line));
+            }
+        };
         if !self.dragging() {
             let (lo, hi) = self.reveal_range();
-            let l0 = rope.byte_to_line(lo);
-            adjust.push(l0, index.reveal_extra(l0));
-            let l1 = rope.byte_to_line(hi);
-            if l1 != l0 {
-                adjust.push(l1, index.reveal_extra(l1));
-            }
+            expand(lo);
+            expand(hi);
         }
         if let Some(raw) = self.raw_image {
-            let lr = rope.byte_to_line(raw);
-            adjust.push(lr, index.reveal_extra(lr));
+            expand(raw);
         }
         adjust
     }
@@ -1124,6 +1146,9 @@ impl EditorPane {
             if incremental {
                 let mut index = self.line_index.take().expect("checked");
                 let prev = self.prev_rope.take().expect("checked");
+                // Shift the fold anchors by the same edit that is about to be
+                // re-measured, so a fold rides its heading as text above it grows.
+                self.folds.remap(&prev, self.text.rope());
                 let ctx = LayoutCtx::for_index(
                     fonts,
                     self.text.rope(),
@@ -1158,10 +1183,28 @@ impl EditorPane {
             self.prev_rope = Some(self.text.rope().clone());
             self.index_key = Some(key);
         }
-        let adjust = self.reveal_adjust();
+        self.ensure_fold_map();
+        let adjust = self.adjust();
         if let Some(index) = self.line_index.as_ref() {
-            self.content_height = index.content_height(&adjust) + 2 * margin;
+            self.content_height = index.content_height(adjust) + 2 * margin;
         }
+    }
+
+    /// Re-resolve what the folds hide when the content or the fold set has moved
+    /// under them, dropping any anchor whose heading is gone. Cheap to check and,
+    /// with nothing folded, cheap to do.
+    fn ensure_fold_map(&mut self) {
+        let Some(index) = self.line_index.as_ref() else {
+            return;
+        };
+        let key = (self.text.version(), self.folds.revision());
+        if self.fold_map_key == Some(key) {
+            return;
+        }
+        self.folds.retain_headings(index);
+        self.fold_map = FoldMap::build(&self.folds, index);
+        // `retain_headings` can bump the revision, so key off where it landed.
+        self.fold_map_key = Some((self.text.version(), self.folds.revision()));
     }
 
     /// The shared layout context for a windowed build: this pane's rope and image
@@ -1181,6 +1224,7 @@ impl EditorPane {
             active,
             &self.images,
             self.image_ui(),
+            &self.fold_map,
             self.scale,
         )
     }
@@ -1211,15 +1255,16 @@ impl EditorPane {
             self.selected_image,
             self.raw_image,
             self.dragging(),
+            self.folds.revision(),
         );
-        let adjust = self.reveal_adjust();
+        let adjust = self.adjust();
         let (vis_top, vis_bot, over, n) = {
             let Some(index) = self.line_index.as_ref() else {
                 return;
             };
             (
-                index.line_at_y(self.scroll_y, &adjust),
-                index.line_at_y(self.scroll_y + rect.h.max(0), &adjust),
+                index.line_at_y(self.scroll_y, adjust),
+                index.line_at_y(self.scroll_y + rect.h.max(0), adjust),
                 self.page_lines(fonts, rect),
                 index.len(),
             )
@@ -1238,7 +1283,7 @@ impl EditorPane {
         let layout = {
             let ctx = self.layout_ctx(fonts, active, wrap_width);
             let index = self.line_index.as_ref().expect("index built above");
-            let seed = rect.y + margin + index.logical_top(start, &adjust);
+            let seed = rect.y + margin + index.logical_top(start, adjust);
             Layout::build_window(&ctx, rect.x + margin, seed, index, start, end)
         };
         self.layout_cache = Some(layout);
@@ -1261,7 +1306,7 @@ impl EditorPane {
     /// is O(viewport), never O(document). Requires the index (call `ensure_index`).
     fn cursor_window(&self, fonts: &Fonts, rect: Rect) -> Option<Layout> {
         let index = self.line_index.as_ref()?;
-        let adjust = self.reveal_adjust();
+        let adjust = self.adjust();
         let active = self.reveal_range();
         let cursor_line = self.text.rope().byte_to_line(self.text.cursor());
         let span = self.page_lines(fonts, rect) + 4;
@@ -1269,7 +1314,7 @@ impl EditorPane {
         let start = cursor_line.saturating_sub(span);
         let end = (cursor_line + span + 1).min(n).max(start);
         let margin = self.scale.px(MARGIN);
-        let seed = rect.y + margin + index.logical_top(start, &adjust);
+        let seed = rect.y + margin + index.logical_top(start, adjust);
         let wrap_width = rect.w - 2 * margin;
         let ctx = self.layout_ctx(fonts, active, wrap_width);
         Some(Layout::build_window(
@@ -1394,6 +1439,106 @@ impl EditorPane {
         self.text.set_cursor_changed(target, extend)
     }
 
+    /// Fold or unfold the section the cursor sits in: the heading on the cursor's
+    /// own line, else the nearest heading above it. Returns whether anything
+    /// changed. A heading with no lines under it has no section, so nothing folds.
+    pub(crate) fn toggle_fold_at_cursor(&mut self, fonts: &Fonts, rect: Rect) -> bool {
+        self.ensure_index(fonts, rect);
+        let Some(index) = self.line_index.as_ref() else {
+            return false;
+        };
+        let line = self.text.rope().byte_to_line(self.text.cursor());
+        let Some(heading) = fold::enclosing_heading(index, line) else {
+            return false;
+        };
+        self.set_fold(heading)
+    }
+
+    /// Fold or unfold the heading whose logical line starts at buffer offset `ls`,
+    /// the chevron's click target. Returns whether anything changed.
+    pub(crate) fn toggle_fold_at(&mut self, fonts: &Fonts, rect: Rect, ls: usize) -> bool {
+        self.ensure_index(fonts, rect);
+        self.set_fold(self.text.rope().byte_to_line(ls))
+    }
+
+    /// Toggle the fold on heading `line` and settle the caret afterwards. The map is
+    /// rebuilt immediately so the caret check sees the fold that just closed.
+    fn set_fold(&mut self, line: usize) -> bool {
+        if !self.folds.toggle(line) {
+            return false;
+        }
+        self.fold_map_key = None;
+        self.ensure_fold_map();
+        self.lift_cursor_out_of_folds();
+        true
+    }
+
+    /// Unfold every section in this document. Returns whether anything was folded.
+    pub(crate) fn unfold_all(&mut self) -> bool {
+        if !self.folds.clear() {
+            return false;
+        }
+        self.fold_map_key = None;
+        self.ensure_fold_map();
+        true
+    }
+
+    /// Move the cursor onto the folded heading above it when the section it was in
+    /// has just closed, so the caret never parks on text nobody can see. Reports
+    /// whether the cursor moved.
+    fn lift_cursor_out_of_folds(&mut self) -> bool {
+        let rope = self.text.rope();
+        let line = rope.byte_to_line(self.text.cursor());
+        if !self.fold_map.hides(line) {
+            return false;
+        }
+        let heading = self.fold_map.first_visible_at_or_before(line);
+        let target = rope.line_content_range(heading).1;
+        self.text.set_cursor_changed(target, false)
+    }
+
+    /// Step the cursor clear of a folded section it just walked into, continuing the
+    /// direction it was traveling: forward lands on the first line past the fold,
+    /// backward on the end of the heading that hides it. Arrowing over a folded
+    /// heading therefore steps across the whole section rather than through its
+    /// hidden text. Reports whether the cursor moved.
+    pub(crate) fn step_over_folds(&mut self, forward: bool, extend: bool) -> bool {
+        if self.fold_map.is_empty() {
+            return false;
+        }
+        let rope = self.text.rope();
+        let line = rope.byte_to_line(self.text.cursor());
+        if !self.fold_map.hides(line) {
+            return false;
+        }
+        let target = if forward {
+            let out = self.fold_map.first_visible_at_or_after(line);
+            if out >= rope.len_lines() {
+                rope.len()
+            } else {
+                rope.line_to_byte(out)
+            }
+        } else {
+            let heading = self.fold_map.first_visible_at_or_before(line);
+            rope.line_content_range(heading).1
+        };
+        self.text.set_cursor_changed(target, extend)
+    }
+
+    /// The logical-line start of the heading whose fold chevron is under a window
+    /// position, if any.
+    pub(crate) fn fold_under_pointer(
+        &mut self,
+        fonts: &Fonts,
+        rect: Rect,
+        px: f32,
+        py: f32,
+    ) -> Option<usize> {
+        let body_size = self.body_size;
+        let (layout, _, y) = self.layout_at(fonts, rect, py)?;
+        layout.fold_at(fonts, px, y, body_size)
+    }
+
     /// How many visual lines make up a Page Up/Down jump in this column: its
     /// height in body line-heights, less one row of overlap, at least one.
     pub(crate) fn page_lines(&self, fonts: &Fonts, rect: Rect) -> usize {
@@ -1412,12 +1557,12 @@ impl EditorPane {
             return Vec::new();
         }
         let rope = self.text.rope();
-        let adjust = self.reveal_adjust();
+        let adjust = self.adjust();
         let margin = self.scale.px(MARGIN);
         self.find
             .matches()
             .iter()
-            .map(|&(start, _)| margin + index.logical_top(rope.byte_to_line(start), &adjust))
+            .map(|&(start, _)| margin + index.logical_top(rope.byte_to_line(start), adjust))
             .collect()
     }
 
@@ -1707,7 +1852,10 @@ impl EditorPane {
         use wp_cursor_shape_device_v1::{SHAPE_DEFAULT, SHAPE_POINTER, SHAPE_TEXT};
         let over_link = self.link_under_pointer(fonts, rect, px, py).is_some();
         let over_checkbox = self.checkbox_under_pointer(fonts, rect, px, py).is_some();
-        if over_link || over_checkbox {
+        // A fold chevron is a control, not text, so the I-beam gives way over it the
+        // way it does over a link or a checkbox.
+        let over_fold = self.fold_under_pointer(fonts, rect, px, py).is_some();
+        if over_link || over_checkbox || over_fold {
             return SHAPE_POINTER;
         }
         match self.layout_at(fonts, rect, py) {
@@ -1985,8 +2133,8 @@ impl PaneGroup {
         self.placeholder.set_scale(scale, body_size);
     }
 
-    /// The persisted form of this pane: each tab's file, caret, and scroll, plus
-    /// the active index.
+    /// The persisted form of this pane: each tab's file, caret, scroll, and folded
+    /// headings, plus the active index.
     pub(crate) fn to_session(&self) -> store::PaneGroupSession {
         store::PaneGroupSession {
             tabs: self
@@ -1996,6 +2144,7 @@ impl PaneGroup {
                     path: d.path.clone(),
                     cursor: d.text.cursor() as u64,
                     scroll_y: d.scroll_y,
+                    folds: d.folds.lines().map(|l| l as u32).collect(),
                 })
                 .collect(),
             active: self.active as u32,
@@ -2068,10 +2217,11 @@ pub(crate) fn restore_group(
     }
 }
 
-/// Build one document from a saved tab, restoring its caret and scroll.
+/// Build one document from a saved tab, restoring its caret, scroll, and folds.
 /// Best-effort: an unreadable or missing file yields an empty document (logged,
 /// not fatal) so a moved-away note never stops the editor opening. `set_cursor`
-/// clamps the offset into the (possibly changed) file.
+/// clamps the offset into the (possibly changed) file, and a fold anchor that no
+/// longer lands on a heading is dropped once the document is first indexed.
 fn restore_doc(saved: &store::PaneSession) -> EditorPane {
     let mut doc = match saved.path.as_deref() {
         Some(p) => EditorPane::open(p).unwrap_or_else(|e| {
@@ -2082,6 +2232,7 @@ fn restore_doc(saved: &store::PaneSession) -> EditorPane {
     };
     doc.text.set_cursor(saved.cursor as usize, false);
     doc.scroll_y = saved.scroll_y.max(0);
+    doc.folds = Folds::from_lines(saved.folds.iter().map(|&l| l as usize));
     doc
 }
 
@@ -2399,6 +2550,219 @@ mod tests {
         assert!(
             !heading_marker_hidden(&pane, heading_start),
             "a live drag keeps the heading marker revealed"
+        );
+    }
+
+    /// The document the fold tests drive, with a section deep enough to nest.
+    const FOLDABLE: &str = "\
+# Guide
+intro
+## Setup
+install
+### Notes
+detail
+## Usage
+run
+";
+
+    fn fold_rect() -> Rect {
+        Rect {
+            x: 0,
+            y: 0,
+            w: 600,
+            h: 400,
+        }
+    }
+
+    /// The logical lines the pane's laid-out window actually drew.
+    fn drawn_lines(pane: &EditorPane) -> Vec<usize> {
+        let rope = pane.text.rope();
+        let mut seen: Vec<usize> = pane
+            .layout_cache
+            .as_ref()
+            .expect("a built window")
+            .lines()
+            .iter()
+            .map(|v| rope.byte_to_line(v.start))
+            .collect();
+        seen.dedup();
+        seen
+    }
+
+    #[test]
+    fn folding_a_section_removes_its_lines_and_its_height() {
+        // The whole feature, driven through the pane the app drives: fold, and the
+        // section's lines stop being laid out while the document gets shorter by
+        // exactly their height.
+        let fonts = Fonts::new(&markdown::all_sizes(FONT_SIZE)).expect("a default font");
+        let rect = fold_rect();
+        let mut pane = pane_of(FOLDABLE);
+        pane.ensure_layout(&fonts, rect);
+        let open_height = pane.content_height;
+        assert_eq!(drawn_lines(&pane), (0..9).collect::<Vec<_>>());
+
+        // Fold `## Setup` (line 2) via the chevron's entry point.
+        let ls = pane.text.rope().line_to_byte(2);
+        assert!(pane.toggle_fold_at(&fonts, rect, ls));
+        pane.ensure_layout(&fonts, rect);
+        assert_eq!(
+            drawn_lines(&pane),
+            vec![0, 1, 2, 6, 7, 8],
+            "the section's body and its nested heading are gone"
+        );
+        assert!(pane.content_height < open_height);
+
+        // Unfolding restores the document exactly.
+        assert!(pane.toggle_fold_at(&fonts, rect, ls));
+        pane.ensure_layout(&fonts, rect);
+        assert_eq!(drawn_lines(&pane), (0..9).collect::<Vec<_>>());
+        assert_eq!(pane.content_height, open_height);
+    }
+
+    #[test]
+    fn folding_lifts_a_caret_that_was_inside_the_section() {
+        // The caret must never park on text nobody can see, so closing the section
+        // under it moves it up to the heading that now hides it.
+        let fonts = Fonts::new(&markdown::all_sizes(FONT_SIZE)).expect("a default font");
+        let rect = fold_rect();
+        let mut pane = pane_of(FOLDABLE);
+        // Park the caret on `detail`, inside `## Setup`'s section.
+        let detail = pane.text.rope().line_to_byte(5);
+        pane.text.set_cursor(detail + 3, false);
+        pane.ensure_layout(&fonts, rect);
+
+        // Ctrl+period folds the section the caret sits in, which is `### Notes`.
+        assert!(pane.toggle_fold_at_cursor(&fonts, rect));
+        let line = pane.text.rope().byte_to_line(pane.text.cursor());
+        assert_eq!(line, 4, "the caret lands on the heading that hid it");
+
+        // Folding again from there closes `### Notes`' parent, and the caret walks
+        // up again rather than being left inside.
+        assert!(pane.toggle_fold_at(&fonts, rect, pane.text.rope().line_to_byte(2)));
+        let line = pane.text.rope().byte_to_line(pane.text.cursor());
+        assert_eq!(line, 2);
+    }
+
+    #[test]
+    fn arrowing_over_a_folded_heading_steps_across_the_whole_section() {
+        let fonts = Fonts::new(&markdown::all_sizes(FONT_SIZE)).expect("a default font");
+        let rect = fold_rect();
+        let mut pane = pane_of(FOLDABLE);
+        let ls = pane.text.rope().line_to_byte(2);
+        assert!(pane.toggle_fold_at(&fonts, rect, ls));
+
+        // At the end of the folded `## Setup` line, one step right lands on the
+        // first visible line past the section, not on its hidden first line.
+        let end = pane.text.rope().line_content_range(2).1;
+        pane.text.set_cursor(end, false);
+        pane.text.move_right(false);
+        pane.step_over_folds(true, false);
+        assert_eq!(pane.text.rope().byte_to_line(pane.text.cursor()), 6);
+
+        // And stepping back left returns to the folded heading's end, not into it.
+        pane.text.move_left(false);
+        pane.step_over_folds(false, false);
+        assert_eq!(pane.text.cursor(), end);
+    }
+
+    #[test]
+    fn a_fold_rides_its_heading_through_an_edit_above_it() {
+        // The anchor is a line number, so text inserted above has to move it. This
+        // drives the remap through `ensure_index`, where the app triggers it.
+        let fonts = Fonts::new(&markdown::all_sizes(FONT_SIZE)).expect("a default font");
+        let rect = fold_rect();
+        let mut pane = pane_of(FOLDABLE);
+        let ls = pane.text.rope().line_to_byte(2);
+        assert!(pane.toggle_fold_at(&fonts, rect, ls));
+        pane.ensure_layout(&fonts, rect);
+        assert_eq!(drawn_lines(&pane), vec![0, 1, 2, 6, 7, 8]);
+
+        // Type two fresh lines at the very top.
+        pane.text.set_cursor(0, false);
+        pane.text.insert_str("added\nlines\n");
+        pane.ensure_layout(&fonts, rect);
+        assert_eq!(
+            pane.folds.lines().collect::<Vec<_>>(),
+            vec![4],
+            "the anchor moved with its heading"
+        );
+        assert_eq!(
+            drawn_lines(&pane),
+            vec![0, 1, 2, 3, 4, 8, 9, 10],
+            "the same section is still the hidden one"
+        );
+    }
+
+    #[test]
+    fn deleting_a_folded_heading_drops_its_fold() {
+        let fonts = Fonts::new(&markdown::all_sizes(FONT_SIZE)).expect("a default font");
+        let rect = fold_rect();
+        let mut pane = pane_of(FOLDABLE);
+        let ls = pane.text.rope().line_to_byte(2);
+        assert!(pane.toggle_fold_at(&fonts, rect, ls));
+        pane.ensure_layout(&fonts, rect);
+
+        // Remove the `## ` so line 2 is ordinary prose; the section unfolds.
+        pane.text.set_cursor(ls, false);
+        for _ in 0..3 {
+            pane.text.delete_forward();
+        }
+        pane.ensure_layout(&fonts, rect);
+        assert!(pane.folds.is_empty(), "an anchor off a heading is dropped");
+        assert_eq!(drawn_lines(&pane), (0..9).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn unfold_all_opens_every_section() {
+        let fonts = Fonts::new(&markdown::all_sizes(FONT_SIZE)).expect("a default font");
+        let rect = fold_rect();
+        let mut pane = pane_of(FOLDABLE);
+        for line in [0, 2, 4] {
+            let ls = pane.text.rope().line_to_byte(line);
+            pane.toggle_fold_at(&fonts, rect, ls);
+        }
+        pane.ensure_layout(&fonts, rect);
+        assert_eq!(drawn_lines(&pane), vec![0], "everything is under `# Guide`");
+        assert!(pane.unfold_all());
+        pane.ensure_layout(&fonts, rect);
+        assert_eq!(drawn_lines(&pane), (0..9).collect::<Vec<_>>());
+        assert!(!pane.unfold_all(), "nothing left to unfold");
+    }
+
+    #[test]
+    fn folds_survive_a_session_round_trip() {
+        // What the state file carries, driven through the same conversion the app
+        // saves and restores with.
+        let fonts = Fonts::new(&markdown::all_sizes(FONT_SIZE)).expect("a default font");
+        let rect = fold_rect();
+        let path = tmp_note("folds-session", FOLDABLE);
+        let mut group = restore_group(
+            &[store::PaneSession {
+                path: Some(path.clone()),
+                cursor: 0,
+                scroll_y: 0,
+                folds: Vec::new(),
+            }],
+            0,
+            None,
+        );
+        let ls = group.active_doc_mut().text.rope().line_to_byte(2);
+        assert!(group.active_doc_mut().toggle_fold_at(&fonts, rect, ls));
+
+        let saved = group.to_session();
+        assert_eq!(saved.tabs[0].folds, vec![2], "the fold is persisted");
+
+        // Reopening the same file restores it, and it hides the same lines.
+        let mut reopened = restore_group(&saved.tabs, saved.active as usize, None);
+        assert_eq!(
+            reopened.active_doc_mut().folds.lines().collect::<Vec<_>>(),
+            vec![2]
+        );
+        reopened.active_doc_mut().set_scale(Scale::ONE, FONT_SIZE);
+        reopened.active_doc_mut().ensure_layout(&fonts, rect);
+        assert_eq!(
+            drawn_lines(reopened.active_doc_mut()),
+            vec![0, 1, 2, 6, 7, 8]
         );
     }
 

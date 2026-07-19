@@ -1715,6 +1715,25 @@ impl EditorPane {
         self.drag = None;
     }
 
+    /// Let go of a drag-selection because the button came up, reporting whether one
+    /// was in flight.
+    ///
+    /// A sweep that reached a heading's text start takes the collapsed `#` marker
+    /// with it. That only applies to a sweep by character: the marker is zero-width
+    /// once collapsed, so a press at the line's left edge lands past it and there is
+    /// no way to aim before it, and pulling the selection back is the only way to
+    /// express "from the start of this heading". A double or triple click carries no
+    /// such intent, having asked for a word or a line, so it keeps the marker out.
+    pub(crate) fn release_drag(&mut self) -> bool {
+        let Some(drag) = self.drag.take() else {
+            return false;
+        };
+        if drag.grain == DragGrain::Char {
+            self.text.include_heading_marker();
+        }
+        true
+    }
+
     /// The destination of the openable link under a window position, if its line
     /// is rendered (markup collapsed) and the scheme is one the browser opens. An
     /// inline `[text](dest)` and a bare URL both resolve here, since a bare URL is
@@ -2551,6 +2570,57 @@ mod tests {
             !heading_marker_hidden(&pane, heading_start),
             "a live drag keeps the heading marker revealed"
         );
+    }
+
+    #[test]
+    fn double_clicking_a_headings_first_word_leaves_the_marker_out() {
+        // The reported bug: a double-click selected the word, then on release the
+        // selection jumped to swallow the `##` too. The marker rule exists for a
+        // character sweep, which has no other way to reach past a collapsed marker;
+        // a double-click asked for a word and gets one.
+        let mut pane = pane_of("## Some heading\nbody\n");
+        let word = pane.text.select_word_at(3);
+        pane.drag = Some(DragSelect::text(word, DragGrain::Word));
+        assert!(pane.release_drag());
+        assert_eq!(
+            pane.text.selection(),
+            Some((3, 7)),
+            "the word alone, `Some`, with the `## ` left out"
+        );
+    }
+
+    #[test]
+    fn sweeping_from_a_headings_text_start_still_takes_the_marker() {
+        // The behavior the rule is for, unchanged: a press at the line's left edge
+        // lands past the zero-width collapsed marker, so pulling the selection back
+        // over it on release is the only way to select a heading with its level.
+        let mut pane = pane_of("## Some heading\nbody\n");
+        pane.text.set_cursor(3, false);
+        pane.drag = Some(DragSelect::text((3, 3), DragGrain::Char));
+        pane.text.set_cursor(7, true);
+        assert!(pane.release_drag());
+        assert_eq!(
+            pane.text.selection(),
+            Some((0, 7)),
+            "the sweep reaches back over `## `"
+        );
+    }
+
+    #[test]
+    fn triple_clicking_a_heading_takes_the_whole_line_either_way() {
+        // A line-grain press already starts at the line's first byte, so the marker
+        // rule has nothing to add and the grain check changes nothing here.
+        let mut pane = pane_of("## Some heading\nbody\n");
+        let line = pane.text.select_line_at(3);
+        pane.drag = Some(DragSelect::text(line, DragGrain::Line));
+        assert!(pane.release_drag());
+        assert_eq!(pane.text.selection(), Some((0, 15)));
+    }
+
+    #[test]
+    fn releasing_without_a_drag_reports_nothing_happened() {
+        let mut pane = pane_of("## Some heading\nbody\n");
+        assert!(!pane.release_drag(), "no drag was in flight");
     }
 
     /// The document the fold tests drive, with a section deep enough to nest.

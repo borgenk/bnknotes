@@ -792,13 +792,9 @@ impl State {
                         // moved finally switches vault.
                         self.release_vault();
                         let i = self.active_editor();
-                        let was_selecting = self.editors[i].dragging();
-                        self.editors[i].end_drag();
+                        let was_selecting = self.editors[i].release_drag();
                         self.editors[i].disarm_autoscroll();
                         if was_selecting {
-                            // Selecting a heading from its text start takes the `#`
-                            // marker with it.
-                            self.editors[i].text.include_heading_marker();
                             // The drag is over: image sources under the selection
                             // ends were held collapsed while dragging and can now
                             // expand, so force a redraw.

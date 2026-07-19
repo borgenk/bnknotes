@@ -325,22 +325,31 @@ pub fn enclosing_heading(index: &LineIndex, line: usize) -> Option<usize> {
         .find(|&l| index.heading_at(l).is_some())
 }
 
-/// Whether the heading of `level` on `line` owns at least one line, and so has a
-/// section to collapse. False when it is the last line, or when the line below is
-/// already a sibling or shallower heading.
+/// The most bytes a heading marker can occupy: six `#` and the space after them.
+const MARKER_PEEK: usize = 7;
+
+/// Whether a heading of `level` owns at least one line, and so has a section to
+/// collapse, given the byte offset the line below it starts at. False when that
+/// line is already a sibling or a shallower heading. The caller only asks about a
+/// heading that has a line below it at all.
 ///
-/// A heading closes any open code fence state by definition (a `#` inside a fence
-/// is code, not a heading), so the line below can be classified on its own without
-/// carrying parser state into the question.
-pub fn owns_section(rope: &Rope, line: usize, level: u8) -> bool {
-    let next = line + 1;
-    if next >= rope.len_lines() {
-        return false;
-    }
-    let (start, end) = rope.line_content_range(next);
-    let text = rope.slice(start..end).as_cow();
+/// This runs for every heading of every layout build, so it reads only the bytes a
+/// marker can occupy rather than materializing the line: the answer turns on the
+/// leading `#` run and the single byte after it. The caller already knows where
+/// that run begins (a logical line's end plus its newline), so the question costs
+/// no tree descent either. The window is cut at the first newline in it, since a
+/// short line like `#` would otherwise read as running into the line below and
+/// come out unclassified.
+///
+/// A heading closes any open code fence by definition (a `#` inside a fence is
+/// code, not a heading), so the line below classifies on its own without carrying
+/// parser state into the question.
+pub fn owns_section(rope: &Rope, next_start: usize, level: u8) -> bool {
+    let end = (next_start + MARKER_PEEK).min(rope.len());
+    let window = rope.slice(next_start..end).as_cow();
+    let head = window.split('\n').next().unwrap_or_default();
     !matches!(
-        crate::markdown::style_of(&text),
+        crate::markdown::style_of(head),
         crate::markdown::LineStyle::Heading(l) if l <= level
     )
 }
@@ -427,8 +436,44 @@ run
         // With no span there is no chevron to draw and nothing to click.
         assert!(!map.is_folded(1));
         let rope = Rope::from_str(text);
-        assert!(!owns_section(&rope, 1, 2));
-        assert!(owns_section(&rope, 2, 2));
+        // `owns_section` is asked about the line below, by its byte offset.
+        assert!(!owns_section(&rope, rope.line_to_byte(2), 2));
+        assert!(owns_section(&rope, rope.line_to_byte(3), 2));
+    }
+
+    #[test]
+    fn a_bare_hash_below_a_heading_is_read_as_the_heading_it_is() {
+        // `owns_section` peeks at a fixed window of bytes rather than the line, so
+        // it has to stop at the newline: a lone `#` is a level-1 heading, and
+        // reading on into the line below would leave it unclassified and wrongly
+        // report a section to fold.
+        let rope = Rope::from_str("# Top\n#\nbody\n");
+        assert!(
+            !owns_section(&rope, rope.line_to_byte(1), 1),
+            "the `#` below is a sibling, so `# Top` owns nothing"
+        );
+        // A bare marker one level deeper is nested, so the section runs on through
+        // it. Same short-line window, opposite answer.
+        let deeper = Rope::from_str("# Top\n##\nbody\n");
+        assert!(
+            owns_section(&deeper, deeper.line_to_byte(1), 1),
+            "a bare `##` nests under the `#` rather than ending it"
+        );
+    }
+
+    #[test]
+    fn a_heading_longer_than_the_peek_window_still_classifies() {
+        // The window is cut short of the text, which is fine: only the marker run
+        // and the byte after it decide the level.
+        let rope = Rope::from_str("# Top\n###### a very long heading indeed\nbody\n");
+        assert!(
+            owns_section(&rope, rope.line_to_byte(1), 1),
+            "an H6 below an H1 is nested, so the H1 owns it"
+        );
+        assert!(
+            !owns_section(&rope, rope.line_to_byte(1), 6),
+            "an H6 below an H6 is a sibling"
+        );
     }
 
     #[test]

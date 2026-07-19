@@ -2174,8 +2174,11 @@ fn lay_line(
     // A heading offers a fold only where it owns a section; the marker rides its
     // first visual row, so a wrapped heading shows one chevron rather than one per
     // row.
-    let fold = heading.filter(|&level| crate::fold::owns_section(ctx.rope, line_no, level));
-    let fold = fold.map(|_| ctx.folds.is_folded(line_no));
+    // The line below starts just past this one's newline, which the caller already
+    // resolved, so asking whether the heading owns a section costs no tree descent.
+    let fold = heading
+        .filter(|&level| has_newline && crate::fold::owns_section(ctx.rope, le + 1, level))
+        .map(|_| ctx.folds.is_folded(line_no));
     let task = class.task();
     let rule = class.rule();
     let block_indent = class.block_indent(ctx.fonts, &line);

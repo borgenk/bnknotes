@@ -18,12 +18,8 @@ use crate::platform::protocol::{
 };
 use crate::platform::scroll::{self, Scrollbar};
 use crate::platform::wire::{Arg, Reader};
+use crate::text::SOFT_TAB;
 use crate::theme::{DRAG_THRESHOLD, SCROLL_MIN_THUMB, TREE_PAD};
-
-/// What the Tab key inserts: spaces (a "soft tab"), not a literal `'\t'`. This
-/// keeps the buffer free of tab characters and spares the renderer any tab-stop
-/// logic. Rendering literal tabs found in a *loaded* file is a separate concern.
-const SOFT_TAB: &str = "    ";
 
 /// How long the caret stays shown, then hidden, while idle. Activity resets it
 /// to shown, so it never blinks out mid-keystroke.
@@ -105,16 +101,20 @@ fn apply_editor_action(
         // item's text (no bullet), so a wrapped thought stays part of the item.
         KeyAction::Enter if extend && ed.text.cursor_on_list_item() => ed.text.list_continuation(),
         KeyAction::Enter => ed.text.enter(),
-        // In a table, Tab moves to the next cell and Shift+Tab to the previous. On a
-        // list item, Tab nests it one level deeper and Shift+Tab one shallower.
-        // Anywhere else, Tab inserts a soft tab and Shift+Tab is a no-op.
+        // In a table, Tab moves to the next cell and Shift+Tab to the previous.
+        // Over a selection spanning lines, Tab shifts the whole block one unit
+        // right and Shift+Tab one left. On a list item, Tab nests it one level
+        // deeper and Shift+Tab one shallower. Anywhere else, Tab inserts a soft
+        // tab and Shift+Tab outdents the line the cursor is on.
         KeyAction::Tab => {
             if ed.text.cursor_in_table() {
                 ed.text.tab_cell(!extend)
+            } else if ed.text.selection_spans_lines() {
+                ed.text.indent_block(extend)
             } else if ed.text.cursor_on_list_item() {
                 ed.text.nest_list_item(extend)
             } else if extend {
-                false
+                ed.text.indent_block(true)
             } else {
                 ed.text.insert_str(SOFT_TAB);
                 true

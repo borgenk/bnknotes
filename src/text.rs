@@ -35,6 +35,11 @@ use crate::table;
 /// Cap on undo history, so a long session cannot grow the stacks without bound.
 const UNDO_CAP: usize = 500;
 
+/// What the Tab key inserts: spaces (a "soft tab"), not a literal `'\t'`. This
+/// keeps the buffer free of tab characters and spares the renderer any tab-stop
+/// logic. Rendering literal tabs found in a *loaded* file is a separate concern.
+pub const SOFT_TAB: &str = "    ";
+
 /// The kind of edit a checkpoint groups. Consecutive edits of the same non-`None`
 /// kind merge into one undo step.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -461,6 +466,89 @@ impl TextBuffer {
         self.anchor = None;
         self.touch();
         true
+    }
+
+    /// Whether the selection covers more than one line, so Tab shifts the whole
+    /// block instead of replacing the selection with a soft tab.
+    pub fn selection_spans_lines(&self) -> bool {
+        self.selection().is_some_and(|(start, end)| {
+            self.text.byte_to_line(start) != self.text.byte_to_line(end)
+        })
+    }
+
+    /// Indent every line of the cursor's block by one unit, or `outdent` them by
+    /// one. The cursor and selection stay over the same text, so holding Tab keeps
+    /// shifting the same block. Blank lines are left blank; outdenting a line with
+    /// less than a full unit of indentation takes what is there. Returns whether
+    /// the buffer changed.
+    pub fn indent_block(&mut self, outdent: bool) -> bool {
+        let (first, last) = self.block_lines();
+        let unit = self.block_indent_unit(first, last);
+        let mut changed = false;
+        // Bottom-up, so every line start above the one being edited stays valid.
+        // Each line's change also moves the cursor and anchor when they sit after
+        // it, which by then includes the shifts the lines below already applied.
+        for line in (first..=last).rev() {
+            let (ls, le) = self.text.line_content_range(line);
+            let delta = if outdent {
+                let indent = markdown::leading_indent(&self.text.slice(ls..le).as_cow());
+                -(indent.min(unit) as i64)
+            } else if ls == le {
+                0
+            } else {
+                unit as i64
+            };
+            if delta == 0 {
+                continue;
+            }
+            if !changed {
+                self.checkpoint(Coalesce::None);
+                changed = true;
+            }
+            if delta > 0 {
+                self.text.insert(ls, &" ".repeat(delta as usize));
+            } else {
+                self.text.remove(ls..ls + (-delta) as usize);
+            }
+            self.cursor = shift_past(self.cursor, ls, delta);
+            self.anchor = self.anchor.map(|a| shift_past(a, ls, delta));
+        }
+        if changed {
+            self.touch();
+        }
+        changed
+    }
+
+    /// The inclusive line range Tab shifts: every line the selection touches, or
+    /// the cursor's own line when there is no selection.
+    fn block_lines(&self) -> (usize, usize) {
+        let Some((start, end)) = self.selection() else {
+            let line = self.text.byte_to_line(self.cursor);
+            return (line, line);
+        };
+        let first = self.text.byte_to_line(start);
+        let mut last = self.text.byte_to_line(end);
+        // A selection ending at column 0 stops on the line above: it reached that
+        // line's start without covering any of it.
+        if last > first && end == self.text.line_to_byte(last) {
+            last -= 1;
+        }
+        (first, last)
+    }
+
+    /// The indentation unit for the block of lines `first..=last`: a block holding
+    /// a list item shifts by one nesting level, so Tab moves it exactly one level
+    /// deeper; anything else shifts by a soft tab.
+    fn block_indent_unit(&self, first: usize, last: usize) -> usize {
+        let nests = (first..=last).any(|line| {
+            let (ls, le) = self.text.line_content_range(line);
+            is_list(&self.text.slice(ls..le).as_cow())
+        });
+        if nests {
+            markdown::LIST_INDENT_SPACES
+        } else {
+            SOFT_TAB.len()
+        }
     }
 
     /// The nesting depth of the nearest list item above line `line_idx`, skipping
@@ -1136,8 +1224,19 @@ impl TextBuffer {
     }
 }
 
-/// Whether `line` is a list item (bullet, ordered, or task, perhaps indented),
-/// the lines Tab nests and `enter` continues.
+/// Move a position along with a `delta`-byte indentation change made at line
+/// start `ls`. Positions before the line hold still; one inside a run that was
+/// removed lands at the line start rather than in the middle of a cluster.
+fn shift_past(pos: usize, ls: usize, delta: i64) -> usize {
+    if pos < ls {
+        pos
+    } else if delta >= 0 {
+        pos + delta as usize
+    } else {
+        pos.saturating_sub((-delta) as usize).max(ls)
+    }
+}
+
 /// The leading whitespace of `line` (spaces and tabs), capped at `col` bytes,
 /// for inheriting a line's indent onto the next line on Enter. Capping at the
 /// cursor keeps a break inside the indent from over-indenting, and a break at
@@ -1150,6 +1249,8 @@ fn inherited_indent(line: &str, col: usize) -> &str {
     &line[..ws.min(col)]
 }
 
+/// Whether `line` is a list item (bullet, ordered, or task, perhaps indented),
+/// the lines Tab nests and `enter` continues.
 fn is_list(line: &str) -> bool {
     matches!(
         markdown::style_of(line),
@@ -2531,6 +2632,142 @@ mod tests {
         // A non-list line is not Tab-nestable.
         b.insert_str("\n\nplain");
         assert!(!b.cursor_on_list_item());
+    }
+
+    #[test]
+    fn tab_over_a_multi_line_selection_shifts_every_line_it_touches() {
+        let mut b = TextBuffer::new();
+        b.insert_str("- a\n- b\n- c");
+        b.set_selection(2, 6); // inside "a" through inside "b", clear of "c"
+        assert!(b.selection_spans_lines());
+        assert!(b.indent_block(false));
+        assert_eq!(b.text(), "  - a\n  - b\n- c");
+        assert!(b.indent_block(true));
+        assert_eq!(b.text(), "- a\n- b\n- c");
+    }
+
+    #[test]
+    fn block_indent_uses_a_nesting_level_for_lists_and_a_soft_tab_elsewhere() {
+        let mut b = TextBuffer::new();
+        b.insert_str("- a\n  continued");
+        b.set_selection(0, b.text().len());
+        b.indent_block(false);
+        assert_eq!(
+            b.text(),
+            "  - a\n    continued",
+            "a block holding a list item moves exactly one nesting level"
+        );
+
+        let mut b = TextBuffer::new();
+        b.insert_str("one\ntwo");
+        b.set_selection(0, b.text().len());
+        b.indent_block(false);
+        assert_eq!(b.text(), "    one\n    two");
+    }
+
+    #[test]
+    fn block_indent_keeps_the_selection_over_the_same_text() {
+        let mut b = TextBuffer::new();
+        b.insert_str("one\ntwo");
+        b.set_selection(1, 5); // "ne\nt"
+        b.indent_block(false);
+        assert_eq!(b.text(), "    one\n    two");
+        assert_eq!(b.selected_text().as_deref(), Some("ne\n    t"));
+        // The selection still spans lines, so a second press shifts the same block.
+        assert!(b.indent_block(false));
+        assert_eq!(b.text(), "        one\n        two");
+    }
+
+    #[test]
+    fn block_indent_stops_above_a_selection_ending_at_column_zero() {
+        let mut b = TextBuffer::new();
+        b.insert_str("one\ntwo\nthree");
+        b.set_selection(0, 8); // through the newline, onto the start of "three"
+        b.indent_block(false);
+        assert_eq!(b.text(), "    one\n    two\nthree");
+    }
+
+    #[test]
+    fn block_indent_leaves_blank_lines_blank_and_outdents_a_partial_indent() {
+        let mut b = TextBuffer::new();
+        b.insert_str("one\n\ntwo");
+        b.set_selection(0, b.text().len());
+        b.indent_block(false);
+        assert_eq!(
+            b.text(),
+            "    one\n\n    two",
+            "no trailing space on the gap"
+        );
+        // Two of the four spaces are removed by hand, so the outdent takes what is
+        // left of that line's indent and a full unit from the other.
+        b.text.remove(0..2);
+        b.set_selection(0, b.text().len());
+        assert!(b.indent_block(true));
+        assert_eq!(b.text(), "one\n\ntwo");
+        // Nothing left to remove: no change, and no undo step for the no-op.
+        let version = b.version;
+        assert!(!b.indent_block(true));
+        assert_eq!(b.version, version);
+    }
+
+    #[test]
+    fn block_indent_is_one_undo_step_and_leaves_no_cursor_mid_indent() {
+        let mut b = TextBuffer::new();
+        b.insert_str("one\ntwo");
+        b.set_selection(0, b.text().len());
+        b.indent_block(false);
+        b.set_selection(6, 9); // both ends inside the second line's new indent
+        assert!(b.indent_block(true));
+        assert_eq!(b.text(), "one\ntwo");
+        assert_eq!(b.cursor(), 4, "clamped to the line start, not into 'two'");
+        // The whole block came back in a single undo.
+        assert!(b.undo());
+        assert_eq!(b.text(), "    one\n    two");
+    }
+
+    #[test]
+    fn a_selection_within_one_line_is_not_a_block() {
+        let mut b = TextBuffer::new();
+        b.insert_str("one\ntwo");
+        b.set_selection(4, 6);
+        assert!(!b.selection_spans_lines());
+        // A collapsed selection is a bare cursor, which spans no lines either.
+        b.set_selection(4, 4);
+        assert!(!b.selection_spans_lines());
+    }
+
+    #[test]
+    fn shift_tab_outdents_the_cursor_line_with_no_selection() {
+        let mut b = TextBuffer::new();
+        b.insert_str("      indented"); // six spaces, so one unit is left over
+        assert!(b.indent_block(true));
+        assert_eq!(
+            b.text(),
+            "  indented",
+            "one soft tab off, not the whole run"
+        );
+        assert_eq!(
+            b.cursor(),
+            "  indented".len(),
+            "the cursor rides the outdent"
+        );
+        assert_eq!(b.selection(), None, "outdenting a line selects nothing");
+        // The stub of an indent goes on the next press, then there is nothing left.
+        assert!(b.indent_block(true));
+        assert_eq!(b.text(), "indented");
+        let version = b.version;
+        assert!(!b.indent_block(true));
+        assert_eq!(b.version, version, "a no-op outdent is not an undo step");
+    }
+
+    #[test]
+    fn outdenting_a_line_clamps_a_cursor_sitting_in_its_indent() {
+        let mut b = TextBuffer::new();
+        b.insert_str("    indented");
+        b.set_cursor(2, false); // between the indent's spaces
+        assert!(b.indent_block(true));
+        assert_eq!(b.text(), "indented");
+        assert_eq!(b.cursor(), 0, "clamped to the line start");
     }
 
     #[test]

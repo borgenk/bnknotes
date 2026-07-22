@@ -943,13 +943,15 @@ impl TextBuffer {
         }
     }
 
-    /// Pull the low end of a mouse-driven selection back over a heading's
-    /// collapsed `#` marker, so selecting a heading from the start of its visible
-    /// text takes the marker with it. Hit-testing lands a click on a heading's
-    /// text start (the marker is zero-width when collapsed), so without this a
-    /// drag from there would select the words but not the `#`. A no-op unless a
-    /// selection's low end sits exactly at a heading line's first content byte.
-    pub fn include_heading_marker(&mut self) {
+    /// Pull the low end of a mouse-driven selection back over a block marker, so
+    /// selecting an item from the start of its visible text takes the marker with
+    /// it. A heading's `#` is zero-width when collapsed, so a far-left click lands
+    /// at its text start with no way to aim before the marker; a bullet or task
+    /// marker is a disc or checkbox in the gutter, so a drag that starts just past
+    /// it (or over it) should still grab the whole `- `/`- [ ] `. A no-op unless a
+    /// selection's low end sits within its line's marker (past the start, up to the
+    /// marker's end) on a heading, bullet, or task line.
+    pub fn include_block_marker(&mut self) {
         let Some(anchor) = self.anchor else {
             return;
         };
@@ -959,11 +961,16 @@ impl TextBuffer {
         let lo = anchor.min(self.cursor);
         let line = self.text.byte_to_line(lo);
         let (ls, le) = self.text.line_content_range(line);
-        if lo == ls {
-            return;
-        }
         let (style, marker_len) = markdown::classify(&self.text.byte_slice(ls..le));
-        if !matches!(style, markdown::LineStyle::Heading(_)) || lo != ls + marker_len {
+        let has_marker = matches!(
+            style,
+            markdown::LineStyle::Heading(_)
+                | markdown::LineStyle::Bullet
+                | markdown::LineStyle::Task { .. }
+        );
+        // Grab only when the low end is inside the marker (past the start, at or
+        // before its end), not when it is out in the words.
+        if !has_marker || lo <= ls || lo > ls + marker_len {
             return;
         }
         if self.cursor < anchor {
@@ -2180,7 +2187,7 @@ mod tests {
         b.set_cursor(2, false);
         b.set_cursor(7, true);
         assert_eq!(b.selection(), Some((2, 7)));
-        b.include_heading_marker();
+        b.include_block_marker();
         assert_eq!(b.selection(), Some((0, 7)));
         assert_eq!(b.selected_text().as_deref(), Some("# Title"));
     }
@@ -2193,7 +2200,7 @@ mod tests {
         b.set_cursor(7, false);
         b.set_cursor(2, true);
         assert_eq!(b.selection(), Some((2, 7)));
-        b.include_heading_marker();
+        b.include_block_marker();
         assert_eq!(b.selection(), Some((0, 7)));
         // The cursor (the low end here) moved onto the line start.
         assert_eq!(b.cursor, 0);
@@ -2206,7 +2213,7 @@ mod tests {
         b.insert_str("## Head");
         b.set_cursor(3, false);
         b.set_cursor(7, true);
-        b.include_heading_marker();
+        b.include_block_marker();
         assert_eq!(b.selection(), Some((0, 7)));
         assert_eq!(b.selected_text().as_deref(), Some("## Head"));
     }
@@ -2219,8 +2226,55 @@ mod tests {
         // start, so the marker stays unselected.
         b.set_cursor(4, false);
         b.set_cursor(7, true);
-        b.include_heading_marker();
+        b.include_block_marker();
         assert_eq!(b.selection(), Some((4, 7)));
+    }
+
+    #[test]
+    fn selecting_a_bullet_from_its_text_start_takes_the_marker() {
+        // "- item": marker is "- " (2 bytes), content "item" at 2..6.
+        let mut b = TextBuffer::new();
+        b.insert_str("- item");
+        b.set_cursor(2, false);
+        b.set_cursor(6, true);
+        b.include_block_marker();
+        assert_eq!(b.selection(), Some((0, 6)));
+        assert_eq!(b.selected_text().as_deref(), Some("- item"));
+    }
+
+    #[test]
+    fn selecting_a_bullet_from_between_dash_and_space_takes_the_marker() {
+        // Low end at byte 1, between the "-" and its space (the item's second
+        // position): still inside the marker, so it pulls the dash in.
+        let mut b = TextBuffer::new();
+        b.insert_str("- item");
+        b.set_cursor(1, false);
+        b.set_cursor(6, true);
+        b.include_block_marker();
+        assert_eq!(b.selection(), Some((0, 6)));
+    }
+
+    #[test]
+    fn selecting_a_task_item_from_its_text_start_takes_the_whole_marker() {
+        // "- [ ] do": marker is "- [ ] " (6 bytes), content "do" at 6..8.
+        let mut b = TextBuffer::new();
+        b.insert_str("- [ ] do");
+        b.set_cursor(6, false);
+        b.set_cursor(8, true);
+        b.include_block_marker();
+        assert_eq!(b.selection(), Some((0, 8)));
+        assert_eq!(b.selected_text().as_deref(), Some("- [ ] do"));
+    }
+
+    #[test]
+    fn selecting_a_bullet_from_mid_text_keeps_the_marker_out() {
+        let mut b = TextBuffer::new();
+        b.insert_str("- item");
+        // Low end at byte 3, inside "item" past the marker: the marker stays out.
+        b.set_cursor(3, false);
+        b.set_cursor(6, true);
+        b.include_block_marker();
+        assert_eq!(b.selection(), Some((3, 6)));
     }
 
     #[test]
@@ -2230,13 +2284,13 @@ mod tests {
         b.insert_str("plain line");
         b.set_cursor(0, false);
         b.set_cursor(5, true);
-        b.include_heading_marker();
+        b.include_block_marker();
         assert_eq!(b.selection(), Some((0, 5)));
         // A bare cursor (no selection) is untouched.
         let mut c = TextBuffer::new();
         c.insert_str("# Title");
         c.set_cursor(2, false);
-        c.include_heading_marker();
+        c.include_block_marker();
         assert_eq!(c.selection(), None);
         assert_eq!(c.cursor, 2);
     }

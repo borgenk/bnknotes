@@ -43,9 +43,10 @@
 //! visual line past the first is inset by the marker's width (`VisualLine::indent`)
 //! so the column aligns. The raw marker gives way to a [`Gutter`] decoration,
 //! always the same width as the source marker so the text never shifts: a bullet
-//! point `•` for a list and a drawn checkbox for a task item stand in on every
-//! line, the cursor's own included, while a quote's bar yields to its editable
-//! `>` on the cursor's own line.
+//! point `•` for a list and a drawn checkbox for a task item stand in while you
+//! edit the label, yielding to the raw marker only where the caret or selection
+//! reaches it ([`active_reveals_marker`]), while a quote's bar yields to its
+//! editable `>` on the cursor's own line.
 //!
 //! Fenced code blocks are the one construct whose classification crosses line
 //! boundaries: a ``` line opens a block and a later ``` closes it, and every line
@@ -373,14 +374,16 @@ pub struct ImageUi {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Gutter {
     /// No decoration: body and heading lines, ordered items (their number stays
-    /// put), and any list or quote line the cursor is currently on.
+    /// put), a quote line the cursor is on, and a bullet or task line whose caret
+    /// or selection has reached its marker (so the raw marker shows for editing).
     None,
-    /// Paint a filled disc in place of a `-`/`+`/`*` marker's glyph.
+    /// Paint a filled disc in place of a `-`/`+`/`*` marker's glyph. Gives way to
+    /// the raw marker (`Gutter::None`) once the caret or selection reaches it.
     Bullet,
     /// Draw a checkbox (built from fills, no glyph dependency) in place of a
-    /// task item's `- [ ]`/`- [x]` marker, once the cursor leaves the line; on
-    /// the cursor's own line the raw marker shows for editing instead. The box
-    /// geometry is [`Layout::checkbox_rect`], shared with click hit-testing.
+    /// task item's `- [ ]`/`- [x]` marker. Gives way to the raw marker for editing
+    /// once the caret or selection reaches it (see [`active_reveals_marker`]). The
+    /// box geometry is [`Layout::checkbox_rect`], shared with click hit-testing.
     Checkbox { checked: bool },
     /// Draw a blockquote bar down the gutter. `marker` is true on the first line,
     /// where the bar stands in for the `>` marker (whose glyphs are not drawn),
@@ -2038,6 +2041,36 @@ fn classify_line(
     }
 }
 
+/// Whether `active` reaches a bullet or task line's block marker, the finer
+/// live-preview test those lists use for revealing their raw `- `/`- [ ] `. A
+/// heading reveals its `#` across the whole line, but a list keeps its disc or
+/// checkbox while you edit the label and gives way to the raw marker only where
+/// the caret or selection actually touches it: a bare caret within the marker's
+/// span (its first positions), or a selection overlapping its bytes. `marker_len`
+/// is the marker's byte length ([`LineClass::block_marker`]), `ls` the line start.
+/// A `dragging` selection holds every marker collapsed so the decorations stay put
+/// under the pointer, giving way once the drag settles.
+pub(crate) fn active_reveals_marker(
+    active: (usize, usize),
+    ls: usize,
+    marker_len: usize,
+    dragging: bool,
+) -> bool {
+    if marker_len == 0 || dragging {
+        return false;
+    }
+    let (a, b) = active;
+    let marker_end = ls + marker_len;
+    if a == b {
+        // A bare caret reveals the marker while it sits within the marker's span,
+        // before the words, so the marker itself is editable.
+        (ls..marker_end).contains(&a)
+    } else {
+        // A selection reveals the marker while it overlaps the marker's bytes.
+        a < marker_end && b > ls
+    }
+}
+
 /// Lay out one logical line `[ls, le)` starting at content-space top `box_top`,
 /// appending its visual line(s) to `out` and returning the height it added (the
 /// amount to advance `box_top` before the next line). `fence` and `list_depth` are
@@ -2206,22 +2239,32 @@ fn lay_line(
         &mut pool.segments,
     );
     let last = pool.segments.len() - 1;
+    // A bullet keeps its dot and a task its checkbox while you edit the label, so a
+    // list stays a list. The decoration gives way to the raw marker only where the
+    // caret or selection reaches the marker (its first positions), so the `- `/`- [ ]`
+    // is itself editable and a multi-item selection can take the markers with it.
+    let marker_revealed =
+        matches!(
+            style,
+            markdown::LineStyle::Bullet | markdown::LineStyle::Task { .. }
+        ) && active_reveals_marker(ctx.active, ls, class.block_marker, ctx.image_ui.dragging);
     for k in 0..pool.segments.len() {
         let (start, end) = pool.segments[k];
         // Every segment carries the shared left inset (`seg_pad`); wrapped
         // continuations add the marker's width on top so their text hangs under the
         // first line's text.
         let indent = seg_pad + if k == 0 { 0 } else { block_indent };
-        // A bullet shows its dot even on the cursor's own line, so a list stays a
-        // list while you edit it. A quote reveals its raw `> ` for editing, drawing
-        // the bar only once the cursor leaves.
+        // A quote reveals its raw `> ` for editing, drawing the bar only once the
+        // cursor leaves; a bullet or task gives way to the raw marker only when the
+        // caret reaches it (`marker_revealed`), otherwise it keeps its decoration.
         let gutter = match style {
-            markdown::LineStyle::Bullet if k == 0 => Gutter::Bullet,
-            // A task item shows its checkbox even on the cursor's own line, the way
-            // a bullet keeps its dot, so the box never flips back to a raw `- [ ]`
-            // while you edit the label. A click on the box toggles it; a click
-            // elsewhere on the line places the caret.
-            markdown::LineStyle::Task { checked } if k == 0 => Gutter::Checkbox { checked },
+            markdown::LineStyle::Bullet if k == 0 && !marker_revealed => Gutter::Bullet,
+            // A click on the box toggles it; a click elsewhere on the line places
+            // the caret. The box gives way to the raw `- [ ]` on the same reveal a
+            // bullet's dot does, so the whole marker is editable.
+            markdown::LineStyle::Task { checked } if k == 0 && !marker_revealed => {
+                Gutter::Checkbox { checked }
+            }
             markdown::LineStyle::Quote if !revealed => Gutter::QuoteBar { marker: k == 0 },
             _ => Gutter::None,
         };
@@ -4678,6 +4721,146 @@ mod tests {
         assert_eq!(hidden.text_height(), shown.text_height());
     }
 
+    // --- List marker reveal -----------------------------------------------
+
+    fn gutter_of(l: &Layout, line: usize) -> Gutter {
+        l.lines()[line].gutter
+    }
+
+    /// Build at unity scale with a selection drag in flight, so list markers stay
+    /// collapsed until the drag settles (the `image_ui.dragging` gate).
+    fn build_dragging(f: &Fonts, r: &Rope, active: (usize, usize)) -> Layout {
+        let images = ImageStore::new(None);
+        let ctx = LayoutCtx::new(
+            f,
+            r,
+            1_000_000,
+            BODY,
+            active,
+            &images,
+            ImageUi {
+                dragging: true,
+                ..ImageUi::default()
+            },
+            FoldMap::NONE,
+            Scale::ONE,
+        );
+        Layout::build_with_images(&ctx, LEFT, TOP)
+    }
+
+    #[test]
+    fn a_bullet_keeps_its_disc_while_the_caret_edits_the_label() {
+        let f = fonts();
+        let r = rope("- item");
+        // Caret at byte 3, inside "item" past the "- " marker.
+        let l = Layout::build(&f, &r, LEFT, TOP, 1_000_000, BODY, (3, 3));
+        assert_eq!(
+            gutter_of(&l, 0),
+            Gutter::Bullet,
+            "editing the label keeps the disc"
+        );
+    }
+
+    #[test]
+    fn a_bullet_reveals_its_marker_at_the_first_two_positions() {
+        let f = fonts();
+        // "- item": "-" is byte 0, the space byte 1, "item" from byte 2.
+        let r = rope("- item");
+        for caret in [0, 1] {
+            let l = Layout::build(&f, &r, LEFT, TOP, 1_000_000, BODY, (caret, caret));
+            assert_eq!(
+                gutter_of(&l, 0),
+                Gutter::None,
+                "caret at position {} reveals the raw marker",
+                caret + 1
+            );
+        }
+        // At byte 2 (on "item") the disc is back: the caret has left the marker.
+        let l = Layout::build(&f, &r, LEFT, TOP, 1_000_000, BODY, (2, 2));
+        assert_eq!(gutter_of(&l, 0), Gutter::Bullet);
+    }
+
+    #[test]
+    fn a_task_item_reveals_its_whole_marker_around_the_bracket() {
+        let f = fonts();
+        // Marker "- [ ] " is bytes 0..6; a caret anywhere within it reveals it, so
+        // the checkbox brackets are editable, not just the leading dash.
+        let r = rope("- [ ] do");
+        for caret in [0, 1, 3, 5] {
+            let l = Layout::build(&f, &r, LEFT, TOP, 1_000_000, BODY, (caret, caret));
+            assert_eq!(
+                gutter_of(&l, 0),
+                Gutter::None,
+                "caret {caret} reveals the marker"
+            );
+        }
+        // At byte 6 (on "do") the checkbox is back.
+        let l = Layout::build(&f, &r, LEFT, TOP, 1_000_000, BODY, (6, 6));
+        assert!(matches!(gutter_of(&l, 0), Gutter::Checkbox { .. }));
+    }
+
+    #[test]
+    fn a_selection_reveals_a_bullet_marker_only_when_it_overlaps_it() {
+        let f = fonts();
+        let r = rope("- item");
+        // A selection from the start over the marker reveals it.
+        let over = Layout::build(&f, &r, LEFT, TOP, 1_000_000, BODY, (0, 4));
+        assert_eq!(gutter_of(&over, 0), Gutter::None);
+        // One confined to the label (bytes 2..6) leaves the disc.
+        let label = Layout::build(&f, &r, LEFT, TOP, 1_000_000, BODY, (2, 6));
+        assert_eq!(gutter_of(&label, 0), Gutter::Bullet);
+    }
+
+    #[test]
+    fn a_multi_item_selection_reveals_every_covered_marker() {
+        let f = fonts();
+        let r = rope("- one\n- two\n- three");
+        // Select the whole buffer: every bullet's marker is within it, so each
+        // reveals.
+        let l = Layout::build(&f, &r, LEFT, TOP, 1_000_000, BODY, (0, r.len()));
+        for line in 0..3 {
+            assert_eq!(
+                gutter_of(&l, line),
+                Gutter::None,
+                "list line {line} reveals"
+            );
+        }
+    }
+
+    #[test]
+    fn a_drag_holds_list_markers_collapsed_until_release() {
+        let f = fonts();
+        let r = rope("- one\n- two\n- three");
+        // The whole-buffer selection mid-drag: every marker stays a disc.
+        let dragging = build_dragging(&f, &r, (0, r.len()));
+        for line in 0..3 {
+            assert_eq!(
+                gutter_of(&dragging, line),
+                Gutter::Bullet,
+                "line {line} holds its disc during the drag"
+            );
+        }
+        // Released (no drag flag), the same selection reveals them.
+        let released = Layout::build(&f, &r, LEFT, TOP, 1_000_000, BODY, (0, r.len()));
+        for line in 0..3 {
+            assert_eq!(gutter_of(&released, line), Gutter::None);
+        }
+    }
+
+    #[test]
+    fn revealing_a_bullet_marker_does_not_reflow() {
+        // Like a heading's, a list marker's reveal is a gutter swap at the same
+        // width, so the label's caret column and the height stay put.
+        let f = fonts();
+        let r = rope("- item");
+        let disc = Layout::build(&f, &r, LEFT, TOP, 1_000_000, BODY, (3, 3));
+        let raw = Layout::build(&f, &r, LEFT, TOP, 1_000_000, BODY, (0, 0));
+        let (x_disc, _, _) = disc.caret(&f, &r, 2);
+        let (x_raw, _, _) = raw.caret(&f, &r, 2);
+        assert_eq!(x_disc, x_raw, "the label column never shifts");
+        assert_eq!(disc.text_height(), raw.text_height());
+    }
+
     // --- inline code runs -------------------------------------------------
 
     #[test]
@@ -5056,7 +5239,8 @@ mod tests {
         let f = fonts();
         // Child at depth 1 (two spaces) under a depth-0 parent.
         let r = rope("- a\n  - b");
-        let l = layout(&f, &r);
+        // Caret on the first line, so the child's marker is untouched and decorated.
+        let l = Layout::build(&f, &r, LEFT, TOP, 1_000_000, BODY, (0, 0));
         let child = &l.lines()[1];
         assert_eq!(
             child.gutter,
@@ -5092,7 +5276,8 @@ mod tests {
         );
         // A following sibling still nests, so the continuation kept the list open.
         let r2 = rope("- a\n  cont\n- b");
-        let l2 = layout(&f, &r2);
+        // Caret on the first line, so the sibling's marker is untouched and decorated.
+        let l2 = Layout::build(&f, &r2, LEFT, TOP, 1_000_000, BODY, (0, 0));
         assert_eq!(
             l2.lines()[2].gutter,
             Gutter::Bullet,
@@ -5160,11 +5345,13 @@ mod tests {
             Gutter::Bullet,
             "a bullet point stands in once the cursor leaves"
         );
-        let on = Layout::build(&f, &r, LEFT, TOP, 1_000_000, BODY, (0, 0));
+        // Editing the label (caret at byte 3, on "item") keeps the dot; only the
+        // caret reaching the marker reveals the raw "- " (the marker-reveal tests).
+        let on = Layout::build(&f, &r, LEFT, TOP, 1_000_000, BODY, (3, 3));
         assert_eq!(
             on.lines()[0].gutter,
             Gutter::Bullet,
-            "and the dot stays while the cursor edits the line"
+            "and the dot stays while the cursor edits the label"
         );
     }
 
@@ -5308,7 +5495,7 @@ mod tests {
     // --- Task lists ---------------------------------------------------------
 
     #[test]
-    fn a_task_line_draws_its_checkbox_even_on_the_cursors_own_line() {
+    fn a_task_line_draws_its_checkbox_while_editing_the_label() {
         let f = fonts();
         let src = "- [ ] todo\nx";
         let r = rope(src);
@@ -5323,9 +5510,10 @@ mod tests {
             away.run_slice(&away.lines()[0])[0].visible,
             "the marker run persists (width-matched under the drawn box)"
         );
-        // The box stays put with the cursor on the line: it never flips back to a
-        // raw `- [ ]`, mirroring how a bullet keeps its dot while editing.
-        let on = Layout::build(&f, &r, LEFT, TOP, 1_000_000, BODY, (0, 0));
+        // The box stays put while the cursor edits the label (byte 8, on "todo"):
+        // it flips back to the raw `- [ ]` only when the caret reaches the marker,
+        // mirroring how a bullet keeps its dot while editing the label.
+        let on = Layout::build(&f, &r, LEFT, TOP, 1_000_000, BODY, (8, 8));
         assert_eq!(on.lines()[0].gutter, Gutter::Checkbox { checked: false });
         assert!(on.run_slice(&on.lines()[0])[0].visible);
     }
@@ -5439,10 +5627,10 @@ mod tests {
             rect.y + rect.h <= line.baseline + m.descent,
             "stays above the descender"
         );
-        // The box shows on the cursor's own line too, at the same geometry
-        // (reveal never moves it).
-        let task_start = 4;
-        let on = Layout::build(&f, &r, LEFT, TOP, 1_000_000, BODY, (task_start, task_start));
+        // The box shows while editing the label (byte 13, on "sub"), at the same
+        // geometry (reveal never moves it).
+        let label = 13;
+        let on = Layout::build(&f, &r, LEFT, TOP, 1_000_000, BODY, (label, label));
         assert_eq!(on.checkbox_rect(&f, &r, &on.lines()[1]), Some(rect));
     }
 
@@ -5468,9 +5656,9 @@ mod tests {
             None,
             "another line is not the checkbox"
         );
-        // On the cursor's own line the box still hit-tests, so a click there
-        // toggles it rather than only placing the caret.
-        let on = Layout::build(&f, &r, LEFT, TOP, 1_000_000, BODY, (0, 0));
+        // While editing the label (byte 8, on "todo") the box still hit-tests, so a
+        // click there toggles it rather than only placing the caret.
+        let on = Layout::build(&f, &r, LEFT, TOP, 1_000_000, BODY, (8, 8));
         assert_eq!(on.checkbox_at(&f, &r, cx, cy), Some(0));
     }
 

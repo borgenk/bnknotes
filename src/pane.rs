@@ -435,12 +435,14 @@ fn load(path: &Path) -> Result<(String, FileFormat)> {
 /// The inputs the laid-out geometry depends on, used to memoize it: content
 /// version, surface width, body font size, the display scale (as its 120ths
 /// factor, so a DPI change reflows even at an unchanged column width and body
-/// size), the active range's logical line span (the marker reveal depends only on
-/// which lines the range touches, not the exact byte offsets), the selected /
-/// raw-pinned image (by line-start offset), and whether a drag is in progress
-/// (which holds image sources collapsed), and the fold revision (folding removes
-/// lines from the build). A scroll, idle redraw, or cursor move within one line
-/// leaves all of these unchanged and reuses the cached layout.
+/// size), the active range's logical line span (a heading or fence reveal depends
+/// only on which lines the range touches, not the exact byte offsets), whether
+/// each active end reaches a bullet/task marker (the one reveal that turns on the
+/// column, not just the line, so it rides the key on its own), the selected /
+/// raw-pinned image (by line-start offset), whether a drag is in progress (which
+/// holds image sources and list markers collapsed), and the fold revision (folding
+/// removes lines from the build). A scroll, idle redraw, or cursor move within one
+/// line that does not cross a marker boundary reuses the cached layout.
 type LayoutKey = (
     u64,
     i32,
@@ -449,6 +451,7 @@ type LayoutKey = (
     u32,
     usize,
     usize,
+    (bool, bool),
     Option<usize>,
     Option<usize>,
     bool,
@@ -1055,6 +1058,30 @@ impl EditorPane {
         self.text.selection().unwrap_or((cursor, cursor))
     }
 
+    /// Whether each end of the active range reveals a bullet or task line's raw
+    /// marker: the finer live-preview test lists use, where a heading reveals its
+    /// `#` across the whole line but a list gives way to its `- `/`- [ ] ` only
+    /// where the range reaches the marker. Folded into the layout cache key, since
+    /// moving the caret across a list's marker boundary flips the reveal without
+    /// changing which lines the range touches, which the coarse line span misses.
+    /// Held false throughout a drag, when every marker stays collapsed until
+    /// release (matching the layout's `dragging` gate).
+    fn marker_reveal(&self, active: (usize, usize)) -> (bool, bool) {
+        if self.dragging() {
+            return (false, false);
+        }
+        let rope = self.text.rope();
+        let reaches = |off: usize| {
+            let (ls, le) = rope.line_content_range(rope.byte_to_line(off));
+            let (style, marker_len) = markdown::classify(&rope.slice(ls..le).as_cow());
+            matches!(
+                style,
+                markdown::LineStyle::Bullet | markdown::LineStyle::Task { .. }
+            ) && crate::layout::active_reveals_marker(active, ls, marker_len, false)
+        };
+        (reaches(active.0), reaches(active.1))
+    }
+
     /// The per-image UI state (selected border, pinned raw source, drag-freeze) for
     /// the layout.
     pub(crate) fn image_ui(&self) -> ImageUi {
@@ -1236,10 +1263,12 @@ impl EditorPane {
     /// out. A scroll or cursor move that stays within the band reuses the cache.
     pub(crate) fn ensure_window(&mut self, fonts: &Fonts, rect: Rect) {
         let active = self.reveal_range();
-        // Reveal depends only on which lines the active range touches, so the key
-        // is coarsened to lines. The live drag rides the key because it holds image
-        // sources collapsed (`image_ui.dragging`), so releasing a drag over an image
-        // must rebuild to let that source expand.
+        // A heading or fence reveal depends only on which lines the active range
+        // touches, so the key coarsens those to lines. A bullet or task reveal is
+        // finer (it turns on where the range reaches the marker, not just the line),
+        // so its two-ended state rides the key on its own. The live drag rides the
+        // key because it holds image sources and list markers collapsed, so
+        // releasing a drag must rebuild to let those reveal.
         let active_lines = {
             let rope = self.text.rope();
             (rope.byte_to_line(active.0), rope.byte_to_line(active.1))
@@ -1252,6 +1281,7 @@ impl EditorPane {
             self.scale.factor_120(),
             active_lines.0,
             active_lines.1,
+            self.marker_reveal(active),
             self.selected_image,
             self.raw_image,
             self.dragging(),
@@ -1718,18 +1748,19 @@ impl EditorPane {
     /// Let go of a drag-selection because the button came up, reporting whether one
     /// was in flight.
     ///
-    /// A sweep that reached a heading's text start takes the collapsed `#` marker
-    /// with it. That only applies to a sweep by character: the marker is zero-width
-    /// once collapsed, so a press at the line's left edge lands past it and there is
-    /// no way to aim before it, and pulling the selection back is the only way to
-    /// express "from the start of this heading". A double or triple click carries no
-    /// such intent, having asked for a word or a line, so it keeps the marker out.
+    /// A sweep that reached a heading's text start, or a list item's, takes the
+    /// block marker with it. That only applies to a sweep by character: a heading's
+    /// marker is zero-width once collapsed, so a press at the line's left edge lands
+    /// past it with no way to aim before it, and pulling the selection back is the
+    /// only way to express "from the start of this item". A double or triple click
+    /// carries no such intent, having asked for a word or a line, so it keeps the
+    /// marker out.
     pub(crate) fn release_drag(&mut self) -> bool {
         let Some(drag) = self.drag.take() else {
             return false;
         };
         if drag.grain == DragGrain::Char {
-            self.text.include_heading_marker();
+            self.text.include_block_marker();
         }
         true
     }
@@ -2604,6 +2635,41 @@ mod tests {
             Some((0, 7)),
             "the sweep reaches back over `## `"
         );
+    }
+
+    #[test]
+    fn sweeping_from_a_list_items_text_start_takes_its_marker() {
+        // The list analog of the heading rule: a char sweep that began at an
+        // item's label pulls the "- " back in on release, so a multi-item selection
+        // ends with the first item's marker grabbed (the covered items' markers are
+        // already inside the range).
+        let mut pane = pane_of("- one\n- two\n- three\n");
+        // Press at the first item's label ("one" starts at byte 2), sweep into the
+        // third item.
+        pane.text.set_cursor(2, false);
+        pane.drag = Some(DragSelect::text((2, 2), DragGrain::Char));
+        pane.text.set_cursor(15, true);
+        assert!(pane.release_drag());
+        let (lo, _) = pane.text.selection().expect("a selection");
+        assert_eq!(lo, 0, "the sweep reaches back over the first item's '- '");
+    }
+
+    #[test]
+    fn marker_reveal_flips_across_a_list_lines_marker_boundary() {
+        // Moving the caret between the marker and the label flips the reveal without
+        // changing which line is touched, so the layout cache key carries this pair
+        // to force a rebuild the coarse line span would miss.
+        let mut pane = pane_of("- item\n");
+        // Caret within the marker ("- " is bytes 0..2): revealed.
+        pane.text.set_cursor(1, false);
+        assert_eq!(pane.marker_reveal(pane.reveal_range()), (true, true));
+        // Caret in the label: collapsed, though the touched line is unchanged.
+        pane.text.set_cursor(4, false);
+        assert_eq!(pane.marker_reveal(pane.reveal_range()), (false, false));
+        // A drag holds it collapsed wherever the ends sit.
+        pane.text.set_cursor(1, false);
+        pane.drag = Some(DragSelect::text((1, 1), DragGrain::Char));
+        assert_eq!(pane.marker_reveal(pane.reveal_range()), (false, false));
     }
 
     #[test]

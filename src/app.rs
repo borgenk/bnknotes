@@ -33,12 +33,13 @@ use self::present::GpuPresentation;
 use crate::ai::{self, Preview};
 use crate::config::{self, vault_name, CaretConfig, Config, IconKeys, Vault, VaultKind};
 use crate::icon;
+use crate::layout::Layout;
 use crate::menu::{Menu, MenuAction, MenuItem};
 use crate::paint::{
     build_display_list, build_find_paint, conflict_banner_layout, font_sizes, measure_tree,
-    push_ai_preview, push_conflict_banner, push_image_view, push_menu, push_palette, push_rail,
-    push_splitter, push_top_bar, push_tree, top_bar_height, tree_metrics, BarCtx, CaretPaint,
-    PaintParams, RailDragView, RailView, TabStrip,
+    push_ai_hint, push_ai_preview, push_conflict_banner, push_image_view, push_menu, push_palette,
+    push_rail, push_splitter, push_top_bar, push_tree, top_bar_height, tree_metrics, BarCtx,
+    CaretPaint, DiffTint, PaintParams, RailDragView, RailView, TabStrip,
 };
 use crate::palette::{Palette, PaletteAction, PaletteRow, Rows};
 use crate::pane::{
@@ -60,6 +61,7 @@ use crate::platform::wire::{Arg, Message, Reader};
 use crate::platform::xkb::Xkb;
 use crate::render::display::{DisplayList, DrawCmd};
 use crate::render::image::{Image, ImageStore, Limits};
+use crate::rope::Rope;
 use crate::scale::Scale;
 use crate::search;
 use crate::store;
@@ -230,6 +232,21 @@ enum AiCommand {
     Custom,
 }
 
+/// The laid-out inline diff preview for a Ready action: the synthetic document (the
+/// pane's text with the selection replaced by the merged diff), its layout built with
+/// the pane's own geometry so it aligns with the live document, and the byte ranges to
+/// tint. Rebuilt only when the column width or font geometry changes, so a modal
+/// preview lays out once and re-renders (and scrolls) against the cached layout.
+struct PreviewRender {
+    pane: usize,
+    rope: Rope,
+    layout: Layout,
+    inserts: Vec<(usize, usize)>,
+    deletes: Vec<(usize, usize)>,
+    /// (column width, body size, scale 120ths) the layout was built for.
+    key: (i32, u32, u32),
+}
+
 /// An in-progress vault drag-to-reorder, the rail's answer to [`TabDrag`] and the
 /// same shape down the y axis: which chip (by its current index, which the reorder
 /// keeps up to date), the pointer y at press, the grab offset within the chip, and
@@ -326,6 +343,9 @@ struct State {
     ai_enabled: bool,
     /// The command-line backend the AI actions run through (config `ai provider`).
     ai_provider: ai::Provider,
+    /// The laid-out inline diff for a Ready preview, `None` otherwise. Built from
+    /// [`Self::ai`] each frame and cached on its geometry (see [`PreviewRender`]).
+    ai_render: Option<PreviewRender>,
     /// The open palette, `None` when none is. It floats over the window and takes
     /// every key while it is up (see [`crate::palette`]).
     palette: Option<Palette>,
@@ -883,6 +903,7 @@ impl State {
             ai_wake: ai::Wake::new()?,
             ai_enabled: config.ai.enabled,
             ai_provider: config.ai.provider,
+            ai_render: None,
             palette: None,
             search: search::Results::default(),
             last_vault: None,
@@ -1720,6 +1741,8 @@ impl State {
                 job,
             },
             Some(ai::Outcome::Revised(revised)) => {
+                // The diff is a pure function of the two texts: whatever the tool
+                // returned is diffed as-is against the selection.
                 let spans = ai::word_diff(&original, &revised);
                 self.dirty = true;
                 Preview::Ready {
@@ -1771,8 +1794,62 @@ impl State {
     /// child). Reports whether one was up, for the caller's repaint.
     pub(super) fn close_ai(&mut self) -> bool {
         let was_open = self.ai.take().is_some();
+        self.ai_render = None;
         self.dirty |= was_open;
         was_open
+    }
+
+    /// Build or refresh the inline diff layout for a Ready preview, keyed on the
+    /// column width and font geometry so a resize rebuilds it and a scroll reuses it.
+    /// Clears it whenever no diff is Ready. Called once per frame before the panes are
+    /// drawn, so the pane loop finds the render ready.
+    fn ensure_ai_render(&mut self, cols: &Columns) {
+        let Some(Preview::Ready {
+            pane, span, spans, ..
+        }) = &self.ai
+        else {
+            self.ai_render = None;
+            return;
+        };
+        let pane = *pane;
+        let Some(rect) = cols.editors.get(pane).copied().flatten() else {
+            self.ai_render = None;
+            return;
+        };
+        let key = (rect.w, self.body_size, self.scale().factor_120());
+        if self.ai_render.as_ref().map(|r| (r.pane, r.key)) == Some((pane, key)) {
+            return;
+        }
+        // The synthetic document: the pane's text with the selection replaced by the
+        // merged diff, so the diff lays out in the document flow and the rest reflows.
+        let m = ai::merged(spans);
+        let span = *span;
+        let original = self.editors[pane].text.rope();
+        let end = original.len();
+        let mut doc = original.byte_slice(0..span.0.min(end));
+        let base = doc.len();
+        doc.push_str(&m.text);
+        doc.push_str(&original.byte_slice(span.1.min(end)..end));
+        // The diff's changed runs, shifted into the synthetic document by the prefix.
+        let (mut inserts, mut deletes) = (Vec::new(), Vec::new());
+        for (r, kind) in &m.runs {
+            let range = (base + r.start, base + r.end);
+            match kind {
+                ai::DiffKind::Insert => inserts.push(range),
+                ai::DiffKind::Delete => deletes.push(range),
+                ai::DiffKind::Equal => {}
+            }
+        }
+        let rope = Rope::from_str(&doc);
+        let layout = self.editors[pane].preview_layout(&self.fonts, rect, &rope);
+        self.ai_render = Some(PreviewRender {
+            pane,
+            rope,
+            layout,
+            inserts,
+            deletes,
+            key,
+        });
     }
 
     /// Put the clipboard's picture on vault `i`'s chip, the menu's "Use image from
@@ -2070,6 +2147,9 @@ impl State {
     fn build_frame_list(&mut self) -> Rc<DisplayList> {
         let cols = self.columns();
         self.sync_tab_scroll(&cols);
+        // Lay out the inline diff for a Ready preview before the panes draw, so the
+        // pane that owns it renders its synthetic document instead of the live one.
+        self.ensure_ai_render(&cols);
         // Bake any chip picture the rail is about to ask for, at the size the chips
         // are this frame.
         let chip_side = crate::paint::rail_chip_side(cols.rail_chips, self.scale());
@@ -2117,6 +2197,36 @@ impl State {
                     rect,
                     color: BACKGROUND,
                 });
+                continue;
+            }
+            // A Ready inline diff owns this pane's body: it renders the synthetic
+            // preview document (the diff in the document flow), with the caret and the
+            // live selection suppressed since it is modal.
+            if let Some(render) = self.ai_render.as_ref().filter(|r| r.pane == i) {
+                let ed = &self.editors[i];
+                let params = PaintParams {
+                    view: rect,
+                    scale: self.scale(),
+                    body_size: self.body_size,
+                    scroll_y: ed.scroll_y,
+                    content_height: ed.content_height,
+                    scrollbar: &ed.scrollbar,
+                    selection: None,
+                    caret: None,
+                    find: None,
+                    table_hover: None,
+                    fold_hover: None,
+                    diff: Some(DiffTint {
+                        inserts: &render.inserts,
+                        deletes: &render.deletes,
+                    }),
+                };
+                list.append(&mut build_display_list(
+                    &self.fonts,
+                    &render.layout,
+                    &render.rope,
+                    &params,
+                ));
                 continue;
             }
             self.editors[i].ensure_layout(&self.fonts, rect);
@@ -2167,6 +2277,7 @@ impl State {
                 find: build_find_paint(&ed.find, &tick_tops),
                 table_hover,
                 fold_hover,
+                diff: None,
             };
             if let Some(layout) = ed.layout_cache.as_ref() {
                 list.append(&mut build_display_list(
@@ -2260,15 +2371,26 @@ impl State {
             push_palette(&mut list, &ctx, palette, &self.palette_layout(palette));
         }
         // The AI preview is the topmost modal: it holds the keyboard for accept or
-        // reject, so nothing else can be up under it.
-        if let Some(preview) = &self.ai {
-            let ctx = BarCtx::new(&self.fonts, scale, self.body_size);
-            push_ai_preview(
-                &mut list,
-                &ctx,
-                preview,
-                (self.width as i32, self.height as i32),
-            );
+        // reject, so nothing else can be up under it. A Ready diff renders inline in
+        // its pane (above), so it shows only a small accept/reject hint over that pane;
+        // Thinking and Failed have nothing to show inline, so they keep the panel.
+        match &self.ai {
+            Some(Preview::Ready { pane, .. }) => {
+                if let Some(rect) = cols.editors.get(*pane).copied().flatten() {
+                    let ctx = BarCtx::new(&self.fonts, scale, self.body_size);
+                    push_ai_hint(&mut list, &ctx, rect);
+                }
+            }
+            Some(preview) => {
+                let ctx = BarCtx::new(&self.fonts, scale, self.body_size);
+                push_ai_preview(
+                    &mut list,
+                    &ctx,
+                    preview,
+                    (self.width as i32, self.height as i32),
+                );
+            }
+            None => {}
         }
         Rc::new(list)
     }

@@ -793,10 +793,10 @@ impl State {
                 let _time = r.u32()?;
                 let button = r.u32()?;
                 let state = r.u32()?;
-                // A modal AI preview swallows presses: a click anywhere discards it,
-                // the way clicking off the context menu dismisses that.
-                if state == wl_pointer::BUTTON_STATE_PRESSED && self.ai.is_some() {
-                    self.close_ai();
+                // A modal AI preview is driven by the keyboard (Enter accepts, Escape
+                // discards): a press is swallowed, not acted on, so refocusing the
+                // window or a stray click cannot discard the diff by accident.
+                if self.ai.is_some() {
                     return Ok(());
                 }
                 if button == wl_pointer::BTN_RIGHT {

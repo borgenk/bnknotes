@@ -6,7 +6,7 @@ use crate::config::CaretConfig;
 use crate::file::{self, FileFormat};
 use crate::find::FindState;
 use crate::fold::{self, FoldMap, Folds};
-use crate::layout::{Adjust, ImageUi, Layout, LayoutCtx, LineIndex, RevealAdjust};
+use crate::layout::{Adjust, ImageUi, Layout, LayoutCtx, LineIndex, RevealAdjust, NO_REVEAL};
 use crate::markdown;
 use crate::platform::error::{Error, Result};
 use crate::platform::freetype::Fonts;
@@ -1329,6 +1329,34 @@ impl EditorPane {
         self.ensure_window(fonts, rect);
     }
 
+    /// Lay out a synthetic document `doc` (the inline diff preview: this pane's text
+    /// with the selection replaced by the merged diff) with this pane's geometry and
+    /// scale, so it aligns with the live document above it and the painter shifts it by
+    /// the same scroll. A full build, not windowed: the preview is modal and built once
+    /// per open (and per resize), so O(document) is fine, and the synthetic document
+    /// carries no images or folds of its own.
+    pub(crate) fn preview_layout(&self, fonts: &Fonts, rect: Rect, doc: &Rope) -> Layout {
+        let margin = self.scale.px(MARGIN);
+        let wrap_width = rect.w - 2 * margin;
+        // The pane's own image store, so an image the synthetic document copies
+        // verbatim (any line outside the selection) renders at its picture height and
+        // the content above the diff stays aligned with the live document. No reveal
+        // and no folds: the diff region is what the preview is about, and image-source
+        // reveal or a fold would shift byte offsets that no longer match this document.
+        let ctx = LayoutCtx::new(
+            fonts,
+            doc,
+            wrap_width,
+            self.body_size,
+            NO_REVEAL,
+            &self.images,
+            ImageUi::default(),
+            FoldMap::NONE,
+            self.scale,
+        );
+        Layout::build_with_images(&ctx, rect.x + margin, rect.y + margin)
+    }
+
     /// Lay out a window centered on the cursor (a page each side plus slack for
     /// page-motion targets landing at the edges), with absolute document positions
     /// from the index. Cursor operations run the ordinary [`Layout`] methods on
@@ -1960,17 +1988,74 @@ impl EditorPane {
     }
 }
 
-/// One content pane as a stack of open documents with one active. A pane may hold
-/// no documents at all (nothing open), in which case it shows an empty column and
-/// a bare tab strip with just the new-tab button. The group forwards to its active
-/// document (via [`Deref`]), so a pane's active tab is simply "the pane" to every
-/// caller that edits, scrolls, or hit-tests it; only tab management (open, close,
-/// switch) and the DPI fan-out are group-level. So the deref stays total even with
-/// no tabs, an empty pane forwards to a scratch `placeholder` document; it is never
-/// drawn (an empty pane paints no content), so editing it is a harmless no-op until
-/// the first keystroke materializes a real tab.
+/// What a tab shows. Tabs are managed uniformly by [`PaneGroup`] (order, active tab,
+/// open/close/move); only the content varies. A document today, with room for a view
+/// that is not backed by a file, a diff or a "new tab" landing page, as its own
+/// variant later.
+pub(crate) enum TabContent {
+    Doc(EditorPane),
+}
+
+/// One tab: its content, kept apart from the strip identity (the title and unsaved
+/// dot the strip draws) so a pane can hold a view that is not a document. The content
+/// answers what the strip needs through [`Self::title`] and [`Self::is_dirty`].
+pub(crate) struct Tab {
+    content: TabContent,
+}
+
+impl Tab {
+    /// A document tab.
+    fn doc(doc: EditorPane) -> Self {
+        Self {
+            content: TabContent::Doc(doc),
+        }
+    }
+
+    /// The document this tab holds, when it holds one.
+    fn as_doc(&self) -> Option<&EditorPane> {
+        match &self.content {
+            TabContent::Doc(doc) => Some(doc),
+        }
+    }
+
+    fn as_doc_mut(&mut self) -> Option<&mut EditorPane> {
+        match &mut self.content {
+            TabContent::Doc(doc) => Some(doc),
+        }
+    }
+
+    /// The document, consuming the tab, for a tab dragged out of the pane.
+    fn into_doc(self) -> Option<EditorPane> {
+        match self.content {
+            TabContent::Doc(doc) => Some(doc),
+        }
+    }
+
+    /// The label the tab strip draws.
+    fn title(&self) -> String {
+        match &self.content {
+            TabContent::Doc(doc) => doc.tab_name(),
+        }
+    }
+
+    /// Whether the strip marks the tab with an unsaved-changes dot.
+    fn is_dirty(&self) -> bool {
+        match &self.content {
+            TabContent::Doc(doc) => doc.text.is_modified(),
+        }
+    }
+}
+
+/// One content pane as a stack of open tabs with one active. A pane may hold no tabs
+/// at all (nothing open), in which case it shows an empty column and a bare tab strip
+/// with just the new-tab button. The group forwards to its active tab's *document*
+/// (via [`Deref`]), so a document tab is simply "the pane" to every caller that edits,
+/// scrolls, or hit-tests it; tab management and the DPI fan-out are group-level. The
+/// deref stays total, an empty pane, or a non-document active tab, forwards to a
+/// scratch `placeholder` document that is never drawn, so editing it is a harmless
+/// no-op.
 pub(crate) struct PaneGroup {
-    docs: Vec<EditorPane>,
+    tabs: Vec<Tab>,
     active: usize,
     /// The document an empty pane's deref targets, so the `pane.field` sites stay
     /// panic-free with no tabs open. Never painted.
@@ -1994,7 +2079,7 @@ impl PaneGroup {
     /// A pane with nothing open (no tabs).
     pub(crate) fn empty() -> Self {
         Self {
-            docs: Vec::new(),
+            tabs: Vec::new(),
             active: 0,
             placeholder: EditorPane::empty(),
             scale: Scale::ONE,
@@ -2011,59 +2096,59 @@ impl PaneGroup {
 
     /// The number of open tabs, for laying out and scrolling the tab strip.
     pub(crate) fn tab_count(&self) -> usize {
-        self.docs.len()
+        self.tabs.len()
     }
 
     /// Whether the pane has any open tab. An empty pane paints no content and no
     /// caret, and its title falls back to the app name.
     pub(crate) fn has_tabs(&self) -> bool {
-        !self.docs.is_empty()
+        !self.tabs.is_empty()
     }
 
-    /// The active document, or the placeholder when the pane is empty. Most callers
-    /// reach it implicitly through [`Deref`]; this explicit borrow is for the few
-    /// sites that mutate one field while reading another, which a deref cannot split
-    /// into disjoint borrows.
+    /// The active document, or the placeholder when the pane is empty or its active
+    /// tab is not a document. Most callers reach it implicitly through [`Deref`]; this
+    /// explicit borrow is for the few sites that mutate one field while reading
+    /// another, which a deref cannot split into disjoint borrows.
     pub(crate) fn active_doc_mut(&mut self) -> &mut EditorPane {
-        self.docs
+        self.tabs
             .get_mut(self.active)
+            .and_then(Tab::as_doc_mut)
             .unwrap_or(&mut self.placeholder)
     }
 
     /// Each tab's label, in order, for the tab strip.
     pub(crate) fn tab_names(&self) -> Vec<String> {
-        self.docs.iter().map(EditorPane::tab_name).collect()
+        self.tabs.iter().map(Tab::title).collect()
     }
 
     /// Whether each tab has unsaved edits, in order, for the tab strip's dot.
     pub(crate) fn tab_dirty(&self) -> Vec<bool> {
-        self.docs.iter().map(|d| d.text.is_modified()).collect()
+        self.tabs.iter().map(Tab::is_dirty).collect()
     }
 
-    /// Every open tab's file path, for the file watcher's set of directories to
-    /// watch. Scratch tabs (no path) contribute nothing.
+    /// Every open document tab's file path, for the file watcher's set of directories
+    /// to watch. Scratch tabs (no path) and non-document tabs contribute nothing.
     pub(crate) fn paths(&self) -> impl Iterator<Item = &Path> {
-        self.docs.iter().filter_map(|d| d.path.as_deref())
+        self.docs().filter_map(|d| d.path.as_deref())
     }
 
-    /// Every open tab, for what the whole group has to answer for rather than just
-    /// the tab on top: saving each document that has unsaved edits, and watching
-    /// each for one.
+    /// Every open document tab, for what the whole group has to answer for rather than
+    /// just the tab on top: saving each with unsaved edits, and watching each for one.
     pub(crate) fn docs_mut(&mut self) -> impl Iterator<Item = &mut EditorPane> {
-        self.docs.iter_mut()
+        self.tabs.iter_mut().filter_map(Tab::as_doc_mut)
     }
 
     /// The group's open documents, for a reader that needs more of one than its path
     /// (a search wanting the buffer's text, which is what is on screen).
     pub(crate) fn docs(&self) -> impl Iterator<Item = &EditorPane> {
-        self.docs.iter()
+        self.tabs.iter().filter_map(Tab::as_doc)
     }
 
-    /// Re-check every open tab against its file on disk, reloading clean buffers
-    /// and flagging conflicts on dirty ones. Returns whether any tab changed.
+    /// Re-check every open document tab against its file on disk, reloading clean
+    /// buffers and flagging conflicts on dirty ones. Returns whether any tab changed.
     pub(crate) fn recheck_disk(&mut self) -> bool {
         let mut changed = false;
-        for doc in &mut self.docs {
+        for doc in self.docs_mut() {
             changed |= doc.recheck_disk();
         }
         changed
@@ -2071,7 +2156,7 @@ impl PaneGroup {
 
     /// Switch the active tab. Out-of-range indices are ignored.
     pub(crate) fn activate(&mut self, i: usize) {
-        if i < self.docs.len() {
+        if i < self.tabs.len() {
             self.active = i;
             self.active_doc_mut().request_caret_snap();
         }
@@ -2083,8 +2168,8 @@ impl PaneGroup {
         let mut doc = EditorPane::empty();
         doc.set_scale(scale, body_size);
         doc.set_vault_root(self.vault.as_deref());
-        self.docs.push(doc);
-        self.active = self.docs.len() - 1;
+        self.tabs.push(Tab::doc(doc));
+        self.active = self.tabs.len() - 1;
     }
 
     /// Open `path`: focus an existing tab holding it, replace a blank scratch tab
@@ -2092,9 +2177,9 @@ impl PaneGroup {
     /// group's current scale so it renders crisp immediately at any DPI.
     pub(crate) fn open_or_focus(&mut self, path: &Path) -> Result<()> {
         if let Some(i) = self
-            .docs
+            .tabs
             .iter()
-            .position(|d| d.path.as_deref() == Some(path))
+            .position(|t| t.as_doc().is_some_and(|d| d.path.as_deref() == Some(path)))
         {
             self.active = i;
             self.active_doc_mut().request_caret_snap();
@@ -2104,11 +2189,16 @@ impl PaneGroup {
         doc.set_scale(self.scale, self.body_size);
         doc.set_vault_root(self.vault.as_deref());
         // Replace a lone blank scratch tab (a just-opened new tab); otherwise stack.
-        if self.docs.get(self.active).is_some_and(EditorPane::is_blank) {
-            self.docs[self.active] = doc;
+        if self
+            .tabs
+            .get(self.active)
+            .and_then(Tab::as_doc)
+            .is_some_and(EditorPane::is_blank)
+        {
+            self.tabs[self.active] = Tab::doc(doc);
         } else {
-            self.docs.push(doc);
-            self.active = self.docs.len() - 1;
+            self.tabs.push(Tab::doc(doc));
+            self.active = self.tabs.len() - 1;
         }
         Ok(())
     }
@@ -2121,20 +2211,21 @@ impl PaneGroup {
     }
 
     /// Remove tab `i` and hand back its document, so it can be re-homed in another
-    /// pane (a tab dragged across the split). The active tab shifts the same way
-    /// [`Self::close`] moves it. An out-of-range index yields `None`.
+    /// pane (a tab dragged across the split). A non-document tab yields `None` but is
+    /// still removed. The active tab shifts the same way [`Self::close`] moves it. An
+    /// out-of-range index yields `None` and removes nothing.
     pub(crate) fn detach(&mut self, i: usize) -> Option<EditorPane> {
-        if i >= self.docs.len() {
+        if i >= self.tabs.len() {
             return None;
         }
-        let doc = self.docs.remove(i);
-        if i < self.active || self.active >= self.docs.len() {
+        let tab = self.tabs.remove(i);
+        if i < self.active || self.active >= self.tabs.len() {
             self.active = self.active.saturating_sub(1);
         }
         // The tab that slid into focus is a different document; snap its caret so it
         // does not resume a smear from wherever it last left off.
         self.active_doc_mut().request_caret_snap();
-        Some(doc)
+        tab.into_doc()
     }
 
     /// Insert `doc` as a tab at index `i` (clamped to the end), adopt it under the
@@ -2142,21 +2233,21 @@ impl PaneGroup {
     /// tab dragged in from the other pane.
     pub(crate) fn insert_tab(&mut self, i: usize, mut doc: EditorPane) -> usize {
         doc.set_scale(self.scale, self.body_size);
-        let i = i.min(self.docs.len());
-        self.docs.insert(i, doc);
+        let i = i.min(self.tabs.len());
+        self.tabs.insert(i, Tab::doc(doc));
         self.active = i;
         i
     }
 
     /// Move the tab at `from` to index `to`, sliding the tabs in between over to
-    /// fill the gap. The same document stays active across the move, whichever slot
-    /// it lands in. Out-of-range or no-op moves are ignored.
+    /// fill the gap. The same tab stays active across the move, whichever slot it
+    /// lands in. Out-of-range or no-op moves are ignored.
     pub(crate) fn move_tab(&mut self, from: usize, to: usize) {
-        if from >= self.docs.len() || to >= self.docs.len() || from == to {
+        if from >= self.tabs.len() || to >= self.tabs.len() || from == to {
             return;
         }
-        let doc = self.docs.remove(from);
-        self.docs.insert(to, doc);
+        let tab = self.tabs.remove(from);
+        self.tabs.insert(to, tab);
         self.active = if self.active == from {
             to
         } else {
@@ -2172,24 +2263,24 @@ impl PaneGroup {
     }
 
     /// Adopt a new display scale and body size (a DPI change), fanning it out to
-    /// every tab (and the placeholder) so an inactive tab re-measures correctly
-    /// when next shown.
+    /// every document tab (and the placeholder) so an inactive tab re-measures
+    /// correctly when next shown.
     pub(crate) fn set_scale(&mut self, scale: Scale, body_size: u32) {
         self.scale = scale;
         self.body_size = body_size;
-        for doc in &mut self.docs {
+        for doc in self.docs_mut() {
             doc.set_scale(scale, body_size);
         }
         self.placeholder.set_scale(scale, body_size);
     }
 
-    /// The persisted form of this pane: each tab's file, caret, scroll, and folded
-    /// headings, plus the active index.
+    /// The persisted form of this pane: each document tab's file, caret, scroll, and
+    /// folded headings, plus the active index. Non-document tabs (a diff view) are
+    /// transient and not persisted.
     pub(crate) fn to_session(&self) -> store::PaneGroupSession {
         store::PaneGroupSession {
             tabs: self
-                .docs
-                .iter()
+                .docs()
                 .map(|d| store::PaneSession {
                     path: d.path.clone(),
                     cursor: d.text.cursor() as u64,
@@ -2206,14 +2297,18 @@ impl Deref for PaneGroup {
     type Target = EditorPane;
 
     fn deref(&self) -> &EditorPane {
-        self.docs.get(self.active).unwrap_or(&self.placeholder)
+        self.tabs
+            .get(self.active)
+            .and_then(Tab::as_doc)
+            .unwrap_or(&self.placeholder)
     }
 }
 
 impl DerefMut for PaneGroup {
     fn deref_mut(&mut self) -> &mut EditorPane {
-        self.docs
+        self.tabs
             .get_mut(self.active)
+            .and_then(Tab::as_doc_mut)
             .unwrap_or(&mut self.placeholder)
     }
 }
@@ -2257,7 +2352,7 @@ pub(crate) fn restore_group(
     }
     let active = active.min(docs.len() - 1);
     PaneGroup {
-        docs,
+        tabs: docs.into_iter().map(Tab::doc).collect(),
         active,
         placeholder: EditorPane::empty(),
         scale: Scale::ONE,
@@ -3277,7 +3372,7 @@ run
     }
 
     fn order(g: &PaneGroup) -> Vec<i32> {
-        g.docs.iter().map(|d| d.scroll_y).collect()
+        g.docs().map(|d| d.scroll_y).collect()
     }
 
     #[test]
@@ -3309,8 +3404,11 @@ run
         let mut a = marked_group(3);
         a.activate(1);
         let mut b = marked_group(2);
-        b.docs[0].scroll_y = 10;
-        b.docs[1].scroll_y = 11;
+        {
+            let mut docs = b.docs_mut();
+            docs.next().unwrap().scroll_y = 10;
+            docs.next().unwrap().scroll_y = 11;
+        }
 
         // Drag A's active tab out: it leaves A, whose active falls to the neighbor
         // that slid into its place.
@@ -3587,7 +3685,7 @@ run
         // Every existing tab adopts the new body size, and so does one opened after.
         assert_eq!(group.body_size, 21);
         group.open_or_focus(&a).expect("open");
-        assert_eq!(group.docs[group.active].body_size, 21);
+        assert_eq!(group.active_doc_mut().body_size, 21);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

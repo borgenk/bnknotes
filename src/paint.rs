@@ -80,6 +80,17 @@ pub(crate) struct PaintParams<'a> {
     /// over. An open section shows its chevron only here; a folded one shows it
     /// regardless, so this only ever adds a chevron.
     pub fold_hover: Option<usize>,
+    /// The inline diff preview's tinted byte ranges, when this pane is rendering a
+    /// Ready AI diff over its synthetic document; `None` for a normal pane.
+    pub diff: Option<DiffTint<'a>>,
+}
+
+/// The byte ranges of an inline diff preview to tint over the synthetic preview
+/// document: a green wash behind insertions, a red wash plus a strikethrough behind
+/// deletions. The ranges are into the document the layout was built from.
+pub(crate) struct DiffTint<'a> {
+    pub inserts: &'a [(usize, usize)],
+    pub deletes: &'a [(usize, usize)],
 }
 
 /// The caret reduced to what the painter draws: its content-space (pre-scroll)
@@ -1130,6 +1141,60 @@ pub(crate) fn push_ai_preview(
     ));
 }
 
+/// Draw the inline diff preview's accept/reject hint: a small pill along the bottom of
+/// pane `rect`. The diff itself renders in the document flow, so this is only a
+/// reminder of the keys, kept out of the way at the pane's foot.
+pub(crate) fn push_ai_hint(list: &mut DisplayList, ctx: &BarCtx, rect: Rect) {
+    let scale = ctx.scale;
+    let m = ctx.metrics();
+    let face = ctx.fonts.face(ctx.body_size, FontStyle::Regular);
+    let text = "Enter to accept   ·   Esc to discard";
+    let text_w = shape::text_advance(face, text).ceil() as i32;
+    let text_h = m.ascent + m.descent;
+    let pad_x = scale.px(AI_PANEL_PAD);
+    let pad_y = scale.px(AI_LINE_VPAD) * 2;
+    let w = text_w + 2 * pad_x;
+    let h = text_h + 2 * pad_y;
+    let gap = scale.px(AI_PANEL_PAD);
+    let x = rect.x + (rect.w - w) / 2;
+    let y = rect.y + rect.h - h - gap;
+
+    let radius = scale.px(AI_PANEL_RADIUS);
+    let border = scale.px(AI_PANEL_BORDER_W).max(1);
+    list.push(DrawCmd::RoundRect {
+        rect: Rect { x, y, w, h },
+        color: AI_PANEL_BORDER,
+        radius,
+        corners: display::RoundedCorners::Both,
+    });
+    list.push(DrawCmd::RoundRect {
+        rect: Rect {
+            x: x + border,
+            y: y + border,
+            w: (w - 2 * border).max(0),
+            h: (h - 2 * border).max(0),
+        },
+        color: AI_PANEL_BG,
+        radius: (radius - border).max(0),
+        corners: display::RoundedCorners::Both,
+    });
+    let tx = x + pad_x;
+    let base = y + pad_y + m.ascent;
+    list.push(clip_text_x(
+        text_cmd(
+            ctx.regular(),
+            tx,
+            base,
+            tx + text_w,
+            AI_HINT,
+            text.to_string(),
+            m,
+        ),
+        tx,
+        tx + text_w,
+    ));
+}
+
 /// The sidebar's text size. The sidebar is chrome, not content, so its names read
 /// a step below the body, the way their muted color does: nine tenths of the body
 /// size, rounded to the nearest pixel, so it tracks the body through every font
@@ -1908,6 +1973,9 @@ pub(crate) fn build_display_list(
     if let Some((start, end)) = p.selection {
         painter.selection(start, end);
     }
+    if let Some(diff) = &p.diff {
+        painter.diff(diff);
+    }
     if let Some(find) = &p.find {
         painter.find_matches(find);
     }
@@ -2107,6 +2175,50 @@ impl<'a> Painter<'a> {
                 self.list.push(DrawCmd::Fill {
                     rect,
                     color: SELECTION_COLOR,
+                });
+            }
+        }
+    }
+
+    /// The inline diff preview's washes, beneath the text like the selection: a green
+    /// fill behind each insertion, a red fill plus a strikethrough behind each
+    /// deletion, so an added word reads as added and a removed one as struck through.
+    /// The ranges are into the synthetic preview document the layout was built from.
+    fn diff(&mut self, diff: &DiffTint) {
+        for &(start, end) in diff.inserts {
+            for rect in self
+                .layout
+                .selection_rects(self.fonts, self.rope, start, end)
+            {
+                if let Some(rect) = self.screen(rect) {
+                    self.list.push(DrawCmd::Fill {
+                        rect,
+                        color: AI_INSERT_BG,
+                    });
+                }
+            }
+        }
+        let strike_h = self.scale.px(1).max(1);
+        for &(start, end) in diff.deletes {
+            for rect in self
+                .layout
+                .selection_rects(self.fonts, self.rope, start, end)
+            {
+                let Some(rect) = self.screen(rect) else {
+                    continue;
+                };
+                self.list.push(DrawCmd::Fill {
+                    rect,
+                    color: AI_DELETE_BG,
+                });
+                self.list.push(DrawCmd::Fill {
+                    rect: Rect {
+                        x: rect.x,
+                        y: rect.y + rect.h / 2,
+                        w: rect.w,
+                        h: strike_h,
+                    },
+                    color: AI_STRIKE,
                 });
             }
         }
@@ -3370,6 +3482,7 @@ mod tests {
             find: None,
             table_hover: None,
             fold_hover: None,
+            diff: None,
         }
     }
 
@@ -3886,6 +3999,38 @@ mod tests {
                 .any(|c| matches!(c, DrawCmd::Text { text, clip_x: None, .. } if text == "+")),
             "pinned new-tab button"
         );
+    }
+
+    #[test]
+    fn the_inline_diff_pass_tints_insertions_and_strikes_deletions() {
+        let fonts = Fonts::new(&markdown::all_sizes(FONT_SIZE)).expect("a default font");
+        let src = "teh the cat";
+        let rope = Rope::from_str(src);
+        let (w, h) = (600i32, 200i32);
+        let wrap = w - 2 * MARGIN;
+        let layout = Layout::build(&fonts, &rope, MARGIN, MARGIN, wrap, FONT_SIZE, (0, 0));
+        // "teh" is the deletion, the following "the" the insertion.
+        let deletes = [(0usize, 3usize)];
+        let inserts = [(4usize, 7usize)];
+        let mut params = paint_params(w, h);
+        params.diff = Some(DiffTint {
+            inserts: &inserts,
+            deletes: &deletes,
+        });
+        let list = build_display_list(&fonts, &layout, &rope, &params);
+        let fills: Vec<u32> = list
+            .iter()
+            .filter_map(|c| match c {
+                DrawCmd::Fill { color, .. } => Some(*color),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            fills.contains(&AI_INSERT_BG),
+            "an insertion gets a green wash"
+        );
+        assert!(fills.contains(&AI_DELETE_BG), "a deletion gets a red wash");
+        assert!(fills.contains(&AI_STRIKE), "a deletion is struck through");
     }
 
     #[test]

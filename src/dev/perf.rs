@@ -363,6 +363,7 @@ fn params(scroll_y: i32, selection: Option<(usize, usize)>) -> PaintParams<'stat
         selection,
         table_hover: None,
         fold_hover: None,
+        diff: None,
         // A settled caret bar: one Fill command, matching the app's steady state so
         // the batch benchmark counts the caret exactly as a live frame does.
         caret: Some(CaretPaint {

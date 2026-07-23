@@ -253,7 +253,32 @@ fn parse(text: &str) -> Config {
     if !paths.is_empty() {
         config.vaults = vaults(paths);
     }
+    config.ai = ai_config(text);
     config
+}
+
+/// The AI settings a config names, laid over the defaults. Every `ai ...` line is
+/// applied in file order, so a later line overrides an earlier one; a value that
+/// names nothing recognized leaves the default standing.
+fn ai_config(text: &str) -> AiConfig {
+    let mut ai = AiConfig::default();
+    for line in text.lines() {
+        let line = line.trim();
+        let Some((field, value)) = line.split_once(char::is_whitespace) else {
+            continue;
+        };
+        if field != "ai" {
+            continue;
+        }
+        match value.trim() {
+            "on" | "true" => ai.enabled = true,
+            "off" | "false" => ai.enabled = false,
+            "provider claude" => ai.provider = crate::ai::Provider::Claude,
+            "provider codex" => ai.provider = crate::ai::Provider::Codex,
+            _ => {}
+        }
+    }
+    ai
 }
 
 /// The vault paths a config's text names, in file order: resolved, deduplicated,
@@ -390,6 +415,33 @@ pub struct Config {
     /// vault when the session has no valid remembered one; the active vault roots
     /// the file tree and every note reference.
     pub vaults: Vec<Vault>,
+    /// AI text actions: the settings for the subscription-backed transforms offered
+    /// over a selection.
+    pub ai: AiConfig,
+}
+
+/// AI text-action settings: whether the feature is offered and which backend runs it.
+/// The action table itself lives in [`crate::ai`] as a built-in until there is a
+/// reason to name it here.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AiConfig {
+    /// Whether the context menu offers AI transforms over a selection. On by default;
+    /// each action still runs only on an explicit click, and hands the selection to a
+    /// local tool that sends it to the provider's cloud model, so a user who would
+    /// rather it never leave the machine turns it off with `ai off` in the config.
+    pub enabled: bool,
+    /// The command-line tool that runs the transforms (`ai provider claude` or
+    /// `ai provider codex`). Claude by default.
+    pub provider: crate::ai::Provider,
+}
+
+impl Default for AiConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            provider: crate::ai::Provider::Claude,
+        }
+    }
 }
 
 /// Caret motion settings: one master toggle plus the knobs that shape the motion.
@@ -453,6 +505,7 @@ impl Default for Config {
             // Resolved like a configured line, so every path in the vault list has
             // been through the same door and comparing two of them means something.
             vaults: vaults([resolve_path(&expand_tilde("~/notes"))]),
+            ai: AiConfig::default(),
         }
     }
 }
@@ -906,5 +959,32 @@ mod tests {
         // A note saved over the config by accident is refused, not read in.
         let path = config_with("huge", &"# padding\n".repeat(CONFIG_MAX_BYTES as usize));
         assert_eq!(load_from(&path).vaults, Config::default().vaults);
+    }
+
+    #[test]
+    fn ai_is_on_by_default_and_the_config_can_turn_it_off() {
+        // Silent by default, and the last ai line wins.
+        assert!(parse("").ai.enabled);
+        assert!(parse("vault ~/notes").ai.enabled);
+        assert!(!parse("ai off").ai.enabled);
+        assert!(!parse("ai true\nai off").ai.enabled);
+        assert!(parse("ai off\nai on").ai.enabled);
+        // A value that is neither on nor off leaves the default standing.
+        assert!(parse("ai maybe").ai.enabled);
+    }
+
+    #[test]
+    fn ai_provider_defaults_to_claude_and_the_config_can_pick_codex() {
+        use crate::ai::Provider;
+        assert_eq!(parse("").ai.provider, Provider::Claude);
+        assert_eq!(parse("ai provider codex").ai.provider, Provider::Codex);
+        // Independent of the on/off toggle, and the last one wins.
+        let c = parse("ai off\nai provider codex");
+        assert!(!c.ai.enabled);
+        assert_eq!(c.ai.provider, Provider::Codex);
+        assert_eq!(
+            parse("ai provider codex\nai provider claude").ai.provider,
+            Provider::Claude
+        );
     }
 }

@@ -52,6 +52,18 @@ pub enum PaletteAction {
     SwitchVault(usize),
     /// Open `path` and put the caret on the match at `offset`.
     OpenMatch { path: PathBuf, offset: usize },
+    /// Run AI action `i` (an index into [`crate::ai::ACTIONS`]) on the focused pane.
+    RunAi(usize),
+    /// Re-open the palette to type a free-form AI instruction.
+    AiCustomPrompt,
+}
+
+/// What Enter takes: the selected row's action (a list to pick from), or the typed
+/// query itself (a free-form field, like the custom AI prompt).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Submit {
+    Row,
+    Query,
 }
 
 /// One row: what it says, and what it does.
@@ -98,6 +110,8 @@ pub struct Palette {
     prompt: &'static str,
     /// Whether the query ranks the rows or the rows already answer it.
     mode: Rows,
+    /// Whether Enter takes the selected row or the typed query.
+    submit: Submit,
     /// A word about the rows, drawn at the field's right the way the find bar's
     /// counter is: how many matches a search found, and whether it stopped counting.
     /// Empty when there is nothing to say, which is every ranked palette.
@@ -125,6 +139,7 @@ impl Palette {
             query: String::new(),
             prompt,
             mode,
+            submit: Submit::Row,
             note: String::new(),
             filtered: Vec::with_capacity(rows.len()),
             scored: Vec::with_capacity(rows.len()),
@@ -134,6 +149,19 @@ impl Palette {
         };
         palette.refilter();
         palette
+    }
+
+    /// A palette that is a single free-form field: no rows, and Enter takes the typed
+    /// query rather than a row. Used for the custom AI prompt.
+    pub fn query_input(prompt: &'static str) -> Self {
+        let mut palette = Self::new(prompt, Rows::Ranked, Vec::new());
+        palette.submit = Submit::Query;
+        palette
+    }
+
+    /// What Enter takes: a row, or the typed query.
+    pub fn submit(&self) -> Submit {
+        self.submit
     }
 
     pub fn query(&self) -> &str {
@@ -503,6 +531,22 @@ mod tests {
         let p = palette(&["work", "notes", "archive"]);
         assert_eq!(shown(&p), ["work", "notes", "archive"]);
         assert_eq!(p.activate(), Some(PaletteAction::SwitchVault(0)));
+    }
+
+    #[test]
+    fn a_row_palette_activates_a_row_a_query_input_takes_its_text() {
+        // The command palette picks a row on Enter.
+        let p = palette(&["work", "notes"]);
+        assert_eq!(p.submit(), Submit::Row);
+        assert_eq!(p.activate(), Some(PaletteAction::SwitchVault(0)));
+        // The custom-prompt field has no rows and submits the typed query instead.
+        let mut q = Palette::query_input("Describe the change");
+        assert_eq!(q.submit(), Submit::Query);
+        q.push('f');
+        q.push('i');
+        q.push('x');
+        assert_eq!(q.query(), "fix");
+        assert_eq!(q.activate(), None, "a query input has no row to activate");
     }
 
     #[test]

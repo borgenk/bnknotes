@@ -30,14 +30,15 @@ use std::time::{Duration, Instant};
 use self::clipboard::{is_text_mime, ClipboardState, CLIPBOARD_MIMES, IMAGE_MIMES};
 use self::input::KeyRepeat;
 use self::present::GpuPresentation;
+use crate::ai::{self, Preview};
 use crate::config::{self, vault_name, CaretConfig, Config, IconKeys, Vault, VaultKind};
 use crate::icon;
 use crate::menu::{Menu, MenuAction, MenuItem};
 use crate::paint::{
     build_display_list, build_find_paint, conflict_banner_layout, font_sizes, measure_tree,
-    push_conflict_banner, push_image_view, push_menu, push_palette, push_rail, push_splitter,
-    push_top_bar, push_tree, top_bar_height, tree_metrics, BarCtx, CaretPaint, PaintParams,
-    RailDragView, RailView, TabStrip,
+    push_ai_preview, push_conflict_banner, push_image_view, push_menu, push_palette, push_rail,
+    push_splitter, push_top_bar, push_tree, top_bar_height, tree_metrics, BarCtx, CaretPaint,
+    PaintParams, RailDragView, RailView, TabStrip,
 };
 use crate::palette::{Palette, PaletteAction, PaletteRow, Rows};
 use crate::pane::{
@@ -220,6 +221,15 @@ struct ImageView {
     raw: String,
 }
 
+/// One AI command offered for a pane: a built-in action by its index, or the
+/// free-form custom prompt. Built once by [`State::ai_commands`] and mapped into a
+/// menu action or a palette action by whichever surface offers it.
+#[derive(Clone, Copy)]
+enum AiCommand {
+    Run(usize),
+    Custom,
+}
+
 /// An in-progress vault drag-to-reorder, the rail's answer to [`TabDrag`] and the
 /// same shape down the y axis: which chip (by its current index, which the reorder
 /// keeps up to date), the pointer y at press, the grab offset within the chip, and
@@ -305,6 +315,17 @@ struct State {
     /// The open context menu, `None` when none is. It floats over the chrome and
     /// takes every press while it is up (see [`crate::menu`]).
     menu: Option<Menu>,
+    /// The open AI text-action preview, `None` when none is. While it is up it holds
+    /// the keyboard (Enter accepts the diff, Escape discards it) and no editing
+    /// reaches the buffer, so the captured selection stays valid until it resolves.
+    ai: Option<Preview>,
+    /// The pipe a finished AI job writes a byte to, polled by the event loop so a
+    /// several-second call never blocks a frame (see [`crate::ai::Wake`]).
+    ai_wake: ai::Wake,
+    /// Whether the context menu offers AI transforms over a selection (config `ai`).
+    ai_enabled: bool,
+    /// The command-line backend the AI actions run through (config `ai provider`).
+    ai_provider: ai::Provider,
     /// The open palette, `None` when none is. It floats over the window and takes
     /// every key while it is up (see [`crate::palette`]).
     palette: Option<Palette>,
@@ -858,6 +879,10 @@ impl State {
             icon_size: 0,
             icon_seq: 0,
             menu: None,
+            ai: None,
+            ai_wake: ai::Wake::new()?,
+            ai_enabled: config.ai.enabled,
+            ai_provider: config.ai.provider,
             palette: None,
             search: search::Results::default(),
             last_vault: None,
@@ -1325,17 +1350,79 @@ impl State {
         self.dirty = true;
     }
 
-    /// What a right-click at `(px, py)` offers. Only the rail's chips offer anything
-    /// so far: a picture for the chip, and, for a vault the config does not name, the
-    /// one action that makes it permanent.
+    /// What a right-click at `(px, py)` offers: a rail chip's icon actions, or the AI
+    /// transforms over an editor pane's selection. Anywhere else offers nothing, and
+    /// so opens no menu.
     fn menu_items_at(&self, px: f32, py: f32) -> Vec<MenuItem> {
-        let Hit::Vault(i) = self.hit_test(px, py) else {
+        match self.hit_test(px, py) {
+            Hit::Vault(i) => self.vault_menu_items(i),
+            Hit::Editor(pane, _) => self.editor_menu_items(pane),
+            _ => Vec::new(),
+        }
+    }
+
+    /// The indices into [`ai::ACTIONS`] offered for pane `i` right now: all of them
+    /// when there is a selection, else the ones that do not require one (they fall
+    /// back to the caret's paragraph or the whole note). Empty when AI actions are
+    /// off. Shared by the context menu and the AI palette so they offer the same set.
+    fn available_ai_actions(&self, i: usize) -> Vec<usize> {
+        if !self.ai_enabled {
             return Vec::new();
-        };
+        }
+        let has_selection = self.editors[i].text.selection().is_some();
+        ai::ACTIONS
+            .iter()
+            .enumerate()
+            .filter(|(_, action)| has_selection || action.scope != ai::Scope::Selection)
+            .map(|(idx, _)| idx)
+            .collect()
+    }
+
+    /// The AI commands offered for pane `i`, as `(label, command)` pairs shared by the
+    /// context menu and the command palette so both offer the same set. Each label is
+    /// prefixed with the configured provider, so it reads as an AI action and says
+    /// which backend runs it. Empty when AI actions are off.
+    fn ai_commands(&self, i: usize) -> Vec<(String, AiCommand)> {
+        if !self.ai_enabled {
+            return Vec::new();
+        }
+        let provider = self.ai_provider.label();
+        let mut commands: Vec<(String, AiCommand)> = self
+            .available_ai_actions(i)
+            .into_iter()
+            .filter_map(|idx| {
+                ai::action(idx)
+                    .map(|action| (format!("{provider}: {}", action.label), AiCommand::Run(idx)))
+            })
+            .collect();
+        // A free-form prompt is always available: it auto-detects selection or whole
+        // note, so it needs neither a selection nor a fixed scope.
+        commands.push((format!("{provider}: Custom prompt…"), AiCommand::Custom));
+        commands
+    }
+
+    /// The AI commands as context-menu items. An editor pane has no other menu yet.
+    fn editor_menu_items(&self, i: usize) -> Vec<MenuItem> {
+        self.ai_commands(i)
+            .into_iter()
+            .map(|(label, command)| MenuItem {
+                label,
+                action: match command {
+                    AiCommand::Run(idx) => MenuAction::Ai(idx),
+                    AiCommand::Custom => MenuAction::AiCustomPrompt,
+                },
+            })
+            .collect()
+    }
+
+    /// The icon actions a right-click offers on rail vault `i`: a picture for the
+    /// chip, and, for a vault the config does not name, the action that makes it
+    /// permanent.
+    fn vault_menu_items(&self, i: usize) -> Vec<MenuItem> {
         let mut items = Vec::new();
         if self.is_temporary_vault(i) {
             items.push(MenuItem {
-                label: "Save as vault",
+                label: "Save as vault".to_string(),
                 action: MenuAction::SaveVault(i),
             });
         }
@@ -1347,13 +1434,13 @@ impl State {
         // pasting an icon, and the picture on the clipboard is the part in question.
         if self.clipboard_offers_image() {
             items.push(MenuItem {
-                label: "Use image from clipboard",
+                label: "Use image from clipboard".to_string(),
                 action: MenuAction::PasteIcon(i),
             });
         }
         if has_icon {
             items.push(MenuItem {
-                label: "Clear icon",
+                label: "Clear icon".to_string(),
                 action: MenuAction::ClearIcon(i),
             });
         }
@@ -1397,22 +1484,36 @@ impl State {
         was_open
     }
 
-    /// Open the palette over the window, or close an open one: Ctrl+K is the way in
-    /// and the way back out.
+    /// Open the command palette over the window, or close an open one: Ctrl+K is the
+    /// way in and the way back out. It is the generic command surface: the AI actions
+    /// for the focused pane first, then the vaults to switch to. A curated set, not one
+    /// entry per feature.
     pub(super) fn toggle_palette(&mut self) {
         if self.close_palette() {
             return;
         }
-        let rows = vault_rows(
+        let pane = self.active_editor();
+        let mut rows: Vec<PaletteRow> = self
+            .ai_commands(pane)
+            .into_iter()
+            .map(|(label, command)| PaletteRow {
+                label,
+                action: match command {
+                    AiCommand::Run(idx) => PaletteAction::RunAi(idx),
+                    AiCommand::Custom => PaletteAction::AiCustomPrompt,
+                },
+            })
+            .collect();
+        rows.extend(vault_rows(
             &self.vaults,
             self.active_vault(),
             self.last_vault.as_deref(),
-        );
-        // A window with nowhere else to go opens nothing rather than an empty panel.
+        ));
+        // A window with nothing to offer opens nothing rather than an empty panel.
         if rows.is_empty() {
             return;
         }
-        self.palette = Some(Palette::new("Go to vault", Rows::Ranked, rows));
+        self.palette = Some(Palette::new("Run a command", Rows::Ranked, rows));
         self.dirty = true;
     }
 
@@ -1478,7 +1579,22 @@ impl State {
         match action {
             PaletteAction::SwitchVault(i) => self.switch_vault(i),
             PaletteAction::OpenMatch { path, offset } => self.open_match(&path, offset),
+            PaletteAction::RunAi(index) => self.start_ai_action(index),
+            PaletteAction::AiCustomPrompt => self.open_ai_prompt(),
         }
+    }
+
+    /// Open the palette as a single free-form field for a custom AI instruction. The
+    /// scope is decided when it runs: the selection if there is one, else the whole
+    /// note. Reached from the command palette's "Custom prompt" row and the context
+    /// menu's item.
+    pub(super) fn open_ai_prompt(&mut self) {
+        if !self.ai_enabled {
+            return;
+        }
+        self.close_palette();
+        self.palette = Some(Palette::query_input("Describe the change to make"));
+        self.dirty = true;
     }
 
     /// Open `path` and select the match at `offset`, the way the find bar lands on
@@ -1505,7 +1621,158 @@ impl State {
             MenuAction::SaveVault(i) => self.save_vault(i),
             MenuAction::PasteIcon(i) => self.paste_icon(i),
             MenuAction::ClearIcon(i) => self.clear_icon(i),
+            MenuAction::Ai(i) => self.start_ai_action(i),
+            MenuAction::AiCustomPrompt => self.open_ai_prompt(),
         }
+    }
+
+    /// Start built-in AI action `index` on the focused pane.
+    fn start_ai_action(&mut self, index: usize) {
+        if let Some(action) = ai::action(index) {
+            self.start_ai(action.instruction, action.label, action.scope);
+        }
+    }
+
+    /// Start a free-form AI action from the prompt the user typed. The scope is the
+    /// selection when there is one, else the whole note (auto-detected in
+    /// [`Self::start_ai`] via [`ai::Scope::Document`]).
+    fn start_ai_custom(&mut self, instruction: String) {
+        if instruction.trim().is_empty() {
+            return;
+        }
+        self.start_ai(&instruction, "Custom prompt", ai::Scope::Document);
+    }
+
+    /// Spawn the configured provider running `instruction` (titled `label`) over the
+    /// focused pane's `scope` region, and put up the "thinking" preview. A selection,
+    /// when present, always wins as the subject; otherwise the scope's region is used,
+    /// and a selection-only action with nothing selected does nothing. Nothing reaches
+    /// the buffer here; the answer lands through the diff preview once it arrives, and
+    /// a spawn that fails shows the failure in its place.
+    fn start_ai(&mut self, instruction: &str, label: &'static str, scope: ai::Scope) {
+        let pane = self.active_editor();
+        let span = {
+            let text = &self.editors[pane].text;
+            match text.selection() {
+                Some(selection) => selection,
+                None => match scope {
+                    ai::Scope::Selection => return,
+                    ai::Scope::Paragraph => text.paragraph_at(text.cursor()),
+                    ai::Scope::Document => (0, text.rope().len()),
+                },
+            }
+        };
+        if span.0 >= span.1 {
+            return;
+        }
+        let original = self.editors[pane].text.rope().byte_slice(span.0..span.1);
+        let version = self.editors[pane].text.version();
+        self.ai = Some(
+            match ai::Job::spawn(
+                self.ai_provider,
+                instruction,
+                &original,
+                self.ai_wake.write_fd(),
+            ) {
+                Ok(job) => Preview::Thinking {
+                    pane,
+                    span,
+                    version,
+                    original,
+                    label,
+                    job,
+                },
+                Err(e) => Preview::Failed {
+                    label,
+                    message: e.to_string(),
+                },
+            },
+        );
+        self.dirty = true;
+    }
+
+    /// A finished (or failed) AI job woke the loop: drain the wake pipe and, when the
+    /// running preview has its answer, turn it into the diff to review or the failure
+    /// to show. A spurious wake (no result yet) leaves the preview untouched.
+    fn poll_ai(&mut self) {
+        self.ai_wake.drain();
+        if !matches!(self.ai, Some(Preview::Thinking { .. })) {
+            return;
+        }
+        let Some(Preview::Thinking {
+            pane,
+            span,
+            version,
+            original,
+            label,
+            mut job,
+        }) = self.ai.take()
+        else {
+            return;
+        };
+        self.ai = Some(match job.take_outcome() {
+            None => Preview::Thinking {
+                pane,
+                span,
+                version,
+                original,
+                label,
+                job,
+            },
+            Some(ai::Outcome::Revised(revised)) => {
+                let spans = ai::word_diff(&original, &revised);
+                self.dirty = true;
+                Preview::Ready {
+                    pane,
+                    span,
+                    version,
+                    revised,
+                    spans,
+                    label,
+                }
+            }
+            Some(ai::Outcome::Failed(message)) => {
+                self.dirty = true;
+                Preview::Failed { label, message }
+            }
+        });
+    }
+
+    /// Accept the diff preview: replace the captured selection with the revised text
+    /// as one undo step, select the result so the change is visible, and dismiss the
+    /// preview. A note that changed underneath (a disk reload while the preview was
+    /// up) is left untouched rather than spliced at a stale offset.
+    pub(super) fn accept_ai(&mut self) {
+        let Some(Preview::Ready {
+            pane,
+            span,
+            version,
+            revised,
+            ..
+        }) = self.ai.take()
+        else {
+            return;
+        };
+        self.dirty = true;
+        if self.editors[pane].text.version() != version {
+            return;
+        }
+        if self.editors[pane].text.replace_ranges(&[span], &revised) {
+            let start = span.0;
+            self.editors[pane]
+                .text
+                .select_range(start, start + revised.len());
+            self.bump_caret();
+            self.reveal_active_caret();
+        }
+    }
+
+    /// Dismiss the AI preview, canceling a still-running job (dropping it kills the
+    /// child). Reports whether one was up, for the caller's repaint.
+    pub(super) fn close_ai(&mut self) -> bool {
+        let was_open = self.ai.take().is_some();
+        self.dirty |= was_open;
+        was_open
     }
 
     /// Put the clipboard's picture on vault `i`'s chip, the menu's "Use image from
@@ -1740,22 +2007,27 @@ impl State {
     /// returns so the caller can service its timers.
     fn wait_for_events(&mut self, timeout: Option<Duration>) -> Result<()> {
         let conn_fd = self.conn.fd();
-        match self.watcher.fd() {
+        let ai_fd = self.ai_wake.read_fd();
+        // Bit 0 is the socket, bit 1 the AI wake pipe, bit 2 the watcher (present
+        // only when the watcher opened its fd); a fixed array so an idle poll does
+        // not allocate.
+        let mut fds = [conn_fd, ai_fd, -1];
+        let n = match self.watcher.fd() {
             Some(watch_fd) => {
-                // Bit 0 is the socket, bit 1 the watcher, per the fd order below.
-                let ready = ffi::poll_readable(&[conn_fd, watch_fd], timeout)?;
-                if ready & 0b10 != 0 {
-                    self.handle_watch_events();
-                }
-                if ready & 0b01 != 0 {
-                    self.pull_socket()?;
-                }
+                fds[2] = watch_fd;
+                3
             }
-            None => {
-                if ffi::poll_readable(&[conn_fd], timeout)? & 0b01 != 0 {
-                    self.pull_socket()?;
-                }
-            }
+            None => 2,
+        };
+        let ready = ffi::poll_readable(&fds[..n], timeout)?;
+        if ready & 0b001 != 0 {
+            self.pull_socket()?;
+        }
+        if ready & 0b010 != 0 {
+            self.poll_ai();
+        }
+        if n == 3 && ready & 0b100 != 0 {
+            self.handle_watch_events();
         }
         Ok(())
     }
@@ -1986,6 +2258,17 @@ impl State {
         if let Some(palette) = &self.palette {
             let ctx = BarCtx::new(&self.fonts, scale, self.body_size);
             push_palette(&mut list, &ctx, palette, &self.palette_layout(palette));
+        }
+        // The AI preview is the topmost modal: it holds the keyboard for accept or
+        // reject, so nothing else can be up under it.
+        if let Some(preview) = &self.ai {
+            let ctx = BarCtx::new(&self.fonts, scale, self.body_size);
+            push_ai_preview(
+                &mut list,
+                &ctx,
+                preview,
+                (self.width as i32, self.height as i32),
+            );
         }
         Rc::new(list)
     }

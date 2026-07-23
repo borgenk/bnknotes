@@ -1,6 +1,7 @@
 //! bnknotes: a minimal, GPU-rendered markdown notes editor and a native
 //! Wayland client (no winit, no smithay, almost no crates).
 
+mod ai;
 mod app;
 mod config;
 mod dev;

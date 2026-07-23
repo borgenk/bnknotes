@@ -7,7 +7,7 @@ use crate::find;
 use crate::keymap::{self, KeyAction};
 use crate::menu::{Menu, MenuLayout};
 use crate::paint::{conflict_banner_layout, BannerButton};
-use crate::palette::{Palette, PaletteLayout, Rows};
+use crate::palette::{Palette, PaletteLayout, Rows, Submit};
 use crate::pane::{CaretAnim, Columns, DiskConflict, EditorPane, Focus, Hit, ImagePress, SPLITTER};
 use crate::platform::error::{Error, Result};
 use crate::platform::ffi;
@@ -296,6 +296,13 @@ impl State {
         // rather than snapping. Set for every action (including non-caret ones); it is
         // only read when the caret's offset actually moves.
         self.caret_from_pointer = false;
+        // The AI preview is the topmost modal: while it is up it holds the keyboard,
+        // Enter to accept the diff and Escape to discard, and swallows everything else
+        // so no edit reaches the buffer under it and its captured selection stays put.
+        if self.ai.is_some() {
+            self.handle_ai_key(action);
+            return Ok(());
+        }
         // A picture over the window is the topmost thing there is, and the keyboard
         // reaches it first: Escape puts it away and does no more, and any other key
         // that acts puts it away before acting, since typing under a picture that
@@ -477,11 +484,38 @@ impl State {
     /// the arrows move the selection (Home and End jump to its ends), Ctrl+V pastes
     /// into the query, Enter goes where the selected row says, and Escape or Ctrl+K
     /// puts the palette away.
+    /// Route a key to the open AI preview: Enter accepts the diff (when one is
+    /// ready), Escape discards it or cancels a running job, and every other key is
+    /// swallowed so the modal preview keeps the keyboard.
+    pub(super) fn handle_ai_key(&mut self, action: KeyAction) {
+        match action {
+            KeyAction::Enter => self.accept_ai(),
+            KeyAction::Escape => {
+                self.close_ai();
+            }
+            _ => {}
+        }
+    }
+
     pub(super) fn handle_palette_key(&mut self, action: KeyAction) {
         // The arms that need more of the app than the palette, taken before it is
         // borrowed.
         match action {
             KeyAction::Enter => {
+                // A free-form field (the custom AI prompt) takes the typed query
+                // itself; every other palette takes the selected row's action.
+                if self.palette.as_ref().map(Palette::submit) == Some(Submit::Query) {
+                    let query = self
+                        .palette
+                        .as_ref()
+                        .map(|p| p.query().trim().to_string())
+                        .unwrap_or_default();
+                    if !query.is_empty() {
+                        self.close_palette();
+                        self.start_ai_custom(query);
+                    }
+                    return;
+                }
                 if let Some(target) = self.palette.as_ref().and_then(Palette::activate) {
                     self.run_palette_action(target);
                 }
@@ -759,6 +793,12 @@ impl State {
                 let _time = r.u32()?;
                 let button = r.u32()?;
                 let state = r.u32()?;
+                // A modal AI preview swallows presses: a click anywhere discards it,
+                // the way clicking off the context menu dismisses that.
+                if state == wl_pointer::BUTTON_STATE_PRESSED && self.ai.is_some() {
+                    self.close_ai();
+                    return Ok(());
+                }
                 if button == wl_pointer::BTN_RIGHT {
                     if state == wl_pointer::BUTTON_STATE_PRESSED {
                         self.open_menu(self.pointer_x, self.pointer_y);

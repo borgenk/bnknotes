@@ -28,12 +28,17 @@ pub enum MenuAction {
     PasteIcon(usize),
     /// Take rail vault `i`'s picture away.
     ClearIcon(usize),
+    /// Run AI action `i` (an index into [`crate::ai::ACTIONS`]) over the focused pane.
+    Ai(usize),
+    /// Open the palette to type a free-form AI instruction for the focused pane.
+    AiCustomPrompt,
 }
 
-/// One row of a menu: what it says, and what it does.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// One row of a menu: what it says, and what it does. The label is owned because a
+/// menu entry can be composed at open time (an AI action carries its provider's name).
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MenuItem {
-    pub label: &'static str,
+    pub label: String,
     pub action: MenuAction,
 }
 
@@ -97,7 +102,7 @@ impl Menu {
         let widest = self
             .items
             .iter()
-            .map(|item| shape::text_advance(face, item.label).ceil() as i32)
+            .map(|item| shape::text_advance(face, &item.label).ceil() as i32)
             .max()
             .unwrap_or(0);
         let item_h = m.ascent + m.descent + 2 * scale.px(MENU_ITEM_VPAD);
@@ -170,7 +175,7 @@ mod tests {
         Menu::new(
             (0..n)
                 .map(|i| MenuItem {
-                    label: "Save as vault",
+                    label: "Save as vault".to_string(),
                     action: MenuAction::SaveVault(i),
                 })
                 .collect(),

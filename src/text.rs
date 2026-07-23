@@ -196,6 +196,36 @@ impl TextBuffer {
             .map(|(start, end)| self.text.byte_slice(start..end))
     }
 
+    /// The byte range of the paragraph containing `offset`: the run of consecutive
+    /// non-blank lines around it, bounded by blank lines or the buffer's ends, with
+    /// the trailing newline excluded so the surrounding blank lines survive a
+    /// replace. A blank line is its own (empty) paragraph. Used to scope an AI action
+    /// to "this paragraph" when there is no selection.
+    pub fn paragraph_at(&self, offset: usize) -> (usize, usize) {
+        let rope = &self.text;
+        let lines = rope.len_lines();
+        let here = rope.byte_to_line(offset.min(rope.len()));
+        let blank = |line: usize| {
+            let (start, end) = rope.line_content_range(line);
+            rope.byte_slice(start..end).trim().is_empty()
+        };
+        if blank(here) {
+            return rope.line_content_range(here);
+        }
+        let mut first = here;
+        while first > 0 && !blank(first - 1) {
+            first -= 1;
+        }
+        let mut last = here;
+        while last + 1 < lines && !blank(last + 1) {
+            last += 1;
+        }
+        (
+            rope.line_content_range(first).0,
+            rope.line_content_range(last).1,
+        )
+    }
+
     /// Insert `s` at the cursor, first replacing any selection, and advance past
     /// it. Clears the selection.
     pub fn insert_str(&mut self, s: &str) {
@@ -2149,6 +2179,23 @@ mod tests {
         assert_eq!(b.text(), "hio");
         assert_eq!(b.cursor, 2);
         assert_eq!(b.selection(), None);
+    }
+
+    #[test]
+    fn paragraph_at_spans_the_block_around_the_caret() {
+        let mut b = TextBuffer::new();
+        b.insert_str("first line\nsecond line\n\nnext para\n");
+        // A caret anywhere in the first block returns both its lines, no trailing newline.
+        let (s, e) = b.paragraph_at(3);
+        assert_eq!(b.rope().byte_slice(s..e), "first line\nsecond line");
+        // A caret in the second block returns just it, bounded by the blank line.
+        let off = b.text().find("next").unwrap();
+        let (s2, e2) = b.paragraph_at(off);
+        assert_eq!(b.rope().byte_slice(s2..e2), "next para");
+        // On the blank line between them, the empty paragraph is that line.
+        let blank = b.text().find("\n\n").unwrap() + 1;
+        let (s3, e3) = b.paragraph_at(blank);
+        assert_eq!(s3, e3);
     }
 
     #[test]

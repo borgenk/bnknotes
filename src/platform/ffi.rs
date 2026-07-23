@@ -46,6 +46,9 @@ const MSG_CTRUNC: c_int = 0x8;
 
 /// Open the pipe with both ends close-on-exec.
 const O_CLOEXEC: c_int = 0x8_0000;
+/// Open a pipe end non-blocking, so a read that finds it empty returns rather than
+/// waiting (the wake pipe, drained after poll reports it readable).
+const O_NONBLOCK: c_int = 0x800;
 
 const EINTR: c_int = 4;
 /// A timed-out or would-block read (EAGAIN == EWOULDBLOCK on Linux).
@@ -509,6 +512,48 @@ pub fn pipe() -> Result<(OwnedFd, OwnedFd)> {
     let read_end = unsafe { OwnedFd::from_raw_fd(fds[0]) };
     let write_end = unsafe { OwnedFd::from_raw_fd(fds[1]) };
     Ok((read_end, write_end))
+}
+
+/// Create a close-on-exec, non-blocking pipe, returning `(read_end, write_end)`.
+/// A worker thread writes a byte to the write end to wake the event loop, which
+/// polls the read end and drains it; the non-blocking read end lets [`drain`] read
+/// once without risking a block on a spurious wake.
+pub fn wake_pipe() -> Result<(OwnedFd, OwnedFd)> {
+    let mut fds = [0 as c_int; 2];
+    // SAFETY: fds is a live 2-element array the call fills in.
+    let rc = unsafe { pipe2(fds.as_mut_ptr(), O_CLOEXEC | O_NONBLOCK) };
+    if rc < 0 {
+        return Err(Error::msg(format!("pipe2 failed: errno {}", errno())));
+    }
+    // SAFETY: both fds are fresh and owned.
+    let read_end = unsafe { OwnedFd::from_raw_fd(fds[0]) };
+    let write_end = unsafe { OwnedFd::from_raw_fd(fds[1]) };
+    Ok((read_end, write_end))
+}
+
+/// Discard whatever is readable on `fd` in one read, for a wake pipe going from an
+/// edge back to empty. The fd is non-blocking, so a read finding it already empty
+/// (EAGAIN) is not an error.
+pub fn drain(fd: RawFd) -> Result<()> {
+    let mut buf = [0u8; 64];
+    loop {
+        // SAFETY: buf is a live writable array of buf.len() bytes.
+        let n = unsafe { read(fd, buf.as_mut_ptr() as *mut c_void, buf.len()) };
+        if n < 0 {
+            let e = errno();
+            if e == EINTR {
+                continue;
+            }
+            if e == EAGAIN {
+                return Ok(());
+            }
+            return Err(Error::msg(format!("drain failed: errno {e}")));
+        }
+        // A short read leaves the pipe empty; a full one may have more queued.
+        if (n as usize) < buf.len() {
+            return Ok(());
+        }
+    }
 }
 
 /// Write every byte of `bytes` to `fd`, retrying short writes and EINTR.

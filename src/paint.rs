@@ -1,3 +1,4 @@
+use crate::ai::{self, DiffKind, Preview};
 use crate::config::{Vault, VaultKind};
 use crate::find::{self, FindState};
 use crate::layout::{
@@ -18,26 +19,28 @@ use crate::platform::shape;
 use crate::render::display::{self, DisplayList, DrawCmd};
 use crate::scale::Scale;
 use crate::theme::{
-    BACKGROUND, CARET_COLOR, CARET_WIDTH, CODE_BG, CODE_COLOR, CODE_COMMENT_COLOR,
-    CODE_KEYWORD_COLOR, CODE_MARKER_COLOR, CODE_NUMBER_COLOR, CODE_PAD_X, CODE_PAD_Y, CODE_RADIUS,
-    CODE_STRING_COLOR, CONFLICT_BANNER_BG, CONFLICT_BANNER_TEXT, CONFLICT_BUTTON_BG,
-    CONFLICT_BUTTON_HOVER_BG, DECOR_TEXT_GAP, FIND_BG, FIND_ERROR_COLOR, FIND_MATCH_COLOR,
-    FIND_TICK_COLOR, FOREGROUND, HEADING_COLORS, IMAGE_BORDER_COLOR, IMAGE_BORDER_THICKNESS,
-    IMAGE_BUTTON_BG, IMAGE_BUTTON_RADIUS, IMAGE_VIEW_BG, IMAGE_VIEW_PAD, LINK_COLOR, MARGIN,
-    MARKER_COLOR, MENU_BG, MENU_BORDER, MENU_BORDER_W, MENU_HOVER_BG, MENU_ITEM_PAD_X,
-    MENU_ITEM_RADIUS, MENU_RADIUS, MENU_TEXT, PALETTE_BG, PALETTE_BORDER, PALETTE_BORDER_W,
-    PALETTE_HINT, PALETTE_MATCH, PALETTE_RADIUS, PALETTE_ROW_PAD_X, PALETTE_ROW_RADIUS,
-    PALETTE_SELECTED_BG, PALETTE_TEXT, QUOTE_BAR_COLOR, QUOTE_BAR_WIDTH, RAIL_ACTIVE_COLOR,
-    RAIL_ACTIVE_SPAN, RAIL_ACTIVE_W, RAIL_BG, RAIL_GAP, RAIL_HOVER_INK, RAIL_HOVER_LIFT,
-    RAIL_INK_DARK, RAIL_INK_LIGHT, RAIL_PAD, RAIL_RADIUS, RAIL_TEMP_RING, RULE_COLOR,
-    RULE_THICKNESS, SCROLL_INK, SCROLL_INSET, SCROLL_MIN_THUMB, SCROLL_NEAR, SCROLL_THIN,
-    SCROLL_THUMB_COVER, SCROLL_THUMB_HOVER_COVER, SCROLL_TROUGH_COVER, SCROLL_WIDE,
-    SELECTION_COLOR, SPLITTER_COLOR, TABLE_BORDER_COLOR, TABLE_HEADER_BG, TAB_ACTIVE_BG,
-    TAB_ACTIVE_TEXT, TAB_BUTTON_HOVER_BG, TAB_BUTTON_RADIUS, TAB_CLOSE_GAP, TAB_CLOSE_W,
-    TAB_DIRTY_COLOR, TAB_HOVER_BG, TAB_INACTIVE_TEXT, TAB_MAX_W, TAB_MIN_W, TAB_NEW_W, TAB_PAD_X,
-    TAB_VPAD, TICK_HEIGHT, TICK_WIDTH, TOP_BAR_BG, TREE_BG, TREE_FOOTER_GAP, TREE_FOOTER_VPAD,
-    TREE_HOVER_BG, TREE_INDENT, TREE_MARKER_COLOR, TREE_MARKER_W, TREE_PAD, TREE_ROW_INSET_Y,
-    TREE_ROW_PAD, TREE_ROW_RADIUS, TREE_TEXT_COLOR, VAULT_PAD_X,
+    AI_DELETE_BG, AI_DELETE_TEXT, AI_ERROR_TEXT, AI_HINT, AI_INSERT_BG, AI_INSERT_TEXT,
+    AI_LINE_VPAD, AI_MAX_LINES, AI_PANEL_BG, AI_PANEL_BORDER, AI_PANEL_BORDER_W, AI_PANEL_PAD,
+    AI_PANEL_RADIUS, AI_PANEL_TOP, AI_PANEL_WIDTH, AI_STRIKE, AI_TEXT, BACKGROUND, CARET_COLOR,
+    CARET_WIDTH, CODE_BG, CODE_COLOR, CODE_COMMENT_COLOR, CODE_KEYWORD_COLOR, CODE_MARKER_COLOR,
+    CODE_NUMBER_COLOR, CODE_PAD_X, CODE_PAD_Y, CODE_RADIUS, CODE_STRING_COLOR, CONFLICT_BANNER_BG,
+    CONFLICT_BANNER_TEXT, CONFLICT_BUTTON_BG, CONFLICT_BUTTON_HOVER_BG, DECOR_TEXT_GAP, FIND_BG,
+    FIND_ERROR_COLOR, FIND_MATCH_COLOR, FIND_TICK_COLOR, FOREGROUND, HEADING_COLORS,
+    IMAGE_BORDER_COLOR, IMAGE_BORDER_THICKNESS, IMAGE_BUTTON_BG, IMAGE_BUTTON_RADIUS,
+    IMAGE_VIEW_BG, IMAGE_VIEW_PAD, LINK_COLOR, MARGIN, MARKER_COLOR, MENU_BG, MENU_BORDER,
+    MENU_BORDER_W, MENU_HOVER_BG, MENU_ITEM_PAD_X, MENU_ITEM_RADIUS, MENU_RADIUS, MENU_TEXT,
+    PALETTE_BG, PALETTE_BORDER, PALETTE_BORDER_W, PALETTE_HINT, PALETTE_MATCH, PALETTE_RADIUS,
+    PALETTE_ROW_PAD_X, PALETTE_ROW_RADIUS, PALETTE_SELECTED_BG, PALETTE_TEXT, QUOTE_BAR_COLOR,
+    QUOTE_BAR_WIDTH, RAIL_ACTIVE_COLOR, RAIL_ACTIVE_SPAN, RAIL_ACTIVE_W, RAIL_BG, RAIL_GAP,
+    RAIL_HOVER_INK, RAIL_HOVER_LIFT, RAIL_INK_DARK, RAIL_INK_LIGHT, RAIL_PAD, RAIL_RADIUS,
+    RAIL_TEMP_RING, RULE_COLOR, RULE_THICKNESS, SCROLL_INK, SCROLL_INSET, SCROLL_MIN_THUMB,
+    SCROLL_NEAR, SCROLL_THIN, SCROLL_THUMB_COVER, SCROLL_THUMB_HOVER_COVER, SCROLL_TROUGH_COVER,
+    SCROLL_WIDE, SELECTION_COLOR, SPLITTER_COLOR, TABLE_BORDER_COLOR, TABLE_HEADER_BG,
+    TAB_ACTIVE_BG, TAB_ACTIVE_TEXT, TAB_BUTTON_HOVER_BG, TAB_BUTTON_RADIUS, TAB_CLOSE_GAP,
+    TAB_CLOSE_W, TAB_DIRTY_COLOR, TAB_HOVER_BG, TAB_INACTIVE_TEXT, TAB_MAX_W, TAB_MIN_W, TAB_NEW_W,
+    TAB_PAD_X, TAB_VPAD, TICK_HEIGHT, TICK_WIDTH, TOP_BAR_BG, TREE_BG, TREE_FOOTER_GAP,
+    TREE_FOOTER_VPAD, TREE_HOVER_BG, TREE_INDENT, TREE_MARKER_COLOR, TREE_MARKER_W, TREE_PAD,
+    TREE_ROW_INSET_Y, TREE_ROW_PAD, TREE_ROW_RADIUS, TREE_TEXT_COLOR, VAULT_PAD_X,
 };
 
 /// The per-frame inputs [`build_display_list`] needs beyond the layout itself:
@@ -849,7 +852,7 @@ pub(crate) fn push_menu(list: &mut DisplayList, ctx: &BarCtx, menu: &Menu, layou
             });
         }
         let x = row.x + scale.px(MENU_ITEM_PAD_X);
-        let w = shape::text_advance(face, item.label) as i32;
+        let w = shape::text_advance(face, &item.label) as i32;
         list.push(text_cmd(
             FaceKey::Prose {
                 size: ctx.body_size,
@@ -859,10 +862,272 @@ pub(crate) fn push_menu(list: &mut DisplayList, ctx: &BarCtx, menu: &Menu, layou
             layout.baseline(i),
             x + w,
             MENU_TEXT,
-            item.label.to_string(),
+            item.label.clone(),
             m,
         ));
     }
+}
+
+/// The color, optional background tint, and strikethrough for a diff run of `kind`:
+/// an insertion in green, a deletion struck through in red, unchanged text plain.
+fn diff_style(kind: DiffKind) -> (u32, Option<u32>, bool) {
+    match kind {
+        DiffKind::Equal => (AI_TEXT, None, false),
+        DiffKind::Insert => (AI_INSERT_TEXT, Some(AI_INSERT_BG), false),
+        DiffKind::Delete => (AI_DELETE_TEXT, Some(AI_DELETE_BG), true),
+    }
+}
+
+/// One word placed on a wrapped diff line: its x within the panel's inner box, its
+/// advance, the text, and how it is drawn.
+struct DiffWord {
+    x: i32,
+    w: i32,
+    text: String,
+    color: u32,
+    bg: Option<u32>,
+    strike: bool,
+}
+
+/// Greedily wrap `words` (each a word or a whitespace run, tagged with its color)
+/// into lines no wider than `max_w`, breaking at the whitespace and forcing a break
+/// on a newline. A word wider than the box is left to overflow; the caller clips it
+/// to the panel.
+fn wrap_diff(
+    words: &[(String, bool, u32, Option<u32>, bool)],
+    face: &Face,
+    max_w: i32,
+) -> Vec<Vec<DiffWord>> {
+    let mut lines: Vec<Vec<DiffWord>> = Vec::new();
+    let mut cur: Vec<DiffWord> = Vec::new();
+    let mut pen = 0i32;
+    let mut pending_space = 0i32;
+    for (text, space, color, bg, strike) in words {
+        if *space {
+            if text.contains('\n') {
+                lines.push(std::mem::take(&mut cur));
+                pen = 0;
+                pending_space = 0;
+            } else {
+                pending_space += shape::text_advance(face, text).ceil() as i32;
+            }
+            continue;
+        }
+        let w = shape::text_advance(face, text).ceil() as i32;
+        let lead = if cur.is_empty() { 0 } else { pending_space };
+        if !cur.is_empty() && pen + lead + w > max_w {
+            lines.push(std::mem::take(&mut cur));
+            pen = 0;
+            pending_space = 0;
+        }
+        let lead = if cur.is_empty() { 0 } else { pending_space };
+        pen += lead;
+        cur.push(DiffWord {
+            x: pen,
+            w,
+            text: text.clone(),
+            color: *color,
+            bg: *bg,
+            strike: *strike,
+        });
+        pen += w;
+        pending_space = 0;
+    }
+    if !cur.is_empty() {
+        lines.push(cur);
+    }
+    lines
+}
+
+/// Draw the AI text-action preview: a floating panel, like the palette, holding the
+/// action's name, its body (a running note, the diff to review, or a failure), and
+/// the accept/reject hint. Pushed after the rest of the frame, so it covers what it
+/// floats over. The body wraps to the panel and, past [`AI_MAX_LINES`], notes how
+/// many changed lines are hidden rather than growing without bound.
+pub(crate) fn push_ai_preview(
+    list: &mut DisplayList,
+    ctx: &BarCtx,
+    preview: &Preview,
+    window: (i32, i32),
+) {
+    let scale = ctx.scale;
+    let m = ctx.metrics();
+    let face = ctx.fonts.face(ctx.body_size, FontStyle::Regular);
+    let pad = scale.px(AI_PANEL_PAD);
+    let vpad = scale.px(AI_LINE_VPAD);
+    let text_h = m.ascent + m.descent;
+    let line_h = text_h + 2 * vpad;
+    let rule_h = scale.px(AI_PANEL_BORDER_W).max(1);
+
+    let w = scale.px(AI_PANEL_WIDTH).min(window.0 - 2 * pad).max(0);
+    let inner_w = (w - 2 * pad).max(0);
+
+    let (title, base_hint) = match preview {
+        Preview::Thinking { label, .. } => (*label, "Esc to cancel"),
+        Preview::Ready { label, .. } => (*label, "Enter to accept  ·  Esc to discard"),
+        Preview::Failed { label, .. } => (*label, "Esc to dismiss"),
+    };
+
+    // The body's colored input words: the diff for a ready preview, a plain line
+    // otherwise. Owned, so nothing borrows the preview across the wrap.
+    let mut words: Vec<(String, bool, u32, Option<u32>, bool)> = Vec::new();
+    match preview {
+        Preview::Ready { spans, .. } => {
+            for p in ai::pieces(spans) {
+                let (color, bg, strike) = diff_style(p.kind);
+                words.push((p.text.to_string(), p.space, color, bg, strike));
+            }
+        }
+        Preview::Thinking { .. } => {
+            words.push(("Working…".to_string(), false, AI_HINT, None, false));
+        }
+        Preview::Failed { message, .. } => {
+            let span = [ai::DiffSpan {
+                kind: DiffKind::Equal,
+                text: message.clone(),
+            }];
+            for p in ai::pieces(&span) {
+                words.push((p.text.to_string(), p.space, AI_ERROR_TEXT, None, false));
+            }
+        }
+    }
+
+    let mut lines = wrap_diff(&words, face, inner_w);
+    let hidden = lines.len().saturating_sub(AI_MAX_LINES);
+    lines.truncate(AI_MAX_LINES);
+    let hint = if hidden > 0 {
+        format!("{base_hint}  ·  +{hidden} more changed lines")
+    } else {
+        base_hint.to_string()
+    };
+
+    // Title row, a rule, the body lines, then the hint row, inside the padding.
+    let body_h = lines.len() as i32 * line_h;
+    let h = 2 * pad + line_h + rule_h + body_h + line_h;
+    let x = ((window.0 - w) / 2).max(0);
+    let y = scale.px(AI_PANEL_TOP).min(window.1 - h).max(0);
+
+    let radius = scale.px(AI_PANEL_RADIUS);
+    let border = scale.px(AI_PANEL_BORDER_W).max(1);
+    list.push(DrawCmd::RoundRect {
+        rect: Rect { x, y, w, h },
+        color: AI_PANEL_BORDER,
+        radius,
+        corners: display::RoundedCorners::Both,
+    });
+    list.push(DrawCmd::RoundRect {
+        rect: Rect {
+            x: x + border,
+            y: y + border,
+            w: (w - 2 * border).max(0),
+            h: (h - 2 * border).max(0),
+        },
+        color: AI_PANEL_BG,
+        radius: (radius - border).max(0),
+        corners: display::RoundedCorners::Both,
+    });
+
+    let inner_x = x + pad;
+    let inner_right = inner_x + inner_w;
+
+    // Title.
+    let title_base = y + pad + vpad + m.ascent;
+    let title_w = shape::text_advance(face, title).ceil() as i32;
+    list.push(clip_text_x(
+        text_cmd(
+            ctx.regular(),
+            inner_x,
+            title_base,
+            inner_x + title_w,
+            AI_TEXT,
+            title.to_string(),
+            m,
+        ),
+        inner_x,
+        inner_right,
+    ));
+
+    // The rule under the title.
+    list.push(DrawCmd::Fill {
+        rect: Rect {
+            x: inner_x,
+            y: y + pad + line_h,
+            w: inner_w,
+            h: rule_h,
+        },
+        color: AI_PANEL_BORDER,
+    });
+
+    // Body lines.
+    let body_top = y + pad + line_h + rule_h;
+    for (li, line) in lines.iter().enumerate() {
+        let top = body_top + li as i32 * line_h;
+        let baseline = top + vpad + m.ascent;
+        for word in line {
+            let wx = inner_x + word.x;
+            if let Some(bg) = word.bg {
+                let x0 = wx.max(inner_x);
+                let x1 = (wx + word.w).min(inner_right);
+                if x1 > x0 {
+                    list.push(DrawCmd::Fill {
+                        rect: Rect {
+                            x: x0,
+                            y: baseline - m.ascent,
+                            w: x1 - x0,
+                            h: text_h,
+                        },
+                        color: bg,
+                    });
+                }
+            }
+            list.push(clip_text_x(
+                text_cmd(
+                    ctx.regular(),
+                    wx,
+                    baseline,
+                    wx + word.w,
+                    word.color,
+                    word.text.clone(),
+                    m,
+                ),
+                inner_x,
+                inner_right,
+            ));
+            if word.strike {
+                let x0 = wx.max(inner_x);
+                let x1 = (wx + word.w).min(inner_right);
+                if x1 > x0 {
+                    list.push(DrawCmd::Fill {
+                        rect: Rect {
+                            x: x0,
+                            y: baseline - m.ascent + text_h / 2,
+                            w: x1 - x0,
+                            h: rule_h,
+                        },
+                        color: AI_STRIKE,
+                    });
+                }
+            }
+        }
+    }
+
+    // Hint row, along the bottom padding.
+    let hint_top = y + h - pad - line_h;
+    let hint_base = hint_top + vpad + m.ascent;
+    let hint_w = shape::text_advance(face, &hint).ceil() as i32;
+    list.push(clip_text_x(
+        text_cmd(
+            ctx.regular(),
+            inner_x,
+            hint_base,
+            inner_x + hint_w,
+            AI_HINT,
+            hint,
+            m,
+        ),
+        inner_x,
+        inner_right,
+    ));
 }
 
 /// The sidebar's text size. The sidebar is chrome, not content, so its names read
@@ -2901,6 +3166,57 @@ mod tests {
 
     use super::*;
     use crate::theme::{FONT_SIZE, RAIL_W, VAULT_COLORS};
+
+    /// The app's real font stack at the body size, so a panel is measured against the
+    /// same text the painter draws.
+    fn test_fonts() -> Fonts {
+        Fonts::with_config(
+            &crate::platform::freetype::FontConfig::default(),
+            &[FONT_SIZE],
+            1.5,
+        )
+        .expect("open the default fonts")
+    }
+
+    #[test]
+    fn the_ai_preview_draws_its_title_and_the_diff_colors() {
+        use crate::ai::{word_diff, Preview};
+        use crate::theme::{AI_DELETE_TEXT, AI_INSERT_BG, AI_STRIKE, AI_TEXT};
+
+        let fonts = test_fonts();
+        let ctx = BarCtx::new(&fonts, Scale::ONE, FONT_SIZE);
+        let preview = Preview::Ready {
+            pane: 0,
+            span: (0, 7),
+            version: 0,
+            revised: "the cat".into(),
+            spans: word_diff("teh cat", "the cat"),
+            label: "Fix spelling & grammar",
+        };
+        let mut list: DisplayList = Vec::new();
+        push_ai_preview(&mut list, &ctx, &preview, (900, 700));
+
+        // The action's name is drawn as a plain text run.
+        assert!(list.iter().any(|c| matches!(
+            c,
+            DrawCmd::Text { text, color, .. } if text == "Fix spelling & grammar" && *color == AI_TEXT
+        )));
+        // The inserted word carries the green tint behind it.
+        assert!(list
+            .iter()
+            .any(|c| matches!(c, DrawCmd::Fill { color, .. } if *color == AI_INSERT_BG)));
+        assert!(list
+            .iter()
+            .any(|c| matches!(c, DrawCmd::Text { text, .. } if text == "the")));
+        // The deleted word is struck through in the delete color.
+        assert!(list
+            .iter()
+            .any(|c| matches!(c, DrawCmd::Fill { color, .. } if *color == AI_STRIKE)));
+        assert!(list.iter().any(|c| matches!(
+            c,
+            DrawCmd::Text { text, color, .. } if text == "teh" && *color == AI_DELETE_TEXT
+        )));
+    }
 
     /// A rail column the width the theme asks for, at scale 1.0.
     fn rail(h: i32) -> Rect {

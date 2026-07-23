@@ -303,6 +303,35 @@ pub(crate) const PALETTE_ROW_VPAD: i32 = 6;
 pub(crate) const PALETTE_ROW_PAD_X: i32 = 10;
 pub(crate) const PALETTE_ROW_RADIUS: i32 = MENU_ITEM_RADIUS;
 
+/// The AI text-action preview: a floating panel, like the palette, holding the diff
+/// between a selection and the tool's revision. It borrows the palette's panel look
+/// and adds the diff's colors: an insertion in green, a deletion struck through in
+/// red, over tints that separate the changed words from the unchanged text.
+pub(crate) const AI_PANEL_BG: u32 = MENU_BG;
+pub(crate) const AI_PANEL_BORDER: u32 = MENU_BORDER;
+pub(crate) const AI_TEXT: u32 = FOREGROUND;
+/// The subdued tone for the panel's title and the accept/reject hint.
+pub(crate) const AI_HINT: u32 = TAB_INACTIVE_TEXT;
+/// A failure message, in the same red the find bar shows a bad pattern in.
+pub(crate) const AI_ERROR_TEXT: u32 = FIND_ERROR_COLOR;
+pub(crate) const AI_INSERT_TEXT: u32 = 0x00a6_e3a1;
+pub(crate) const AI_INSERT_BG: u32 = 0x0030_4a38;
+pub(crate) const AI_DELETE_TEXT: u32 = 0x00f3_8ba8;
+pub(crate) const AI_DELETE_BG: u32 = 0x004a_3038;
+/// The line struck through a deletion, the deletion's own color.
+pub(crate) const AI_STRIKE: u32 = AI_DELETE_TEXT;
+/// The panel's width and the gap above it; it is wider than the palette because it
+/// holds wrapped prose, not one-line rows.
+pub(crate) const AI_PANEL_WIDTH: i32 = 640;
+pub(crate) const AI_PANEL_TOP: i32 = 84;
+pub(crate) const AI_PANEL_RADIUS: i32 = PALETTE_RADIUS;
+pub(crate) const AI_PANEL_BORDER_W: i32 = 1;
+pub(crate) const AI_PANEL_PAD: i32 = 14;
+/// Padding above and below one wrapped diff line, and the most lines the panel shows
+/// before it notes the rest are hidden.
+pub(crate) const AI_LINE_VPAD: i32 = 3;
+pub(crate) const AI_MAX_LINES: usize = 18;
+
 /// The full-window picture view: what a double-clicked image opens into. The
 /// backdrop covers the whole window rather than dimming it, since the point is the
 /// picture and everything else is in the way of it; near-black, so a picture's own

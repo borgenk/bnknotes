@@ -1255,6 +1255,14 @@ impl EditorPane {
         if self.index_key != Some(key) {
             let wrap_width = rect.w - 2 * margin;
             self.scan_images();
+            // Shift the fold anchors by whatever edit happened since the last index,
+            // so a fold rides its heading as text above it grows or shrinks. This
+            // runs before either rebuild path below: a resize batched with an edit
+            // takes the full rebuild yet still moves headings, so remapping only on
+            // the incremental path would drop those folds.
+            if let Some(prev) = self.prev_rope.as_ref() {
+                self.folds.remap(prev, self.text.rope());
+            }
             // When only the content changed (same column, font, and scale), re-measure
             // just the edited region against the previous rope; otherwise (first build,
             // or a resize) rebuild in full.
@@ -1269,9 +1277,6 @@ impl EditorPane {
             if incremental {
                 let mut index = self.line_index.take().expect("checked");
                 let prev = self.prev_rope.take().expect("checked");
-                // Shift the fold anchors by the same edit that is about to be
-                // re-measured, so a fold rides its heading as text above it grows.
-                self.folds.remap(&prev, self.text.rope());
                 let ctx = LayoutCtx::for_index(
                     fonts,
                     self.text.rope(),
@@ -3502,6 +3507,37 @@ run
         assert_eq!(
             drawn_lines(&pane),
             vec![0, 1, 2, 3, 4, 8, 9, 10],
+            "the same section is still the hidden one"
+        );
+    }
+
+    #[test]
+    fn a_fold_survives_a_line_typed_directly_above_it() {
+        // The reported bug, end to end: fold a section, then open a blank line right
+        // above its heading. The heading moves down one line and the fold must ride
+        // with it, not spring open.
+        let fonts = Fonts::new(&markdown::all_sizes(FONT_SIZE)).expect("a default font");
+        let rect = fold_rect();
+        let mut pane = pane_of(FOLDABLE);
+        let ls = pane.text.rope().line_to_byte(2);
+        assert!(pane.toggle_fold_at(&fonts, rect, ls));
+        pane.ensure_layout(&fonts, rect);
+        assert_eq!(drawn_lines(&pane), vec![0, 1, 2, 6, 7, 8]);
+
+        // Insert a blank line immediately above `## Setup`, the adjacent case the
+        // old boundary math misplaced.
+        pane.text
+            .set_cursor(pane.text.rope().line_to_byte(2), false);
+        pane.text.insert_str("\n");
+        pane.ensure_layout(&fonts, rect);
+        assert_eq!(
+            pane.folds.lines().collect::<Vec<_>>(),
+            vec![3],
+            "the fold rode its heading down instead of popping open"
+        );
+        assert_eq!(
+            drawn_lines(&pane),
+            vec![0, 1, 2, 3, 7, 8, 9],
             "the same section is still the hidden one"
         );
     }

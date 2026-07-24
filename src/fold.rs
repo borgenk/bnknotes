@@ -103,37 +103,38 @@ impl Folds {
     /// Shift the anchors across an edit that turned `prev` into `new`, so a fold
     /// stays on its heading when text above it grows or shrinks.
     ///
-    /// The changed line range comes from the same byte-cheap rope diff
+    /// The edit's untouched tail comes from the same byte-cheap rope diff
     /// [`LineIndex::update`] uses (matching prefix from the front, matching suffix
-    /// from the back). An anchor above the change keeps its line; one in the
-    /// untouched tail moves by the line delta. An anchor inside the changed range
-    /// keeps its line and is left for [`retain_headings`](Self::retain_headings) to
-    /// judge, so editing a folded heading's own text does not pop it open, while
+    /// from the back). An anchor whose heading line begins at or after where that
+    /// tail starts sits wholly inside it, so it moved by exactly the line delta.
+    /// Any other anchor keeps its line: one before the edit never moved, and the
+    /// edited line itself is held for [`retain_headings`](Self::retain_headings) to
+    /// judge, so editing a folded heading's own text does not pop it open while
     /// deleting the heading outright drops the fold.
+    ///
+    /// The start-byte test is what makes an insert or delete *directly above* a
+    /// heading ride correctly: the heading's line is byte-identical in the tail even
+    /// though the ambiguous boundary newline is split between the two sides of the
+    /// diff, so a line-boundary guess would misplace it but its start byte does not.
     pub fn remap(&mut self, prev: &Rope, new: &Rope) {
         if self.lines.is_empty() {
             return;
         }
-        let (old_n, new_n) = (prev.len_lines(), new.len_lines());
-        let delta = new_n as isize - old_n as isize;
+        let delta = new.len_lines() as isize - prev.len_lines() as isize;
         if delta == 0 {
             return;
         }
         let prefix = new.common_prefix_len(prev);
         let suffix = new.common_suffix_len(prev, new.len().min(prev.len()) - prefix);
-        let front = new.byte_to_line(prefix);
-        // Lines strictly after the one holding the suffix boundary are untouched;
-        // the boundary line itself counts as changed, matching the index's diff.
-        let back = (new_n - 1)
-            .saturating_sub(new.byte_to_line(new.len() - suffix))
-            .min(new_n.saturating_sub(front))
-            .min(old_n.saturating_sub(front));
-        let resync_old = old_n - back;
+        // Where the unchanged tail begins in the old text. A heading line starting
+        // here or later is wholly inside it and rode the edit down (or up) by delta.
+        let tail_start = prev.len() - suffix;
+        let new_n = new.len_lines();
         let shifted: BTreeSet<usize> = self
             .lines
             .iter()
             .map(|&line| {
-                if line >= resync_old {
+                if prev.line_to_byte(line) >= tail_start {
                     line.saturating_add_signed(delta)
                 } else {
                     line
@@ -531,6 +532,39 @@ run
         let mut folds = Folds::from_lines([4, 8]);
         folds.remap(&prev, &new);
         assert_eq!(folds.lines().collect::<Vec<_>>(), vec![2, 6]);
+    }
+
+    #[test]
+    fn a_fold_survives_a_line_inserted_directly_above_its_heading() {
+        // The reported bug: inserting a blank line right above a folded heading used
+        // to leave the anchor unshifted (the boundary newline is split across the
+        // diff), so `retain_headings` then saw the old line gone blank and dropped
+        // the fold, popping it open. The anchor must ride the heading down instead.
+        let new_text = NESTED.replace("intro\n## Setup", "intro\n\n## Setup");
+        let prev = Rope::from_str(NESTED);
+        let new = Rope::from_str(&new_text);
+        let mut folds = Folds::from_lines([2, 6]);
+        folds.remap(&prev, &new);
+        assert_eq!(folds.lines().collect::<Vec<_>>(), vec![3, 7]);
+        // And they still land on their headings, so the fold holds.
+        let (_, idx) = index(&new_text);
+        folds.retain_headings(&idx);
+        assert_eq!(folds.lines().collect::<Vec<_>>(), vec![3, 7]);
+    }
+
+    #[test]
+    fn a_fold_survives_a_line_deleted_directly_above_its_heading() {
+        // The mirror case: deleting the line just above a folded heading pulls it up
+        // by one, and the fold rides with it rather than being dropped.
+        let new_text = NESTED.replace("intro\n## Setup", "## Setup");
+        let prev = Rope::from_str(NESTED);
+        let new = Rope::from_str(&new_text);
+        let mut folds = Folds::from_lines([2, 6]);
+        folds.remap(&prev, &new);
+        assert_eq!(folds.lines().collect::<Vec<_>>(), vec![1, 5]);
+        let (_, idx) = index(&new_text);
+        folds.retain_headings(&idx);
+        assert_eq!(folds.lines().collect::<Vec<_>>(), vec![1, 5]);
     }
 
     #[test]

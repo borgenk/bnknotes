@@ -32,9 +32,10 @@ const MAGIC: &[u8; 4] = b"BNKN";
 /// The version written. Older versions still readable are listed in
 /// [`MIN_VERSION`]; a decode fills anything they predate with its default, so a
 /// schema addition costs the user nothing.
-const VERSION: u8 = 7;
+const VERSION: u8 = 8;
 /// The oldest version [`decode`] understands. v6 is v7 without the per-tab fold
-/// list; anything older is refused and the session falls back to defaults.
+/// list; v7 is v8 without the per-tab pinned flag; anything older is refused and
+/// the session falls back to defaults.
 const MIN_VERSION: u8 = 6;
 /// Cap on folded headings persisted per tab, matching the in-memory cap so a
 /// state file cannot ask for a set the editor would not build.
@@ -139,6 +140,8 @@ pub struct PaneSession {
     /// holds a heading is dropped when the document is re-indexed, so an external
     /// edit degrades to fewer folds rather than to nonsense.
     pub folds: Vec<u32>,
+    /// Whether the tab was pinned (kept in place, guarded against close).
+    pub pinned: bool,
 }
 
 /// A content pane's remembered stack of open tabs and which one was active. An
@@ -456,6 +459,7 @@ fn write_pane_group(out: &mut Vec<u8>, pane: &PaneGroupSession) -> Result<()> {
         for line in tab.folds.iter().take(MAX_FOLDS) {
             out.extend_from_slice(&line.to_le_bytes());
         }
+        out.push(u8::from(tab.pinned));
     }
     out.extend_from_slice(&pane.active.to_le_bytes());
     Ok(())
@@ -553,11 +557,14 @@ fn read_pane(r: &mut Reader) -> Result<PaneSession> {
             }
         }
     }
+    // v7 predates the pinned flag, so a tab restored from one opens unpinned.
+    let pinned = r.version >= 8 && r.u8()? != 0;
     Ok(PaneSession {
         path,
         cursor,
         scroll_y,
         folds,
+        pinned,
     })
 }
 
@@ -704,6 +711,7 @@ mod tests {
                                         cursor: 42,
                                         scroll_y: 128,
                                         folds: vec![3, 17, 40],
+                                        pinned: true,
                                     },
                                     PaneSession {
                                         path: Some(PathBuf::from(
@@ -712,6 +720,7 @@ mod tests {
                                         cursor: 7,
                                         scroll_y: 0,
                                         folds: Vec::new(),
+                                        pinned: false,
                                     },
                                 ],
                                 active: 1,
@@ -722,6 +731,7 @@ mod tests {
                                     cursor: 0,
                                     scroll_y: -5,
                                     folds: Vec::new(),
+                                    pinned: false,
                                 }],
                                 active: 0,
                             },
@@ -738,6 +748,7 @@ mod tests {
                                     cursor: 3,
                                     scroll_y: 12,
                                     folds: vec![0],
+                                    pinned: false,
                                 }],
                                 active: 0,
                             },
@@ -779,6 +790,37 @@ mod tests {
         let original = sample();
         let bytes = encode(&original).expect("encode");
         assert_eq!(decode(&bytes).expect("decode"), original);
+    }
+
+    #[test]
+    fn a_v7_tab_reads_unpinned_and_a_v8_tab_keeps_its_pin() {
+        let group = PaneGroupSession {
+            tabs: vec![PaneSession {
+                path: None,
+                cursor: 11,
+                scroll_y: 22,
+                folds: Vec::new(),
+                pinned: true,
+            }],
+            active: 0,
+        };
+        let mut v8 = Vec::new();
+        write_pane_group(&mut v8, &group).expect("write");
+        // v8 carries the pinned byte, so the tab reads back pinned.
+        let mut r8 = Reader::new(&v8);
+        r8.version = VERSION;
+        assert!(read_pane_group(&mut r8).expect("read v8").tabs[0].pinned);
+        // A v7 record is a v8 one without the trailing pinned byte (it sits just
+        // before the active index): a v7 reader must not reach for it, so the tab
+        // opens unpinned and the fields after it still line up.
+        let mut v7 = v8.clone();
+        v7.remove(v7.len() - 5);
+        let mut r7 = Reader::new(&v7);
+        r7.version = 7;
+        let read7 = read_pane_group(&mut r7).expect("read v7");
+        assert!(!read7.tabs[0].pinned);
+        assert_eq!(read7.tabs[0].cursor, 11);
+        assert_eq!(read7.active, 0);
     }
 
     #[test]
@@ -938,6 +980,7 @@ mod tests {
             for pane in &mut vault.panes {
                 for tab in &mut pane.tabs {
                     tab.folds.clear();
+                    tab.pinned = false;
                 }
             }
         }

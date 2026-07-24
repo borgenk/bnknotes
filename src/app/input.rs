@@ -380,9 +380,12 @@ impl State {
             KeyAction::CloseTab => {
                 // The tree has no tabs of its own, so Ctrl+W there closes one in the
                 // pane the user was last editing, the pane the tree opens files into.
+                // A pinned tab is guarded against Ctrl+W the same as against the click,
+                // so it is left alone; unpin it (its badge, or the menu) to close it.
                 let g = self.last_editor;
-                if self.editors[g].has_tabs() {
-                    self.close_tab(g, self.editors[g].active_index());
+                let active = self.editors[g].active_index();
+                if self.editors[g].has_tabs() && !self.editors[g].is_pinned(active) {
+                    self.close_tab(g, active);
                 }
                 return Ok(());
             }
@@ -1035,15 +1038,16 @@ impl State {
                 continue;
             }
             let labels = self.editors[g].tab_names();
+            let pinned = self.editors[g].tab_pinned();
             let scale = self.scale();
-            let layout = crate::paint::tab_layout(strip, labels.len(), scale);
+            let layout = crate::paint::tab_layout(strip, &pinned, scale);
             // The pinned + button wins over any tab scrolled beneath it, so it is
             // tested first; tabs count only within the viewport lane the run is
             // clipped to, matching what the painter draws.
             if crate::paint::new_tab_button_rect(strip, layout, scale).contains(px, py) {
                 return Hit::NewTab(g);
             }
-            let tabs = crate::paint::tab_rects(strip, &labels, scale, self.tab_scroll[g]);
+            let tabs = crate::paint::tab_rects(strip, &labels, &pinned, scale, self.tab_scroll[g]);
             if (px as i32) < layout.viewport_right(strip) {
                 for (i, tab) in tabs.iter().enumerate() {
                     if tab.rect.contains(px, py) {
@@ -1671,7 +1675,15 @@ impl State {
                 self.editor_press(i, rect, px, py);
             }
             Hit::Tab(g, i) => self.press_tab(g, i, px),
-            Hit::TabClose(g, i) => self.close_tab(g, i),
+            // The pin badge stands where the close cross would: a pinned tab's slot
+            // unpins rather than closes, so an accidental click cannot lose the tab.
+            Hit::TabClose(g, i) => {
+                if self.editors[g].is_pinned(i) {
+                    self.toggle_pin_tab(g, i);
+                } else {
+                    self.close_tab(g, i);
+                }
+            }
             Hit::NewTab(g) => self.new_tab_in(g),
             // The empty part of a pane's tab strip still focuses that pane.
             Hit::TabStrip(g) => self.focus_pane(g),
@@ -1782,8 +1794,10 @@ impl State {
                 .tab_strip_rects(over)
                 .map(|(_, tabs)| crate::paint::tab_drop_index(&tabs, None, px))
                 .unwrap_or(0);
+            let pinned = self.editors[drag.pane].is_pinned(drag.tab);
             if let Some(doc) = self.editors[drag.pane].detach(drag.tab) {
                 drag.tab = self.editors[over].insert_tab(idx, doc);
+                self.editors[over].set_pinned(drag.tab, pinned);
                 drag.pane = over;
                 self.focus_pane(over);
             }
@@ -1812,7 +1826,9 @@ impl State {
     fn tab_strip_rects(&self, g: usize) -> Option<(Rect, Vec<crate::paint::TabHit>)> {
         let strip = self.columns().tab_strips[g]?;
         let labels = self.editors[g].tab_names();
-        let tabs = crate::paint::tab_rects(strip, &labels, self.scale(), self.tab_scroll[g]);
+        let pinned = self.editors[g].tab_pinned();
+        let tabs =
+            crate::paint::tab_rects(strip, &labels, &pinned, self.scale(), self.tab_scroll[g]);
         Some((strip, tabs))
     }
 
@@ -1822,7 +1838,8 @@ impl State {
         let Some(strip) = self.columns().tab_strips[g] else {
             return;
         };
-        let layout = crate::paint::tab_layout(strip, self.editors[g].tab_count(), self.scale());
+        let pinned = self.editors[g].tab_pinned();
+        let layout = crate::paint::tab_layout(strip, &pinned, self.scale());
         let want = scroll::clamp(self.tab_scroll[g] + delta, layout.content, layout.avail);
         if want != self.tab_scroll[g] {
             self.tab_scroll[g] = want;

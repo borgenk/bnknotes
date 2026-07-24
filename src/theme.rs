@@ -176,14 +176,20 @@ pub(crate) const TAB_CLOSE_GAP: i32 = 6;
 /// The square side of a tab's close-glyph button and of the new-tab (+) button.
 pub(crate) const TAB_CLOSE_W: i32 = 18;
 pub(crate) const TAB_NEW_W: i32 = 24;
-/// Every tab in a strip shares one width, shrinking from `TAB_MAX_W` toward
-/// `TAB_MIN_W` as tabs pile up; past the floor the strip scrolls instead of
+/// Every unpinned tab in a strip shares one width, shrinking from `TAB_MAX_W`
+/// toward `TAB_MIN_W` as tabs pile up; past the floor the strip scrolls instead of
 /// squeezing further. The floor is the tightest a tab reads at: its first letter
 /// plus the close box (`TAB_PAD_X` + a glyph + `TAB_CLOSE_GAP` + `TAB_CLOSE_W` +
 /// `TAB_PAD_X`, ~48 of chrome around one 14px letter). A longer label hard-cuts at
 /// the close box, scissored by the painter, with no ellipsis.
 pub(crate) const TAB_MIN_W: i32 = 58;
 pub(crate) const TAB_MAX_W: i32 = 220;
+/// A pinned tab takes this fixed compact width instead of sharing the unpinned
+/// tabs' width, so it reads as a small anchor and hands its slack to the tabs being
+/// switched between. It is the ~48 of chrome plus room for a few letters of the
+/// name (hard-cut at the pin badge, no ellipsis), enough to tell one pin from
+/// another where an icon-only tab could not.
+pub(crate) const TAB_PINNED_W: i32 = 96;
 /// How far the pointer must travel from a press before it counts as a drag to
 /// reorder rather than a plain click. A hand is never quite still, so a click must
 /// survive a few pixels of it. Shared by the tab strip and the vault rail, each

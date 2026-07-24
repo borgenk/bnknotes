@@ -70,6 +70,11 @@ pub enum DrawCmd {
     /// (expanded). Like the check mark, the shape is intrinsic, so the command
     /// carries only its box, color, and direction.
     Chevron { rect: Rect, color: u32, down: bool },
+    /// A pin marker, inked from a distance field over `rect`: a round head with a
+    /// needle tapering to a point below it, the badge a pinned tab wears where its
+    /// close cross would sit. Like the check mark and chevron, the shape is
+    /// intrinsic, so the command carries only its box and color.
+    Pin { rect: Rect, color: u32 },
     /// A run of text drawn from `x` along `baseline`. `bounds` is the run's screen
     /// rectangle padded for glyph ink that overhangs the advance box, so the
     /// damage diff and the clip test never clip a glyph's edge. `clip_x`, when set,
@@ -111,6 +116,7 @@ impl DrawCmd {
             | DrawCmd::RoundRect { rect, .. }
             | DrawCmd::CheckMark { rect, .. }
             | DrawCmd::Chevron { rect, .. }
+            | DrawCmd::Pin { rect, .. }
             | DrawCmd::Hatch { rect, .. }
             | DrawCmd::Image { rect, .. } => *rect,
             DrawCmd::Text { bounds, .. } => *bounds,

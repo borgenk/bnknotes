@@ -1,7 +1,7 @@
 // The one fragment shader. Modes (src/gpu.rs): 0 solid fill, 1 glyph coverage
 // from the R8 atlas, 2 emoji from the BGRA atlas, 3 an image texture,
 // 4 rounded-rect coverage, 5 a task check mark, 6 a disclosure chevron,
-// 7 diagonal hatching. Glyph and emoji reads are texelFetch at integer
+// 7 diagonal hatching, 8 a pin marker. Glyph and emoji reads are texelFetch at integer
 // coords so a 1:1 atlas quad reproduces its source texels exactly. An image is
 // an sRGB texture sampled with texture() and normalized UVs, so the GPU decodes
 // and scales its native-size texture to the display quad in linear space,
@@ -113,6 +113,25 @@ float hatch_coverage(vec2 p, float period, float half_w) {
     return clamp(half_w - d + 0.5, 0.0, 1.0);
 }
 
+// A pin marker filling the box `size` (v_extra.xy): a round head with a short
+// needle tapering to a point below it, the shape a pinned tab wears where its
+// close cross would sit. Built as the union (min of two signed distances) of the
+// head disc and the needle, a segment whose half-width shrinks to zero at the
+// tip, then inked over the one-pixel band at the zero crossing, the same
+// anti-aliased fill the check mark and chevron use, so it stays crisp at any size.
+float pin_coverage(vec2 p, vec2 size) {
+    float s = min(size.x, size.y);
+    vec2 head = vec2(0.50, 0.40) * size;
+    float d = length(p - head) - 0.30 * s;
+    vec2 top = vec2(0.50, 0.44) * size;
+    vec2 tip = vec2(0.50, 0.92) * size;
+    vec2 seg = tip - top;
+    float t = clamp(dot(p - top, seg) / dot(seg, seg), 0.0, 1.0);
+    float dn = length(p - (top + seg * t)) - mix(0.17, 0.0, t) * s;
+    d = min(d, dn);
+    return clamp(0.5 - d, 0.0, 1.0);
+}
+
 void main() {
     if (v_mode == 0u) {
         out_color = vec4(srgb_to_linear(v_color.rgb), v_color.a);
@@ -143,8 +162,11 @@ void main() {
     } else if (v_mode == 6u) {
         float cov = chevron_coverage(v_uv, v_extra.xy, v_extra.z > 0.5);
         out_color = vec4(srgb_to_linear(v_color.rgb), v_color.a * cov);
-    } else {
+    } else if (v_mode == 7u) {
         float cov = hatch_coverage(v_uv, v_extra.x, v_extra.y);
+        out_color = vec4(srgb_to_linear(v_color.rgb), v_color.a * cov);
+    } else {
+        float cov = pin_coverage(v_uv, v_extra.xy);
         out_color = vec4(srgb_to_linear(v_color.rgb), v_color.a * cov);
     }
 }

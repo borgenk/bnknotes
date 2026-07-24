@@ -32,6 +32,8 @@ pub enum MenuAction {
     Ai(usize),
     /// Open the palette to type a free-form AI instruction for the focused pane.
     AiCustomPrompt,
+    /// Pin or unpin tab `tab` of pane `pane`: the right-click on a tab toggles it.
+    TogglePin { pane: usize, tab: usize },
 }
 
 /// One row of a menu: what it says, and what it does. The label is owned because a

@@ -1081,12 +1081,16 @@ impl State {
             };
             let count = self.editors[g].tab_count();
             let active = self.editors[g].active_index();
-            let layout = crate::paint::tab_layout(strip, count, scale);
+            let pinned = self.editors[g].tab_pinned();
+            let layout = crate::paint::tab_layout(strip, &pinned, scale);
             if self.tab_anchor[g] != (active, count) {
+                // The run is variable-width, so the active tab's slot is the sum of
+                // the widths before it, not `active * width`.
+                let (start, size) = layout.tab_span(&pinned, active);
                 self.tab_scroll[g] = scroll::reveal(
                     self.tab_scroll[g],
-                    active as i32 * layout.width,
-                    layout.width,
+                    start,
+                    size,
                     layout.avail,
                     layout.content,
                     0,
@@ -1424,8 +1428,27 @@ impl State {
         match self.hit_test(px, py) {
             Hit::Vault(i) => self.vault_menu_items(i),
             Hit::Editor(pane, _) => self.editor_menu_items(pane),
+            Hit::Tab(g, i) | Hit::TabClose(g, i) => self.tab_menu_items(g, i),
             _ => Vec::new(),
         }
+    }
+
+    /// The menu a right-click on tab `i` of pane `g` offers: pin it, or unpin it if
+    /// it already is. A diff review is transient and re-homes to no document, so it
+    /// cannot be pinned and offers nothing.
+    fn tab_menu_items(&self, g: usize, i: usize) -> Vec<MenuItem> {
+        if self.editors[g].tab_is_diff(i) {
+            return Vec::new();
+        }
+        let label = if self.editors[g].is_pinned(i) {
+            "Unpin tab"
+        } else {
+            "Pin tab"
+        };
+        vec![MenuItem {
+            label: label.to_string(),
+            action: MenuAction::TogglePin { pane: g, tab: i },
+        }]
     }
 
     /// The indices into [`ai::ACTIONS`] offered for pane `i` right now: all of them
@@ -1690,7 +1713,17 @@ impl State {
             MenuAction::ClearIcon(i) => self.clear_icon(i),
             MenuAction::Ai(i) => self.start_ai_action(i),
             MenuAction::AiCustomPrompt => self.open_ai_prompt(),
+            MenuAction::TogglePin { pane, tab } => self.toggle_pin_tab(pane, tab),
         }
+    }
+
+    /// Pin or unpin tab `i` of pane `g` and remember it. A pinned tab keeps its
+    /// place, wears a pin badge in its close slot, and is guarded against the click
+    /// and the Ctrl+W that would otherwise close it.
+    pub(super) fn toggle_pin_tab(&mut self, g: usize, i: usize) {
+        self.editors[g].toggle_pin(i);
+        self.save_session();
+        self.dirty = true;
     }
 
     /// Start built-in AI action `index` on the focused pane.
@@ -2328,11 +2361,13 @@ impl State {
             let bar = cols.bar;
             let labels = [self.editors[0].tab_names(), self.editors[1].tab_names()];
             let dirty = [self.editors[0].tab_dirty(), self.editors[1].tab_dirty()];
+            let pinned = [self.editors[0].tab_pinned(), self.editors[1].tab_pinned()];
             let strip = |g: usize| {
                 cols.tab_strips[g].map(|rect| TabStrip {
                     rect,
                     labels: &labels[g],
                     dirty: &dirty[g],
+                    pinned: &pinned[g],
                     active: self.editors[g].active_index(),
                     hovered: self.hovered_tab.and_then(|h| h.tab_in(g)),
                     close_hover: self.hovered_tab.and_then(|h| h.close_in(g)),

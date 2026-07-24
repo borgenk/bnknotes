@@ -2457,6 +2457,11 @@ pub(crate) enum TabContent {
 /// answers what the strip needs through [`Self::title`] and [`Self::is_dirty`].
 pub(crate) struct Tab {
     content: TabContent,
+    /// Whether the tab is pinned: kept where it is, marked with a pin badge instead
+    /// of a close cross, and guarded against the click and the Ctrl+W that would
+    /// otherwise close it. Only a document tab is ever pinned; a diff review is
+    /// transient. Persisted with the tab.
+    pinned: bool,
 }
 
 impl Tab {
@@ -2464,6 +2469,7 @@ impl Tab {
     fn doc(doc: EditorPane) -> Self {
         Self {
             content: TabContent::Doc(Box::new(doc)),
+            pinned: false,
         }
     }
 
@@ -2471,6 +2477,7 @@ impl Tab {
     fn diff(view: DiffView) -> Self {
         Self {
             content: TabContent::Diff(Box::new(view)),
+            pinned: false,
         }
     }
 
@@ -2710,6 +2717,35 @@ impl PaneGroup {
         self.tabs.iter().map(Tab::is_dirty).collect()
     }
 
+    /// Whether each tab is pinned, in order, for the tab strip's pin badge.
+    pub(crate) fn tab_pinned(&self) -> Vec<bool> {
+        self.tabs.iter().map(|t| t.pinned).collect()
+    }
+
+    /// Whether tab `i` is pinned. An out-of-range index reads as unpinned, so a
+    /// close or a Ctrl+W on a pane with no tabs falls through to its normal no-op.
+    pub(crate) fn is_pinned(&self, i: usize) -> bool {
+        self.tabs.get(i).is_some_and(|t| t.pinned)
+    }
+
+    /// Flip tab `i`'s pinned state. A diff review is transient and never re-homed,
+    /// so it is never pinned; the toggle ignores one (and any out-of-range index).
+    pub(crate) fn toggle_pin(&mut self, i: usize) {
+        if let Some(tab) = self.tabs.get_mut(i) {
+            if tab.as_doc().is_some() {
+                tab.pinned = !tab.pinned;
+            }
+        }
+    }
+
+    /// Set tab `i`'s pinned state, for carrying a pin across the split when a tab is
+    /// dragged into this pane (where it arrives as a fresh, unpinned tab).
+    pub(crate) fn set_pinned(&mut self, i: usize, pinned: bool) {
+        if let Some(tab) = self.tabs.get_mut(i) {
+            tab.pinned = pinned;
+        }
+    }
+
     /// Every open document tab's file path, for the file watcher's set of directories
     /// to watch. Scratch tabs (no path) and non-document tabs contribute nothing.
     pub(crate) fn paths(&self) -> impl Iterator<Item = &Path> {
@@ -2772,11 +2808,11 @@ impl PaneGroup {
         doc.set_scale(self.scale, self.body_size);
         doc.set_vault_root(self.vault.as_deref());
         // Replace a lone blank scratch tab (a just-opened new tab); otherwise stack.
+        // A pinned blank tab is left alone, since pinning it asks to keep it.
         if self
             .tabs
             .get(self.active)
-            .and_then(Tab::as_doc)
-            .is_some_and(EditorPane::is_blank)
+            .is_some_and(|t| !t.pinned && t.as_doc().is_some_and(EditorPane::is_blank))
         {
             doc.id = self.mint_id();
             self.tabs[self.active] = Tab::doc(doc);
@@ -2873,12 +2909,16 @@ impl PaneGroup {
             .min(doc_count.saturating_sub(1));
         store::PaneGroupSession {
             tabs: self
-                .docs()
-                .map(|d| store::PaneSession {
-                    path: d.path.clone(),
-                    cursor: d.text.cursor() as u64,
-                    scroll_y: d.scroll_y,
-                    folds: d.folds.lines().map(|l| l as u32).collect(),
+                .tabs
+                .iter()
+                .filter_map(|t| {
+                    t.as_doc().map(|d| store::PaneSession {
+                        path: d.path.clone(),
+                        cursor: d.text.cursor() as u64,
+                        scroll_y: d.scroll_y,
+                        folds: d.folds.lines().map(|l| l as u32).collect(),
+                        pinned: t.pinned,
+                    })
                 })
                 .collect(),
             active: active as u32,
@@ -2943,7 +2983,8 @@ pub(crate) fn restore_group(
     for saved in tabs {
         let mut doc = restore_doc(saved);
         doc.set_vault_root(vault);
-        group.push_doc(doc);
+        let idx = group.push_doc(doc);
+        group.tabs[idx].pinned = saved.pinned;
     }
     group.active = active.min(group.tabs.len() - 1);
     group
@@ -3591,6 +3632,7 @@ run
                 cursor: 0,
                 scroll_y: 0,
                 folds: Vec::new(),
+                pinned: false,
             }],
             0,
             None,
@@ -4048,6 +4090,46 @@ run
     }
 
     #[test]
+    fn toggle_pin_flips_only_the_named_tab() {
+        let mut g = marked_group(3);
+        assert!(!g.is_pinned(1));
+        g.toggle_pin(1);
+        assert_eq!(g.tab_pinned(), vec![false, true, false]);
+        g.toggle_pin(1);
+        assert!(!g.is_pinned(1));
+        // An out-of-range toggle changes nothing and reads as unpinned.
+        g.toggle_pin(9);
+        assert_eq!(g.tab_pinned(), vec![false, false, false]);
+        assert!(!g.is_pinned(9));
+    }
+
+    #[test]
+    fn a_pin_rides_its_tab_through_a_reorder() {
+        // Pin the first tab, then drag it to the last slot: the pin follows the tab,
+        // not the slot it left.
+        let mut g = marked_group(4);
+        g.toggle_pin(0);
+        g.move_tab(0, 3);
+        assert_eq!(order(&g), vec![1, 2, 3, 0]);
+        assert_eq!(g.tab_pinned(), vec![false, false, false, true]);
+    }
+
+    #[test]
+    fn a_pin_crosses_the_split_with_its_tab() {
+        // A tab dragged to the other pane arrives as a fresh, unpinned tab; the drag
+        // path re-applies the pin, so carrying its state is set_pinned's job.
+        let mut a = marked_group(2);
+        a.toggle_pin(0);
+        let pinned = a.is_pinned(0);
+        let doc = a.detach(0).expect("a tab to detach");
+        let mut b = marked_group(1);
+        let landed = b.insert_tab(0, doc);
+        assert!(!b.is_pinned(landed), "arrives unpinned");
+        b.set_pinned(landed, pinned);
+        assert!(b.is_pinned(landed), "the pin is carried over");
+    }
+
+    #[test]
     fn insert_tab_clamps_past_the_end() {
         let mut b = marked_group(2);
         let doc = EditorPane::empty();
@@ -4278,6 +4360,39 @@ run
         assert_eq!(group.tab_names(), vec!["a", "b", "c"]);
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_pinned_blank_tab_is_not_replaced_by_an_open() {
+        let dir = std::env::temp_dir().join(format!("bnknotes_pinblank_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let a = dir.join("a.md");
+        std::fs::write(&a, b"alpha").expect("write a");
+
+        let mut group = PaneGroup::empty();
+        group.new_tab(Scale::ONE, FONT_SIZE);
+        group.toggle_pin(0);
+        // Pinning the blank tab asks to keep it: the open stacks a new tab rather
+        // than filling the blank in place.
+        group.open_or_focus(&a).expect("open a");
+        assert_eq!(group.tab_names(), vec!["untitled", "a"]);
+        assert_eq!(group.tab_pinned(), vec![true, false]);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn to_session_carries_each_tabs_pin() {
+        let mut group = PaneGroup::empty();
+        group.new_tab(Scale::ONE, FONT_SIZE);
+        group.new_tab(Scale::ONE, FONT_SIZE);
+        group.toggle_pin(0);
+        let session = group.to_session();
+        assert_eq!(
+            session.tabs.iter().map(|t| t.pinned).collect::<Vec<_>>(),
+            vec![true, false]
+        );
     }
 
     #[test]

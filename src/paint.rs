@@ -41,9 +41,9 @@ use crate::theme::{
     SELECTION_COLOR, SPLITTER_COLOR, TABLE_BORDER_COLOR, TABLE_HEADER_BG, TAB_ACTIVE_BG,
     TAB_ACTIVE_TEXT, TAB_BUTTON_HOVER_BG, TAB_BUTTON_RADIUS, TAB_CLOSE_GAP, TAB_CLOSE_W,
     TAB_DIRTY_COLOR, TAB_HOVER_BG, TAB_INACTIVE_TEXT, TAB_MAX_W, TAB_MIN_W, TAB_NEW_W, TAB_PAD_X,
-    TAB_VPAD, TICK_HEIGHT, TICK_WIDTH, TOP_BAR_BG, TREE_BG, TREE_FOOTER_GAP, TREE_FOOTER_VPAD,
-    TREE_HOVER_BG, TREE_INDENT, TREE_MARKER_COLOR, TREE_MARKER_W, TREE_PAD, TREE_ROW_INSET_Y,
-    TREE_ROW_PAD, TREE_ROW_RADIUS, TREE_TEXT_COLOR, VAULT_PAD_X,
+    TAB_PINNED_W, TAB_VPAD, TICK_HEIGHT, TICK_WIDTH, TOP_BAR_BG, TREE_BG, TREE_FOOTER_GAP,
+    TREE_FOOTER_VPAD, TREE_HOVER_BG, TREE_INDENT, TREE_MARKER_COLOR, TREE_MARKER_W, TREE_PAD,
+    TREE_ROW_INSET_Y, TREE_ROW_PAD, TREE_ROW_RADIUS, TREE_TEXT_COLOR, VAULT_PAD_X,
 };
 
 /// The per-frame inputs [`build_display_list`] needs beyond the layout itself:
@@ -1789,6 +1789,9 @@ pub(crate) struct TabStrip<'a> {
     pub rect: Rect,
     pub labels: &'a [String],
     pub dirty: &'a [bool],
+    /// Whether each tab is pinned, so it wears a pin badge in its close slot
+    /// instead of a close cross or an unsaved dot.
+    pub pinned: &'a [bool],
     pub active: usize,
     pub hovered: Option<usize>,
     pub close_hover: Option<usize>,
@@ -1813,17 +1816,20 @@ fn tab_close_side(scale: Scale) -> i32 {
     scale.px(TAB_CLOSE_W)
 }
 
-/// One strip's tab geometry, derived from the strip width and the tab count. Every
-/// tab shares `width`, which shrinks from `TAB_MAX_W` toward `TAB_MIN_W` as tabs
-/// pile up; below that floor the run overflows and the strip scrolls, so `content`
-/// (the tabs' total width) exceeds `avail` (the strip minus the reserved new-tab
-/// lane). The scroll clamp turns that difference into the overflow (see
-/// [`crate::platform::scroll::clamp`]).
+/// One strip's tab geometry, derived from the strip width and which tabs are
+/// pinned. A pinned tab takes the fixed compact `pinned_w`; the unpinned tabs share
+/// `unpinned_w`, which shrinks from `TAB_MAX_W` toward `TAB_MIN_W` over whatever
+/// space the pins leave, so freeing a tab to a pin widens the rest. Below the floor
+/// the run overflows and the strip scrolls, so `content` (the tabs' total width)
+/// exceeds `avail` (the strip minus the reserved new-tab lane). The scroll clamp
+/// turns that difference into the overflow (see [`crate::platform::scroll::clamp`]).
 #[derive(Clone, Copy)]
 pub(crate) struct TabLayout {
-    /// The shared width of every tab.
-    pub width: i32,
-    /// The tabs' total width, `width * count`.
+    /// The fixed compact width of a pinned tab.
+    pub pinned_w: i32,
+    /// The shared width of an unpinned tab.
+    pub unpinned_w: i32,
+    /// The tabs' total width, pinned and unpinned summed.
     pub content: i32,
     /// The visible tab lane: the strip minus the reserved new-tab (+) button.
     pub avail: i32,
@@ -1835,22 +1841,50 @@ impl TabLayout {
     pub(crate) fn viewport_right(&self, strip: Rect) -> i32 {
         strip.x + self.avail
     }
+
+    /// The width tab `i` takes, given which tabs are pinned: the compact pinned
+    /// width for a pinned tab, else the shared unpinned width.
+    fn width_of(&self, pinned: &[bool], i: usize) -> i32 {
+        if pinned.get(i).copied().unwrap_or(false) {
+            self.pinned_w
+        } else {
+            self.unpinned_w
+        }
+    }
+
+    /// Tab `i`'s left offset from the strip's left (before scroll) and its width,
+    /// summing the widths of the tabs before it. For the reveal that scrolls a tab
+    /// into view, where the run is variable-width so a tab's slot is not `i * width`.
+    pub(crate) fn tab_span(&self, pinned: &[bool], i: usize) -> (i32, i32) {
+        let start = (0..i).map(|k| self.width_of(pinned, k)).sum();
+        (start, self.width_of(pinned, i))
+    }
 }
 
-/// Lay out `count` equal-width tabs in `strip`, reserving a lane at the right for
-/// the always-reachable new-tab button. Shared by the painter, the hit-testing,
-/// and the scroll clamp so all three agree on the width and the scroll range.
-pub(crate) fn tab_layout(strip: Rect, count: usize, scale: Scale) -> TabLayout {
+/// Lay the tabs of `strip` out from their `pinned` flags, reserving a lane at the
+/// right for the always-reachable new-tab button. Each pinned tab takes the fixed
+/// compact width; the unpinned tabs share what the pins leave, shrinking between the
+/// ceiling and the floor. Shared by the painter, the hit-testing, and the scroll
+/// clamp so all three agree on the widths and the scroll range.
+pub(crate) fn tab_layout(strip: Rect, pinned: &[bool], scale: Scale) -> TabLayout {
     let new_lane = scale.px(TAB_CLOSE_GAP) + scale.px(TAB_NEW_W);
     let avail = (strip.w - new_lane).max(0);
-    let width = if count == 0 {
+    let pinned_w = scale.px(TAB_PINNED_W);
+    let pinned_count = pinned.iter().filter(|&&p| p).count() as i32;
+    let unpinned_count = pinned.len() as i32 - pinned_count;
+    let pinned_total = pinned_w * pinned_count;
+    // The unpinned tabs share the space the pins leave; a strip that is all pins
+    // has none to share, and its width goes unused.
+    let unpinned_w = if unpinned_count == 0 {
         0
     } else {
-        (avail / count as i32).clamp(scale.px(TAB_MIN_W), scale.px(TAB_MAX_W))
+        ((avail - pinned_total).max(0) / unpinned_count)
+            .clamp(scale.px(TAB_MIN_W), scale.px(TAB_MAX_W))
     };
     TabLayout {
-        width,
-        content: width * count as i32,
+        pinned_w,
+        unpinned_w,
+        content: pinned_total + unpinned_w * unpinned_count,
         avail,
     }
 }
@@ -1890,25 +1924,30 @@ fn fit_label(face: &Face, label: &str, max_w: i32) -> String {
     out
 }
 
-/// The tabs of one strip, every tab the same width (see [`tab_layout`]), laid left
-/// to right from `strip.x` and shifted left by `scroll_x`. The result stays
-/// index-aligned with `labels`: a tab scrolled out of view keeps its slot with an
-/// off-strip rect, so the painter and the hit-testing cull it by position against
-/// the viewport. Labels are carried untrimmed; the painter scissors them. Shared by
-/// both so a click lands where the eye expects.
+/// The tabs of one strip (see [`tab_layout`]), laid left to right from `strip.x`
+/// and shifted left by `scroll_x`. A pinned tab takes the compact width and the
+/// rest share theirs, so the run is variable-width and each tab starts where the
+/// one before it ends. The result stays index-aligned with `labels` and `pinned`:
+/// a tab scrolled out of view keeps its slot with an off-strip rect, so the painter
+/// and the hit-testing cull it by position against the viewport. Labels are carried
+/// untrimmed; the painter scissors them. Shared by both so a click lands where the
+/// eye expects.
 pub(crate) fn tab_rects(
     strip: Rect,
     labels: &[String],
+    pinned: &[bool],
     scale: Scale,
     scroll_x: i32,
 ) -> Vec<TabHit> {
     let pad = scale.px(TAB_PAD_X);
     let close = tab_close_side(scale);
-    let w = tab_layout(strip, labels.len(), scale).width;
+    let layout = tab_layout(strip, pinned, scale);
     let mut out = Vec::with_capacity(labels.len());
+    let mut x = strip.x - scroll_x;
     for (i, label) in labels.iter().enumerate() {
+        let w = layout.width_of(pinned, i);
         let rect = Rect {
-            x: strip.x + i as i32 * w - scroll_x,
+            x,
             y: strip.y,
             w,
             h: strip.h,
@@ -1924,6 +1963,7 @@ pub(crate) fn tab_rects(
             close: close_rect,
             label: label.clone(),
         });
+        x += w;
     }
     out
 }
@@ -2078,14 +2118,52 @@ fn push_glyph_button(list: &mut DisplayList, ctx: &BarCtx, box_: Rect, glyph: &s
     ));
 }
 
+/// The pin badge a pinned tab wears in its close slot: the pin marker inked from
+/// its distance field, over the same rounded highlight the close and new-tab
+/// buttons light up with under the pointer (`hovered`). It stands where the close
+/// cross would, so the click that lands there unpins the tab. `bright` inks it in
+/// the active-tab text color (on the active or hovered tab) and the subdued
+/// inactive color otherwise, matching how the close cross reads.
+fn push_pin_badge(list: &mut DisplayList, ctx: &BarCtx, box_: Rect, bright: bool, hovered: bool) {
+    if hovered {
+        list.push(DrawCmd::RoundRect {
+            rect: box_,
+            color: TAB_BUTTON_HOVER_BG,
+            radius: ctx.scale.px(TAB_BUTTON_RADIUS),
+            corners: display::RoundedCorners::Both,
+        });
+    }
+    let inset = ctx.scale.px(3);
+    let side = (box_.w.min(box_.h) - 2 * inset).max(1);
+    list.push(DrawCmd::Pin {
+        rect: Rect {
+            x: box_.x + (box_.w - side) / 2,
+            y: box_.y + (box_.h - side) / 2,
+            w: side,
+            h: side,
+        },
+        color: if bright {
+            TAB_ACTIVE_TEXT
+        } else {
+            TAB_INACTIVE_TEXT
+        },
+    });
+}
+
 /// Draw one pane's tabs and its new-tab button (see [`push_top_bar`]). The tabs
 /// are scissored to the viewport `[strip.x, viewport_right)`, so a scrolled run
 /// slides under the strip's edges and the pinned + button; a tab fully outside it
 /// is skipped.
 fn push_tab_strip(list: &mut DisplayList, ctx: &BarCtx, strip: &TabStrip) {
     let scale = ctx.scale;
-    let layout = tab_layout(strip.rect, strip.labels.len(), scale);
-    let tabs = tab_rects(strip.rect, strip.labels, scale, strip.scroll_x);
+    let layout = tab_layout(strip.rect, strip.pinned, scale);
+    let tabs = tab_rects(
+        strip.rect,
+        strip.labels,
+        strip.pinned,
+        scale,
+        strip.scroll_x,
+    );
     let vpad = scale.px(TAB_VPAD);
     let divider = scale.px(1).max(1);
     let clip = [strip.rect.x, layout.viewport_right(strip.rect)];
@@ -2124,6 +2202,7 @@ fn push_tab_strip(list: &mut DisplayList, ctx: &BarCtx, strip: &TabStrip) {
             }
         }
         let dirty = strip.dirty.get(i).copied().unwrap_or(false);
+        let pinned = strip.pinned.get(i).copied().unwrap_or(false);
         push_tab_body(
             list,
             ctx,
@@ -2132,6 +2211,7 @@ fn push_tab_strip(list: &mut DisplayList, ctx: &BarCtx, strip: &TabStrip) {
             hovered,
             strip.close_hover == Some(i),
             dirty,
+            pinned,
             clip,
         );
     }
@@ -2160,6 +2240,7 @@ fn push_tab_strip(list: &mut DisplayList, ctx: &BarCtx, strip: &TabStrip) {
                 label: tab.label.clone(),
             };
             let dirty = strip.dirty.get(d.tab).copied().unwrap_or(false);
+            let pinned = strip.pinned.get(d.tab).copied().unwrap_or(false);
             // The float rides above the run, clipped to the whole strip so it is not
             // cut at the + lane it may overlap.
             push_tab_body(
@@ -2170,19 +2251,22 @@ fn push_tab_strip(list: &mut DisplayList, ctx: &BarCtx, strip: &TabStrip) {
                 false,
                 false,
                 dirty,
+                pinned,
                 [strip.rect.x, strip.rect.x + strip.rect.w],
             );
         }
     }
 }
 
-/// Draw one tab's contents: its active or hover background, the label, and either
-/// the close glyph (active or hovered tab) or the unsaved dot (a resting modified
-/// tab). The inter-tab hairline is the strip's business, not a tab's, so it stays
-/// out of here. Everything is scissored to `clip` (a window x-range): the fill
-/// clamps to it, the label glyphs slide under its edges, and the close box or dot
-/// draws only while it sits wholly inside, so a scrolled tab never spills past the
-/// viewport.
+/// Draw one tab's contents: its active or hover background, the label, and the one
+/// glyph in its close slot: a pin badge when the tab is pinned, else the close
+/// cross (active or hovered tab) or the unsaved dot (a resting modified tab). A pin
+/// owns the slot outright, since a pinned tab shows a pin badge in place of its
+/// close cross and cannot be closed by the click there. The inter-tab hairline is
+/// the strip's business, not a tab's, so it stays out of here. Everything is
+/// scissored to `clip` (a window x-range): the fill clamps to it, the label glyphs
+/// slide under its edges, and the close box, pin, or dot draws only while it sits
+/// wholly inside, so a scrolled tab never spills past the viewport.
 #[allow(clippy::too_many_arguments)]
 fn push_tab_body(
     list: &mut DisplayList,
@@ -2192,6 +2276,7 @@ fn push_tab_body(
     hovered: bool,
     close_hover: bool,
     dirty: bool,
+    pinned: bool,
     clip: [i32; 2],
 ) {
     let scale = ctx.scale;
@@ -2233,10 +2318,16 @@ fn push_tab_body(
         clip[0],
         label_right,
     ));
-    // The close box and the dot are small targets, so they show only while wholly
-    // inside the viewport rather than as a sheared sliver.
+    // The close box, pin, and dot are small targets, so they show only while wholly
+    // inside the viewport rather than as a sheared sliver. A pin badge owns the slot
+    // whenever the tab is pinned, standing where the close cross would so the click
+    // there unpins rather than closes.
     let close_in = tab.close.x >= clip[0] && tab.close.x + tab.close.w <= clip[1];
-    if active || hovered {
+    if pinned {
+        if close_in {
+            push_pin_badge(list, ctx, tab.close, active || close_hover, close_hover);
+        }
+    } else if active || hovered {
         if close_in {
             push_glyph_button(list, ctx, tab.close, "×", close_hover);
         }
@@ -4279,11 +4370,13 @@ mod tests {
         // Two tabs, the second active, the first unsaved.
         let labels = vec!["intro".to_string(), "todo".to_string()];
         let dirty = vec![true, false];
+        let pinned = vec![false, false];
         let strips = [
             Some(TabStrip {
                 rect: strip_rect,
                 labels: &labels,
                 dirty: &dirty,
+                pinned: &pinned,
                 active: 1,
                 hovered: None,
                 close_hover: None,
@@ -4331,7 +4424,7 @@ mod tests {
         // The active tab (index 1) melts into the pane background over its whole
         // square box and shows a close glyph; the resting unsaved tab (index 0) shows
         // a dirty dot instead.
-        let tabs = tab_rects(strip_rect, &labels, Scale::ONE, 0);
+        let tabs = tab_rects(strip_rect, &labels, &pinned, Scale::ONE, 0);
         let active = tabs[1].rect;
         assert!(
             list.iter().any(
@@ -4349,6 +4442,72 @@ mod tests {
     }
 
     #[test]
+    fn a_pinned_tab_wears_a_pin_badge_in_its_close_slot() {
+        let fonts = Fonts::new(&markdown::all_sizes(FONT_SIZE)).expect("a default font");
+        let top = top_bar_height(fonts.metrics(FONT_SIZE), Scale::ONE);
+        let strip_rect = Rect {
+            x: 0,
+            y: 0,
+            w: 400,
+            h: top,
+        };
+        // Two tabs: the first pinned and unsaved, the second active. The pin owns the
+        // slot, so the pinned tab shows no unsaved dot and no close cross even though
+        // it is dirty, and the badge sits in its close box.
+        let labels = vec!["ref".to_string(), "todo".to_string()];
+        let dirty = vec![true, false];
+        let pinned = vec![true, false];
+        let strips = [
+            Some(TabStrip {
+                rect: strip_rect,
+                labels: &labels,
+                dirty: &dirty,
+                pinned: &pinned,
+                active: 1,
+                hovered: None,
+                close_hover: None,
+                new_hover: false,
+                scroll_x: 0,
+                drag: None,
+            }),
+            None,
+        ];
+        let mut list: DisplayList = Vec::new();
+        let ctx = BarCtx::new(&fonts, Scale::ONE, FONT_SIZE);
+        push_top_bar(&mut list, &ctx, strip_rect, None, strips, &[]);
+
+        let tabs = tab_rects(strip_rect, &labels, &pinned, Scale::ONE, 0);
+        let inside = |rect: &Rect, host: Rect| {
+            rect.x >= host.x
+                && rect.y >= host.y
+                && rect.x + rect.w <= host.x + host.w
+                && rect.y + rect.h <= host.y + host.h
+        };
+        // The pin badge lands inside the pinned tab's close box.
+        assert!(
+            list.iter()
+                .any(|c| matches!(c, DrawCmd::Pin { rect, .. } if inside(rect, tabs[0].close))),
+            "pin badge on the pinned tab"
+        );
+        // The pinned tab is dirty, but the pin owns the slot, so no dirty dot is drawn
+        // in its close box.
+        assert!(
+            !list.iter().any(|c| matches!(
+                c,
+                DrawCmd::RoundRect { rect, color, .. }
+                    if *color == TAB_DIRTY_COLOR && inside(rect, tabs[0].close)
+            )),
+            "no dirty dot behind the pin badge"
+        );
+        // The active tab (index 1) is not pinned, so it still shows its close cross.
+        assert!(
+            list.iter()
+                .any(|c| matches!(c, DrawCmd::Text { text, .. } if text == "×")),
+            "close cross on the unpinned active tab"
+        );
+    }
+
+    #[test]
     fn tabs_share_one_width_that_shrinks_with_the_count() {
         let strip = Rect {
             x: 0,
@@ -4358,24 +4517,58 @@ mod tests {
         };
         let avail = 800 - (TAB_CLOSE_GAP + TAB_NEW_W);
         // Few tabs: capped at the max width, leaving the rest of the lane empty.
-        let two = tab_layout(strip, 2, Scale::ONE);
-        assert_eq!(two.width, TAB_MAX_W);
+        let two = tab_layout(strip, &[false; 2], Scale::ONE);
+        assert_eq!(two.unpinned_w, TAB_MAX_W);
         assert_eq!(two.avail, avail);
         assert!(
             two.content < two.avail,
             "two wide tabs do not fill the strip"
         );
         // Many tabs: an equal share strictly between the floor and the ceiling.
-        let six = tab_layout(strip, 6, Scale::ONE);
-        assert_eq!(six.width, avail / 6);
-        assert!(six.width > TAB_MIN_W && six.width < TAB_MAX_W);
+        let six = tab_layout(strip, &[false; 6], Scale::ONE);
+        assert_eq!(six.unpinned_w, avail / 6);
+        assert!(six.unpinned_w > TAB_MIN_W && six.unpinned_w < TAB_MAX_W);
         // Too many: pinned at the floor and overflowing, so the strip must scroll.
-        let many = tab_layout(strip, 20, Scale::ONE);
-        assert_eq!(many.width, TAB_MIN_W);
+        let many = tab_layout(strip, &[false; 20], Scale::ONE);
+        assert_eq!(many.unpinned_w, TAB_MIN_W);
         assert!(
             many.content > many.avail,
             "the run overflows the visible lane"
         );
+    }
+
+    #[test]
+    fn a_pinned_tab_takes_the_compact_width_and_widens_the_rest() {
+        // A strip whose two tabs, unpinned, would each land mid-range (not capped at
+        // the ceiling), so pinning one visibly frees width to the other.
+        let strip = Rect {
+            x: 10,
+            y: 0,
+            w: 330, // avail = 330 - (TAB_CLOSE_GAP + TAB_NEW_W) = 300
+            h: 30,
+        };
+        let both_free = tab_layout(strip, &[false, false], Scale::ONE);
+        assert_eq!(
+            both_free.unpinned_w, 150,
+            "two unpinned split the lane evenly"
+        );
+        // Pin the first: it takes the fixed compact width, and the one unpinned tab
+        // takes all the lane the pin left.
+        let one_pinned = tab_layout(strip, &[true, false], Scale::ONE);
+        assert_eq!(one_pinned.pinned_w, TAB_PINNED_W);
+        assert_eq!(one_pinned.unpinned_w, 300 - TAB_PINNED_W);
+        assert!(
+            one_pinned.unpinned_w > both_free.unpinned_w,
+            "the freed space widens the remaining tab"
+        );
+        // The rects follow the widths: the compact pin sits first, the wide tab
+        // begins where it ends.
+        let labels = vec!["ref".to_string(), "work".to_string()];
+        let tabs = tab_rects(strip, &labels, &[true, false], Scale::ONE, 0);
+        assert_eq!(tabs[0].rect.w, TAB_PINNED_W);
+        assert_eq!(tabs[1].rect.w, 300 - TAB_PINNED_W);
+        assert_eq!(tabs[0].rect.x, strip.x);
+        assert_eq!(tabs[1].rect.x, strip.x + TAB_PINNED_W);
     }
 
     #[test]
@@ -4387,8 +4580,9 @@ mod tests {
             h: 30,
         };
         let labels: Vec<String> = (0..20).map(|i| format!("note-{i}")).collect();
-        let w = tab_layout(strip, labels.len(), Scale::ONE).width;
-        let unscrolled = tab_rects(strip, &labels, Scale::ONE, 0);
+        let pinned = vec![false; labels.len()];
+        let w = tab_layout(strip, &pinned, Scale::ONE).unpinned_w;
+        let unscrolled = tab_rects(strip, &labels, &pinned, Scale::ONE, 0);
         // One rect per label (a slot is kept even for a tab scrolled out of view),
         // all the same width, laid end to end from the strip's left edge.
         assert_eq!(unscrolled.len(), labels.len());
@@ -4396,7 +4590,7 @@ mod tests {
         assert_eq!(unscrolled[0].rect.x, strip.x);
         assert_eq!(unscrolled[3].rect.x, strip.x + 3 * w);
         // Scrolling shifts every tab left by the offset, keeping the slots aligned.
-        let scrolled = tab_rects(strip, &labels, Scale::ONE, 50);
+        let scrolled = tab_rects(strip, &labels, &pinned, Scale::ONE, 50);
         assert!(unscrolled
             .iter()
             .zip(&scrolled)
@@ -4412,12 +4606,12 @@ mod tests {
             h: 30,
         };
         // Fitting: the + sits just past the last tab.
-        let few = tab_layout(strip, 2, Scale::ONE);
+        let few = tab_layout(strip, &[false; 2], Scale::ONE);
         let plus = new_tab_button_rect(strip, few, Scale::ONE);
         assert_eq!(plus.x, strip.x + few.content + TAB_CLOSE_GAP);
         // Overflowing: the + pins to the right of the visible lane and stays inside
         // the strip, so it is always reachable.
-        let many = tab_layout(strip, 20, Scale::ONE);
+        let many = tab_layout(strip, &[false; 20], Scale::ONE);
         let plus = new_tab_button_rect(strip, many, Scale::ONE);
         assert_eq!(plus.x, strip.x + many.avail + TAB_CLOSE_GAP);
         assert!(plus.x + plus.w <= strip.x + strip.w);
@@ -4435,12 +4629,14 @@ mod tests {
         };
         let labels: Vec<String> = (0..20).map(|i| format!("note-{i}")).collect();
         let dirty = vec![false; labels.len()];
-        let layout = tab_layout(strip_rect, labels.len(), Scale::ONE);
+        let pinned = vec![false; labels.len()];
+        let layout = tab_layout(strip_rect, &pinned, Scale::ONE);
         let strips = [
             Some(TabStrip {
                 rect: strip_rect,
                 labels: &labels,
                 dirty: &dirty,
+                pinned: &pinned,
                 active: 0,
                 hovered: None,
                 close_hover: None,

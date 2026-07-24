@@ -32,6 +32,7 @@ pub const MODE_ROUND: u32 = 4;
 pub const MODE_CHECK: u32 = 5;
 pub const MODE_CHEVRON: u32 = 6;
 pub const MODE_HATCH: u32 = 7;
+pub const MODE_PIN: u32 = 8;
 
 /// Atlases start here and double when full, up to [`ATLAS_MAX`]; growth wipes
 /// the atlas (sources are cached in `Fonts`, so re-inserting is cheap) and the
@@ -400,6 +401,12 @@ impl Batcher<'_> {
                 // facing (0 right for collapsed, 1 down for expanded).
                 let extra = [rect.w as f32, rect.h as f32, f32::from(*down), 0.0];
                 self.quad(*rect, MODE_CHEVRON, *color, [0.0; 2], extra);
+            }
+            DrawCmd::Pin { rect, color } => {
+                // Same intrinsic-shape path as the check mark: the box size in
+                // extra.xy feeds the distance field the pin marker is inked from.
+                let extra = [rect.w as f32, rect.h as f32, 0.0, 0.0];
+                self.quad(*rect, MODE_PIN, *color, [0.0; 2], extra);
             }
             DrawCmd::Hatch {
                 rect,

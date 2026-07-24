@@ -956,8 +956,25 @@ impl Layout {
         )
     }
 
-    /// The byte offset nearest a click at window `(x, y)`.
+    /// The byte offset nearest a click at content-space `(x, y)`.
+    ///
+    /// A click outside the text's vertical extent resolves in reading order rather
+    /// than to the column the pointer's x happens to sit over on the edge line it
+    /// would otherwise clamp to: below the last line lands at the document end,
+    /// above the first line at its start. This is what lets a drag begun in the
+    /// empty space below a note anchor at the end of the text, not mid-line. Within
+    /// the text the band picks the line and x picks the column.
     pub fn offset_at(&self, fonts: &Fonts, rope: &Rope, x: f32, y: f32) -> usize {
+        let last = self.last_line();
+        if y >= self.line_bottom(fonts, last) as f32 {
+            return last.end;
+        }
+        if let Some(first) = self.lines.first() {
+            let top = first.baseline - fonts.metrics(first.size).ascent;
+            if y < top as f32 {
+                return first.start;
+            }
+        }
         let line = self.line_for_y(fonts, y);
         self.hit(fonts, rope, line, x, y)
     }
@@ -4477,8 +4494,29 @@ mod tests {
         assert_eq!(off, text.len(), "past the last glyph of line two -> end");
         let off = l.offset_at(&f, &r, -100.0, y0);
         assert_eq!(off, 0);
-        let off = l.offset_at(&f, &r, -100.0, 9_000.0);
-        assert_eq!(off, 4, "start of the last line");
+    }
+
+    #[test]
+    fn a_click_past_the_text_vertically_lands_at_the_document_edge() {
+        // A drag started in the empty space below a note must anchor at the end of
+        // the text, not at the column the pointer's x sits over on the last line;
+        // above the first line is the mirror, the document start. The x is placed
+        // squarely mid-line so a column-based hit would land there instead.
+        let f = fonts();
+        let text = "one two\nthree four";
+        let r = rope(text);
+        let l = layout(&f, &r);
+        let mid_x = l.caret(&f, &r, text.len() - 4).0 as f32;
+        assert_eq!(
+            l.offset_at(&f, &r, mid_x, 9_000.0),
+            text.len(),
+            "below the text -> document end, whatever the x"
+        );
+        assert_eq!(
+            l.offset_at(&f, &r, mid_x, -100.0),
+            0,
+            "above the text -> document start, whatever the x"
+        );
     }
 
     #[test]

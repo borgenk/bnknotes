@@ -33,13 +33,12 @@ use self::present::GpuPresentation;
 use crate::ai::{self, Preview};
 use crate::config::{self, vault_name, CaretConfig, Config, IconKeys, Vault, VaultKind};
 use crate::icon;
-use crate::layout::Layout;
 use crate::menu::{Menu, MenuAction, MenuItem};
 use crate::paint::{
-    build_display_list, build_find_paint, conflict_banner_layout, font_sizes, measure_tree,
-    push_ai_hint, push_ai_preview, push_conflict_banner, push_image_view, push_menu, push_palette,
-    push_rail, push_splitter, push_top_bar, push_tree, top_bar_height, tree_metrics, BarCtx,
-    CaretPaint, DiffTint, PaintParams, RailDragView, RailView, TabStrip,
+    build_display_list, build_find_paint, conflict_banner_layout, diff_columns, font_sizes,
+    measure_tree, push_ai_preview, push_conflict_banner, push_diff_view, push_image_view,
+    push_menu, push_palette, push_rail, push_splitter, push_top_bar, push_tree, top_bar_height,
+    tree_metrics, BarCtx, CaretPaint, PaintParams, RailDragView, RailView, TabStrip,
 };
 use crate::palette::{Palette, PaletteAction, PaletteRow, Rows};
 use crate::pane::{
@@ -61,7 +60,6 @@ use crate::platform::wire::{Arg, Message, Reader};
 use crate::platform::xkb::Xkb;
 use crate::render::display::{DisplayList, DrawCmd};
 use crate::render::image::{Image, ImageStore, Limits};
-use crate::rope::Rope;
 use crate::scale::Scale;
 use crate::search;
 use crate::store;
@@ -173,9 +171,20 @@ impl Scaling {
 }
 
 pub fn run() -> Result<()> {
-    // An optional path to open; everything after it is ignored for now.
-    let path = std::env::args_os().nth(1).map(PathBuf::from);
-    State::new(path)?.bring_up()
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    // `--demo-diff` opens a demonstration diff review at startup (every diff concept in
+    // one tab), so the view can be seen and tuned without running a real AI action.
+    let demo_diff = args.iter().any(|a| a == "--demo-diff");
+    // The first non-flag argument is the file to open, if any.
+    let path = args
+        .iter()
+        .find(|a| !a.starts_with("--"))
+        .map(PathBuf::from);
+    let mut state = State::new(path)?;
+    if demo_diff {
+        state.open_demo_diff();
+    }
+    state.bring_up()
 }
 
 /// `--gpu-probe`: report what the compositor offers the dmabuf presentation
@@ -184,6 +193,47 @@ pub fn run() -> Result<()> {
 /// successful probe means the GPU backend's protocol prerequisites hold.
 pub fn gpu_probe() -> Result<()> {
     State::new(None)?.probe_dmabuf()
+}
+
+/// The before and after text of the `--demo-diff` review, crafted so the diff exercises
+/// every concept the view draws: unchanged lines carried through (heading, blanks, prose,
+/// list items), a changed line with a word inserted, a long changed line that wraps
+/// within its band, a wholly removed line (hatched on the right), a wholly added line
+/// (hatched on the left), and a one-into-many replacement (a changed pair plus surplus
+/// added lines). Kept as two line lists joined by newlines so the alignment reads clearly
+/// from the source.
+fn demo_diff_texts() -> (String, String) {
+    let old = [
+        "# Release checklist",
+        "",
+        "Run the full test suite before tagging.",
+        "Update the changlog with the new version and link every entry to its pull \
+         request so the release history stays easy to trace later.",
+        "Remove this temporary debugging note before you cut the release.",
+        "",
+        "- Bump the version number",
+        "- Tag the commit",
+        "",
+        "Deploy: build, smoke-test, then ship.",
+    ]
+    .join("\n");
+    let new = [
+        "# Release checklist",
+        "",
+        "Run the full test suite locally and in CI before tagging.",
+        "Update the changelog with the new version and link every entry to its pull \
+         request so the release history stays easy to trace later.",
+        "",
+        "- Bump the version number",
+        "- Tag the commit",
+        "- Push the tag to origin",
+        "",
+        "Deploy:",
+        "1. build the release artifacts",
+        "2. smoke-test, then ship",
+    ]
+    .join("\n");
+    (old, new)
 }
 
 /// What the pointer is hovering in a pane's tab strip, so the painter can light
@@ -230,21 +280,6 @@ struct ImageView {
 enum AiCommand {
     Run(usize),
     Custom,
-}
-
-/// The laid-out inline diff preview for a Ready action: the synthetic document (the
-/// pane's text with the selection replaced by the merged diff), its layout built with
-/// the pane's own geometry so it aligns with the live document, and the byte ranges to
-/// tint. Rebuilt only when the column width or font geometry changes, so a modal
-/// preview lays out once and re-renders (and scrolls) against the cached layout.
-struct PreviewRender {
-    pane: usize,
-    rope: Rope,
-    layout: Layout,
-    inserts: Vec<(usize, usize)>,
-    deletes: Vec<(usize, usize)>,
-    /// (column width, body size, scale 120ths) the layout was built for.
-    key: (i32, u32, u32),
 }
 
 /// An in-progress vault drag-to-reorder, the rail's answer to [`TabDrag`] and the
@@ -343,9 +378,6 @@ struct State {
     ai_enabled: bool,
     /// The command-line backend the AI actions run through (config `ai provider`).
     ai_provider: ai::Provider,
-    /// The laid-out inline diff for a Ready preview, `None` otherwise. Built from
-    /// [`Self::ai`] each frame and cached on its geometry (see [`PreviewRender`]).
-    ai_render: Option<PreviewRender>,
     /// The open palette, `None` when none is. It floats over the window and takes
     /// every key while it is up (see [`crate::palette`]).
     palette: Option<Palette>,
@@ -841,17 +873,20 @@ impl State {
                 }],
                 0,
                 Some(root.as_path()),
+                0,
             ),
             None => restore_group(
                 &layout.panes[0].tabs,
                 layout.panes[0].active as usize,
                 Some(root.as_path()),
+                0,
             ),
         };
         let editor_b = restore_group(
             &layout.panes[1].tabs,
             layout.panes[1].active as usize,
             Some(root.as_path()),
+            1,
         );
 
         let expanded: BTreeSet<PathBuf> = layout.expanded.iter().cloned().collect();
@@ -903,7 +938,6 @@ impl State {
             ai_wake: ai::Wake::new()?,
             ai_enabled: config.ai.enabled,
             ai_provider: config.ai.provider,
-            ai_render: None,
             palette: None,
             search: search::Results::default(),
             last_vault: None,
@@ -1006,14 +1040,25 @@ impl State {
         self.vaults.iter().position(|v| v.path == root)
     }
 
-    /// The current column layout for this window size, below the top bar.
+    /// The current column layout for this window size, below the top bar. A diff review
+    /// solos its pane (see [`Self::diff_solo`]), hiding the sidebar and the other pane so
+    /// the two diff columns get the full width.
     fn columns(&self) -> Columns {
         self.panes.columns(
             self.width as i32,
             self.height as i32,
             self.top_bar_h(),
             self.scale(),
+            self.diff_solo(),
         )
+    }
+
+    /// The pane a diff review has taken over, if one is open, so the layout hides
+    /// everything else while it is up. The first pane showing a diff wins (only one is
+    /// the norm); a normal document layout returns once the review is accepted or
+    /// rejected.
+    fn diff_solo(&self) -> Option<usize> {
+        (0..self.editors.len()).find(|&i| self.editors[i].active_is_diff())
     }
 
     /// The top bar's device-pixel height at the current body size and scale.
@@ -1327,7 +1372,8 @@ impl State {
         let show_empty_dirs = self.vault_prefs.show_empty_dirs(&root);
         let (scale, body_size) = (self.scale(), self.body_size);
         for (g, pane) in layout.panes.iter().enumerate() {
-            self.editors[g] = restore_group(&pane.tabs, pane.active as usize, Some(&root));
+            self.editors[g] =
+                restore_group(&pane.tabs, pane.active as usize, Some(&root), g as u64);
             // A restored group starts at scale 1.0, which is the truth only at
             // startup, before the compositor has reported one. This window already
             // knows its scale, so the new tabs take it now.
@@ -1688,6 +1734,9 @@ impl State {
         }
         let original = self.editors[pane].text.rope().byte_slice(span.0..span.1);
         let version = self.editors[pane].text.version();
+        // The document the answer applies back to, pinned now so a tab switch while the
+        // tool thinks cannot retarget the edit.
+        let source = self.editors[pane].id;
         self.ai = Some(
             match ai::Job::spawn(
                 self.ai_provider,
@@ -1697,6 +1746,7 @@ impl State {
             ) {
                 Ok(job) => Preview::Thinking {
                     pane,
+                    source,
                     span,
                     version,
                     original,
@@ -1713,8 +1763,8 @@ impl State {
     }
 
     /// A finished (or failed) AI job woke the loop: drain the wake pipe and, when the
-    /// running preview has its answer, turn it into the diff to review or the failure
-    /// to show. A spurious wake (no result yet) leaves the preview untouched.
+    /// running job has its answer, open a diff tab to review it or show the failure. A
+    /// spurious wake (no result yet) leaves the modal untouched.
     fn poll_ai(&mut self) {
         self.ai_wake.drain();
         if !matches!(self.ai, Some(Preview::Thinking { .. })) {
@@ -1722,6 +1772,7 @@ impl State {
         }
         let Some(Preview::Thinking {
             pane,
+            source,
             span,
             version,
             original,
@@ -1731,125 +1782,100 @@ impl State {
         else {
             return;
         };
-        self.ai = Some(match job.take_outcome() {
-            None => Preview::Thinking {
-                pane,
-                span,
-                version,
-                original,
-                label,
-                job,
-            },
-            Some(ai::Outcome::Revised(revised)) => {
-                // The diff is a pure function of the two texts: whatever the tool
-                // returned is diffed as-is against the selection.
-                let spans = ai::word_diff(&original, &revised);
-                self.dirty = true;
-                Preview::Ready {
+        match job.take_outcome() {
+            None => {
+                // Still running: put the modal back as it was.
+                self.ai = Some(Preview::Thinking {
                     pane,
+                    source,
                     span,
                     version,
-                    revised,
-                    spans,
+                    original,
                     label,
-                }
+                    job,
+                });
+            }
+            Some(ai::Outcome::Revised(revised)) => {
+                // The answer is a side-by-side diff in its own tab. Nothing massages
+                // it: whatever the tool returned is diffed as-is against the selection.
+                let view =
+                    crate::pane::DiffView::new(source, span, version, original, revised, label);
+                self.editors[pane].open_diff(view);
+                self.focus = Focus::Editor(pane);
+                self.ai = None;
+                self.dirty = true;
             }
             Some(ai::Outcome::Failed(message)) => {
+                self.ai = Some(Preview::Failed { label, message });
                 self.dirty = true;
-                Preview::Failed { label, message }
             }
-        });
+        }
     }
 
-    /// Accept the diff preview: replace the captured selection with the revised text
-    /// as one undo step, select the result so the change is visible, and dismiss the
-    /// preview. A note that changed underneath (a disk reload while the preview was
-    /// up) is left untouched rather than spliced at a stale offset.
-    pub(super) fn accept_ai(&mut self) {
-        let Some(Preview::Ready {
-            pane,
-            span,
-            version,
-            revised,
-            ..
-        }) = self.ai.take()
-        else {
+    /// Accept the active diff review: splice its revision over the source span as one
+    /// undo step, select the result so the change is visible, focus the source, and
+    /// close the review tab. A note that changed underneath (a disk reload, or a fresh
+    /// edit, while the review was up) fails the version check and is left untouched; a
+    /// source whose tab was closed has nowhere to land, so the review just closes.
+    pub(super) fn accept_diff(&mut self) {
+        let focus = self.active_editor();
+        let Some((source, span, version, revised)) = self.editors[focus].active_diff().map(|d| {
+            let (s, sp, v, r) = d.apply();
+            (s, sp, v, r.to_string())
+        }) else {
             return;
         };
         self.dirty = true;
-        if self.editors[pane].text.version() != version {
-            return;
-        }
-        if self.editors[pane].text.replace_ranges(&[span], &revised) {
-            let start = span.0;
-            self.editors[pane]
-                .text
-                .select_range(start, start + revised.len());
+        // Close the review first, so focusing the source next does not fight it for the
+        // active tab. The source is found by id afterwards, robust to the index shift.
+        self.editors[focus].close_active();
+        // Find the source wherever its tab now sits (this pane or the other), apply only
+        // if it still matches the version the span was captured at, then focus it.
+        for g in 0..self.editors.len() {
+            let Some(doc) = self.editors[g].doc_by_id_mut(source) else {
+                continue;
+            };
+            if doc.text.version() == version && doc.text.replace_ranges(&[span], &revised) {
+                doc.text.select_range(span.0, span.0 + revised.len());
+            }
+            self.editors[g].focus_doc(source);
+            self.focus = Focus::Editor(g);
             self.bump_caret();
             self.reveal_active_caret();
+            break;
         }
     }
 
-    /// Dismiss the AI preview, canceling a still-running job (dropping it kills the
-    /// child). Reports whether one was up, for the caller's repaint.
+    /// Reject the active diff review: close its tab, leaving the source untouched.
+    pub(super) fn reject_diff(&mut self) {
+        let focus = self.active_editor();
+        if self.editors[focus].active_is_diff() {
+            self.editors[focus].close_active();
+            self.dirty = true;
+        }
+    }
+
+    /// Open the demonstration diff review (the `--demo-diff` flag): a crafted before and
+    /// after that exercises every diff concept in one tab, so the view can be seen and
+    /// tuned without running a real AI action. It targets pane A's current document, so
+    /// accept (Enter) splices the revision into it and reject (Escape) just closes; the
+    /// content is for looking at, not for keeping.
+    fn open_demo_diff(&mut self) {
+        let (old, new) = demo_diff_texts();
+        let source = self.editors[0].id;
+        let version = self.editors[0].text.version();
+        let view = crate::pane::DiffView::new(source, (0, 0), version, old, new, "Diff demo");
+        self.editors[0].open_diff(view);
+        self.focus = Focus::Editor(0);
+        self.dirty = true;
+    }
+
+    /// Dismiss the AI modal (a still-running job, canceled by dropping it, or a shown
+    /// failure). Reports whether one was up, for the caller's repaint.
     pub(super) fn close_ai(&mut self) -> bool {
         let was_open = self.ai.take().is_some();
-        self.ai_render = None;
         self.dirty |= was_open;
         was_open
-    }
-
-    /// Build or refresh the inline diff layout for a Ready preview, keyed on the
-    /// column width and font geometry so a resize rebuilds it and a scroll reuses it.
-    /// Clears it whenever no diff is Ready. Called once per frame before the panes are
-    /// drawn, so the pane loop finds the render ready.
-    fn ensure_ai_render(&mut self, cols: &Columns) {
-        let Some(Preview::Ready {
-            pane, span, spans, ..
-        }) = &self.ai
-        else {
-            self.ai_render = None;
-            return;
-        };
-        let pane = *pane;
-        let Some(rect) = cols.editors.get(pane).copied().flatten() else {
-            self.ai_render = None;
-            return;
-        };
-        let key = (rect.w, self.body_size, self.scale().factor_120());
-        if self.ai_render.as_ref().map(|r| (r.pane, r.key)) == Some((pane, key)) {
-            return;
-        }
-        // The synthetic document: the pane's text with the selection replaced by the
-        // merged diff, so the diff lays out in the document flow and the rest reflows.
-        let m = ai::merged(spans);
-        let span = *span;
-        let original = self.editors[pane].text.rope();
-        let end = original.len();
-        let mut doc = original.byte_slice(0..span.0.min(end));
-        let base = doc.len();
-        doc.push_str(&m.text);
-        doc.push_str(&original.byte_slice(span.1.min(end)..end));
-        // The diff's changed runs, shifted into the synthetic document by the prefix.
-        let (mut inserts, mut deletes) = (Vec::new(), Vec::new());
-        for (r, kind) in &m.runs {
-            let range = (base + r.start, base + r.end);
-            match kind {
-                ai::DiffKind::Insert => inserts.push(range),
-                ai::DiffKind::Delete => deletes.push(range),
-                ai::DiffKind::Equal => {}
-            }
-        }
-        let rope = Rope::from_str(&doc);
-        let layout = self.editors[pane].preview_layout(&self.fonts, rect, &rope);
-        self.ai_render = Some(PreviewRender {
-            pane,
-            rope,
-            layout,
-            inserts,
-            deletes,
-            key,
-        });
     }
 
     /// Put the clipboard's picture on vault `i`'s chip, the menu's "Use image from
@@ -2147,9 +2173,6 @@ impl State {
     fn build_frame_list(&mut self) -> Rc<DisplayList> {
         let cols = self.columns();
         self.sync_tab_scroll(&cols);
-        // Lay out the inline diff for a Ready preview before the panes draw, so the
-        // pane that owns it renders its synthetic document instead of the live one.
-        self.ensure_ai_render(&cols);
         // Bake any chip picture the rail is about to ask for, at the size the chips
         // are this frame.
         let chip_side = crate::paint::rail_chip_side(cols.rail_chips, self.scale());
@@ -2199,34 +2222,29 @@ impl State {
                 });
                 continue;
             }
-            // A Ready inline diff owns this pane's body: it renders the synthetic
-            // preview document (the diff in the document flow), with the caret and the
-            // live selection suppressed since it is modal.
-            if let Some(render) = self.ai_render.as_ref().filter(|r| r.pane == i) {
-                let ed = &self.editors[i];
-                let params = PaintParams {
-                    view: rect,
-                    scale: self.scale(),
-                    body_size: self.body_size,
-                    scroll_y: ed.scroll_y,
-                    content_height: ed.content_height,
-                    scrollbar: &ed.scrollbar,
-                    selection: None,
-                    caret: None,
-                    find: None,
-                    table_hover: None,
-                    fold_hover: None,
-                    diff: Some(DiffTint {
-                        inserts: &render.inserts,
-                        deletes: &render.deletes,
-                    }),
+            // A diff review owns its pane's body: the two side-by-side columns with
+            // their word highlights, scrolling together, in place of a document. Its
+            // scroll lives on the view; the column scrollbar rides the taller side.
+            if self.editors[i].active_is_diff() {
+                let (scale, body_size) = (self.scale(), self.body_size);
+                let dc = diff_columns(rect, scale, body_size, &self.fonts);
+                let content_h = {
+                    let dv = self.editors[i].active_diff_mut().expect("active diff");
+                    dv.ensure_layouts(&self.fonts, &dc, scale, body_size);
+                    dv.scroll_y = scroll::clamp(dv.scroll_y, dv.content_height(), rect.h);
+                    dv.content_height()
                 };
-                list.append(&mut build_display_list(
+                tick_scrollbar(&mut self.editors[i].scrollbar, content_h, rect.h, now);
+                let dv = self.editors[i].active_diff().expect("active diff");
+                push_diff_view(
+                    &mut list,
                     &self.fonts,
-                    &render.layout,
-                    &render.rope,
-                    &params,
-                ));
+                    rect,
+                    dv,
+                    scale,
+                    body_size,
+                    &self.editors[i].scrollbar,
+                );
                 continue;
             }
             self.editors[i].ensure_layout(&self.fonts, rect);
@@ -2370,27 +2388,17 @@ impl State {
             let ctx = BarCtx::new(&self.fonts, scale, self.body_size);
             push_palette(&mut list, &ctx, palette, &self.palette_layout(palette));
         }
-        // The AI preview is the topmost modal: it holds the keyboard for accept or
-        // reject, so nothing else can be up under it. A Ready diff renders inline in
-        // its pane (above), so it shows only a small accept/reject hint over that pane;
-        // Thinking and Failed have nothing to show inline, so they keep the panel.
-        match &self.ai {
-            Some(Preview::Ready { pane, .. }) => {
-                if let Some(rect) = cols.editors.get(*pane).copied().flatten() {
-                    let ctx = BarCtx::new(&self.fonts, scale, self.body_size);
-                    push_ai_hint(&mut list, &ctx, rect);
-                }
-            }
-            Some(preview) => {
-                let ctx = BarCtx::new(&self.fonts, scale, self.body_size);
-                push_ai_preview(
-                    &mut list,
-                    &ctx,
-                    preview,
-                    (self.width as i32, self.height as i32),
-                );
-            }
-            None => {}
+        // The AI modal (still-working or failed) floats over everything and holds the
+        // keyboard until dismissed. A successful answer is not here: it opened a diff
+        // tab, which the pane loop above already drew.
+        if let Some(preview) = &self.ai {
+            let ctx = BarCtx::new(&self.fonts, scale, self.body_size);
+            push_ai_preview(
+                &mut list,
+                &ctx,
+                preview,
+                (self.width as i32, self.height as i32),
+            );
         }
         Rc::new(list)
     }
@@ -3013,6 +3021,35 @@ mod tests {
 
     fn vaults(paths: &[&str]) -> Vec<Vault> {
         crate::config::vaults(paths.iter().map(PathBuf::from))
+    }
+
+    #[test]
+    fn the_demo_diff_exercises_every_concept() {
+        let (old, new) = demo_diff_texts();
+        let rows = crate::ai::line_diff(&old, &new);
+        // An unchanged line carried through on both sides.
+        assert!(rows
+            .iter()
+            .any(|r| !r.changed && r.old.is_some() && r.new.is_some()));
+        // A changed pair (both sides present, tinted).
+        assert!(rows
+            .iter()
+            .any(|r| r.changed && r.old.is_some() && r.new.is_some()));
+        // A wholly removed line (present on the left, hatched on the right).
+        assert!(rows
+            .iter()
+            .any(|r| r.changed && r.old.is_some() && r.new.is_none()));
+        // A wholly added line (present on the right, hatched on the left).
+        assert!(rows
+            .iter()
+            .any(|r| r.changed && r.old.is_none() && r.new.is_some()));
+        // Reading each side back reproduces it, so the demo is a real diff, not a mock.
+        let a: Vec<&str> = old.split('\n').collect();
+        let b: Vec<&str> = new.split('\n').collect();
+        let left: Vec<&str> = rows.iter().filter_map(|r| r.old).map(|i| a[i]).collect();
+        let right: Vec<&str> = rows.iter().filter_map(|r| r.new).map(|j| b[j]).collect();
+        assert_eq!(left, a);
+        assert_eq!(right, b);
     }
 
     #[test]

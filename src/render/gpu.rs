@@ -31,6 +31,7 @@ pub const MODE_IMAGE: u32 = 3;
 pub const MODE_ROUND: u32 = 4;
 pub const MODE_CHECK: u32 = 5;
 pub const MODE_CHEVRON: u32 = 6;
+pub const MODE_HATCH: u32 = 7;
 
 /// Atlases start here and double when full, up to [`ATLAS_MAX`]; growth wipes
 /// the atlas (sources are cached in `Fonts`, so re-inserting is cheap) and the
@@ -399,6 +400,27 @@ impl Batcher<'_> {
                 // facing (0 right for collapsed, 1 down for expanded).
                 let extra = [rect.w as f32, rect.h as f32, f32::from(*down), 0.0];
                 self.quad(*rect, MODE_CHEVRON, *color, [0.0; 2], extra);
+            }
+            DrawCmd::Hatch {
+                rect,
+                color,
+                period,
+                stroke,
+            } => {
+                // The stripe pattern is intrinsic to the mode: extra carries the diagonal
+                // spacing (period) and the stroke half-width the shader fades coverage
+                // over. The uv is seeded at the quad's absolute screen position (not the
+                // usual box-local zero), so the diagonals are computed in one global
+                // screen-space grid and line up seamlessly across separate hatch bands
+                // rather than each restarting its own phase.
+                let extra = [*period as f32, *stroke as f32 * 0.5, 0.0, 0.0];
+                self.quad(
+                    *rect,
+                    MODE_HATCH,
+                    *color,
+                    [rect.x as f32, rect.y as f32],
+                    extra,
+                );
             }
             DrawCmd::Text {
                 x,

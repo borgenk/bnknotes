@@ -1,6 +1,7 @@
 // The one fragment shader. Modes (src/gpu.rs): 0 solid fill, 1 glyph coverage
 // from the R8 atlas, 2 emoji from the BGRA atlas, 3 an image texture,
-// 4 rounded-rect coverage, 5 a task check mark, 6 a disclosure chevron. Glyph and emoji reads are texelFetch at integer
+// 4 rounded-rect coverage, 5 a task check mark, 6 a disclosure chevron,
+// 7 diagonal hatching. Glyph and emoji reads are texelFetch at integer
 // coords so a 1:1 atlas quad reproduces its source texels exactly. An image is
 // an sRGB texture sampled with texture() and normalized UVs, so the GPU decodes
 // and scales its native-size texture to the display quad in linear space,
@@ -101,6 +102,17 @@ float chevron_coverage(vec2 p, vec2 size, bool down) {
     return clamp(half_w - d + 0.5, 0.0, 1.0);
 }
 
+// Diagonal hatching over the box: 45-degree strokes half-width `half_w`
+// (v_extra.y) repeating every `period` (v_extra.x) pixels along the p.x + p.y
+// axis. Coverage fades over the one-pixel band at the stroke edge, so the lines
+// read smooth rather than aliased, the same distance-to-band trick the check mark
+// and chevron use.
+float hatch_coverage(vec2 p, float period, float half_w) {
+    float t = mod(p.x + p.y, period);
+    float d = min(t, period - t);
+    return clamp(half_w - d + 0.5, 0.0, 1.0);
+}
+
 void main() {
     if (v_mode == 0u) {
         out_color = vec4(srgb_to_linear(v_color.rgb), v_color.a);
@@ -128,8 +140,11 @@ void main() {
     } else if (v_mode == 5u) {
         float cov = check_coverage(v_uv, v_extra.xy);
         out_color = vec4(srgb_to_linear(v_color.rgb), v_color.a * cov);
-    } else {
+    } else if (v_mode == 6u) {
         float cov = chevron_coverage(v_uv, v_extra.xy, v_extra.z > 0.5);
+        out_color = vec4(srgb_to_linear(v_color.rgb), v_color.a * cov);
+    } else {
+        float cov = hatch_coverage(v_uv, v_extra.x, v_extra.y);
         out_color = vec4(srgb_to_linear(v_color.rgb), v_color.a * cov);
     }
 }

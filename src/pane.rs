@@ -6,7 +6,9 @@ use crate::config::CaretConfig;
 use crate::file::{self, FileFormat};
 use crate::find::FindState;
 use crate::fold::{self, FoldMap, Folds};
-use crate::layout::{Adjust, ImageUi, Layout, LayoutCtx, LineIndex, RevealAdjust, NO_REVEAL};
+use crate::layout::{
+    Adjust, ImageUi, Layout, LayoutCtx, LineIndex, RevealAdjust, VisualLine, NO_REVEAL,
+};
 use crate::markdown;
 use crate::platform::error::{Error, Result};
 use crate::platform::freetype::Fonts;
@@ -18,7 +20,7 @@ use crate::rope::Rope;
 use crate::scale::Scale;
 use crate::store;
 use crate::text::{DragGrain, TextBuffer};
-use crate::theme::{FONT_SIZE, MARGIN, RAIL_W};
+use crate::theme::{DIFF_MARGIN, FONT_SIZE, MARGIN, RAIL_W};
 use crate::tree;
 
 /// Largest file the editor will open, as a guard against mapping a huge file into
@@ -552,7 +554,18 @@ impl PaneLayout {
     ///   │chips│    tree     │ s │ editor A  │ s │ editor B │
     ///   └─────┴─────────────┴───┴───────────┴───┴──────────┘
     /// ```
-    pub(crate) fn columns(&self, width: i32, height: i32, top: i32, scale: Scale) -> Columns {
+    /// When `solo` is `Some(i)`, editor `i` takes over the whole content area: the
+    /// sidebar and the other pane are hidden and no splitters are drawn, so a diff
+    /// review gets the full width to read across. Everything else (the rail, that pane's
+    /// tab strip) stays. `None` is the ordinary layout below.
+    pub(crate) fn columns(
+        &self,
+        width: i32,
+        height: i32,
+        top: i32,
+        scale: Scale,
+        solo: Option<usize>,
+    ) -> Columns {
         let splitter = scale.px(SPLITTER);
         let tree_width = scale.px(self.tree_width);
         let body = (height - top).max(0);
@@ -575,6 +588,62 @@ impl PaneLayout {
             w: (width - rail.w).max(0),
             h: top,
         };
+        if let Some(i) = solo.filter(|&i| i < 2) {
+            // A soloed pane takes the whole content area beside the sidebar: the other
+            // pane and the pane splitter fall away, but the file tree stays (it is kept
+            // visible during a diff review), so the pane spans from the tree's right edge
+            // to the window's.
+            let mut x = rail.w;
+            let mut tree = None;
+            let mut splitters = [None, None];
+            if self.tree_visible {
+                tree = Some(Rect {
+                    x,
+                    y: top,
+                    w: tree_width,
+                    h: body,
+                });
+                x += tree_width;
+                splitters[0] = Some(Rect {
+                    x,
+                    y: top,
+                    w: splitter,
+                    h: body,
+                });
+                x += splitter;
+            }
+            let editor = Rect {
+                x,
+                y: top,
+                w: (width - x).max(0),
+                h: body,
+            };
+            // The tab strip reaches left across the tree splitter's grab margin so its
+            // first tab sits flush against the divider, matching the ordinary layout.
+            let strip_x = splitters[0].map_or(x, |s| {
+                let line = divider_line(s, scale);
+                line.x + line.w
+            });
+            let strip = Rect {
+                x: strip_x,
+                y: 0,
+                w: (width - strip_x).max(0),
+                h: top,
+            };
+            let mut editors = [None, None];
+            let mut tab_strips = [None, None];
+            editors[i] = Some(editor);
+            tab_strips[i] = Some(strip);
+            return Columns {
+                rail,
+                rail_chips,
+                bar,
+                tree,
+                editors,
+                splitters,
+                tab_strips,
+            };
+        }
         let mut x = rail.w;
         let mut tree = None;
         let mut splitters = [None, None];
@@ -798,7 +867,33 @@ pub(crate) enum Saved {
     Conflict,
 }
 
+/// A process-unique handle to one open document, stamped by its [`PaneGroup`] when the
+/// tab is created and kept as the tab moves, reorders, or crosses the split. A view
+/// that is not itself the document (a diff tab) names its source this way, so an
+/// accept finds the right buffer wherever its tab now sits, or learns it was closed.
+/// The two panes mint from distinct residues (see [`PaneGroup::mint_id`]) so their
+/// ids never collide.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) struct DocId(u64);
+
+impl DocId {
+    /// A document not yet owned by a pane: a freshly built [`EditorPane`] before it
+    /// is stamped, and the never-drawn placeholder. A diff view never targets one, so
+    /// it reads as a safe non-match.
+    const UNSTAMPED: DocId = DocId(u64::MAX);
+
+    /// A fixed id for a test that builds a view in isolation, without a pane to mint one.
+    #[cfg(test)]
+    pub(crate) fn from_raw(n: u64) -> DocId {
+        DocId(n)
+    }
+}
+
 pub(crate) struct EditorPane {
+    /// This document's stable identity, stamped by the [`PaneGroup`] that opens it so
+    /// a diff view can name the buffer it applies back to. [`DocId::UNSTAMPED`] until a
+    /// pane takes ownership.
+    pub(crate) id: DocId,
     pub(crate) text: TextBuffer,
     pub(crate) path: Option<PathBuf>,
     pub(crate) format: FileFormat,
@@ -861,6 +956,7 @@ impl EditorPane {
     /// An empty, file-less pane (blank buffer, no images).
     pub(crate) fn empty() -> Self {
         Self {
+            id: DocId::UNSTAMPED,
             text: TextBuffer::new(),
             path: None,
             format: FileFormat::default(),
@@ -1327,34 +1423,6 @@ impl EditorPane {
     pub(crate) fn ensure_layout(&mut self, fonts: &Fonts, rect: Rect) {
         self.ensure_index(fonts, rect);
         self.ensure_window(fonts, rect);
-    }
-
-    /// Lay out a synthetic document `doc` (the inline diff preview: this pane's text
-    /// with the selection replaced by the merged diff) with this pane's geometry and
-    /// scale, so it aligns with the live document above it and the painter shifts it by
-    /// the same scroll. A full build, not windowed: the preview is modal and built once
-    /// per open (and per resize), so O(document) is fine, and the synthetic document
-    /// carries no images or folds of its own.
-    pub(crate) fn preview_layout(&self, fonts: &Fonts, rect: Rect, doc: &Rope) -> Layout {
-        let margin = self.scale.px(MARGIN);
-        let wrap_width = rect.w - 2 * margin;
-        // The pane's own image store, so an image the synthetic document copies
-        // verbatim (any line outside the selection) renders at its picture height and
-        // the content above the diff stays aligned with the live document. No reveal
-        // and no folds: the diff region is what the preview is about, and image-source
-        // reveal or a fold would shift byte offsets that no longer match this document.
-        let ctx = LayoutCtx::new(
-            fonts,
-            doc,
-            wrap_width,
-            self.body_size,
-            NO_REVEAL,
-            &self.images,
-            ImageUi::default(),
-            FoldMap::NONE,
-            self.scale,
-        );
-        Layout::build_with_images(&ctx, rect.x + margin, rect.y + margin)
     }
 
     /// Lay out a window centered on the cursor (a page each side plus slack for
@@ -1988,12 +2056,395 @@ impl EditorPane {
     }
 }
 
+/// The two columns' aligned layout is memoized on the geometry it was built for: the
+/// old and new text-area widths (a resize or a split-ratio drag changes them), the body
+/// size, and the display scale. A scroll leaves all of these unchanged and reuses the
+/// layout; only the visible window shifts.
+type DiffLayoutKey = (i32, i32, u32, u32);
+
+/// The two text rectangles a [`DiffView`] lays its columns into: the old (left) and the
+/// new (right). Each is the text area only, its line-number gutter already carved off.
+/// The renderer computes these; the view lays out to them so the tinted words land where
+/// they are drawn.
+#[derive(Clone, Copy)]
+pub(crate) struct DiffColumns {
+    pub(crate) old_text: Rect,
+    pub(crate) new_text: Rect,
+}
+
+/// One side of one aligned row: whether this side has a line here, whether that line is
+/// a change (tinted and accented) rather than carried through, its content height within
+/// the band, its 1-based line number, and the first visual row's baseline (for the
+/// gutter number). An absent cell (`!present`) is the empty half of a one-sided change,
+/// which the renderer hatches.
+#[derive(Clone, Copy)]
+pub(crate) struct DiffCell {
+    pub(crate) present: bool,
+    pub(crate) changed: bool,
+    pub(crate) height: i32,
+    pub(crate) number: usize,
+    pub(crate) baseline: i32,
+}
+
+impl DiffCell {
+    const ABSENT: DiffCell = DiffCell {
+        present: false,
+        changed: false,
+        height: 0,
+        number: 0,
+        baseline: 0,
+    };
+}
+
+/// One aligned row of the diff: the content-space band both columns share, and each
+/// side's cell within it. The old and new lines of a row sit at the same `y` so a change
+/// reads straight across the divider; the taller side sets the band height and the
+/// shorter side leaves the surplus blank (a changed pair) or hatched (a one-sided
+/// change).
+#[derive(Clone, Copy)]
+pub(crate) struct DiffBand {
+    pub(crate) y: i32,
+    pub(crate) height: i32,
+    pub(crate) old: DiffCell,
+    pub(crate) new: DiffCell,
+}
+
+/// A side-by-side diff shown in its own tab: the old text on the left, the new on the
+/// right, aligned line for line so a change reads across the divider. It is a pure
+/// function of the two texts (the line and word diffs decide the tint; nothing massages
+/// the tool's answer), and it remembers only what an accept needs: the source document,
+/// the span it replaces, the version that span was captured at, and the revised text to
+/// write. Accept applies that edit to the source wherever its tab now sits; reject just
+/// closes this one.
+pub(crate) struct DiffView {
+    /// The document this diff applies back to, named by id so it is found after a tab
+    /// move or reorder, or known to be gone.
+    source: DocId,
+    /// The byte range in the source the revised text replaces.
+    span: (usize, usize),
+    /// The source's content version when the action ran. A later version means the note
+    /// changed underneath, so the span is stale and accept is refused.
+    version: u64,
+    /// What accept writes over `span`: the tool's answer verbatim.
+    revised: String,
+    /// The action's name, shown as the tab's title.
+    label: &'static str,
+    /// The two sides as ropes: `old` is the original fragment, `new` the revision.
+    old: Rope,
+    new: Rope,
+    /// The removed word ranges in `old` and the added word ranges in `new`, tinted red
+    /// on the left and green on the right. A one-sided line contributes its whole range
+    /// (it is wholly added or removed); a changed pair contributes only its edited words.
+    deletes: Vec<(usize, usize)>,
+    inserts: Vec<(usize, usize)>,
+    /// The line alignment: one row per aligned old/new line pair.
+    rows: Vec<crate::ai::DiffRow>,
+    /// The shared vertical scroll, applied to both sides so they move together.
+    pub(crate) scroll_y: i32,
+    /// The scrollable extent (aligned content plus top and bottom margin), for the
+    /// shared scroll clamp and the column scrollbar. Refreshed with the layout.
+    content_height: i32,
+    /// The two columns' laid-out text, each line nudged to the row band both columns
+    /// share. `None` until first built; rebuilt on a resize, reused on a scroll.
+    old_layout: Option<Layout>,
+    new_layout: Option<Layout>,
+    /// The aligned row bands, in reading order, alongside the layouts they were placed
+    /// under, so the renderer draws the tints, hatching, and gutter numbers.
+    bands: Vec<DiffBand>,
+    layout_key: Option<DiffLayoutKey>,
+    /// An empty image store: a prose fragment carries no pictures to decode, so an
+    /// image line (rare in a selection) lays out as its raw source text.
+    images: ImageStore,
+}
+
+impl DiffView {
+    /// Build a diff of `old` into `revised`, targeting document `source` at `span`
+    /// (captured at content `version`). The line and word diffs run once here; the
+    /// layout builds lazily on the first frame that knows the column geometry.
+    pub(crate) fn new(
+        source: DocId,
+        span: (usize, usize),
+        version: u64,
+        old: String,
+        revised: String,
+        label: &'static str,
+    ) -> Self {
+        let rows = crate::ai::line_diff(&old, &revised);
+        let (deletes, inserts) = diff_word_ranges(&old, &revised, &rows);
+        Self {
+            source,
+            span,
+            version,
+            old: Rope::from_str(&old),
+            new: Rope::from_str(&revised),
+            revised,
+            label,
+            deletes,
+            inserts,
+            rows,
+            scroll_y: 0,
+            content_height: 0,
+            old_layout: None,
+            new_layout: None,
+            bands: Vec::new(),
+            layout_key: None,
+            images: ImageStore::new(None),
+        }
+    }
+
+    /// The document this diff applies to, the range it replaces, the version that range
+    /// was captured at, and the text to write. The app resolves the source by id, checks
+    /// the version still matches, and splices `revised` over `span` as one undo step.
+    pub(crate) fn apply(&self) -> (DocId, (usize, usize), u64, &str) {
+        (self.source, self.span, self.version, &self.revised)
+    }
+
+    /// Build or refresh the aligned layout for the geometry in `cols`, and refresh the
+    /// content height and row bands. Each side is laid out on its own, then every line is
+    /// nudged so the two columns share one row band per aligned line pair. Keyed on the
+    /// geometry, so a scroll reuses the cached layout and a resize rebuilds it. Called
+    /// each frame before the view is drawn.
+    pub(crate) fn ensure_layouts(
+        &mut self,
+        fonts: &Fonts,
+        cols: &DiffColumns,
+        scale: Scale,
+        body_size: u32,
+    ) {
+        let key = (
+            cols.old_text.w,
+            cols.new_text.w,
+            body_size,
+            scale.factor_120(),
+        );
+        if self.layout_key == Some(key) {
+            return;
+        }
+        let margin = scale.px(DIFF_MARGIN);
+        let build = |rope: &Rope, rect: Rect| {
+            let ctx = LayoutCtx::new(
+                fonts,
+                rope,
+                (rect.w - 2 * margin).max(0),
+                body_size,
+                NO_REVEAL,
+                &self.images,
+                ImageUi::default(),
+                FoldMap::NONE,
+                scale,
+            );
+            Layout::build_with_images(&ctx, rect.x + margin, rect.y + margin)
+        };
+        let mut old_layout = build(&self.old, cols.old_text);
+        let mut new_layout = build(&self.new, cols.new_text);
+
+        // Group each side into its logical lines, then walk the aligned rows: each row's
+        // band is as tall as its taller side, and every line is shifted so its box top
+        // lands at the band both columns share.
+        let old_groups = logical_groups(old_layout.lines(), fonts);
+        let new_groups = logical_groups(new_layout.lines(), fonts);
+        let mut old_shift = vec![0i32; old_layout.lines().len()];
+        let mut new_shift = vec![0i32; new_layout.lines().len()];
+        let mut bands = Vec::with_capacity(self.rows.len());
+        // The bands are placed in the same window space the raw layouts were built in
+        // (both columns start at the pane's top plus a margin), so a scroll of 0 shows
+        // the first line a margin below the pane top, as the document view does.
+        let top = cols.old_text.y + margin;
+        let mut y = top;
+        for row in &self.rows {
+            let old_g = row.old.and_then(|i| old_groups.get(i)).copied();
+            let new_g = row.new.and_then(|j| new_groups.get(j)).copied();
+            let band_h = old_g
+                .map_or(0, |g| g.height)
+                .max(new_g.map_or(0, |g| g.height));
+            let cell =
+                |group: Option<LineGroup>, number: Option<usize>, shift: &mut [i32]| -> DiffCell {
+                    match (group, number) {
+                        (Some(g), Some(idx)) => {
+                            let dy = y - g.top;
+                            for s in shift.iter_mut().take(g.last + 1).skip(g.first) {
+                                *s = dy;
+                            }
+                            DiffCell {
+                                present: true,
+                                changed: row.changed,
+                                height: g.height,
+                                number: idx + 1,
+                                baseline: g.baseline + dy,
+                            }
+                        }
+                        _ => DiffCell::ABSENT,
+                    }
+                };
+            let old = cell(old_g, row.old, &mut old_shift);
+            let new = cell(new_g, row.new, &mut new_shift);
+            bands.push(DiffBand {
+                y,
+                height: band_h,
+                old,
+                new,
+            });
+            y += band_h;
+        }
+        // The scrollable extent runs from the pane top to the last band's bottom, plus a
+        // margin each end (the top margin is the gap from the pane top to the first band).
+        let content_height = (y - cols.old_text.y) + margin;
+        old_layout.shift_baselines(&old_shift, content_height);
+        new_layout.shift_baselines(&new_shift, content_height);
+
+        self.content_height = content_height;
+        self.bands = bands;
+        self.old_layout = Some(old_layout);
+        self.new_layout = Some(new_layout);
+        self.layout_key = Some(key);
+    }
+
+    /// The scrollable extent, for the scroll clamp and the scrollbar.
+    pub(crate) fn content_height(&self) -> i32 {
+        self.content_height
+    }
+
+    /// The aligned row bands, for the tints, hatching, and gutter numbers.
+    pub(crate) fn bands(&self) -> &[DiffBand] {
+        &self.bands
+    }
+
+    /// The old side (removed words tinted), or `None` before the first
+    /// [`Self::ensure_layouts`].
+    pub(crate) fn old_side(&self) -> Option<DiffSide<'_>> {
+        self.old_layout.as_ref().map(|layout| DiffSide {
+            layout,
+            rope: &self.old,
+            ranges: &self.deletes,
+        })
+    }
+
+    /// The new side (added words tinted).
+    pub(crate) fn new_side(&self) -> Option<DiffSide<'_>> {
+        self.new_layout.as_ref().map(|layout| DiffSide {
+            layout,
+            rope: &self.new,
+            ranges: &self.inserts,
+        })
+    }
+}
+
+/// One logical line's placement within a laid-out side: the visual-row range it spans
+/// (`[first, last]`, inclusive), its box top, its first row's baseline, and its total
+/// height. The diff alignment shifts each group as a unit onto its row band.
+#[derive(Clone, Copy)]
+struct LineGroup {
+    first: usize,
+    last: usize,
+    top: i32,
+    baseline: i32,
+    height: i32,
+}
+
+/// Group a side's visual lines into logical lines, one [`LineGroup`] per `'\n'`-
+/// delimited line (matching [`crate::ai::line_diff`]'s split). A logical line ends at
+/// the first row whose hard break follows it, or at the last row of the layout.
+fn logical_groups(lines: &[VisualLine], fonts: &Fonts) -> Vec<LineGroup> {
+    let mut groups = Vec::new();
+    let mut first = 0;
+    for (i, line) in lines.iter().enumerate() {
+        if !(line.hard || i + 1 == lines.len()) {
+            continue;
+        }
+        let seed = &lines[first];
+        let top = seed.baseline - fonts.metrics(seed.size).ascent;
+        let height = lines[first..=i]
+            .iter()
+            .map(|l| row_box_height(l, fonts))
+            .sum();
+        groups.push(LineGroup {
+            first,
+            last: i,
+            top,
+            baseline: seed.baseline,
+            height,
+        });
+        first = i + 1;
+    }
+    groups
+}
+
+/// A visual line's box height, the baseline-to-next advance the layout stacked it by: an
+/// image or table row's taller box, else the line-height of its font size.
+fn row_box_height(line: &VisualLine, fonts: &Fonts) -> i32 {
+    if let Some(img) = &line.image {
+        img.box_height()
+    } else if let Some(table) = &line.table {
+        table.box_height()
+    } else {
+        fonts.metrics(line.size).line_height
+    }
+}
+
+/// The word ranges to tint over each side, from the aligned rows: a changed pair (both
+/// lines present) contributes only the words that differ, while a one-sided line (wholly
+/// added or removed) contributes its whole extent. Ranges are byte offsets into `old`
+/// and `new`, the space the layout and its tinting read.
+fn diff_word_ranges(
+    old: &str,
+    new: &str,
+    rows: &[crate::ai::DiffRow],
+) -> (crate::ai::WordRanges, crate::ai::WordRanges) {
+    let old_spans = line_spans(old);
+    let new_spans = line_spans(new);
+    let (mut deletes, mut inserts) = (Vec::new(), Vec::new());
+    for row in rows {
+        if !row.changed {
+            continue;
+        }
+        let old_line = row.old.map(|i| old_spans[i]);
+        let new_line = row.new.map(|j| new_spans[j]);
+        match (old_line, new_line) {
+            (Some((os, oe)), Some((ns, ne))) => {
+                // A changed pair: tint only the words that differ, shifted into each
+                // side's byte space.
+                let (dels, inss) = crate::ai::side_ranges(&old[os..oe], &new[ns..ne]);
+                deletes.extend(dels.into_iter().map(|(a, b)| (os + a, os + b)));
+                inserts.extend(inss.into_iter().map(|(a, b)| (ns + a, ns + b)));
+            }
+            (Some(span), None) => deletes.push(span),
+            (None, Some(span)) => inserts.push(span),
+            (None, None) => {}
+        }
+    }
+    (deletes, inserts)
+}
+
+/// The byte range of each `'\n'`-delimited line in `s` (the newline excluded), matching
+/// the logical lines [`crate::ai::line_diff`] indexes.
+fn line_spans(s: &str) -> Vec<(usize, usize)> {
+    let mut spans = Vec::new();
+    let mut start = 0;
+    for (i, b) in s.bytes().enumerate() {
+        if b == b'\n' {
+            spans.push((start, i));
+            start = i + 1;
+        }
+    }
+    spans.push((start, s.len()));
+    spans
+}
+
+/// One side of a diff for the renderer: its laid-out text, the rope it was built from,
+/// and the changed word ranges to tint (removed on the old side, added on the new).
+pub(crate) struct DiffSide<'a> {
+    pub(crate) layout: &'a Layout,
+    pub(crate) rope: &'a Rope,
+    pub(crate) ranges: &'a [(usize, usize)],
+}
+
 /// What a tab shows. Tabs are managed uniformly by [`PaneGroup`] (order, active tab,
-/// open/close/move); only the content varies. A document today, with room for a view
-/// that is not backed by a file, a diff or a "new tab" landing page, as its own
-/// variant later.
+/// open/close/move); only the content varies: a document, or a side-by-side diff
+/// awaiting accept or reject. Both are heavy, so each is boxed to keep a `Tab` (and the
+/// `Vec<Tab>` a pane holds) a small tagged pointer.
 pub(crate) enum TabContent {
-    Doc(EditorPane),
+    Doc(Box<EditorPane>),
+    Diff(Box<DiffView>),
 }
 
 /// One tab: its content, kept apart from the strip identity (the title and unsaved
@@ -2007,27 +2458,53 @@ impl Tab {
     /// A document tab.
     fn doc(doc: EditorPane) -> Self {
         Self {
-            content: TabContent::Doc(doc),
+            content: TabContent::Doc(Box::new(doc)),
         }
     }
 
-    /// The document this tab holds, when it holds one.
+    /// A diff tab: a side-by-side review awaiting accept or reject.
+    fn diff(view: DiffView) -> Self {
+        Self {
+            content: TabContent::Diff(Box::new(view)),
+        }
+    }
+
+    /// The document this tab holds, when it holds one (not a diff).
     fn as_doc(&self) -> Option<&EditorPane> {
         match &self.content {
             TabContent::Doc(doc) => Some(doc),
+            TabContent::Diff(_) => None,
         }
     }
 
     fn as_doc_mut(&mut self) -> Option<&mut EditorPane> {
         match &mut self.content {
             TabContent::Doc(doc) => Some(doc),
+            TabContent::Diff(_) => None,
         }
     }
 
-    /// The document, consuming the tab, for a tab dragged out of the pane.
+    /// The diff this tab shows, when it is a diff tab.
+    fn as_diff(&self) -> Option<&DiffView> {
+        match &self.content {
+            TabContent::Diff(view) => Some(view),
+            TabContent::Doc(_) => None,
+        }
+    }
+
+    fn as_diff_mut(&mut self) -> Option<&mut DiffView> {
+        match &mut self.content {
+            TabContent::Diff(view) => Some(view),
+            TabContent::Doc(_) => None,
+        }
+    }
+
+    /// The document, consuming the tab, for a tab dragged out of the pane. A diff tab
+    /// yields nothing: it is transient and never re-homed.
     fn into_doc(self) -> Option<EditorPane> {
         match self.content {
-            TabContent::Doc(doc) => Some(doc),
+            TabContent::Doc(doc) => Some(*doc),
+            TabContent::Diff(_) => None,
         }
     }
 
@@ -2035,13 +2512,16 @@ impl Tab {
     fn title(&self) -> String {
         match &self.content {
             TabContent::Doc(doc) => doc.tab_name(),
+            TabContent::Diff(view) => view.label.to_string(),
         }
     }
 
-    /// Whether the strip marks the tab with an unsaved-changes dot.
+    /// Whether the strip marks the tab with an unsaved-changes dot. A diff carries no
+    /// file, so it is never dirty.
     fn is_dirty(&self) -> bool {
         match &self.content {
             TabContent::Doc(doc) => doc.text.is_modified(),
+            TabContent::Diff(_) => false,
         }
     }
 }
@@ -2073,11 +2553,17 @@ pub(crate) struct PaneGroup {
     /// document, so switching tabs slides the same bar onto the new document's scroll
     /// instead of resurrecting the one the old tab left half-faded.
     pub(crate) scrollbar: Scrollbar,
+    /// The next document id this pane mints, stepped by two from a per-pane residue so
+    /// the two panes' ids never collide and a tab dragged across the split keeps its
+    /// own. See [`Self::mint_id`].
+    next_id: u64,
 }
 
 impl PaneGroup {
-    /// A pane with nothing open (no tabs).
-    pub(crate) fn empty() -> Self {
+    /// A pane with nothing open (no tabs), minting ids from `seed`. The two panes seed
+    /// from distinct residues (0 and 1) and every id steps by two, so their documents
+    /// are globally distinguishable.
+    pub(crate) fn with_seed(seed: u64) -> Self {
         Self {
             tabs: Vec::new(),
             active: 0,
@@ -2086,7 +2572,34 @@ impl PaneGroup {
             body_size: FONT_SIZE,
             vault: None,
             scrollbar: Scrollbar::default(),
+            next_id: seed,
         }
+    }
+
+    /// A pane with nothing open, seeded to mint even ids. A test convenience for a
+    /// single-pane context; the app builds both panes through [`Self::with_seed`] so
+    /// the second seeds odd.
+    #[cfg(test)]
+    pub(crate) fn empty() -> Self {
+        Self::with_seed(0)
+    }
+
+    /// Mint the next id for a document this pane opens, stepping the counter by two so
+    /// the sibling pane (seeded to the other residue) can never mint the same value.
+    fn mint_id(&mut self) -> DocId {
+        let id = DocId(self.next_id);
+        self.next_id += 2;
+        id
+    }
+
+    /// Stamp `doc` with a fresh id and append it as a tab, returning its index. The one
+    /// place a brand-new document joins the pane, so id assignment lives here rather
+    /// than at each call site. A tab arriving from the sibling pane (see
+    /// [`Self::insert_tab`]) keeps the id it was already stamped with.
+    fn push_doc(&mut self, mut doc: EditorPane) -> usize {
+        doc.id = self.mint_id();
+        self.tabs.push(Tab::doc(doc));
+        self.tabs.len() - 1
     }
 
     /// The active tab index (0 and meaningless when the pane has no tabs).
@@ -2114,6 +2627,72 @@ impl PaneGroup {
             .get_mut(self.active)
             .and_then(Tab::as_doc_mut)
             .unwrap_or(&mut self.placeholder)
+    }
+
+    /// Open `view` as a diff tab and focus it. It lands directly after the document it
+    /// reviews when that document is in this pane, else at the end, so the review sits
+    /// beside its source.
+    pub(crate) fn open_diff(&mut self, view: DiffView) {
+        let source = view.apply().0;
+        let at = self
+            .tabs
+            .iter()
+            .position(|t| t.as_doc().is_some_and(|d| d.id == source))
+            .map_or(self.tabs.len(), |i| i + 1);
+        self.tabs.insert(at, Tab::diff(view));
+        self.active = at;
+    }
+
+    /// Whether the active tab is a diff review rather than a document, so the frame
+    /// draws the two columns and the keyboard resolves accept or reject.
+    pub(crate) fn active_is_diff(&self) -> bool {
+        self.tabs
+            .get(self.active)
+            .is_some_and(|t| t.as_diff().is_some())
+    }
+
+    /// Whether tab `i` is a diff review. A diff tab is transient and re-homes to no
+    /// document, so a cross-split drag leaves it where it is (see the tab-drag path).
+    pub(crate) fn tab_is_diff(&self, i: usize) -> bool {
+        self.tabs.get(i).is_some_and(|t| t.as_diff().is_some())
+    }
+
+    /// The active diff review, when the active tab is one.
+    pub(crate) fn active_diff(&self) -> Option<&DiffView> {
+        self.tabs.get(self.active).and_then(Tab::as_diff)
+    }
+
+    /// The active diff review mutably, for refreshing its layouts and scroll.
+    pub(crate) fn active_diff_mut(&mut self) -> Option<&mut DiffView> {
+        self.tabs.get_mut(self.active).and_then(Tab::as_diff_mut)
+    }
+
+    /// The document with id `id`, if a tab in this pane holds it, for a diff applying
+    /// its edit back to its source.
+    pub(crate) fn doc_by_id_mut(&mut self, id: DocId) -> Option<&mut EditorPane> {
+        self.docs_mut().find(|d| d.id == id)
+    }
+
+    /// Focus the tab holding document `id`, snapping its caret, and report whether it
+    /// was found here.
+    pub(crate) fn focus_doc(&mut self, id: DocId) -> bool {
+        let Some(i) = self
+            .tabs
+            .iter()
+            .position(|t| t.as_doc().is_some_and(|d| d.id == id))
+        else {
+            return false;
+        };
+        self.active = i;
+        self.active_doc_mut().request_caret_snap();
+        true
+    }
+
+    /// Close the active tab, if there is one. Used to dismiss a resolved diff review.
+    pub(crate) fn close_active(&mut self) {
+        if self.active < self.tabs.len() {
+            self.close(self.active);
+        }
     }
 
     /// Each tab's label, in order, for the tab strip.
@@ -2168,8 +2747,7 @@ impl PaneGroup {
         let mut doc = EditorPane::empty();
         doc.set_scale(scale, body_size);
         doc.set_vault_root(self.vault.as_deref());
-        self.tabs.push(Tab::doc(doc));
-        self.active = self.tabs.len() - 1;
+        self.active = self.push_doc(doc);
     }
 
     /// Open `path`: focus an existing tab holding it, replace a blank scratch tab
@@ -2195,10 +2773,10 @@ impl PaneGroup {
             .and_then(Tab::as_doc)
             .is_some_and(EditorPane::is_blank)
         {
+            doc.id = self.mint_id();
             self.tabs[self.active] = Tab::doc(doc);
         } else {
-            self.tabs.push(Tab::doc(doc));
-            self.active = self.tabs.len() - 1;
+            self.active = self.push_doc(doc);
         }
         Ok(())
     }
@@ -2278,6 +2856,16 @@ impl PaneGroup {
     /// folded headings, plus the active index. Non-document tabs (a diff view) are
     /// transient and not persisted.
     pub(crate) fn to_session(&self) -> store::PaneGroupSession {
+        // Only documents persist, so the active index is measured in the document-only
+        // list: the count of documents ahead of the active tab, clamped into that list.
+        // When the active tab is itself a diff (transient), this lands on the nearest
+        // saved document rather than off the end.
+        let doc_count = self.docs().count();
+        let active = self.tabs[..self.active.min(self.tabs.len())]
+            .iter()
+            .filter(|t| t.as_doc().is_some())
+            .count()
+            .min(doc_count.saturating_sub(1));
         store::PaneGroupSession {
             tabs: self
                 .docs()
@@ -2288,7 +2876,7 @@ impl PaneGroup {
                     folds: d.folds.lines().map(|l| l as u32).collect(),
                 })
                 .collect(),
-            active: self.active as u32,
+            active: active as u32,
         }
     }
 }
@@ -2340,26 +2928,20 @@ pub(crate) fn restore_group(
     tabs: &[store::PaneSession],
     active: usize,
     vault: Option<&Path>,
+    seed: u64,
 ) -> PaneGroup {
+    let mut group = PaneGroup::with_seed(seed);
+    group.vault = vault.map(Path::to_path_buf);
     if tabs.is_empty() {
-        let mut group = PaneGroup::empty();
-        group.vault = vault.map(Path::to_path_buf);
         return group;
     }
-    let mut docs: Vec<EditorPane> = tabs.iter().map(restore_doc).collect();
-    for doc in &mut docs {
+    for saved in tabs {
+        let mut doc = restore_doc(saved);
         doc.set_vault_root(vault);
+        group.push_doc(doc);
     }
-    let active = active.min(docs.len() - 1);
-    PaneGroup {
-        tabs: docs.into_iter().map(Tab::doc).collect(),
-        active,
-        placeholder: EditorPane::empty(),
-        scale: Scale::ONE,
-        body_size: FONT_SIZE,
-        vault: vault.map(Path::to_path_buf),
-        scrollbar: Scrollbar::default(),
-    }
+    group.active = active.min(group.tabs.len() - 1);
+    group
 }
 
 /// Build one document from a saved tab, restoring its caret, scroll, and folds.
@@ -2976,6 +3558,7 @@ run
             }],
             0,
             None,
+            0,
         );
         let ls = group.active_doc_mut().text.rope().line_to_byte(2);
         assert!(group.active_doc_mut().toggle_fold_at(&fonts, rect, ls));
@@ -2984,7 +3567,7 @@ run
         assert_eq!(saved.tabs[0].folds, vec![2], "the fold is persisted");
 
         // Reopening the same file restores it, and it hides the same lines.
-        let mut reopened = restore_group(&saved.tabs, saved.active as usize, None);
+        let mut reopened = restore_group(&saved.tabs, saved.active as usize, None, 0);
         assert_eq!(
             reopened.active_doc_mut().folds.lines().collect::<Vec<_>>(),
             vec![2]
@@ -3456,7 +4039,7 @@ run
             tree_visible: true,
             second_open: true,
         };
-        let cols = panes.columns(1000, 700, 0, Scale::ONE);
+        let cols = panes.columns(1000, 700, 0, Scale::ONE, None);
         // Every column is measured from the rail's right edge, not the window's.
         let tree = cols.tree.expect("tree shown");
         assert_eq!((tree.x, tree.w, tree.h), (RAIL_W, 200, 700));
@@ -3472,6 +4055,30 @@ run
     }
 
     #[test]
+    fn soloing_a_pane_keeps_the_tree_and_drops_the_other_pane() {
+        let panes = PaneLayout {
+            tree_width: 200,
+            split_ratio: 0.5,
+            tree_visible: true,
+            second_open: true,
+        };
+        // A diff review solos pane 1: the tree stays (the file explorer is not hidden),
+        // the other editor and the pane splitter fall away, and the diff pane spans from
+        // the tree's right edge to the window.
+        let cols = panes.columns(1000, 700, 30, Scale::ONE, Some(1));
+        let tree = cols
+            .tree
+            .expect("the tree stays visible during a diff review");
+        assert_eq!((tree.x, tree.w), (RAIL_W, 200));
+        assert!(cols.editors[0].is_none(), "the other pane is hidden");
+        assert!(cols.splitters[1].is_none(), "no pane splitter");
+        let diff = cols.editors[1].expect("the soloed pane");
+        assert_eq!(diff.x, RAIL_W + 200 + SPLITTER);
+        assert_eq!(diff.x + diff.w, 1000);
+        assert!(cols.tab_strips[1].is_some() && cols.tab_strips[0].is_none());
+    }
+
+    #[test]
     fn the_rail_is_the_outermost_column_and_the_only_full_height_one() {
         let panes = PaneLayout {
             tree_width: 200,
@@ -3479,7 +4086,7 @@ run
             tree_visible: true,
             second_open: false,
         };
-        let cols = panes.columns(1000, 700, 30, Scale::ONE);
+        let cols = panes.columns(1000, 700, 30, Scale::ONE, None);
         // The rail runs the whole window height, beside the bar rather than under
         // it, and the bar starts where the rail ends.
         assert_eq!(
@@ -3509,7 +4116,7 @@ run
             tree_visible: true,
             second_open: false,
         };
-        let cols = panes.columns(1000, 700, 30, Scale::ONE);
+        let cols = panes.columns(1000, 700, 30, Scale::ONE, None);
         // The rail is drawn full height, but its chips take the column beneath the
         // bar, so they start where the tree and the editors do.
         let chips = cols.rail_chips;
@@ -3530,7 +4137,7 @@ run
         };
         // A window squeezed narrower than the rail gives it what there is, and the
         // columns beside it collapse to nothing rather than to a negative width.
-        let cols = panes.columns(20, 700, 30, Scale::ONE);
+        let cols = panes.columns(20, 700, 30, Scale::ONE, None);
         assert_eq!(cols.rail.w, 20);
         assert_eq!((cols.bar.x, cols.bar.w), (20, 0));
         let a = cols.editors[0].expect("editor A");
@@ -3546,7 +4153,7 @@ run
             second_open: false,
         };
         let scale = Scale::from_120(240);
-        let cols = panes.columns(2000, 1400, 60, scale);
+        let cols = panes.columns(2000, 1400, 60, scale, None);
         assert_eq!(cols.rail.w, scale.px(RAIL_W));
         assert_eq!(cols.bar.x, scale.px(RAIL_W));
         assert_eq!(cols.tree.expect("tree shown").x, scale.px(RAIL_W));
@@ -3560,7 +4167,7 @@ run
             tree_visible: true,
             second_open: true,
         };
-        let cols = panes.columns(1000, 700, 30, Scale::ONE);
+        let cols = panes.columns(1000, 700, 30, Scale::ONE, None);
         // Every column starts below the bar and is that much shorter.
         let tree = cols.tree.expect("tree shown");
         assert_eq!((tree.y, tree.h), (30, 670));
@@ -3596,7 +4203,7 @@ run
             tree_visible: false,
             second_open: false,
         };
-        let cols = panes.columns(1000, 700, 30, Scale::ONE);
+        let cols = panes.columns(1000, 700, 30, Scale::ONE, None);
         let strip_a = cols.tab_strips[0].expect("strip A");
         assert_eq!((strip_a.x, strip_a.w), (RAIL_W, 1000 - RAIL_W));
         assert!(cols.tab_strips[1].is_none());
@@ -3672,6 +4279,72 @@ run
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// A diff review over the given group's active document.
+    fn open_review(group: &mut PaneGroup) {
+        let source = group.id;
+        let version = group.text.version();
+        let view = DiffView::new(
+            source,
+            (0, 7),
+            version,
+            "teh cat".into(),
+            "the cat".into(),
+            "Fix spelling & grammar",
+        );
+        group.open_diff(view);
+    }
+
+    #[test]
+    fn a_diff_review_sits_by_its_source_and_never_persists() {
+        let a = tmp_note("diff-src", "teh cat\n");
+        let mut group = PaneGroup::empty();
+        group.open_or_focus(&a).expect("open the source");
+        open_review(&mut group);
+        // It is active, is a diff, sits right after its source, and shows the label.
+        assert!(group.active_is_diff());
+        assert_eq!(group.active_index(), 1);
+        assert_eq!(
+            group.tab_names(),
+            vec!["note".to_string(), "Fix spelling & grammar".to_string()]
+        );
+        // The document list skips it, so a search or the watcher never sees it.
+        assert_eq!(group.docs().count(), 1);
+        // Only the document persists; the active index maps into the doc-only list, so
+        // an active diff points at its source rather than off the end.
+        let session = group.to_session();
+        assert_eq!(session.tabs.len(), 1);
+        assert_eq!(session.active, 0);
+    }
+
+    #[test]
+    fn detaching_a_diff_review_removes_it_and_yields_no_document() {
+        let a = tmp_note("diff-detach", "teh cat\n");
+        let mut group = PaneGroup::empty();
+        group.open_or_focus(&a).expect("open the source");
+        open_review(&mut group);
+        assert!(group.tab_is_diff(1));
+        // A diff re-homes to no document: detach removes it but hands back nothing.
+        assert!(group.detach(1).is_none());
+        assert_eq!(group.tab_count(), 1);
+        assert!(!group.active_is_diff());
+    }
+
+    #[test]
+    fn the_two_panes_mint_distinct_ids_that_survive_a_move() {
+        let mut a = PaneGroup::with_seed(0);
+        let mut b = PaneGroup::with_seed(1);
+        a.new_tab(Scale::ONE, FONT_SIZE);
+        b.new_tab(Scale::ONE, FONT_SIZE);
+        // Even in A, odd in B: the two panes can never mint the same id.
+        assert_ne!(a.id, b.id);
+        // A document keeps its id when it is dragged across the split.
+        let before = a.id;
+        let doc = a.detach(0).expect("a document tab");
+        assert_eq!(doc.id, before);
+        b.insert_tab(0, doc);
+        assert_eq!(b.id, before, "the id survives the move");
+    }
+
     #[test]
     fn set_scale_reaches_every_tab_and_new_tabs() {
         let dir = std::env::temp_dir().join(format!("bnknotes_scale_{}", std::process::id()));
@@ -3697,7 +4370,7 @@ run
             tree_visible: false,
             second_open: false,
         };
-        let cols = panes.columns(1000, 700, 0, Scale::ONE);
+        let cols = panes.columns(1000, 700, 0, Scale::ONE, None);
         assert!(cols.tree.is_none());
         assert!(cols.splitters[0].is_none() && cols.splitters[1].is_none());
         let a = cols.editors[0].expect("editor A");

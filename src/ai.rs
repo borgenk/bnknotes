@@ -46,13 +46,17 @@ commentary, no code fences, and never a copy of the instruction or action.";
 /// letting it grow with the input.
 const MAX_DIFF_CELLS: u64 = 4_000_000;
 
-/// The provider the app spawns while its process runs, or the answer it produced,
-/// waiting to be applied or discarded. The app holds one of these while an action
-/// is in flight, and it takes the keyboard until it is resolved.
+/// A provider invocation the app is waiting on, or the failure it ended in. While one
+/// is held it takes the keyboard (Escape cancels or dismisses) until it resolves. A
+/// successful answer does not live here: it opens a diff tab (see
+/// [`crate::pane::DiffView`]), so the modal is only ever "still working" or "it failed".
 pub enum Preview {
     /// The tool is running. The job feeds the wake pipe; Escape cancels it.
     Thinking {
         pane: usize,
+        /// The document the answer applies back to, captured now so a tab switch while
+        /// the tool thinks cannot retarget it.
+        source: crate::pane::DocId,
         span: (usize, usize),
         /// The pane's content version at launch, so an apply against a buffer that
         /// changed underneath (a note reloaded from disk) can be refused.
@@ -62,15 +66,6 @@ pub enum Preview {
         original: String,
         label: &'static str,
         job: Job,
-    },
-    /// The tool answered; the diff is shown for accept or reject.
-    Ready {
-        pane: usize,
-        span: (usize, usize),
-        version: u64,
-        revised: String,
-        spans: Vec<DiffSpan>,
-        label: &'static str,
     },
     /// The tool failed; the message is shown until dismissed.
     Failed {
@@ -355,23 +350,21 @@ fn tokens(s: &str) -> Vec<&str> {
     out
 }
 
-/// A drawable piece of a diff: one word or one whitespace run, tagged with its
-/// kind. The painter lays these left to right and wraps at the spaces.
+/// A drawable piece of text: one word or one whitespace run. The painter lays these
+/// left to right and wraps at the spaces.
 pub struct Piece<'a> {
-    pub kind: DiffKind,
     pub text: &'a str,
     /// Whether this piece is whitespace (a wrap opportunity, and a forced break when
     /// it holds a newline).
     pub space: bool,
 }
 
-/// The diff's spans broken into per-word and per-whitespace pieces for wrapping.
+/// Spans broken into per-word and per-whitespace pieces for wrapping.
 pub fn pieces(spans: &[DiffSpan]) -> Vec<Piece<'_>> {
     let mut out = Vec::new();
     for span in spans {
         for tok in tokens(&span.text) {
             out.push(Piece {
-                kind: span.kind,
                 text: tok,
                 space: tok.starts_with(char::is_whitespace),
             });
@@ -380,72 +373,15 @@ pub fn pieces(spans: &[DiffSpan]) -> Vec<Piece<'_>> {
     out
 }
 
-/// The merged diff rendered inline: one string that reads as the change in place, plus
-/// the byte ranges within it that are deletions or insertions. Reading it with the
-/// deletions kept and the insertions dropped spells (near enough) the original; the
-/// reverse spells the revision. Everything outside a marked range is unchanged text.
-pub struct Merged {
-    pub text: String,
-    /// Byte ranges into `text`, in order, each a deletion or an insertion. The gaps
-    /// between them are unchanged text.
-    pub runs: Vec<(std::ops::Range<usize>, DiffKind)>,
-}
-
-/// Build the [`Merged`] inline rendering of `spans`: lay the whole diff out as one
-/// string, marking the changed runs, so the caller can splice it into the document and
-/// color the runs in place.
-///
-/// A deletion and the insertion that replaces it are adjacent in the diff (the old
-/// "teh" then the new "the"), so a space is put between them where neither side
-/// already has one, keeping the struck and inserted words from running together. That
-/// space is display only: what an accept writes is the revision, never this string.
-pub fn merged(spans: &[DiffSpan]) -> Merged {
-    let mut text = String::new();
-    let mut runs: Vec<(std::ops::Range<usize>, DiffKind)> = Vec::new();
-    let mut prev_kind: Option<DiffKind> = None;
-    for span in spans {
-        let joins_pair = prev_kind == Some(DiffKind::Delete)
-            && span.kind == DiffKind::Insert
-            && !text.ends_with(char::is_whitespace)
-            && !span.text.starts_with(char::is_whitespace);
-        if joins_pair {
-            text.push(' ');
-        }
-        let start = text.len();
-        if span.kind == DiffKind::Equal {
-            // Unchanged text keeps its real line breaks and spacing.
-            text.push_str(&span.text);
-        } else {
-            // A changed run shows its whitespace the way a word processor's tracked
-            // changes do. A newline becomes a pilcrow drawn inline, never a real break:
-            // a removed or added line break then reads as one struck-or-green glyph in
-            // the flow, and, since no changed run holds a real newline, the diff
-            // highlight can never stretch a deleted break to the margin. A run that is
-            // only whitespace also shows its spaces as middle dots and tabs as arrows;
-            // spaces between changed words stay spaces.
-            let ws_only = span.text.chars().all(char::is_whitespace);
-            for ch in span.text.chars() {
-                text.push(match ch {
-                    '\n' => '\u{b6}',              // PILCROW SIGN: a line break
-                    ' ' if ws_only => '\u{b7}',    // MIDDLE DOT: a space
-                    '\t' if ws_only => '\u{2192}', // RIGHTWARDS ARROW: a tab
-                    other => other,
-                });
-            }
-        }
-        if span.kind != DiffKind::Equal {
-            runs.push((start..text.len(), span.kind));
-        }
-        prev_kind = Some(span.kind);
-    }
-    Merged { text, runs }
-}
+/// A list of `(start, end)` byte ranges into one text: the changed words on one side
+/// of a diff.
+pub type WordRanges = Vec<(usize, usize)>;
 
 /// The deletion byte ranges within `old` and the insertion byte ranges within `new`,
 /// from their word diff. A side-by-side diff highlights each side on its own: the
 /// removed words over the old text, the added words over the new, each in that text's
 /// byte space.
-pub fn side_ranges(old: &str, new: &str) -> (Vec<(usize, usize)>, Vec<(usize, usize)>) {
+pub fn side_ranges(old: &str, new: &str) -> (WordRanges, WordRanges) {
     let (mut deletes, mut inserts) = (Vec::new(), Vec::new());
     let (mut o, mut n) = (0usize, 0usize);
     for span in word_diff(old, new) {
@@ -466,6 +402,128 @@ pub fn side_ranges(old: &str, new: &str) -> (Vec<(usize, usize)>, Vec<(usize, us
         }
     }
     (deletes, inserts)
+}
+
+// ---------------------------------------------------------------------------
+// The line diff
+// ---------------------------------------------------------------------------
+
+/// One row of a line-aligned side-by-side diff: the old line (left) and the new line
+/// (right), each an index into its side's logical lines (`split('\n')`, which counts
+/// lines the way the rope does), either absent where a change is one-sided. `changed`
+/// is false only for a line carried through unchanged on both sides. A renderer places
+/// the two columns row for row and fills the empty half of a one-sided change.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DiffRow {
+    pub old: Option<usize>,
+    pub new: Option<usize>,
+    pub changed: bool,
+}
+
+/// One step of the line LCS walk before the change blocks are paired into rows.
+#[derive(Clone, Copy)]
+enum LineOp {
+    Equal(usize, usize),
+    Delete(usize),
+    Insert(usize),
+}
+
+/// The line-level alignment of `old` into `new`: one [`DiffRow`] per aligned line pair,
+/// in reading order. Equal lines pair one to one; a block of removed lines against a
+/// block of added ones pairs them by position, so the first removed line sits beside
+/// the first added line, and the surplus on the longer side gets one-sided rows. A
+/// wholly added or removed line is a one-sided row on its own.
+///
+/// A longest-common-subsequence over the lines does the alignment. A pair of texts too
+/// large for the quadratic table falls back to every old line removed then every new
+/// line added, which the renderer still shows (paired where it can).
+pub fn line_diff(old: &str, new: &str) -> Vec<DiffRow> {
+    let a: Vec<&str> = old.split('\n').collect();
+    let b: Vec<&str> = new.split('\n').collect();
+    let (n, m) = (a.len(), b.len());
+
+    let ops = if (n as u64 + 1) * (m as u64 + 1) > MAX_DIFF_CELLS {
+        // Too large to align: remove every old line, add every new one. The pairing
+        // below still puts them side by side as far as the shorter side reaches.
+        let mut ops = Vec::with_capacity(n + m);
+        ops.extend((0..n).map(LineOp::Delete));
+        ops.extend((0..m).map(LineOp::Insert));
+        ops
+    } else {
+        line_lcs(&a, &b)
+    };
+
+    // Pair each change block's removals with its additions by position; a trailing
+    // equal run and the surplus of a lopsided block fall out as one-sided rows.
+    let mut rows = Vec::new();
+    let mut k = 0;
+    while k < ops.len() {
+        match ops[k] {
+            LineOp::Equal(i, j) => {
+                rows.push(DiffRow {
+                    old: Some(i),
+                    new: Some(j),
+                    changed: false,
+                });
+                k += 1;
+            }
+            _ => {
+                let (mut dels, mut inss) = (Vec::new(), Vec::new());
+                while let Some(op) = ops.get(k) {
+                    match op {
+                        LineOp::Delete(i) => dels.push(*i),
+                        LineOp::Insert(j) => inss.push(*j),
+                        LineOp::Equal(..) => break,
+                    }
+                    k += 1;
+                }
+                for r in 0..dels.len().max(inss.len()) {
+                    rows.push(DiffRow {
+                        old: dels.get(r).copied(),
+                        new: inss.get(r).copied(),
+                        changed: true,
+                    });
+                }
+            }
+        }
+    }
+    rows
+}
+
+/// The forward LCS walk over two line arrays, emitting equals, deletions, and
+/// insertions in reading order. The same bottom-up table and greedy forward walk the
+/// word diff uses, over whole lines instead of tokens.
+fn line_lcs(a: &[&str], b: &[&str]) -> Vec<LineOp> {
+    let (n, m) = (a.len(), b.len());
+    let mut dp = vec![0u32; (n + 1) * (m + 1)];
+    let at = |i: usize, j: usize| i * (m + 1) + j;
+    for i in (0..n).rev() {
+        for j in (0..m).rev() {
+            dp[at(i, j)] = if a[i] == b[j] {
+                dp[at(i + 1, j + 1)] + 1
+            } else {
+                dp[at(i + 1, j)].max(dp[at(i, j + 1)])
+            };
+        }
+    }
+    let mut ops = Vec::new();
+    let (mut i, mut j) = (0, 0);
+    while i < n && j < m {
+        if a[i] == b[j] {
+            ops.push(LineOp::Equal(i, j));
+            i += 1;
+            j += 1;
+        } else if dp[at(i + 1, j)] >= dp[at(i, j + 1)] {
+            ops.push(LineOp::Delete(i));
+            i += 1;
+        } else {
+            ops.push(LineOp::Insert(j));
+            j += 1;
+        }
+    }
+    ops.extend((i..n).map(LineOp::Delete));
+    ops.extend((j..m).map(LineOp::Insert));
+    ops
 }
 
 // ---------------------------------------------------------------------------
@@ -775,13 +833,6 @@ mod tests {
         assert!(ps.iter().any(|p| p.space && p.text.contains('\n')));
     }
 
-    fn marked(m: &Merged) -> Vec<(&str, DiffKind)> {
-        m.runs
-            .iter()
-            .map(|(r, k)| (&m.text[r.clone()], *k))
-            .collect()
-    }
-
     #[test]
     fn side_ranges_mark_removed_words_in_the_old_and_added_in_the_new() {
         let (old, new) = ("teh quick cat", "the quick fox");
@@ -794,81 +845,93 @@ mod tests {
     }
 
     #[test]
-    fn the_merged_diff_marks_the_changed_words_in_place() {
-        let m = merged(&word_diff("teh cat sat", "the cat sat"));
-        // The old and new words sit side by side, separated so they do not abut.
-        assert_eq!(m.text, "teh the cat sat");
+    fn line_diff_pairs_a_changed_line_and_carries_the_rest_through() {
+        // Middle line changed, the ones around it unchanged: two equal rows framing one
+        // changed pair, each side present.
+        let rows = line_diff("a\nb\nc", "a\nB\nc");
         assert_eq!(
-            marked(&m),
-            vec![("teh", DiffKind::Delete), ("the", DiffKind::Insert)]
+            rows,
+            vec![
+                DiffRow {
+                    old: Some(0),
+                    new: Some(0),
+                    changed: false
+                },
+                DiffRow {
+                    old: Some(1),
+                    new: Some(1),
+                    changed: true
+                },
+                DiffRow {
+                    old: Some(2),
+                    new: Some(2),
+                    changed: false
+                },
+            ]
         );
     }
 
     #[test]
-    fn a_whitespace_only_change_is_shown_with_visible_marks() {
-        // Two spaces collapsed to one: invisible as spaces, so it renders as middle
-        // dots the reader can see, one run deleted and one inserted.
-        let m = merged(&word_diff("a  b", "a b"));
-        assert!(
-            m.text.contains('\u{b7}'),
-            "changed spaces become middle dots"
+    fn line_diff_makes_a_one_sided_row_for_an_added_line() {
+        // A line inserted between two kept lines: the old side of that row is absent, so
+        // the renderer hatches the empty half.
+        let rows = line_diff("a\nc", "a\nb\nc");
+        assert_eq!(
+            rows,
+            vec![
+                DiffRow {
+                    old: Some(0),
+                    new: Some(0),
+                    changed: false
+                },
+                DiffRow {
+                    old: None,
+                    new: Some(1),
+                    changed: true
+                },
+                DiffRow {
+                    old: Some(1),
+                    new: Some(2),
+                    changed: false
+                },
+            ]
         );
-        let runs = marked(&m);
-        assert_eq!(runs[0].1, DiffKind::Delete);
-        assert_eq!(runs[1].1, DiffKind::Insert);
-        // A word change keeps its letters; only whitespace-only runs are dotted.
-        assert!(!merged(&word_diff("teh cat", "the cat"))
-            .text
-            .contains('\u{b7}'));
-        // A removed line break renders as an inline pilcrow, never a real break, so the
-        // diff highlight cannot run to the margin.
-        let n = merged(&word_diff("a\nb", "a b"));
-        assert!(n.text.contains('\u{b6}'), "a changed newline is a pilcrow");
-        // No changed run keeps a real newline, not even a multi-line word deletion,
-        // which is what would otherwise stretch a deleted break's highlight to the edge.
-        let ml = merged(&word_diff("keep this\nand gone", "keep this"));
-        assert!(
-            ml.text.contains('\u{b6}'),
-            "the removed break shows as a pilcrow"
-        );
-        for (r, _) in &ml.runs {
-            assert!(
-                !ml.text[r.clone()].contains('\n'),
-                "a changed run never holds a real newline"
-            );
-        }
     }
 
     #[test]
-    fn a_pure_insertion_or_deletion_needs_no_separator() {
-        let ins = merged(&word_diff("cat", "the cat"));
-        assert_eq!(ins.text, "the cat");
-        assert_eq!(marked(&ins), vec![("the ", DiffKind::Insert)]);
-
-        let del = merged(&word_diff("the cat", "cat"));
-        assert_eq!(del.text, "the cat");
-        assert_eq!(marked(&del), vec![("the ", DiffKind::Delete)]);
+    fn line_diff_pairs_a_lopsided_block_and_leaves_the_surplus_one_sided() {
+        // Two lines removed, one added in their place: the first removed line pairs with
+        // the added line, and the second removed line is a one-sided row.
+        let rows = line_diff("x\ny", "z");
+        assert_eq!(
+            rows,
+            vec![
+                DiffRow {
+                    old: Some(0),
+                    new: Some(0),
+                    changed: true
+                },
+                DiffRow {
+                    old: Some(1),
+                    new: None,
+                    changed: true
+                },
+            ]
+        );
     }
 
     #[test]
-    fn a_separator_goes_only_between_an_adjacent_old_new_pair() {
-        // Delete, then Equal, then Insert: the delete and insert are not adjacent, so
-        // no separator is inserted between them.
-        let spans = vec![
-            DiffSpan {
-                kind: DiffKind::Delete,
-                text: "a".into(),
-            },
-            DiffSpan {
-                kind: DiffKind::Equal,
-                text: "b".into(),
-            },
-            DiffSpan {
-                kind: DiffKind::Insert,
-                text: "c".into(),
-            },
-        ];
-        assert_eq!(merged(&spans).text, "abc");
+    fn line_diff_reads_back_as_both_sides() {
+        // Reading each row's present side spells that side's text back, so the alignment
+        // never drops or reorders a line.
+        let (old, new) = ("one\ntwo\nthree\nfour", "one\ntwo b\nfour\nfive");
+        let rows = line_diff(old, new);
+        let a: Vec<&str> = old.split('\n').collect();
+        let b: Vec<&str> = new.split('\n').collect();
+        let left: Vec<&str> = rows.iter().filter_map(|r| r.old).map(|i| a[i]).collect();
+        let right: Vec<&str> = rows.iter().filter_map(|r| r.new).map(|j| b[j]).collect();
+        assert_eq!(left, a);
+        assert_eq!(right, b);
     }
 
     #[test]

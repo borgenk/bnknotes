@@ -9,7 +9,7 @@ use crate::layout::{
 use crate::markdown;
 use crate::menu::{Menu, MenuLayout};
 use crate::palette::{self, Palette, PaletteLayout};
-use crate::pane::{DiskConflict, TreePane};
+use crate::pane::{DiffColumns, DiffView, DiskConflict, TreePane};
 use crate::platform::freetype::{Face, FaceKey, FontStyle, Fonts, Metrics};
 use crate::platform::geom::Rect;
 use crate::platform::grapheme;
@@ -19,28 +19,31 @@ use crate::platform::shape;
 use crate::render::display::{self, DisplayList, DrawCmd};
 use crate::scale::Scale;
 use crate::theme::{
-    AI_DELETE_BG, AI_DELETE_TEXT, AI_ERROR_TEXT, AI_HINT, AI_INSERT_BG, AI_INSERT_TEXT,
-    AI_LINE_VPAD, AI_MAX_LINES, AI_PANEL_BG, AI_PANEL_BORDER, AI_PANEL_BORDER_W, AI_PANEL_PAD,
-    AI_PANEL_RADIUS, AI_PANEL_TOP, AI_PANEL_WIDTH, AI_STRIKE, AI_TEXT, BACKGROUND, CARET_COLOR,
-    CARET_WIDTH, CODE_BG, CODE_COLOR, CODE_COMMENT_COLOR, CODE_KEYWORD_COLOR, CODE_MARKER_COLOR,
-    CODE_NUMBER_COLOR, CODE_PAD_X, CODE_PAD_Y, CODE_RADIUS, CODE_STRING_COLOR, CONFLICT_BANNER_BG,
-    CONFLICT_BANNER_TEXT, CONFLICT_BUTTON_BG, CONFLICT_BUTTON_HOVER_BG, DECOR_TEXT_GAP, FIND_BG,
-    FIND_ERROR_COLOR, FIND_MATCH_COLOR, FIND_TICK_COLOR, FOREGROUND, HEADING_COLORS,
-    IMAGE_BORDER_COLOR, IMAGE_BORDER_THICKNESS, IMAGE_BUTTON_BG, IMAGE_BUTTON_RADIUS,
-    IMAGE_VIEW_BG, IMAGE_VIEW_PAD, LINK_COLOR, MARGIN, MARKER_COLOR, MENU_BG, MENU_BORDER,
-    MENU_BORDER_W, MENU_HOVER_BG, MENU_ITEM_PAD_X, MENU_ITEM_RADIUS, MENU_RADIUS, MENU_TEXT,
-    PALETTE_BG, PALETTE_BORDER, PALETTE_BORDER_W, PALETTE_HINT, PALETTE_MATCH, PALETTE_RADIUS,
-    PALETTE_ROW_PAD_X, PALETTE_ROW_RADIUS, PALETTE_SELECTED_BG, PALETTE_TEXT, QUOTE_BAR_COLOR,
-    QUOTE_BAR_WIDTH, RAIL_ACTIVE_COLOR, RAIL_ACTIVE_SPAN, RAIL_ACTIVE_W, RAIL_BG, RAIL_GAP,
-    RAIL_HOVER_INK, RAIL_HOVER_LIFT, RAIL_INK_DARK, RAIL_INK_LIGHT, RAIL_PAD, RAIL_RADIUS,
-    RAIL_TEMP_RING, RULE_COLOR, RULE_THICKNESS, SCROLL_INK, SCROLL_INSET, SCROLL_MIN_THUMB,
-    SCROLL_NEAR, SCROLL_THIN, SCROLL_THUMB_COVER, SCROLL_THUMB_HOVER_COVER, SCROLL_TROUGH_COVER,
-    SCROLL_WIDE, SELECTION_COLOR, SPLITTER_COLOR, TABLE_BORDER_COLOR, TABLE_HEADER_BG,
-    TAB_ACTIVE_BG, TAB_ACTIVE_TEXT, TAB_BUTTON_HOVER_BG, TAB_BUTTON_RADIUS, TAB_CLOSE_GAP,
-    TAB_CLOSE_W, TAB_DIRTY_COLOR, TAB_HOVER_BG, TAB_INACTIVE_TEXT, TAB_MAX_W, TAB_MIN_W, TAB_NEW_W,
-    TAB_PAD_X, TAB_VPAD, TICK_HEIGHT, TICK_WIDTH, TOP_BAR_BG, TREE_BG, TREE_FOOTER_GAP,
-    TREE_FOOTER_VPAD, TREE_HOVER_BG, TREE_INDENT, TREE_MARKER_COLOR, TREE_MARKER_W, TREE_PAD,
-    TREE_ROW_INSET_Y, TREE_ROW_PAD, TREE_ROW_RADIUS, TREE_TEXT_COLOR, VAULT_PAD_X,
+    AI_DELETE_BG, AI_ERROR_TEXT, AI_HINT, AI_INSERT_BG, AI_LINE_VPAD, AI_MAX_LINES, AI_PANEL_BG,
+    AI_PANEL_BORDER, AI_PANEL_BORDER_W, AI_PANEL_PAD, AI_PANEL_RADIUS, AI_PANEL_TOP,
+    AI_PANEL_WIDTH, AI_TEXT, BACKGROUND, CARET_COLOR, CARET_WIDTH, CODE_BG, CODE_COLOR,
+    CODE_COMMENT_COLOR, CODE_KEYWORD_COLOR, CODE_MARKER_COLOR, CODE_NUMBER_COLOR, CODE_PAD_X,
+    CODE_PAD_Y, CODE_RADIUS, CODE_STRING_COLOR, CONFLICT_BANNER_BG, CONFLICT_BANNER_TEXT,
+    CONFLICT_BUTTON_BG, CONFLICT_BUTTON_HOVER_BG, DECOR_TEXT_GAP, DIFF_DELETE_ACCENT, DIFF_DIVIDER,
+    DIFF_DIVIDER_W, DIFF_GUTTER_BORDER, DIFF_GUTTER_PAD, DIFF_GUTTER_TEXT, DIFF_HATCH,
+    DIFF_HATCH_PERIOD, DIFF_HATCH_STROKE, DIFF_INSERT_ACCENT, DIFF_LINE_DELETE_BG,
+    DIFF_LINE_INSERT_BG, DIFF_LINE_PAD, FIND_BG, FIND_ERROR_COLOR, FIND_MATCH_COLOR,
+    FIND_TICK_COLOR, FOREGROUND, HEADING_COLORS, IMAGE_BORDER_COLOR, IMAGE_BORDER_THICKNESS,
+    IMAGE_BUTTON_BG, IMAGE_BUTTON_RADIUS, IMAGE_VIEW_BG, IMAGE_VIEW_PAD, LINK_COLOR, MARGIN,
+    MARKER_COLOR, MENU_BG, MENU_BORDER, MENU_BORDER_W, MENU_HOVER_BG, MENU_ITEM_PAD_X,
+    MENU_ITEM_RADIUS, MENU_RADIUS, MENU_TEXT, PALETTE_BG, PALETTE_BORDER, PALETTE_BORDER_W,
+    PALETTE_HINT, PALETTE_MATCH, PALETTE_RADIUS, PALETTE_ROW_PAD_X, PALETTE_ROW_RADIUS,
+    PALETTE_SELECTED_BG, PALETTE_TEXT, QUOTE_BAR_COLOR, QUOTE_BAR_WIDTH, RAIL_ACTIVE_COLOR,
+    RAIL_ACTIVE_SPAN, RAIL_ACTIVE_W, RAIL_BG, RAIL_GAP, RAIL_HOVER_INK, RAIL_HOVER_LIFT,
+    RAIL_INK_DARK, RAIL_INK_LIGHT, RAIL_PAD, RAIL_RADIUS, RAIL_TEMP_RING, RULE_COLOR,
+    RULE_THICKNESS, SCROLL_INK, SCROLL_INSET, SCROLL_MIN_THUMB, SCROLL_NEAR, SCROLL_THIN,
+    SCROLL_THUMB_COVER, SCROLL_THUMB_HOVER_COVER, SCROLL_TROUGH_COVER, SCROLL_WIDE,
+    SELECTION_COLOR, SPLITTER_COLOR, TABLE_BORDER_COLOR, TABLE_HEADER_BG, TAB_ACTIVE_BG,
+    TAB_ACTIVE_TEXT, TAB_BUTTON_HOVER_BG, TAB_BUTTON_RADIUS, TAB_CLOSE_GAP, TAB_CLOSE_W,
+    TAB_DIRTY_COLOR, TAB_HOVER_BG, TAB_INACTIVE_TEXT, TAB_MAX_W, TAB_MIN_W, TAB_NEW_W, TAB_PAD_X,
+    TAB_VPAD, TICK_HEIGHT, TICK_WIDTH, TOP_BAR_BG, TREE_BG, TREE_FOOTER_GAP, TREE_FOOTER_VPAD,
+    TREE_HOVER_BG, TREE_INDENT, TREE_MARKER_COLOR, TREE_MARKER_W, TREE_PAD, TREE_ROW_INSET_Y,
+    TREE_ROW_PAD, TREE_ROW_RADIUS, TREE_TEXT_COLOR, VAULT_PAD_X,
 };
 
 /// The per-frame inputs [`build_display_list`] needs beyond the layout itself:
@@ -705,20 +708,38 @@ pub(crate) fn push_palette(
     let caret_w = scale.px(CARET_WIDTH);
     let query_w = shape::text_advance(face, palette.query()).ceil() as i32;
     let pen = layout.field.x + pad_x;
+    // The note (a search's match count) sits at the field's right, so the query and
+    // its caret run up to that edge, or to the field's inner edge when there is none.
+    let note_w = if palette.note().is_empty() {
+        0
+    } else {
+        shape::text_advance(face, palette.note()).ceil() as i32 + pad_x
+    };
+    let right = layout.field.x + layout.field.w - pad_x - note_w;
+    // The field takes text one character at a time, always at the end, so a query
+    // longer than the field scrolls left to keep the caret in view rather than running
+    // the text (and the caret) off past the panel's edge. The text is clipped to the
+    // field so what scrolls off the left does not spill into the padding.
+    let caret_x = pen + query_w + 1;
+    let shift = (caret_x + caret_w - right).max(0);
     if !palette.query().is_empty() {
-        list.push(text_cmd(
-            ctx.regular(),
+        list.push(clip_text_x(
+            text_cmd(
+                ctx.regular(),
+                pen - shift,
+                layout.field_baseline,
+                pen - shift + query_w,
+                PALETTE_TEXT,
+                palette.query().to_string(),
+                m,
+            ),
             pen,
-            layout.field_baseline,
-            pen + query_w,
-            PALETTE_TEXT,
-            palette.query().to_string(),
-            m,
+            right,
         ));
     }
     list.push(DrawCmd::Fill {
         rect: Rect {
-            x: pen + query_w + 1,
+            x: caret_x - shift,
             y: layout.field_baseline - m.ascent,
             w: caret_w,
             h: text_h,
@@ -879,16 +900,6 @@ pub(crate) fn push_menu(list: &mut DisplayList, ctx: &BarCtx, menu: &Menu, layou
     }
 }
 
-/// The color, optional background tint, and strikethrough for a diff run of `kind`:
-/// an insertion in green, a deletion struck through in red, unchanged text plain.
-fn diff_style(kind: DiffKind) -> (u32, Option<u32>, bool) {
-    match kind {
-        DiffKind::Equal => (AI_TEXT, None, false),
-        DiffKind::Insert => (AI_INSERT_TEXT, Some(AI_INSERT_BG), false),
-        DiffKind::Delete => (AI_DELETE_TEXT, Some(AI_DELETE_BG), true),
-    }
-}
-
 /// One word placed on a wrapped diff line: its x within the panel's inner box, its
 /// advance, the text, and how it is drawn.
 struct DiffWord {
@@ -897,7 +908,6 @@ struct DiffWord {
     text: String,
     color: u32,
     bg: Option<u32>,
-    strike: bool,
 }
 
 /// Greedily wrap `words` (each a word or a whitespace run, tagged with its color)
@@ -905,7 +915,7 @@ struct DiffWord {
 /// on a newline. A word wider than the box is left to overflow; the caller clips it
 /// to the panel.
 fn wrap_diff(
-    words: &[(String, bool, u32, Option<u32>, bool)],
+    words: &[(String, bool, u32, Option<u32>)],
     face: &Face,
     max_w: i32,
 ) -> Vec<Vec<DiffWord>> {
@@ -913,7 +923,7 @@ fn wrap_diff(
     let mut cur: Vec<DiffWord> = Vec::new();
     let mut pen = 0i32;
     let mut pending_space = 0i32;
-    for (text, space, color, bg, strike) in words {
+    for (text, space, color, bg) in words {
         if *space {
             if text.contains('\n') {
                 lines.push(std::mem::take(&mut cur));
@@ -939,7 +949,6 @@ fn wrap_diff(
             text: text.clone(),
             color: *color,
             bg: *bg,
-            strike: *strike,
         });
         pen += w;
         pending_space = 0;
@@ -950,11 +959,12 @@ fn wrap_diff(
     lines
 }
 
-/// Draw the AI text-action preview: a floating panel, like the palette, holding the
-/// action's name, its body (a running note, the diff to review, or a failure), and
-/// the accept/reject hint. Pushed after the rest of the frame, so it covers what it
-/// floats over. The body wraps to the panel and, past [`AI_MAX_LINES`], notes how
-/// many changed lines are hidden rather than growing without bound.
+/// Draw the AI text-action modal: a floating panel, like the palette, holding the
+/// action's name, its body (a running note or a failure message), and the dismiss
+/// hint. Pushed after the rest of the frame, so it covers what it floats over. A
+/// successful answer is not shown here; it opens a diff tab. The body wraps to the
+/// panel and, past [`AI_MAX_LINES`], notes how many lines are hidden rather than
+/// growing without bound.
 pub(crate) fn push_ai_preview(
     list: &mut DisplayList,
     ctx: &BarCtx,
@@ -975,22 +985,15 @@ pub(crate) fn push_ai_preview(
 
     let (title, base_hint) = match preview {
         Preview::Thinking { label, .. } => (*label, "Esc to cancel"),
-        Preview::Ready { label, .. } => (*label, "Enter to accept  ·  Esc to discard"),
         Preview::Failed { label, .. } => (*label, "Esc to dismiss"),
     };
 
-    // The body's colored input words: the diff for a ready preview, a plain line
-    // otherwise. Owned, so nothing borrows the preview across the wrap.
-    let mut words: Vec<(String, bool, u32, Option<u32>, bool)> = Vec::new();
+    // The body's words: a running note, or the failure in red. Owned, so nothing
+    // borrows the preview across the wrap.
+    let mut words: Vec<(String, bool, u32, Option<u32>)> = Vec::new();
     match preview {
-        Preview::Ready { spans, .. } => {
-            for p in ai::pieces(spans) {
-                let (color, bg, strike) = diff_style(p.kind);
-                words.push((p.text.to_string(), p.space, color, bg, strike));
-            }
-        }
         Preview::Thinking { .. } => {
-            words.push(("Working…".to_string(), false, AI_HINT, None, false));
+            words.push(("Working…".to_string(), false, AI_HINT, None));
         }
         Preview::Failed { message, .. } => {
             let span = [ai::DiffSpan {
@@ -998,7 +1001,7 @@ pub(crate) fn push_ai_preview(
                 text: message.clone(),
             }];
             for p in ai::pieces(&span) {
-                words.push((p.text.to_string(), p.space, AI_ERROR_TEXT, None, false));
+                words.push((p.text.to_string(), p.space, AI_ERROR_TEXT, None));
             }
         }
     }
@@ -1104,21 +1107,6 @@ pub(crate) fn push_ai_preview(
                 inner_x,
                 inner_right,
             ));
-            if word.strike {
-                let x0 = wx.max(inner_x);
-                let x1 = (wx + word.w).min(inner_right);
-                if x1 > x0 {
-                    list.push(DrawCmd::Fill {
-                        rect: Rect {
-                            x: x0,
-                            y: baseline - m.ascent + text_h / 2,
-                            w: x1 - x0,
-                            h: rule_h,
-                        },
-                        color: AI_STRIKE,
-                    });
-                }
-            }
         }
     }
 
@@ -1141,10 +1129,10 @@ pub(crate) fn push_ai_preview(
     ));
 }
 
-/// Draw the inline diff preview's accept/reject hint: a small pill along the bottom of
-/// pane `rect`. The diff itself renders in the document flow, so this is only a
-/// reminder of the keys, kept out of the way at the pane's foot.
-pub(crate) fn push_ai_hint(list: &mut DisplayList, ctx: &BarCtx, rect: Rect) {
+/// Draw the diff view's accept/reject hint: a small pill along the bottom of pane
+/// `rect`, reminding the user that Enter keeps the change and Escape discards it,
+/// kept out of the way at the pane's foot.
+fn push_diff_hint(list: &mut DisplayList, ctx: &BarCtx, rect: Rect) {
     let scale = ctx.scale;
     let m = ctx.metrics();
     let face = ctx.fonts.face(ctx.body_size, FontStyle::Regular);
@@ -1193,6 +1181,323 @@ pub(crate) fn push_ai_hint(list: &mut DisplayList, ctx: &BarCtx, rect: Rect) {
         tx,
         tx + text_w,
     ));
+}
+
+/// The full geometry of a diff view laid into pane `view`: the two full side columns
+/// (gutter plus text), the two text areas the layout builds into (what [`DiffColumns`]
+/// carries, so the layout lands where the render draws it), the gutter width, and the
+/// divider between the columns.
+struct DiffGeom {
+    cols: DiffColumns,
+    old_side: Rect,
+    new_side: Rect,
+    divider: Rect,
+}
+
+/// The width of a diff view's line-number gutter: room for three digits (a diff of an AI
+/// edit numbers its own fragment's lines, rarely into the hundreds; a longer one clips
+/// the number, not the diff) plus its padding each side.
+fn diff_gutter_w(scale: Scale, body_size: u32, fonts: &Fonts) -> i32 {
+    let digit = shape::text_advance(fonts.face(body_size, FontStyle::Regular), "0").ceil() as i32;
+    digit * 3 + 2 * scale.px(DIFF_GUTTER_PAD)
+}
+
+/// Split pane `view` into the diff's two side-by-side columns: the old on the left, the
+/// new on the right, with a divider in the seam. Each column reserves a fixed
+/// line-number gutter on its left; the text area is what is left.
+fn diff_geom(view: Rect, scale: Scale, body_size: u32, fonts: &Fonts) -> DiffGeom {
+    let divider_w = scale.px(DIFF_DIVIDER_W).max(1);
+    let gutter_w = diff_gutter_w(scale, body_size, fonts);
+    let half_w = (view.w - divider_w) / 2;
+    let old_side = Rect { w: half_w, ..view };
+    let new_side = Rect {
+        x: view.x + half_w + divider_w,
+        w: (view.w - half_w - divider_w).max(0),
+        ..view
+    };
+    let divider = Rect {
+        x: view.x + half_w,
+        w: divider_w,
+        ..view
+    };
+    // The text area within a side, past its gutter.
+    let text_of = |side: Rect| Rect {
+        x: side.x + gutter_w,
+        w: (side.w - gutter_w).max(0),
+        ..side
+    };
+    DiffGeom {
+        cols: DiffColumns {
+            old_text: text_of(old_side),
+            new_text: text_of(new_side),
+        },
+        old_side,
+        new_side,
+        divider,
+    }
+}
+
+/// The two text columns a diff view lays out into, for [`DiffView::ensure_layouts`].
+/// The render derives the same rectangles from the same inputs, so the tinted words land
+/// exactly where the text is drawn.
+pub(crate) fn diff_columns(view: Rect, scale: Scale, body_size: u32, fonts: &Fonts) -> DiffColumns {
+    diff_geom(view, scale, body_size, fonts).cols
+}
+
+/// Draw a side-by-side diff view into pane `view`: the old text on the left with its
+/// removed lines washed red, the new text on the right with its added lines washed
+/// green, aligned line for line so a change reads across the divider. A changed line
+/// carries a faint full-line wash and, over it, the stronger wash on just its edited
+/// words; the empty half of a one-sided change is hatched; a line-number gutter runs
+/// down each column, and one scrollbar serves the pane. The two sides share
+/// `diff.scroll_y`, so they move together.
+pub(crate) fn push_diff_view(
+    list: &mut DisplayList,
+    fonts: &Fonts,
+    view: Rect,
+    diff: &DiffView,
+    scale: Scale,
+    body_size: u32,
+    scrollbar: &scroll::Scrollbar,
+) {
+    let g = diff_geom(view, scale, body_size, fonts);
+    // The pane background covers both columns and the divider seam; the row bands, the
+    // text, and the chrome all draw over it.
+    list.push(DrawCmd::Fill {
+        rect: view,
+        color: BACKGROUND,
+    });
+    // The aligned row bands, beneath the text: a faint full-line wash and accent bar on
+    // a changed side, and diagonal hatching on the empty half of a one-sided change.
+    push_diff_bands(list, diff, &g, view, scale);
+    // Each side's text draws with the stronger word washes over it (the DiffTint pass),
+    // but without its own background fill: the pane background and the row bands beneath
+    // it must show through, so the opening background command is dropped.
+    let mut draw_side = |layout: &Layout,
+                         rope: &crate::rope::Rope,
+                         ranges: &[(usize, usize)],
+                         text_rect: Rect,
+                         deletes: bool| {
+        let tint = if deletes {
+            DiffTint {
+                inserts: &[],
+                deletes: ranges,
+            }
+        } else {
+            DiffTint {
+                inserts: ranges,
+                deletes: &[],
+            }
+        };
+        let params = PaintParams {
+            view: text_rect,
+            scale,
+            body_size,
+            scroll_y: diff.scroll_y,
+            content_height: 0,
+            scrollbar: &scroll::Scrollbar::default(),
+            selection: None,
+            caret: None,
+            find: None,
+            table_hover: None,
+            fold_hover: None,
+            diff: Some(tint),
+        };
+        let mut side_list = build_display_list(fonts, layout, rope, &params);
+        if matches!(side_list.first(), Some(DrawCmd::Fill { rect, color }) if *rect == text_rect && *color == BACKGROUND)
+        {
+            side_list.remove(0);
+        }
+        list.append(&mut side_list);
+    };
+    if let Some(old) = diff.old_side() {
+        draw_side(old.layout, old.rope, old.ranges, g.cols.old_text, true);
+    }
+    if let Some(new) = diff.new_side() {
+        draw_side(new.layout, new.rope, new.ranges, g.cols.new_text, false);
+    }
+    list.push(DrawCmd::Fill {
+        rect: g.divider,
+        color: DIFF_DIVIDER,
+    });
+    push_diff_gutters(list, fonts, diff, &g, scale, body_size);
+    push_scrollbar(
+        list,
+        view,
+        scrollbar,
+        diff.content_height(),
+        diff.scroll_y,
+        BACKGROUND,
+        scale,
+    );
+    // The keys are not obvious for a tab that is not a document, so a small pill at the
+    // foot names them.
+    push_diff_hint(list, &BarCtx::new(fonts, scale, body_size), view);
+}
+
+/// Draw the aligned row bands beneath the diff's text. A changed line takes a faint
+/// full-row wash (its whole column, gutter and text, so the tint reads at the number
+/// too), inset only on the right so it clears the divider. The empty half of a one-sided
+/// change is split: its gutter is a flat solid and its text area is diagonal hatching, so
+/// the number column reads as a clean edge and only the text carries the "nothing here"
+/// texture. Scroll-shifted and culled to the pane.
+fn push_diff_bands(
+    list: &mut DisplayList,
+    diff: &DiffView,
+    g: &DiffGeom,
+    view: Rect,
+    scale: Scale,
+) {
+    let line_pad = scale.px(DIFF_LINE_PAD);
+    let period = scale.px(DIFF_HATCH_PERIOD).max(2);
+    let stroke = scale.px(DIFF_HATCH_STROKE).max(1);
+    let (top, bottom) = (view.y, view.y + view.h);
+    // `full` is the whole side column; `text` is its text area past the gutter.
+    let side_band = |list: &mut DisplayList,
+                     full: Rect,
+                     text: Rect,
+                     cell: &crate::pane::DiffCell,
+                     band_y: i32,
+                     band_h: i32,
+                     line_bg: u32| {
+        let y = band_y - diff.scroll_y;
+        if !cell.present {
+            // The empty half of a one-sided change: a solid gutter and a hatched text
+            // area, so the number column stays clean and the text reads as absent.
+            if y + band_h > top && y < bottom {
+                list.push(DrawCmd::Fill {
+                    rect: Rect {
+                        y,
+                        w: (text.x - full.x).max(0),
+                        h: band_h,
+                        ..full
+                    },
+                    color: DIFF_HATCH,
+                });
+                list.push(DrawCmd::Hatch {
+                    rect: Rect {
+                        y,
+                        h: band_h,
+                        ..text
+                    },
+                    color: DIFF_HATCH,
+                    period,
+                    stroke,
+                });
+            }
+            return;
+        }
+        if !cell.changed {
+            return;
+        }
+        // A changed line: the faint wash over the whole column (gutter included), inset on
+        // the right so it clears the divider. The text keeps its own margin inside, so the
+        // words and their washes stay well within the band.
+        if y + cell.height > top && y < bottom {
+            list.push(DrawCmd::Fill {
+                rect: Rect {
+                    y,
+                    w: (full.w - line_pad).max(0),
+                    h: cell.height,
+                    ..full
+                },
+                color: line_bg,
+            });
+        }
+    };
+    for band in diff.bands() {
+        side_band(
+            list,
+            g.old_side,
+            g.cols.old_text,
+            &band.old,
+            band.y,
+            band.height,
+            DIFF_LINE_DELETE_BG,
+        );
+        side_band(
+            list,
+            g.new_side,
+            g.cols.new_text,
+            &band.new,
+            band.y,
+            band.height,
+            DIFF_LINE_INSERT_BG,
+        );
+    }
+}
+
+/// Draw both columns' line-number gutters: a subtle hairline parting each gutter from its
+/// text, then each present line's real (1-based) number, right-aligned in its gutter on
+/// the first row of the line, scroll-shifted and culled to the pane. A changed line's
+/// number takes the accent color (green added, red removed); an unchanged line's is dim.
+/// An absent side (the empty half of a one-sided change) has no number there.
+fn push_diff_gutters(
+    list: &mut DisplayList,
+    fonts: &Fonts,
+    diff: &DiffView,
+    g: &DiffGeom,
+    scale: Scale,
+    body_size: u32,
+) {
+    // The numbers read a step below the body, the way the sidebar's chrome text does
+    // (and that size is already opened, so it renders crisp rather than falling back).
+    let num_size = tree_font_size(body_size);
+    let face_key = FaceKey::Prose {
+        size: num_size,
+        style: FontStyle::Regular,
+    };
+    let face = fonts.face(num_size, FontStyle::Regular);
+    let num_m = fonts.metrics(num_size);
+    let pad = scale.px(DIFF_GUTTER_PAD);
+    let (top, bottom) = (g.old_side.y, g.old_side.y + g.old_side.h);
+    // A hairline down each gutter's inner edge (just left of its text), full column
+    // height, so the numbers read as their own column rather than floating loose.
+    let border_w = scale.px(1).max(1);
+    for text in [g.cols.old_text, g.cols.new_text] {
+        list.push(DrawCmd::Fill {
+            rect: Rect {
+                x: text.x - border_w,
+                y: top,
+                w: border_w,
+                h: (bottom - top).max(0),
+            },
+            color: DIFF_GUTTER_BORDER,
+        });
+    }
+    let number = |list: &mut DisplayList,
+                  cell: &crate::pane::DiffCell,
+                  gutter_right: i32,
+                  left: i32,
+                  accent: u32| {
+        if !cell.present {
+            return;
+        }
+        let baseline = cell.baseline - diff.scroll_y;
+        if baseline + num_m.descent <= top || baseline - num_m.ascent >= bottom {
+            return;
+        }
+        let num = cell.number.to_string();
+        let w = shape::text_advance(face, &num).ceil() as i32;
+        // Right-aligned, but never spilling past the column's left edge: a rare four-digit
+        // number (summarizing a very long note) crowds the border rather than the rail.
+        let x = (gutter_right - w).max(left);
+        let color = if cell.changed {
+            accent
+        } else {
+            DIFF_GUTTER_TEXT
+        };
+        list.push(text_cmd(face_key, x, baseline, x + w, color, num, num_m));
+    };
+    // The numbers sit a little left of the gutter's inner border, with more breathing
+    // room on their right than the tight pad, so they do not crowd the text.
+    let right_gap = border_w + 2 * pad;
+    let old_right = g.cols.old_text.x - right_gap;
+    let new_right = g.cols.new_text.x - right_gap;
+    for band in diff.bands() {
+        number(list, &band.old, old_right, g.old_side.x, DIFF_DELETE_ACCENT);
+        number(list, &band.new, new_right, g.new_side.x, DIFF_INSERT_ACCENT);
+    }
 }
 
 /// The sidebar's text size. The sidebar is chrome, not content, so its names read
@@ -2180,48 +2485,25 @@ impl<'a> Painter<'a> {
         }
     }
 
-    /// The inline diff preview's washes, beneath the text like the selection: a green
-    /// fill behind each insertion, a red fill plus a strikethrough behind each
-    /// deletion, so an added word reads as added and a removed one as struck through.
-    /// The ranges are into the synthetic preview document the layout was built from.
+    /// The diff view's word washes, beneath the text like the selection: a stronger
+    /// green fill behind each added word and a stronger red behind each removed one, over
+    /// the faint full-line wash already drawn, so the edited words stand out within the
+    /// changed line. The ranges are into the side's own text.
     fn diff(&mut self, diff: &DiffTint) {
-        for &(start, end) in diff.inserts {
-            for rect in self
-                .layout
-                .selection_rects(self.fonts, self.rope, start, end)
-            {
-                if let Some(rect) = self.screen(rect) {
-                    self.list.push(DrawCmd::Fill {
-                        rect,
-                        color: AI_INSERT_BG,
-                    });
+        let mut wash = |ranges: &[(usize, usize)], color: u32| {
+            for &(start, end) in ranges {
+                for rect in self
+                    .layout
+                    .diff_wash_rects(self.fonts, self.rope, start, end)
+                {
+                    if let Some(rect) = self.screen(rect) {
+                        self.list.push(DrawCmd::Fill { rect, color });
+                    }
                 }
             }
-        }
-        let strike_h = self.scale.px(1).max(1);
-        for &(start, end) in diff.deletes {
-            for rect in self
-                .layout
-                .selection_rects(self.fonts, self.rope, start, end)
-            {
-                let Some(rect) = self.screen(rect) else {
-                    continue;
-                };
-                self.list.push(DrawCmd::Fill {
-                    rect,
-                    color: AI_DELETE_BG,
-                });
-                self.list.push(DrawCmd::Fill {
-                    rect: Rect {
-                        x: rect.x,
-                        y: rect.y + rect.h / 2,
-                        w: rect.w,
-                        h: strike_h,
-                    },
-                    color: AI_STRIKE,
-                });
-            }
-        }
+        };
+        wash(diff.inserts, AI_INSERT_BG);
+        wash(diff.deletes, AI_DELETE_BG);
     }
 
     /// Find matches, filled like a dimmer selection beneath the text. The current
@@ -3291,43 +3573,259 @@ mod tests {
     }
 
     #[test]
-    fn the_ai_preview_draws_its_title_and_the_diff_colors() {
-        use crate::ai::{word_diff, Preview};
-        use crate::theme::{AI_DELETE_TEXT, AI_INSERT_BG, AI_STRIKE, AI_TEXT};
+    fn the_diff_view_tints_each_side_and_numbers_its_lines() {
+        use crate::pane::{DiffView, DocId};
+        use crate::theme::{
+            AI_DELETE_BG, AI_INSERT_BG, DIFF_DELETE_ACCENT, DIFF_DIVIDER, DIFF_INSERT_ACCENT,
+        };
 
         let fonts = test_fonts();
-        let ctx = BarCtx::new(&fonts, Scale::ONE, FONT_SIZE);
-        let preview = Preview::Ready {
-            pane: 0,
-            span: (0, 7),
-            version: 0,
-            revised: "the cat".into(),
-            spans: word_diff("teh cat", "the cat"),
-            label: "Fix spelling & grammar",
+        let view = Rect {
+            x: 0,
+            y: 0,
+            w: 900,
+            h: 400,
         };
+        let mut diff = DiffView::new(
+            DocId::from_raw(0),
+            (0, 7),
+            0,
+            "teh cat".into(),
+            "the cat".into(),
+            "Fix spelling & grammar",
+        );
+        let cols = diff_columns(view, Scale::ONE, FONT_SIZE, &fonts);
+        diff.ensure_layouts(&fonts, &cols, Scale::ONE, FONT_SIZE);
         let mut list: DisplayList = Vec::new();
-        push_ai_preview(&mut list, &ctx, &preview, (900, 700));
+        push_diff_view(
+            &mut list,
+            &fonts,
+            view,
+            &diff,
+            Scale::ONE,
+            FONT_SIZE,
+            &scroll::Scrollbar::default(),
+        );
 
-        // The action's name is drawn as a plain text run.
-        assert!(list.iter().any(|c| matches!(
-            c,
-            DrawCmd::Text { text, color, .. } if text == "Fix spelling & grammar" && *color == AI_TEXT
-        )));
-        // The inserted word carries the green tint behind it.
+        // The removed word is washed red on the left; the added word is washed green on
+        // the right. Neither is struck through.
+        assert!(list
+            .iter()
+            .any(|c| matches!(c, DrawCmd::Fill { color, .. } if *color == AI_DELETE_BG)));
         assert!(list
             .iter()
             .any(|c| matches!(c, DrawCmd::Fill { color, .. } if *color == AI_INSERT_BG)));
+        // Both sides draw their text.
         assert!(list
             .iter()
-            .any(|c| matches!(c, DrawCmd::Text { text, .. } if text == "the")));
-        // The deleted word is struck through in the delete color.
+            .any(|c| matches!(c, DrawCmd::Text { text, .. } if text.contains("teh"))));
         assert!(list
             .iter()
-            .any(|c| matches!(c, DrawCmd::Fill { color, .. } if *color == AI_STRIKE)));
+            .any(|c| matches!(c, DrawCmd::Text { text, .. } if text.contains("the cat"))));
+        // A line-number gutter numbers the first line on each side; this line changed, so
+        // its number takes the accent color (red on the left, green on the right).
         assert!(list.iter().any(|c| matches!(
             c,
-            DrawCmd::Text { text, color, .. } if text == "teh" && *color == AI_DELETE_TEXT
+            DrawCmd::Text { text, color, .. } if text == "1" && *color == DIFF_DELETE_ACCENT
         )));
+        assert!(list.iter().any(|c| matches!(
+            c,
+            DrawCmd::Text { text, color, .. } if text == "1" && *color == DIFF_INSERT_ACCENT
+        )));
+        // The two columns are parted by a divider.
+        assert!(list
+            .iter()
+            .any(|c| matches!(c, DrawCmd::Fill { color, .. } if *color == DIFF_DIVIDER)));
+    }
+
+    #[test]
+    fn a_one_sided_change_hatches_the_empty_half_and_bands_the_added_line() {
+        use crate::pane::{DiffView, DocId};
+        use crate::theme::{
+            DIFF_GUTTER_BORDER, DIFF_GUTTER_TEXT, DIFF_HATCH, DIFF_INSERT_ACCENT,
+            DIFF_LINE_INSERT_BG,
+        };
+
+        let fonts = test_fonts();
+        // A non-zero top (as a real pane sits below the top bar), so the test also guards
+        // that the aligned content is placed in the pane rather than above it.
+        let view = Rect {
+            x: 0,
+            y: 40,
+            w: 900,
+            h: 400,
+        };
+        // A line inserted between two kept lines: "a\nc" -> "a\nb\nc". The new middle
+        // line has no counterpart on the left, so that half is hatched and the added
+        // line is banded and accented on the right.
+        let mut diff = DiffView::new(
+            DocId::from_raw(0),
+            (0, 3),
+            0,
+            "a\nc".into(),
+            "a\nb\nc".into(),
+            "Fix spelling & grammar",
+        );
+        let cols = diff_columns(view, Scale::ONE, FONT_SIZE, &fonts);
+        diff.ensure_layouts(&fonts, &cols, Scale::ONE, FONT_SIZE);
+        let mut list: DisplayList = Vec::new();
+        push_diff_view(
+            &mut list,
+            &fonts,
+            view,
+            &diff,
+            Scale::ONE,
+            FONT_SIZE,
+            &scroll::Scrollbar::default(),
+        );
+
+        // The empty left half of the added line has a hatched text area and a solid
+        // gutter of the same tone.
+        assert!(list
+            .iter()
+            .any(|c| matches!(c, DrawCmd::Hatch { color, .. } if *color == DIFF_HATCH)));
+        assert!(list
+            .iter()
+            .any(|c| matches!(c, DrawCmd::Fill { color, .. } if *color == DIFF_HATCH)));
+        // The added line carries a faint full-line wash (extending into its gutter) and
+        // its line number is drawn in the green accent.
+        assert!(list
+            .iter()
+            .any(|c| matches!(c, DrawCmd::Fill { color, .. } if *color == DIFF_LINE_INSERT_BG)));
+        assert!(list
+            .iter()
+            .any(|c| matches!(c, DrawCmd::Text { color, .. } if *color == DIFF_INSERT_ACCENT)));
+        // The right side numbers three lines, the left only two: the gutter numbers are
+        // the real line numbers, aligned across the change.
+        let numbers: Vec<&str> = list
+            .iter()
+            .filter_map(|c| match c {
+                DrawCmd::Text { text, .. } if text.chars().all(|ch| ch.is_ascii_digit()) => {
+                    Some(text.as_str())
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(numbers.iter().filter(|n| **n == "3").count(), 1);
+        assert_eq!(numbers.iter().filter(|n| **n == "2").count(), 2);
+        // The unchanged first line's number is drawn in the dim gutter tone (only changed
+        // lines take an accent color).
+        assert!(list.iter().any(|c| matches!(
+            c,
+            DrawCmd::Text { text, color, .. } if text == "1" && *color == DIFF_GUTTER_TEXT
+        )));
+        // A subtle hairline parts each gutter from its text.
+        assert!(list
+            .iter()
+            .any(|c| matches!(c, DrawCmd::Fill { color, .. } if *color == DIFF_GUTTER_BORDER)));
+        // Nothing is drawn above the pane top: the aligned bands are placed in the pane's
+        // window space, not at the window origin.
+        let min_text_y = list
+            .iter()
+            .filter_map(|c| match c {
+                DrawCmd::Text { baseline, .. } => Some(*baseline),
+                _ => None,
+            })
+            .min()
+            .expect("some text");
+        assert!(min_text_y >= view.y, "text is drawn above the pane top");
+    }
+
+    #[test]
+    fn a_wholly_added_list_item_washes_its_bullet_too() {
+        use crate::pane::{DiffView, DocId};
+        use crate::theme::{AI_INSERT_BG, MARKER_COLOR};
+
+        let fonts = test_fonts();
+        let view = Rect {
+            x: 0,
+            y: 0,
+            w: 900,
+            h: 400,
+        };
+        // A bullet item added at the end: its whole line changed, so the wash must reach
+        // its bullet decoration rather than starting at the text past the collapsed marker.
+        let mut diff = DiffView::new(
+            DocId::from_raw(0),
+            (0, 0),
+            0,
+            "- a\n- b".into(),
+            "- a\n- b\n- c".into(),
+            "x",
+        );
+        let cols = diff_columns(view, Scale::ONE, FONT_SIZE, &fonts);
+        diff.ensure_layouts(&fonts, &cols, Scale::ONE, FONT_SIZE);
+        let mut list: DisplayList = Vec::new();
+        push_diff_view(
+            &mut list,
+            &fonts,
+            view,
+            &diff,
+            Scale::ONE,
+            FONT_SIZE,
+            &scroll::Scrollbar::default(),
+        );
+
+        // The bullet disc of the added line, and the strong wash on that same row.
+        let disc = list
+            .iter()
+            .filter_map(|c| match c {
+                DrawCmd::RoundRect { rect, color, .. } if *color == MARKER_COLOR => Some(*rect),
+                _ => None,
+            })
+            .max_by_key(|r| r.y)
+            .expect("a bullet disc for the added item");
+        let wash = list
+            .iter()
+            .filter_map(|c| match c {
+                DrawCmd::Fill { rect, color } if *color == AI_INSERT_BG => Some(*rect),
+                _ => None,
+            })
+            .find(|r| r.y <= disc.y && r.y + r.h >= disc.y + disc.h)
+            .expect("a strong wash on the added item's row");
+        // The wash's left edge reaches the disc, so the bullet sits inside the highlight.
+        assert!(
+            wash.x <= disc.x,
+            "the wash (x={}) does not reach the bullet (x={})",
+            wash.x,
+            disc.x
+        );
+    }
+
+    #[test]
+    fn a_long_palette_query_keeps_the_caret_inside_the_field() {
+        use crate::palette::Palette;
+
+        let fonts = test_fonts();
+        let ctx = BarCtx::new(&fonts, Scale::ONE, FONT_SIZE);
+        // A query far longer than the field, typed into the custom-prompt input.
+        let mut p = Palette::query_input("Describe the change");
+        for _ in 0..200 {
+            p.push('x');
+        }
+        let layout = p.layout(&fonts, FONT_SIZE, Scale::ONE, (600, 800));
+        let mut list: DisplayList = Vec::new();
+        push_palette(&mut list, &ctx, &p, &layout);
+
+        // The steady caret is the one CARET_COLOR fill; it must stay within the field
+        // rather than running off past the panel's edge with the text.
+        let caret = list
+            .iter()
+            .find_map(|c| match c {
+                DrawCmd::Fill { rect, color } if *color == CARET_COLOR => Some(*rect),
+                _ => None,
+            })
+            .expect("a caret fill");
+        assert!(caret.x >= layout.field.x, "the caret is left of the field");
+        assert!(
+            caret.x + caret.w <= layout.field.x + layout.field.w,
+            "the caret runs past the field's right edge"
+        );
+        // The query text is drawn clipped to the field, so what scrolls off does not
+        // spill into the panel's padding.
+        assert!(list.iter().any(
+            |c| matches!(c, DrawCmd::Text { clip_x: Some(_), color, .. } if *color == PALETTE_TEXT)
+        ));
     }
 
     /// A rail column the width the theme asks for, at scale 1.0.
@@ -4002,7 +4500,7 @@ mod tests {
     }
 
     #[test]
-    fn the_inline_diff_pass_tints_insertions_and_strikes_deletions() {
+    fn the_diff_pass_washes_insertions_green_and_deletions_red() {
         let fonts = Fonts::new(&markdown::all_sizes(FONT_SIZE)).expect("a default font");
         let src = "teh the cat";
         let rope = Rope::from_str(src);
@@ -4030,7 +4528,6 @@ mod tests {
             "an insertion gets a green wash"
         );
         assert!(fills.contains(&AI_DELETE_BG), "a deletion gets a red wash");
-        assert!(fills.contains(&AI_STRIKE), "a deletion is struck through");
     }
 
     #[test]

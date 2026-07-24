@@ -887,6 +887,18 @@ impl Layout {
         &self.lines
     }
 
+    /// Nudge each visual line's baseline by `shifts[i]` and set the total content
+    /// height, re-placing the laid-out lines at externally computed positions. The diff
+    /// view uses it to align its two columns line for line: it lays each side out
+    /// normally, then shifts every line onto the shared row band both columns occupy.
+    /// `shifts` has one entry per visual line, in order.
+    pub fn shift_baselines(&mut self, shifts: &[i32], content_height: i32) {
+        for (line, &dy) in self.lines.iter_mut().zip(shifts) {
+            line.baseline += dy;
+        }
+        self.text_height = content_height;
+    }
+
     /// The inline runs of `line`, resolved from the shared `runs` pool. `line`
     /// must belong to this layout (its `runs` range indexes this pool).
     pub fn run_slice(&self, line: &VisualLine) -> &[Run] {
@@ -1259,6 +1271,36 @@ impl Layout {
         start: usize,
         end: usize,
     ) -> Vec<Rect> {
+        self.rects(fonts, rope, start, end, false)
+    }
+
+    /// The highlight rectangles for a diff word wash, like [`Self::selection_rects`] but
+    /// reaching the content-left edge on a line the range starts at or before. A change
+    /// that spans a whole line (a wholly added or removed line) then washes its list
+    /// bullet or quote marker too, rather than starting at the text past the collapsed
+    /// marker and leaving the decoration bare. A mid-line change (a single reworded word)
+    /// starts past the marker as before, so only a line-leading change reaches it.
+    pub fn diff_wash_rects(
+        &self,
+        fonts: &Fonts,
+        rope: &Rope,
+        start: usize,
+        end: usize,
+    ) -> Vec<Rect> {
+        self.rects(fonts, rope, start, end, true)
+    }
+
+    /// The highlight rectangles covering `[start, end)`. `cover_leading` reaches the
+    /// content-left edge on a line the range begins at or before (the diff wash uses it
+    /// to cover a line's marker); otherwise the left edge follows the text.
+    fn rects(
+        &self,
+        fonts: &Fonts,
+        rope: &Rope,
+        start: usize,
+        end: usize,
+        cover_leading: bool,
+    ) -> Vec<Rect> {
         let mut rects = Vec::new();
         for (i, line) in self.lines.iter().enumerate() {
             let m = fonts.metrics(line.size);
@@ -1307,10 +1349,19 @@ impl Layout {
             }
             // Measure the run-walked advance to each end of the selection; bytes
             // in a hidden marker collapse to the marker's edge, so a selection
-            // touching one (in practice a revealed line) measures sensibly.
-            let x0 = self.left as f32
-                + line.indent as f32
-                + self.advance_to(fonts, rope, line, sel_start);
+            // touching one (in practice a revealed line) measures sensibly. When
+            // covering the leading edge (a diff wash over a whole line), the left edge
+            // is the content-left rather than the text past the marker, so the line's
+            // bullet or quote decoration is washed too.
+            let x0 = if cover_leading && start <= line.start {
+                // The content-left edge, before the item's hanging indent, so the wash
+                // reaches the bullet or quote marker sitting in that gutter.
+                self.left as f32
+            } else {
+                self.left as f32
+                    + line.indent as f32
+                    + self.advance_to(fonts, rope, line, sel_start)
+            };
             let x1 =
                 self.left as f32 + line.indent as f32 + self.advance_to(fonts, rope, line, sel_end);
             let mut w = (x1 - x0).round() as i32;

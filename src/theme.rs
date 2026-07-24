@@ -314,12 +314,13 @@ pub(crate) const AI_TEXT: u32 = FOREGROUND;
 pub(crate) const AI_HINT: u32 = TAB_INACTIVE_TEXT;
 /// A failure message, in the same red the find bar shows a bad pattern in.
 pub(crate) const AI_ERROR_TEXT: u32 = FIND_ERROR_COLOR;
-pub(crate) const AI_INSERT_TEXT: u32 = 0x00a6_e3a1;
-pub(crate) const AI_INSERT_BG: u32 = 0x0030_4a38;
-pub(crate) const AI_DELETE_TEXT: u32 = 0x00f3_8ba8;
-pub(crate) const AI_DELETE_BG: u32 = 0x004a_3038;
-/// The line struck through a deletion, the deletion's own color.
-pub(crate) const AI_STRIKE: u32 = AI_DELETE_TEXT;
+/// The stronger washes behind the changed words in the diff view: a saturated green
+/// behind an added word, a saturated red behind a removed one, drawn over the faint
+/// full-line wash so the edited words stand out clearly and the two colors read apart
+/// at a glance rather than blending. The text keeps its normal color; the wash carries
+/// the meaning, the way a selection highlight does.
+pub(crate) const AI_INSERT_BG: u32 = 0x002f_7a4a;
+pub(crate) const AI_DELETE_BG: u32 = 0x008c_3a45;
 /// The panel's width and the gap above it; it is wider than the palette because it
 /// holds wrapped prose, not one-line rows.
 pub(crate) const AI_PANEL_WIDTH: i32 = 640;
@@ -331,6 +332,50 @@ pub(crate) const AI_PANEL_PAD: i32 = 14;
 /// before it notes the rest are hidden.
 pub(crate) const AI_LINE_VPAD: i32 = 3;
 pub(crate) const AI_MAX_LINES: usize = 18;
+
+/// The side-by-side diff view (the tab a Ready AI action opens into): two columns, the
+/// old text on the left and the new on the right, aligned line for line so a change
+/// reads across the divider, sharing one scroll.
+///
+/// A changed line carries two tints: a faint wash over the line (DIFF_LINE_*) inset a
+/// little from the column edges, and, over it, the stronger word wash (AI_INSERT_BG /
+/// AI_DELETE_BG) on just the words that changed, the way GitHub layers a line and its
+/// intraline diff. A thin accent bar (DIFF_*_ACCENT) runs down the band's leading edge
+/// and the line number is drawn in that accent. Where a change is one-sided (a line
+/// added or removed, with no counterpart), the empty half is filled with diagonal
+/// hatching (DIFF_HATCH) so it reads as absent rather than blank.
+///
+/// The text inset inside each column, narrower than the document's [`MARGIN`] because a
+/// column is half the width. The gutter's padding each side of the number, the inset of
+/// a changed line's band from the text edges (kept below [`DIFF_MARGIN`] so the word
+/// washes stay inside it), and the divider between the two columns.
+pub(crate) const DIFF_MARGIN: i32 = 16;
+pub(crate) const DIFF_GUTTER_PAD: i32 = 5;
+pub(crate) const DIFF_LINE_PAD: i32 = 6;
+pub(crate) const DIFF_DIVIDER_W: i32 = 1;
+/// The divider between the columns (the same tone every chrome divider uses), the dim
+/// gutter text, and the subtle hairline parting a gutter from its text.
+pub(crate) const DIFF_DIVIDER: u32 = SPLITTER_COLOR;
+pub(crate) const DIFF_GUTTER_TEXT: u32 = TAB_INACTIVE_TEXT;
+pub(crate) const DIFF_GUTTER_BORDER: u32 = 0x0024_2a31;
+/// The faint full-line washes behind a changed line: a step up from the background
+/// toward the stronger word washes above them, so the whole changed line reads as
+/// changed while its edited words stand out within it.
+pub(crate) const DIFF_LINE_INSERT_BG: u32 = 0x0022_3327;
+pub(crate) const DIFF_LINE_DELETE_BG: u32 = 0x0033_2429;
+/// The thin accent bar down a changed line's band edge, also the tone its line number is
+/// drawn in: a saturated green for an added line, red for a removed one, so the change is
+/// legible at the margin.
+pub(crate) const DIFF_INSERT_ACCENT: u32 = 0x0098_c379;
+pub(crate) const DIFF_DELETE_ACCENT: u32 = 0x00e0_6c75;
+/// The empty half of a one-sided change (a line present on one side, absent on the
+/// other): its text area is diagonal hatching, thin 45-degree strokes `PERIOD` device
+/// pixels apart and `STROKE` wide, over the background; its gutter is a flat solid of the
+/// same tone (see `push_diff_bands`), so the number column reads as a clean edge and only
+/// the text area carries the "nothing here" texture.
+pub(crate) const DIFF_HATCH: u32 = 0x0032_3d48;
+pub(crate) const DIFF_HATCH_PERIOD: i32 = 6;
+pub(crate) const DIFF_HATCH_STROKE: i32 = 1;
 
 /// The full-window picture view: what a double-clicked image opens into. The
 /// backdrop covers the whole window rather than dimming it, since the point is the

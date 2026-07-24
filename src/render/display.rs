@@ -89,6 +89,17 @@ pub enum DrawCmd {
     /// store key (the raw markdown destination); a not-yet-decoded image draws
     /// nothing.
     Image { rect: Rect, path: String },
+    /// Diagonal hatching over `rect`, in `color`: parallel 45-degree strokes
+    /// `stroke` device pixels wide repeating every `period` pixels. The diff view
+    /// fills the empty half of a one-sided change with it, so a line present on one
+    /// side reads as absent (not blank) on the other. The pattern is intrinsic to
+    /// the shader mode, so the command carries only its box, color, and spacing.
+    Hatch {
+        rect: Rect,
+        color: u32,
+        period: i32,
+        stroke: i32,
+    },
 }
 
 impl DrawCmd {
@@ -100,6 +111,7 @@ impl DrawCmd {
             | DrawCmd::RoundRect { rect, .. }
             | DrawCmd::CheckMark { rect, .. }
             | DrawCmd::Chevron { rect, .. }
+            | DrawCmd::Hatch { rect, .. }
             | DrawCmd::Image { rect, .. } => *rect,
             DrawCmd::Text { bounds, .. } => *bounds,
         }

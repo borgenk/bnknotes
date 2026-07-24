@@ -402,6 +402,13 @@ impl State {
         // Keyboard input goes to the focused editor; `rect` is its column, for
         // the motion methods that need the viewport.
         let i = self.active_editor();
+        // A diff review holds this pane's keyboard: Enter keeps the change, Escape
+        // discards it, the navigation keys scroll the two columns, and everything else
+        // is swallowed so no edit reaches a document that is not on screen.
+        if self.editors[i].active_is_diff() {
+            self.handle_diff_key(action);
+            return Ok(());
+        }
         // Typing into an empty pane opens a fresh tab to receive the text, so a
         // just-launched blank pane becomes editable on the first keystroke.
         if !self.editors[i].has_tabs() && opens_a_tab(&action) {
@@ -484,16 +491,49 @@ impl State {
     /// the arrows move the selection (Home and End jump to its ends), Ctrl+V pastes
     /// into the query, Enter goes where the selected row says, and Escape or Ctrl+K
     /// puts the palette away.
-    /// Route a key to the open AI preview: Enter accepts the diff (when one is
-    /// ready), Escape discards it or cancels a running job, and every other key is
-    /// swallowed so the modal preview keeps the keyboard.
+    /// Route a key to the open AI modal (a still-running job or a shown failure):
+    /// Escape cancels or dismisses it, and every other key is swallowed so the modal
+    /// keeps the keyboard. A successful answer is not a modal; it is a diff tab, keyed
+    /// through [`Self::handle_diff_key`].
     pub(super) fn handle_ai_key(&mut self, action: KeyAction) {
+        if action == KeyAction::Escape {
+            self.close_ai();
+        }
+    }
+
+    /// Route a key to the focused pane's diff review: Enter keeps the change, Escape
+    /// discards it, the navigation keys scroll the two columns together, and every
+    /// other key is swallowed so no edit reaches a document that is not on screen.
+    pub(super) fn handle_diff_key(&mut self, action: KeyAction) {
+        let i = self.active_editor();
+        let page = (self.editor_rect(i).h - self.line_step()).max(self.line_step());
         match action {
-            KeyAction::Enter => self.accept_ai(),
-            KeyAction::Escape => {
-                self.close_ai();
-            }
+            KeyAction::Enter => self.accept_diff(),
+            KeyAction::Escape => self.reject_diff(),
+            KeyAction::Up => self.scroll_diff(i, -self.line_step()),
+            KeyAction::Down => self.scroll_diff(i, self.line_step()),
+            KeyAction::PageUp => self.scroll_diff(i, -page),
+            KeyAction::PageDown => self.scroll_diff(i, page),
+            KeyAction::DocStart => self.scroll_diff(i, i32::MIN),
+            KeyAction::DocEnd => self.scroll_diff(i, i32::MAX),
             _ => {}
+        }
+    }
+
+    /// One text line's worth of scroll, for stepping a diff review with the arrows.
+    fn line_step(&self) -> i32 {
+        self.fonts.metrics(self.body_size).line_height
+    }
+
+    /// Scroll the focused pane's diff review by `delta` device pixels (its two sides
+    /// move together), clamped to the taller side's extent. A saturating add lets a
+    /// Home/End jump pass `i32::MIN`/`MAX` without overflowing before the clamp.
+    fn scroll_diff(&mut self, i: usize, delta: i32) {
+        let h = self.editor_rect(i).h;
+        if let Some(dv) = self.editors[i].active_diff_mut() {
+            let content = dv.content_height();
+            dv.scroll_y = scroll::clamp(dv.scroll_y.saturating_add(delta), content, h);
+            self.dirty = true;
         }
     }
 
@@ -858,6 +898,10 @@ impl State {
                 match self.hit_test(px, py) {
                     Hit::Tab(g, _) | Hit::TabClose(g, _) | Hit::NewTab(g) | Hit::TabStrip(g) => {
                         self.scroll_tabs(g, delta);
+                    }
+                    Hit::Editor(i, _) if vertical && self.editors[i].active_is_diff() => {
+                        self.scroll_diff(i, delta);
+                        self.flash_scrollbar(Focus::Editor(i));
                     }
                     Hit::Editor(i, rect) if vertical => {
                         if self.editors[i].scroll_by(&self.fonts, rect, delta) {
@@ -1372,6 +1416,9 @@ impl State {
             match self.hit_test(px, py) {
                 Hit::Splitter(_) => SHAPE_EW_RESIZE,
                 Hit::Tree(_) => SHAPE_DEFAULT,
+                // A diff review is not editable, so its body takes the plain arrow
+                // rather than the text I-beam.
+                Hit::Editor(i, _) if self.editors[i].active_is_diff() => SHAPE_DEFAULT,
                 Hit::Editor(i, rect) => self.editors[i].cursor_shape_at(&self.fonts, rect, px, py),
                 Hit::Tab(..)
                 | Hit::TabClose(..)
@@ -1416,7 +1463,15 @@ impl State {
     fn scroll_extent(&self, region: Focus, view: Rect) -> (i32, i32) {
         match region {
             Focus::Tree => (self.tree.content_height, view.h),
-            Focus::Editor(i) => (self.editors[i].content_height, view.h),
+            // A diff review's scrollable extent is its own, not the placeholder
+            // document the pane derefs to while the review is active.
+            Focus::Editor(i) => {
+                let content = match self.editors[i].active_diff() {
+                    Some(dv) => dv.content_height(),
+                    None => self.editors[i].content_height,
+                };
+                (content, view.h)
+            }
         }
     }
 
@@ -1526,7 +1581,10 @@ impl State {
         if sy != at {
             match region {
                 Focus::Tree => self.tree.scroll_y = sy,
-                Focus::Editor(i) => self.editors[i].scroll_y = sy,
+                Focus::Editor(i) => match self.editors[i].active_diff_mut() {
+                    Some(dv) => dv.scroll_y = sy,
+                    None => self.editors[i].scroll_y = sy,
+                },
             }
             self.dirty = true;
         }
@@ -1536,7 +1594,10 @@ impl State {
     fn scroll_y(&self, region: Focus) -> i32 {
         match region {
             Focus::Tree => self.tree.scroll_y,
-            Focus::Editor(i) => self.editors[i].scroll_y,
+            Focus::Editor(i) => match self.editors[i].active_diff() {
+                Some(dv) => dv.scroll_y,
+                None => self.editors[i].scroll_y,
+            },
         }
     }
 
@@ -1593,6 +1654,12 @@ impl State {
             // not reach the row scrolled beneath the strip.
             Hit::TreeFooter => {}
             Hit::Editor(i, rect) => {
+                // A press in a diff review just focuses its pane (so the keyboard
+                // resolves it); there is no text under it to place a caret in.
+                if self.editors[i].active_is_diff() {
+                    self.focus_pane(i);
+                    return;
+                }
                 // A disk-conflict banner sits over the pane's top edge; a press on
                 // it acts on its buttons rather than placing a caret beneath it.
                 if self.conflict_banner_press(i, rect, px, py) {
@@ -1706,7 +1773,9 @@ impl State {
             drag.moved = true;
         }
         let over = self.tab_target_pane(px).unwrap_or(drag.pane);
-        if over != drag.pane {
+        // A diff review re-homes to no document, so it cannot cross the split; it stays
+        // in its pane, where it can still be reordered.
+        if over != drag.pane && !self.editors[drag.pane].tab_is_diff(drag.tab) {
             // Cross the split: detach from the source pane and insert where the
             // pointer sits in the target's strip, which then owns and focuses it.
             let idx = self

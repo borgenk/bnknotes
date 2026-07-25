@@ -413,13 +413,72 @@ impl TextBuffer {
         let markdown::LineStyle::Task { checked } = style else {
             return false;
         };
-        // The check character sits inside the marker's trailing `[c] `.
-        let at = ls + marker_len - 3;
         self.checkpoint(Coalesce::None);
-        self.text.remove(at..at + 1);
-        self.text.insert(at, if checked { " " } else { "x" });
+        self.flip_task_box(ls, marker_len, checked);
         self.touch();
         true
+    }
+
+    /// Flip the checkbox byte of the task whose content line starts at `ls` with
+    /// block-marker length `marker_len`: `[ ] ` gains an `x`, `[x] ` clears back
+    /// to a space. The check character sits inside the marker's trailing `[c] `.
+    /// Edits the rope directly with no checkpoint or version bump, so the caller
+    /// groups and stamps it; the swap is one byte for one, so nothing downstream
+    /// shifts.
+    fn flip_task_box(&mut self, ls: usize, marker_len: usize, checked: bool) {
+        let at = ls + marker_len - 3;
+        self.text.remove(at..at + 1);
+        self.text.insert(at, if checked { " " } else { "x" });
+    }
+
+    /// Format the line(s) the cursor or selection touches as task-list items, the
+    /// Ctrl+L gesture. Each line is handled on its own: a task flips its checkbox,
+    /// and any other line (body, bullet, ordered, quote, heading) becomes an
+    /// unchecked `- [ ] ` item, its old block marker replaced and its indentation
+    /// kept. Across a multi-line selection blank lines are left alone, so a
+    /// checklist gains no empty rows, but a single targeted line converts even
+    /// when blank, so Ctrl+L on an empty line opens a checkbox. The whole sweep is
+    /// one undo step, and the cursor and selection ride the edits so a repeated
+    /// press keeps acting on the same lines. Returns whether the buffer changed.
+    pub fn toggle_task_list(&mut self) -> bool {
+        let (first, last) = self.block_lines();
+        let single = first == last;
+        let mut changed = false;
+        // Bottom-up, so a line start above the one being edited stays valid as the
+        // lines below it change length.
+        for line_idx in (first..=last).rev() {
+            let (ls, le) = self.text.line_content_range(line_idx);
+            let content = self.text.byte_slice(ls..le);
+            // A blank row in a multi-line sweep is a separator, not an item; a
+            // single targeted line converts even when blank.
+            if !single && content.trim().is_empty() {
+                continue;
+            }
+            let (style, marker_len) = markdown::classify(&content);
+            if !changed {
+                self.checkpoint(Coalesce::None);
+                changed = true;
+            }
+            if let markdown::LineStyle::Task { checked } = style {
+                self.flip_task_box(ls, marker_len, checked);
+                continue;
+            }
+            // Replace the old block marker (empty on a body line) with `- [ ] `,
+            // keeping the line's leading indentation.
+            let indent = markdown::leading_indent(&content);
+            let start = ls + indent;
+            let cut = ls + marker_len.max(indent);
+            let new = "- [ ] ";
+            let delta = new.len() as i64 - (cut - start) as i64;
+            self.text.remove(start..cut);
+            self.text.insert(start, new);
+            self.cursor = shift_past(self.cursor, start, delta);
+            self.anchor = self.anchor.map(|a| shift_past(a, start, delta));
+        }
+        if changed {
+            self.touch();
+        }
+        changed
     }
 
     /// The content of the logical line containing `byte` (excluding any trailing
@@ -1978,6 +2037,137 @@ mod tests {
         b.set_cursor(13, true); // select "plain"
         assert!(b.toggle_task(0));
         assert_eq!(b.selection(), Some((8, 13)), "the selection survives");
+    }
+
+    // --- Ctrl+L: format line(s) as task items ------------------------------
+
+    #[test]
+    fn toggle_task_list_converts_each_block_style_and_keeps_indent() {
+        // A body line gains the box; the caret rides past the inserted marker.
+        let mut b = TextBuffer::from_text("groceries".to_string());
+        b.set_cursor(9, false); // end of "groceries"
+        assert!(b.toggle_task_list());
+        assert_eq!(b.text(), "- [ ] groceries");
+        assert_eq!(b.cursor(), 15, "the caret follows the text past the marker");
+        // A bullet, an ordered item, a quote, and a heading each shed their old
+        // marker for the box, and indentation (list nesting) is preserved.
+        for (before, after) in [
+            ("- milk", "- [ ] milk"),
+            ("+ milk", "- [ ] milk"),
+            ("1. milk", "- [ ] milk"),
+            ("3) milk", "- [ ] milk"),
+            ("> quote", "- [ ] quote"),
+            ("# head", "- [ ] head"),
+            ("  - sub", "  - [ ] sub"),
+            ("    1. deep", "    - [ ] deep"),
+        ] {
+            let mut b = TextBuffer::from_text(before.to_string());
+            assert!(b.toggle_task_list(), "{before:?} converts");
+            assert_eq!(b.text(), after, "{before:?} -> {after:?}");
+        }
+    }
+
+    #[test]
+    fn toggle_task_list_toggles_a_line_already_a_task() {
+        let mut b = TextBuffer::from_text("- [ ] a".to_string());
+        b.set_cursor(7, false); // end of the label
+        assert!(b.toggle_task_list());
+        assert_eq!(b.text(), "- [x] a");
+        assert_eq!(b.cursor(), 7, "toggling a task never moves the caret");
+        assert!(b.toggle_task_list());
+        assert_eq!(b.text(), "- [ ] a");
+    }
+
+    #[test]
+    fn toggle_task_list_over_a_selection_handles_each_line() {
+        // A mixed block: a bullet and a plain line convert, an existing task
+        // flips, all in one pass over the selection.
+        let mut b = TextBuffer::from_text("- one\ntwo\n- [ ] three".to_string());
+        b.set_cursor(0, false);
+        b.set_cursor(b.rope().len(), true); // select every line
+        assert!(b.toggle_task_list());
+        assert_eq!(b.text(), "- [ ] one\n- [ ] two\n- [x] three");
+        // One more press now flips all three (they are all tasks).
+        assert!(b.toggle_task_list());
+        assert_eq!(b.text(), "- [x] one\n- [x] two\n- [ ] three");
+    }
+
+    #[test]
+    fn toggle_task_list_skips_blank_lines_in_a_multi_line_sweep() {
+        // A loose list: the blank separator stays blank, only the items convert.
+        let mut b = TextBuffer::from_text("a\n\nb".to_string());
+        b.set_cursor(0, false);
+        b.set_cursor(4, true); // select all three lines
+        assert!(b.toggle_task_list());
+        assert_eq!(b.text(), "- [ ] a\n\n- [ ] b");
+    }
+
+    #[test]
+    fn toggle_task_list_converts_a_single_blank_line() {
+        // With no selection, a blank line is a deliberate "start a checkbox here".
+        let mut b = TextBuffer::from_text("x\n\ny".to_string());
+        b.set_cursor(2, false); // on the empty middle line
+        assert!(b.toggle_task_list());
+        assert_eq!(b.text(), "x\n- [ ] \ny");
+        assert_eq!(b.cursor(), 8, "the caret waits at the end of the fresh box");
+    }
+
+    #[test]
+    fn toggle_task_list_is_one_undo_step() {
+        let mut b = TextBuffer::from_text("- one\ntwo".to_string());
+        b.set_cursor(0, false);
+        b.set_cursor(b.rope().len(), true);
+        assert!(b.toggle_task_list());
+        assert_eq!(b.text(), "- [ ] one\n- [ ] two");
+        assert!(b.undo());
+        assert_eq!(b.text(), "- one\ntwo", "the whole sweep reverts at once");
+        assert!(b.redo());
+        assert_eq!(b.text(), "- [ ] one\n- [ ] two", "and redo replays it");
+    }
+
+    #[test]
+    fn toggle_task_list_keeps_the_selection_over_the_converted_lines() {
+        // The selection rides the edits (the anchor moves past the marker just
+        // inserted on the first line, as block-indent does), so it still spans
+        // both lines and a second press keeps acting on them.
+        let mut b = TextBuffer::from_text("one\ntwo".to_string());
+        b.set_cursor(0, false);
+        b.set_cursor(7, true); // select both lines
+        assert!(b.toggle_task_list());
+        assert_eq!(b.text(), "- [ ] one\n- [ ] two");
+        let (lo, hi) = b.selection().expect("a selection survives");
+        assert_eq!(
+            b.rope().byte_to_line(lo),
+            0,
+            "still starts on the first line"
+        );
+        assert_eq!(b.rope().byte_to_line(hi), 1, "still ends on the second");
+        assert!(b.toggle_task_list());
+        assert_eq!(
+            b.text(),
+            "- [x] one\n- [x] two",
+            "the second press flips both",
+        );
+    }
+
+    #[test]
+    fn toggle_task_list_on_a_long_ordered_marker_shifts_the_caret_back() {
+        // A marker longer than `- [ ] ` shrinks the line; the caret, past it,
+        // moves back by the difference rather than drifting into the markup.
+        let mut b = TextBuffer::from_text("123456789. deep".to_string());
+        b.set_cursor(15, false); // end of "deep"
+        assert!(b.toggle_task_list());
+        assert_eq!(b.text(), "- [ ] deep");
+        assert_eq!(b.cursor(), 10, "caret at the end of the shortened line");
+    }
+
+    #[test]
+    fn toggle_task_list_on_empty_multi_line_selection_is_a_no_op() {
+        let mut b = TextBuffer::from_text("\n\n".to_string());
+        b.set_cursor(0, false);
+        b.set_cursor(2, true);
+        assert!(!b.toggle_task_list(), "all-blank selection changes nothing");
+        assert_eq!(b.text(), "\n\n");
     }
 
     // --- Ordered renumbering on Enter ---------------------------------------

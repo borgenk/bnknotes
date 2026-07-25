@@ -28,6 +28,9 @@ pub enum MenuAction {
     PasteIcon(usize),
     /// Take rail vault `i`'s picture away.
     ClearIcon(usize),
+    /// Format the line(s) pane `pane` has under its caret or selection as task
+    /// items, toggling the box on lines already tasks: the menu twin of Ctrl+L.
+    ToggleTaskList { pane: usize },
     /// Run AI action `i` (an index into [`crate::ai::ACTIONS`]) over the focused pane.
     Ai(usize),
     /// Open the palette to type a free-form AI instruction for the focused pane.

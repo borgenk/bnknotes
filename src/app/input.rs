@@ -157,6 +157,9 @@ fn apply_editor_action(
         KeyAction::Redo => ed.text.redo(),
         KeyAction::ToggleFold => ed.toggle_fold_at_cursor(fonts, rect),
         KeyAction::UnfoldAll => ed.unfold_all(),
+        // Ctrl+L: convert the cursor's line, or every line the selection touches,
+        // into a task item, toggling the box on lines already tasks.
+        KeyAction::ToggleTaskList => ed.text.toggle_task_list(),
         // With no find bar, Escape collapses a selection to a bare cursor; with
         // nothing selected there is nothing to leave.
         KeyAction::Escape => {
@@ -278,7 +281,7 @@ impl State {
 
     /// Move keyboard focus to editor pane `i`, remembering it as the last active
     /// editor, refreshing the title for its note, and marking a repaint.
-    fn focus_pane(&mut self, i: usize) {
+    pub(super) fn focus_pane(&mut self, i: usize) {
         // Snap the caret only when focus actually crosses panes; a click within the
         // already-focused pane is a navigation move that should still smear.
         let crossed = self.focus != Focus::Editor(i);

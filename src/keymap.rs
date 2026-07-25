@@ -82,6 +82,9 @@ pub enum KeyAction {
     /// unfold every section in the document (Ctrl+Shift+period).
     ToggleFold,
     UnfoldAll,
+    /// Format the cursor's line, or every line the selection touches, as a task
+    /// item; a line already a task toggles its checkbox (Ctrl+L).
+    ToggleTaskList,
     None,
 }
 
@@ -144,6 +147,7 @@ fn ctrl_action_for_sym(sym: u32, shift: bool) -> KeyAction {
         0x66 if shift => KeyAction::SearchVault, // Ctrl+Shift+F: search the vault
         0x66 => KeyAction::Find,                 // f
         0x68 => KeyAction::Replace,              // h
+        0x6C => KeyAction::ToggleTaskList,       // l: format the line(s) as a task
         0x73 => KeyAction::Save,                 // s
         0x78 => KeyAction::Cut,                  // x
         0x76 => KeyAction::Paste,                // v
@@ -221,6 +225,10 @@ mod tests {
         assert_eq!(ctrl_action_for_sym(sym('b'), false), KeyAction::ToggleTree);
         assert_eq!(ctrl_action_for_sym(sym('s'), false), KeyAction::Save);
         assert_eq!(ctrl_action_for_sym(sym('f'), false), KeyAction::Find);
+        assert_eq!(
+            ctrl_action_for_sym(sym('l'), false),
+            KeyAction::ToggleTaskList
+        );
         assert_eq!(ctrl_action_for_sym(sym('1'), false), KeyAction::FocusPaneA);
         // An unbound key is inert rather than falling through to another action.
         assert_eq!(ctrl_action_for_sym(sym('q'), false), KeyAction::None);
@@ -247,7 +255,7 @@ mod tests {
     fn every_bound_ctrl_letter_is_distinct() {
         // A duplicate keysym in the table would silently shadow the earlier arm, so a
         // rebind that collides fails here rather than in the user's hands.
-        let bound: Vec<KeyAction> = "acfhksxvbw\\012zy."
+        let bound: Vec<KeyAction> = "acfhklsxvbw\\012zy."
             .chars()
             .map(|c| ctrl_action_for_sym(c as u32, false))
             .collect();

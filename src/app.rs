@@ -1421,9 +1421,9 @@ impl State {
         self.dirty = true;
     }
 
-    /// What a right-click at `(px, py)` offers: a rail chip's icon actions, or the AI
-    /// transforms over an editor pane's selection. Anywhere else offers nothing, and
-    /// so opens no menu.
+    /// What a right-click at `(px, py)` offers: a rail chip's icon actions, a tab's
+    /// pin toggle, or an editor pane's editing commands and (when on) AI transforms.
+    /// Anywhere else offers nothing, and so opens no menu.
     fn menu_items_at(&self, px: f32, py: f32) -> Vec<MenuItem> {
         match self.hit_test(px, py) {
             Hit::Vault(i) => self.vault_menu_items(i),
@@ -1491,18 +1491,40 @@ impl State {
         commands
     }
 
-    /// The AI commands as context-menu items. An editor pane has no other menu yet.
+    /// What a right-click over editor pane `i` offers: the editing commands first,
+    /// then the AI commands when they are on. The editing commands do not depend on
+    /// the AI feature, so a pane holding a document always has a menu, and a new
+    /// editing action is another row here rather than a second pop-up.
     fn editor_menu_items(&self, i: usize) -> Vec<MenuItem> {
-        self.ai_commands(i)
-            .into_iter()
-            .map(|(label, command)| MenuItem {
-                label,
-                action: match command {
-                    AiCommand::Run(idx) => MenuAction::Ai(idx),
-                    AiCommand::Custom => MenuAction::AiCustomPrompt,
-                },
-            })
-            .collect()
+        // A pane with no document has nothing to format; only the AI commands (which
+        // fall back to the whole note) could apply, so leave the editing rows off.
+        let mut items = if self.editors[i].has_tabs() {
+            Self::edit_command_items(i)
+        } else {
+            Vec::new()
+        };
+        items.extend(
+            self.ai_commands(i)
+                .into_iter()
+                .map(|(label, command)| MenuItem {
+                    label,
+                    action: match command {
+                        AiCommand::Run(idx) => MenuAction::Ai(idx),
+                        AiCommand::Custom => MenuAction::AiCustomPrompt,
+                    },
+                }),
+        );
+        items
+    }
+
+    /// The plain editing commands the editor context menu offers on pane `i`,
+    /// independent of the AI feature. Today just formatting the caret's line, or a
+    /// whole selection, as a task list (the menu twin of Ctrl+L).
+    fn edit_command_items(i: usize) -> Vec<MenuItem> {
+        vec![MenuItem {
+            label: "Toggle task list".to_string(),
+            action: MenuAction::ToggleTaskList { pane: i },
+        }]
     }
 
     /// The icon actions a right-click offers on rail vault `i`: a picture for the
@@ -1711,9 +1733,21 @@ impl State {
             MenuAction::SaveVault(i) => self.save_vault(i),
             MenuAction::PasteIcon(i) => self.paste_icon(i),
             MenuAction::ClearIcon(i) => self.clear_icon(i),
+            MenuAction::ToggleTaskList { pane } => self.toggle_task_list_in_pane(pane),
             MenuAction::Ai(i) => self.start_ai_action(i),
             MenuAction::AiCustomPrompt => self.open_ai_prompt(),
             MenuAction::TogglePin { pane, tab } => self.toggle_pin_tab(pane, tab),
+        }
+    }
+
+    /// Format pane `pane`'s caret line, or its whole selection, as a task list, the
+    /// context-menu twin of Ctrl+L. Focus the pane first so the caret revealed after
+    /// the edit is the one that changed, then run the after-edit bookkeeping only
+    /// when the buffer actually moved (an all-blank selection is a no-op).
+    fn toggle_task_list_in_pane(&mut self, pane: usize) {
+        self.focus_pane(pane);
+        if self.editors[pane].text.toggle_task_list() {
+            self.after_edit();
         }
     }
 
@@ -3085,6 +3119,16 @@ mod tests {
         let right: Vec<&str> = rows.iter().filter_map(|r| r.new).map(|j| b[j]).collect();
         assert_eq!(left, a);
         assert_eq!(right, b);
+    }
+
+    #[test]
+    fn the_editor_menu_offers_the_task_list_command_per_pane() {
+        // The editing command is independent of AI, names its pane, and reads as an
+        // action, so a right-click over a pane always has at least this to click.
+        let items = State::edit_command_items(1);
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].label, "Toggle task list");
+        assert_eq!(items[0].action, MenuAction::ToggleTaskList { pane: 1 });
     }
 
     #[test]

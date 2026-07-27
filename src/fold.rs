@@ -326,33 +326,42 @@ pub fn enclosing_heading(index: &LineIndex, line: usize) -> Option<usize> {
         .find(|&l| index.heading_at(l).is_some())
 }
 
-/// The most bytes a heading marker can occupy: six `#` and the space after them.
-const MARKER_PEEK: usize = 7;
-
 /// Whether a heading of `level` owns at least one line, and so has a section to
 /// collapse, given the byte offset the line below it starts at. False when that
 /// line is already a sibling or a shallower heading. The caller only asks about a
 /// heading that has a line below it at all.
 ///
-/// This runs for every heading of every layout build, so it reads only the bytes a
-/// marker can occupy rather than materializing the line: the answer turns on the
-/// leading `#` run and the single byte after it. The caller already knows where
-/// that run begins (a logical line's end plus its newline), so the question costs
-/// no tree descent either. The window is cut at the first newline in it, since a
-/// short line like `#` would otherwise read as running into the line below and
-/// come out unclassified.
+/// This runs for every heading of every layout build, so it reads only the marker:
+/// one to six leading hashes and the byte after them. It never materializes the
+/// line or forms a text slice whose fixed end could bisect a UTF-8 character.
 ///
 /// A heading closes any open code fence by definition (a `#` inside a fence is
 /// code, not a heading), so the line below classifies on its own without carrying
 /// parser state into the question.
 pub fn owns_section(rope: &Rope, next_start: usize, level: u8) -> bool {
-    let end = (next_start + MARKER_PEEK).min(rope.len());
-    let window = rope.slice(next_start..end).as_cow();
-    let head = window.split('\n').next().unwrap_or_default();
     !matches!(
-        crate::markdown::style_of(head),
-        crate::markdown::LineStyle::Heading(l) if l <= level
+        heading_level_at(rope, next_start),
+        Some(next_level) if next_level <= level
     )
+}
+
+/// The ATX heading level at `start`, using the same marker rule as markdown:
+/// one to six hashes followed by a space, a newline, or the document end.
+fn heading_level_at(rope: &Rope, start: usize) -> Option<u8> {
+    let mut hashes = 0;
+    while rope.byte(start.saturating_add(hashes)) == Some(b'#') {
+        hashes += 1;
+        if hashes > 6 {
+            return None;
+        }
+    }
+    if hashes == 0 {
+        return None;
+    }
+    match rope.byte(start.saturating_add(hashes)) {
+        None | Some(b'\n' | b' ') => Some(hashes as u8),
+        Some(_) => None,
+    }
 }
 
 #[cfg(test)]
@@ -474,6 +483,27 @@ run
         assert!(
             !owns_section(&rope, rope.line_to_byte(1), 6),
             "an H6 below an H6 is a sibling"
+        );
+    }
+
+    #[test]
+    fn a_unicode_byte_at_the_marker_peek_boundary_is_safe() {
+        let body = Rope::from_str("# Top\nabcdefæ body\n");
+        assert!(
+            owns_section(&body, body.line_to_byte(1), 1),
+            "ordinary Unicode text belongs to the section"
+        );
+
+        let sibling = Rope::from_str("# Top\n# café\n");
+        assert!(
+            !owns_section(&sibling, sibling.line_to_byte(1), 1),
+            "Unicode heading text does not change the sibling level"
+        );
+
+        let tag = Rope::from_str("# Top\n#æ\n");
+        assert!(
+            owns_section(&tag, tag.line_to_byte(1), 1),
+            "a hash without a separating space is not a heading"
         );
     }
 

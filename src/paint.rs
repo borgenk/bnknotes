@@ -1,3 +1,5 @@
+use std::borrow::Cow;
+
 use crate::ai::{self, DiffKind, Preview};
 use crate::config::{Vault, VaultKind};
 use crate::find::{self, FindState};
@@ -9,7 +11,7 @@ use crate::layout::{
 use crate::markdown;
 use crate::menu::{Menu, MenuLayout};
 use crate::palette::{self, Palette, PaletteLayout};
-use crate::pane::{DiffColumns, DiffView, DiskConflict, TreePane};
+use crate::pane::{DiffColumns, DiffView, DiskConflict, TabView, TreePane};
 use crate::platform::freetype::{Face, FaceKey, FontStyle, Fonts, Metrics};
 use crate::platform::geom::Rect;
 use crate::platform::grapheme;
@@ -1759,7 +1761,7 @@ fn push_tree_footer(
         col.button.y + (col.button.h - (m.ascent + m.descent)) / 2 + m.ascent,
         right,
         if hovered { FOREGROUND } else { TREE_TEXT_COLOR },
-        fit_label(face, TREE_FILTER_LABEL, (right - x).max(0)),
+        fit_label(face, TREE_FILTER_LABEL, (right - x).max(0)).into_owned(),
         m,
     ));
 }
@@ -1771,27 +1773,24 @@ pub(crate) fn top_bar_height(m: Metrics, scale: Scale) -> i32 {
     (m.line_height + 2 * scale.px(TAB_VPAD)).max(1)
 }
 
-/// One tab's geometry within a strip: its full pill, the close-glyph box inside
-/// it, and its label. The label is untrimmed; the painter scissors it to the space
-/// before the close box (a long name hard-cuts, no ellipsis). Shared by the painter
-/// and the pointer hit-testing so a click lands where the eye expects.
+/// One tab's geometry within a strip: its full pill and the close-glyph box inside
+/// it. Index-aligned with the strip's tabs, so the label is read from those; the
+/// painter scissors it to the space before the close box (a long name hard-cuts, no
+/// ellipsis). Shared by the painter and the pointer hit-testing so a click lands
+/// where the eye expects.
+#[derive(Clone, Copy)]
 pub(crate) struct TabHit {
     pub rect: Rect,
     pub close: Rect,
-    pub label: String,
 }
 
-/// The paint inputs for one pane's tab strip: where it sits and its tabs' labels,
-/// unsaved flags, active index, and what the pointer is over: a tab body
-/// (`hovered`), a tab's close glyph (`close_hover`), or the new-tab button
+/// The paint inputs for one pane's tab strip: where it sits, its tabs (label,
+/// unsaved flag, pinned flag), the active index, and what the pointer is over: a tab
+/// body (`hovered`), a tab's close glyph (`close_hover`), or the new-tab button
 /// (`new_hover`).
 pub(crate) struct TabStrip<'a> {
     pub rect: Rect,
-    pub labels: &'a [String],
-    pub dirty: &'a [bool],
-    /// Whether each tab is pinned, so it wears a pin badge in its close slot
-    /// instead of a close cross or an unsaved dot.
-    pub pinned: &'a [bool],
+    pub tabs: &'a [TabView<'a>],
     pub active: usize,
     pub hovered: Option<usize>,
     pub close_hover: Option<usize>,
@@ -1842,10 +1841,10 @@ impl TabLayout {
         strip.x + self.avail
     }
 
-    /// The width tab `i` takes, given which tabs are pinned: the compact pinned
-    /// width for a pinned tab, else the shared unpinned width.
-    fn width_of(&self, pinned: &[bool], i: usize) -> i32 {
-        if pinned.get(i).copied().unwrap_or(false) {
+    /// The width tab `i` takes: the compact pinned width for a pinned tab, else the
+    /// shared unpinned width.
+    fn width_of(&self, tabs: &[TabView], i: usize) -> i32 {
+        if tabs.get(i).is_some_and(|t| t.pinned) {
             self.pinned_w
         } else {
             self.unpinned_w
@@ -1855,23 +1854,23 @@ impl TabLayout {
     /// Tab `i`'s left offset from the strip's left (before scroll) and its width,
     /// summing the widths of the tabs before it. For the reveal that scrolls a tab
     /// into view, where the run is variable-width so a tab's slot is not `i * width`.
-    pub(crate) fn tab_span(&self, pinned: &[bool], i: usize) -> (i32, i32) {
-        let start = (0..i).map(|k| self.width_of(pinned, k)).sum();
-        (start, self.width_of(pinned, i))
+    pub(crate) fn tab_span(&self, tabs: &[TabView], i: usize) -> (i32, i32) {
+        let start = (0..i).map(|k| self.width_of(tabs, k)).sum();
+        (start, self.width_of(tabs, i))
     }
 }
 
-/// Lay the tabs of `strip` out from their `pinned` flags, reserving a lane at the
-/// right for the always-reachable new-tab button. Each pinned tab takes the fixed
-/// compact width; the unpinned tabs share what the pins leave, shrinking between the
-/// ceiling and the floor. Shared by the painter, the hit-testing, and the scroll
-/// clamp so all three agree on the widths and the scroll range.
-pub(crate) fn tab_layout(strip: Rect, pinned: &[bool], scale: Scale) -> TabLayout {
+/// Lay the tabs of `strip` out, reserving a lane at the right for the
+/// always-reachable new-tab button. Each pinned tab takes the fixed compact width;
+/// the unpinned tabs share what the pins leave, shrinking between the ceiling and
+/// the floor. Shared by the painter, the hit-testing, and the scroll clamp so all
+/// three agree on the widths and the scroll range.
+pub(crate) fn tab_layout(strip: Rect, tabs: &[TabView], scale: Scale) -> TabLayout {
     let new_lane = scale.px(TAB_CLOSE_GAP) + scale.px(TAB_NEW_W);
     let avail = (strip.w - new_lane).max(0);
     let pinned_w = scale.px(TAB_PINNED_W);
-    let pinned_count = pinned.iter().filter(|&&p| p).count() as i32;
-    let unpinned_count = pinned.len() as i32 - pinned_count;
+    let pinned_count = tabs.iter().filter(|t| t.pinned).count() as i32;
+    let unpinned_count = tabs.len() as i32 - pinned_count;
     let pinned_total = pinned_w * pinned_count;
     // The unpinned tabs share the space the pins leave; a strip that is all pins
     // has none to share, and its width goes unused.
@@ -1905,10 +1904,10 @@ pub(crate) fn new_tab_button_rect(strip: Rect, layout: TabLayout, scale: Scale) 
 }
 
 /// Truncate `label` with a trailing ellipsis until it fits `max_w` pixels in
-/// `face`; returns it unchanged when it already fits.
-fn fit_label(face: &Face, label: &str, max_w: i32) -> String {
+/// `face`; a label that already fits is borrowed through unchanged.
+fn fit_label<'a>(face: &Face, label: &'a str, max_w: i32) -> Cow<'a, str> {
     if shape::text_advance(face, label) as i32 <= max_w {
-        return label.to_string();
+        return Cow::Borrowed(label);
     }
     let ellipsis = '…';
     let budget = (max_w - shape::text_advance(face, "…") as i32).max(0);
@@ -1921,31 +1920,24 @@ fn fit_label(face: &Face, label: &str, max_w: i32) -> String {
         }
     }
     out.push(ellipsis);
-    out
+    Cow::Owned(out)
 }
 
 /// The tabs of one strip (see [`tab_layout`]), laid left to right from `strip.x`
 /// and shifted left by `scroll_x`. A pinned tab takes the compact width and the
 /// rest share theirs, so the run is variable-width and each tab starts where the
-/// one before it ends. The result stays index-aligned with `labels` and `pinned`:
-/// a tab scrolled out of view keeps its slot with an off-strip rect, so the painter
-/// and the hit-testing cull it by position against the viewport. Labels are carried
-/// untrimmed; the painter scissors them. Shared by both so a click lands where the
-/// eye expects.
-pub(crate) fn tab_rects(
-    strip: Rect,
-    labels: &[String],
-    pinned: &[bool],
-    scale: Scale,
-    scroll_x: i32,
-) -> Vec<TabHit> {
+/// one before it ends. The result stays index-aligned with `tabs`: a tab scrolled
+/// out of view keeps its slot with an off-strip rect, so the painter and the
+/// hit-testing cull it by position against the viewport. Shared by both so a click
+/// lands where the eye expects.
+pub(crate) fn tab_rects(strip: Rect, tabs: &[TabView], scale: Scale, scroll_x: i32) -> Vec<TabHit> {
     let pad = scale.px(TAB_PAD_X);
     let close = tab_close_side(scale);
-    let layout = tab_layout(strip, pinned, scale);
-    let mut out = Vec::with_capacity(labels.len());
+    let layout = tab_layout(strip, tabs, scale);
+    let mut out = Vec::with_capacity(tabs.len());
     let mut x = strip.x - scroll_x;
-    for (i, label) in labels.iter().enumerate() {
-        let w = layout.width_of(pinned, i);
+    for i in 0..tabs.len() {
+        let w = layout.width_of(tabs, i);
         let rect = Rect {
             x,
             y: strip.y,
@@ -1961,7 +1953,6 @@ pub(crate) fn tab_rects(
         out.push(TabHit {
             rect,
             close: close_rect,
-            label: label.clone(),
         });
         x += w;
     }
@@ -2081,7 +2072,7 @@ pub(crate) fn push_top_bar(
             baseline,
             right,
             FOREGROUND,
-            fitted,
+            fitted.into_owned(),
             m,
         ));
     }
@@ -2156,14 +2147,8 @@ fn push_pin_badge(list: &mut DisplayList, ctx: &BarCtx, box_: Rect, bright: bool
 /// is skipped.
 fn push_tab_strip(list: &mut DisplayList, ctx: &BarCtx, strip: &TabStrip) {
     let scale = ctx.scale;
-    let layout = tab_layout(strip.rect, strip.pinned, scale);
-    let tabs = tab_rects(
-        strip.rect,
-        strip.labels,
-        strip.pinned,
-        scale,
-        strip.scroll_x,
-    );
+    let layout = tab_layout(strip.rect, strip.tabs, scale);
+    let tabs = tab_rects(strip.rect, strip.tabs, scale, strip.scroll_x);
     let vpad = scale.px(TAB_VPAD);
     let divider = scale.px(1).max(1);
     let clip = [strip.rect.x, layout.viewport_right(strip.rect)];
@@ -2201,17 +2186,17 @@ fn push_tab_strip(list: &mut DisplayList, ctx: &BarCtx, strip: &TabStrip) {
                 });
             }
         }
-        let dirty = strip.dirty.get(i).copied().unwrap_or(false);
-        let pinned = strip.pinned.get(i).copied().unwrap_or(false);
+        let Some(view) = strip.tabs.get(i) else {
+            continue;
+        };
         push_tab_body(
             list,
             ctx,
             tab,
+            view,
             active,
             hovered,
             strip.close_hover == Some(i),
-            dirty,
-            pinned,
             clip,
         );
     }
@@ -2224,7 +2209,7 @@ fn push_tab_strip(list: &mut DisplayList, ctx: &BarCtx, strip: &TabStrip) {
     // The floating dragged tab, drawn last so it rides over its neighbors and the
     // + button. It follows the pointer, clamped to stay within the visible lane.
     if let Some(d) = &strip.drag {
-        if let Some(tab) = tabs.get(d.tab) {
+        if let (Some(tab), Some(view)) = (tabs.get(d.tab), strip.tabs.get(d.tab)) {
             let max_left = (clip[1] - tab.rect.w).max(strip.rect.x);
             let left = d.left.clamp(strip.rect.x, max_left);
             let dx = left - tab.rect.x;
@@ -2237,21 +2222,17 @@ fn push_tab_strip(list: &mut DisplayList, ctx: &BarCtx, strip: &TabStrip) {
                     x: tab.close.x + dx,
                     ..tab.close
                 },
-                label: tab.label.clone(),
             };
-            let dirty = strip.dirty.get(d.tab).copied().unwrap_or(false);
-            let pinned = strip.pinned.get(d.tab).copied().unwrap_or(false);
             // The float rides above the run, clipped to the whole strip so it is not
             // cut at the + lane it may overlap.
             push_tab_body(
                 list,
                 ctx,
                 &floated,
+                view,
                 true,
                 false,
                 false,
-                dirty,
-                pinned,
                 [strip.rect.x, strip.rect.x + strip.rect.w],
             );
         }
@@ -2272,11 +2253,10 @@ fn push_tab_body(
     list: &mut DisplayList,
     ctx: &BarCtx,
     tab: &TabHit,
+    view: &TabView,
     active: bool,
     hovered: bool,
     close_hover: bool,
-    dirty: bool,
-    pinned: bool,
     clip: [i32; 2],
 ) {
     let scale = ctx.scale;
@@ -2312,7 +2292,7 @@ fn push_tab_body(
             baseline,
             label_right,
             color,
-            tab.label.clone(),
+            view.label.to_string(),
             m,
         ),
         clip[0],
@@ -2323,7 +2303,7 @@ fn push_tab_body(
     // whenever the tab is pinned, standing where the close cross would so the click
     // there unpins rather than closes.
     let close_in = tab.close.x >= clip[0] && tab.close.x + tab.close.w <= clip[1];
-    if pinned {
+    if view.pinned {
         if close_in {
             push_pin_badge(list, ctx, tab.close, active || close_hover, close_hover);
         }
@@ -2331,7 +2311,7 @@ fn push_tab_body(
         if close_in {
             push_glyph_button(list, ctx, tab.close, "×", close_hover);
         }
-    } else if dirty && close_in {
+    } else if view.dirty && close_in {
         let dot = scale.px(7);
         list.push(DrawCmd::RoundRect {
             rect: Rect {
@@ -2360,7 +2340,21 @@ pub(crate) fn build_display_list(
     rope: &crate::rope::Rope,
     p: &PaintParams,
 ) -> DisplayList {
-    let mut painter = Painter::new(fonts, layout, rope, p);
+    let mut list = DisplayList::new();
+    build_display_list_into(&mut list, fonts, layout, rope, p);
+    list
+}
+
+/// [`build_display_list`] appending into `list`, so the window's frame is composed
+/// in one buffer instead of a Vec per pane that is then copied in.
+pub(crate) fn build_display_list_into(
+    list: &mut DisplayList,
+    fonts: &Fonts,
+    layout: &Layout,
+    rope: &crate::rope::Rope,
+    p: &PaintParams,
+) {
+    let mut painter = Painter::new(list, fonts, layout, rope, p);
     // Bottom-to-top stacking order. This sequence is also the damage-diff order,
     // so the passes must run in exactly this order; each is one method below.
     painter.background();
@@ -2389,7 +2383,6 @@ pub(crate) fn build_display_list(
         painter.find_ticks(find, p.content_height);
         painter.find_bar(find);
     }
-    painter.list
 }
 
 /// Accumulates one frame's display list from the layout and rope. The read-only
@@ -2403,7 +2396,7 @@ pub(crate) fn build_display_list(
 /// band and pins its chrome to `view`'s edges, and a pane that is not the top-left
 /// one lands where it looks.
 struct Painter<'a> {
-    list: DisplayList,
+    list: &'a mut DisplayList,
     fonts: &'a Fonts,
     layout: &'a Layout,
     rope: &'a crate::rope::Rope,
@@ -2423,16 +2416,17 @@ struct Painter<'a> {
 
 impl<'a> Painter<'a> {
     fn new(
+        list: &'a mut DisplayList,
         fonts: &'a Fonts,
         layout: &'a Layout,
         rope: &'a crate::rope::Rope,
         p: &PaintParams,
     ) -> Self {
+        // Roughly a few commands per visual line (panel, runs, decorations) plus the
+        // background and caret; reserving up front beats growing the list mid-build.
+        list.reserve(layout.lines().len() * 3 + 8);
         Self {
-            // Roughly a few commands per visual line (panel, runs, decorations)
-            // plus the background and caret; one upfront allocation beats growing
-            // the list mid-build.
-            list: Vec::with_capacity(layout.lines().len() * 3 + 8),
+            list,
             fonts,
             layout,
             rope,
@@ -2660,7 +2654,7 @@ impl<'a> Painter<'a> {
                     // and a corner toggle button: a rounded panel with a centered
                     // `</>` "source" glyph, the affordance to reveal its markdown.
                     if img.selected {
-                        push_image_chrome(&mut self.list, fonts, &pic, self.scale, self.body_size);
+                        push_image_chrome(self.list, fonts, &pic, self.scale, self.body_size);
                     }
                 }
                 continue;
@@ -2747,7 +2741,10 @@ impl<'a> Painter<'a> {
                 // rest (regular and emphasized prose) is FG.
                 let fk = face_key(line.size, run.kind, heading);
                 let face = fonts.face_for(fk);
-                let slice = rope.byte_slice(run.start..run.end);
+                // Borrowed while the run sits inside one rope leaf, which is the
+                // normal case, so a marker that is only measured and then replaced by
+                // its gutter decoration costs nothing.
+                let slice = rope.slice(run.start..run.end).as_cow();
                 // The block marker (the first run on a list/quote line) gives way to
                 // its gutter decoration: a filled disc for a list, nothing for a
                 // quote (the bar above replaces it). Either keeps the source width,
@@ -2795,7 +2792,7 @@ impl<'a> Painter<'a> {
                                     y: rect.y - scroll_y,
                                     ..rect
                                 };
-                                push_checkbox(&mut self.list, rect, checked, BACKGROUND);
+                                push_checkbox(self.list, rect, checked, BACKGROUND);
                             }
                             pen += advance;
                             continue;
@@ -2839,7 +2836,7 @@ impl<'a> Painter<'a> {
                 // still advances by the run's true width (subtract the shift back out).
                 let shift = backtick_reveal_shift(rope, runs, i, self.scale);
                 let run_x = pen + pad + shift;
-                let run_end = self.push_text(fk, run_x, baseline, color, slice, m);
+                let run_end = self.push_text(fk, run_x, baseline, color, slice.into_owned(), m);
                 pen = run_end + pad - shift;
                 // Inline decorations over the glyphs, each spanning the run's drawn
                 // width: a link is underlined and struck text gets a line through its
@@ -3052,7 +3049,7 @@ impl<'a> Painter<'a> {
     /// The scrollbar for this pane, floating in the right margin.
     fn scrollbar(&mut self, bar: &scroll::Scrollbar, content_height: i32) {
         push_scrollbar(
-            &mut self.list,
+            self.list,
             self.view,
             bar,
             content_height,
@@ -3064,13 +3061,13 @@ impl<'a> Painter<'a> {
 
     /// The match tick strip, riding the scrollbar's lane.
     fn find_ticks(&mut self, find: &FindPaint, content_height: i32) {
-        push_find_ticks(&mut self.list, find, self.view, content_height, self.scale);
+        push_find_ticks(self.list, find, self.view, content_height, self.scale);
     }
 
     /// The find bar panel, floating top-right over everything else.
     fn find_bar(&mut self, find: &FindPaint) {
         push_find_bar(
-            &mut self.list,
+            self.list,
             self.fonts,
             find,
             self.view,
@@ -4086,8 +4083,26 @@ mod tests {
                 w: 0,
                 h: 0,
             },
-            label: String::new(),
         }
+    }
+
+    /// Tab views from labels plus their unsaved and pinned flags, both padded with
+    /// false, for the strip painting and geometry tests.
+    fn views<'a>(labels: &[&'a str], dirty: &[bool], pinned: &[bool]) -> Vec<TabView<'a>> {
+        labels
+            .iter()
+            .enumerate()
+            .map(|(i, label)| TabView {
+                label,
+                dirty: dirty.get(i).copied().unwrap_or(false),
+                pinned: pinned.get(i).copied().unwrap_or(false),
+            })
+            .collect()
+    }
+
+    /// `n` unlabeled, unpinned tabs, for the tests that only measure widths.
+    fn plain_views(n: usize) -> Vec<TabView<'static>> {
+        views(&vec![""; n], &[], &[])
     }
 
     #[test]
@@ -4368,15 +4383,11 @@ mod tests {
             h: top,
         };
         // Two tabs, the second active, the first unsaved.
-        let labels = vec!["intro".to_string(), "todo".to_string()];
-        let dirty = vec![true, false];
-        let pinned = vec![false, false];
+        let tabs = views(&["intro", "todo"], &[true, false], &[]);
         let strips = [
             Some(TabStrip {
                 rect: strip_rect,
-                labels: &labels,
-                dirty: &dirty,
-                pinned: &pinned,
+                tabs: &tabs,
                 active: 1,
                 hovered: None,
                 close_hover: None,
@@ -4424,8 +4435,8 @@ mod tests {
         // The active tab (index 1) melts into the pane background over its whole
         // square box and shows a close glyph; the resting unsaved tab (index 0) shows
         // a dirty dot instead.
-        let tabs = tab_rects(strip_rect, &labels, &pinned, Scale::ONE, 0);
-        let active = tabs[1].rect;
+        let hits = tab_rects(strip_rect, &tabs, Scale::ONE, 0);
+        let active = hits[1].rect;
         assert!(
             list.iter().any(
                 |c| matches!(c, DrawCmd::Fill { rect, color } if *rect == active && *color == TAB_ACTIVE_BG)
@@ -4454,15 +4465,11 @@ mod tests {
         // Two tabs: the first pinned and unsaved, the second active. The pin owns the
         // slot, so the pinned tab shows no unsaved dot and no close cross even though
         // it is dirty, and the badge sits in its close box.
-        let labels = vec!["ref".to_string(), "todo".to_string()];
-        let dirty = vec![true, false];
-        let pinned = vec![true, false];
+        let tabs = views(&["ref", "todo"], &[true, false], &[true, false]);
         let strips = [
             Some(TabStrip {
                 rect: strip_rect,
-                labels: &labels,
-                dirty: &dirty,
-                pinned: &pinned,
+                tabs: &tabs,
                 active: 1,
                 hovered: None,
                 close_hover: None,
@@ -4476,7 +4483,7 @@ mod tests {
         let ctx = BarCtx::new(&fonts, Scale::ONE, FONT_SIZE);
         push_top_bar(&mut list, &ctx, strip_rect, None, strips, &[]);
 
-        let tabs = tab_rects(strip_rect, &labels, &pinned, Scale::ONE, 0);
+        let hits = tab_rects(strip_rect, &tabs, Scale::ONE, 0);
         let inside = |rect: &Rect, host: Rect| {
             rect.x >= host.x
                 && rect.y >= host.y
@@ -4486,7 +4493,7 @@ mod tests {
         // The pin badge lands inside the pinned tab's close box.
         assert!(
             list.iter()
-                .any(|c| matches!(c, DrawCmd::Pin { rect, .. } if inside(rect, tabs[0].close))),
+                .any(|c| matches!(c, DrawCmd::Pin { rect, .. } if inside(rect, hits[0].close))),
             "pin badge on the pinned tab"
         );
         // The pinned tab is dirty, but the pin owns the slot, so no dirty dot is drawn
@@ -4495,7 +4502,7 @@ mod tests {
             !list.iter().any(|c| matches!(
                 c,
                 DrawCmd::RoundRect { rect, color, .. }
-                    if *color == TAB_DIRTY_COLOR && inside(rect, tabs[0].close)
+                    if *color == TAB_DIRTY_COLOR && inside(rect, hits[0].close)
             )),
             "no dirty dot behind the pin badge"
         );
@@ -4517,7 +4524,7 @@ mod tests {
         };
         let avail = 800 - (TAB_CLOSE_GAP + TAB_NEW_W);
         // Few tabs: capped at the max width, leaving the rest of the lane empty.
-        let two = tab_layout(strip, &[false; 2], Scale::ONE);
+        let two = tab_layout(strip, &plain_views(2), Scale::ONE);
         assert_eq!(two.unpinned_w, TAB_MAX_W);
         assert_eq!(two.avail, avail);
         assert!(
@@ -4525,11 +4532,11 @@ mod tests {
             "two wide tabs do not fill the strip"
         );
         // Many tabs: an equal share strictly between the floor and the ceiling.
-        let six = tab_layout(strip, &[false; 6], Scale::ONE);
+        let six = tab_layout(strip, &plain_views(6), Scale::ONE);
         assert_eq!(six.unpinned_w, avail / 6);
         assert!(six.unpinned_w > TAB_MIN_W && six.unpinned_w < TAB_MAX_W);
         // Too many: pinned at the floor and overflowing, so the strip must scroll.
-        let many = tab_layout(strip, &[false; 20], Scale::ONE);
+        let many = tab_layout(strip, &plain_views(20), Scale::ONE);
         assert_eq!(many.unpinned_w, TAB_MIN_W);
         assert!(
             many.content > many.avail,
@@ -4547,14 +4554,14 @@ mod tests {
             w: 330, // avail = 330 - (TAB_CLOSE_GAP + TAB_NEW_W) = 300
             h: 30,
         };
-        let both_free = tab_layout(strip, &[false, false], Scale::ONE);
+        let both_free = tab_layout(strip, &plain_views(2), Scale::ONE);
         assert_eq!(
             both_free.unpinned_w, 150,
             "two unpinned split the lane evenly"
         );
         // Pin the first: it takes the fixed compact width, and the one unpinned tab
         // takes all the lane the pin left.
-        let one_pinned = tab_layout(strip, &[true, false], Scale::ONE);
+        let one_pinned = tab_layout(strip, &views(&["", ""], &[], &[true, false]), Scale::ONE);
         assert_eq!(one_pinned.pinned_w, TAB_PINNED_W);
         assert_eq!(one_pinned.unpinned_w, 300 - TAB_PINNED_W);
         assert!(
@@ -4563,8 +4570,12 @@ mod tests {
         );
         // The rects follow the widths: the compact pin sits first, the wide tab
         // begins where it ends.
-        let labels = vec!["ref".to_string(), "work".to_string()];
-        let tabs = tab_rects(strip, &labels, &[true, false], Scale::ONE, 0);
+        let tabs = tab_rects(
+            strip,
+            &views(&["ref", "work"], &[], &[true, false]),
+            Scale::ONE,
+            0,
+        );
         assert_eq!(tabs[0].rect.w, TAB_PINNED_W);
         assert_eq!(tabs[1].rect.w, 300 - TAB_PINNED_W);
         assert_eq!(tabs[0].rect.x, strip.x);
@@ -4579,18 +4590,17 @@ mod tests {
             w: 800,
             h: 30,
         };
-        let labels: Vec<String> = (0..20).map(|i| format!("note-{i}")).collect();
-        let pinned = vec![false; labels.len()];
-        let w = tab_layout(strip, &pinned, Scale::ONE).unpinned_w;
-        let unscrolled = tab_rects(strip, &labels, &pinned, Scale::ONE, 0);
+        let tabs = plain_views(20);
+        let w = tab_layout(strip, &tabs, Scale::ONE).unpinned_w;
+        let unscrolled = tab_rects(strip, &tabs, Scale::ONE, 0);
         // One rect per label (a slot is kept even for a tab scrolled out of view),
         // all the same width, laid end to end from the strip's left edge.
-        assert_eq!(unscrolled.len(), labels.len());
+        assert_eq!(unscrolled.len(), tabs.len());
         assert!(unscrolled.iter().all(|t| t.rect.w == w));
         assert_eq!(unscrolled[0].rect.x, strip.x);
         assert_eq!(unscrolled[3].rect.x, strip.x + 3 * w);
         // Scrolling shifts every tab left by the offset, keeping the slots aligned.
-        let scrolled = tab_rects(strip, &labels, &pinned, Scale::ONE, 50);
+        let scrolled = tab_rects(strip, &tabs, Scale::ONE, 50);
         assert!(unscrolled
             .iter()
             .zip(&scrolled)
@@ -4606,12 +4616,12 @@ mod tests {
             h: 30,
         };
         // Fitting: the + sits just past the last tab.
-        let few = tab_layout(strip, &[false; 2], Scale::ONE);
+        let few = tab_layout(strip, &plain_views(2), Scale::ONE);
         let plus = new_tab_button_rect(strip, few, Scale::ONE);
         assert_eq!(plus.x, strip.x + few.content + TAB_CLOSE_GAP);
         // Overflowing: the + pins to the right of the visible lane and stays inside
         // the strip, so it is always reachable.
-        let many = tab_layout(strip, &[false; 20], Scale::ONE);
+        let many = tab_layout(strip, &plain_views(20), Scale::ONE);
         let plus = new_tab_button_rect(strip, many, Scale::ONE);
         assert_eq!(plus.x, strip.x + many.avail + TAB_CLOSE_GAP);
         assert!(plus.x + plus.w <= strip.x + strip.w);
@@ -4627,16 +4637,14 @@ mod tests {
             w: 700,
             h: top,
         };
-        let labels: Vec<String> = (0..20).map(|i| format!("note-{i}")).collect();
-        let dirty = vec![false; labels.len()];
-        let pinned = vec![false; labels.len()];
-        let layout = tab_layout(strip_rect, &pinned, Scale::ONE);
+        let names: Vec<String> = (0..20).map(|i| format!("note-{i}")).collect();
+        let labels: Vec<&str> = names.iter().map(String::as_str).collect();
+        let tabs = views(&labels, &[], &[]);
+        let layout = tab_layout(strip_rect, &tabs, Scale::ONE);
         let strips = [
             Some(TabStrip {
                 rect: strip_rect,
-                labels: &labels,
-                dirty: &dirty,
-                pinned: &pinned,
+                tabs: &tabs,
                 active: 0,
                 hovered: None,
                 close_hover: None,

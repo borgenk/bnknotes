@@ -24,12 +24,55 @@ pub enum Arg<'a> {
     },
 }
 
+/// How many argument bytes a message keeps inline. Every event on the input path
+/// is smaller (pointer motion is 12 bytes, a key 16), so the events that arrive by
+/// the hundred per second never reach the heap; the rare larger one (an interface
+/// string at startup, a keymap, a configure carrying states) spills.
+const INLINE_BODY: usize = 32;
+
+/// The argument bytes of a received event, owned so the connection buffer can
+/// advance independently.
+enum Body {
+    Inline { len: u8, bytes: [u8; INLINE_BODY] },
+    Heap(Vec<u8>),
+}
+
 /// A fully received event: its target object, opcode, and the argument bytes
-/// after the header. Owned so the connection buffer can advance independently.
+/// after the header.
 pub struct Message {
     pub object: u32,
     pub opcode: u16,
-    pub body: Vec<u8>,
+    body: Body,
+}
+
+impl Message {
+    /// Take a copy of `body`, inline when it fits.
+    pub fn new(object: u32, opcode: u16, body: &[u8]) -> Message {
+        let body = match body.len() <= INLINE_BODY {
+            true => {
+                let mut bytes = [0u8; INLINE_BODY];
+                bytes[..body.len()].copy_from_slice(body);
+                Body::Inline {
+                    len: body.len() as u8,
+                    bytes,
+                }
+            }
+            false => Body::Heap(body.to_vec()),
+        };
+        Message {
+            object,
+            opcode,
+            body,
+        }
+    }
+
+    /// The argument bytes after the header, to read arguments from.
+    pub fn body(&self) -> &[u8] {
+        match &self.body {
+            Body::Inline { len, bytes } => &bytes[..*len as usize],
+            Body::Heap(bytes) => bytes,
+        }
+    }
 }
 
 /// Append an encoded request to `buf`.
@@ -142,6 +185,46 @@ impl<'a> Reader<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_small_body_rides_inline_and_reads_back_whole() {
+        // Every hot event (pointer motion, a key, a frame callback) is this shape.
+        let body: Vec<u8> = (0..16).collect();
+        let msg = Message::new(3, 2, &body);
+        assert!(
+            matches!(msg.body, Body::Inline { .. }),
+            "a 16-byte body must not reach the heap"
+        );
+        assert_eq!(msg.body(), &body[..]);
+        assert_eq!((msg.object, msg.opcode), (3, 2));
+    }
+
+    #[test]
+    fn a_body_at_the_inline_bound_still_rides_inline() {
+        let body = vec![0xab; INLINE_BODY];
+        let msg = Message::new(1, 0, &body);
+        assert!(matches!(msg.body, Body::Inline { .. }), "the bound fits");
+        assert_eq!(msg.body(), &body[..]);
+    }
+
+    #[test]
+    fn an_oversized_body_spills_to_the_heap_and_reads_back_whole() {
+        // A registry global's interface string, or a keymap: rare, and startup-only.
+        let body: Vec<u8> = (0..INLINE_BODY as u32 * 3).map(|i| i as u8).collect();
+        let msg = Message::new(2, 0, &body);
+        assert!(
+            matches!(msg.body, Body::Heap(_)),
+            "past the bound the body spills"
+        );
+        assert_eq!(msg.body(), &body[..]);
+    }
+
+    #[test]
+    fn an_empty_body_reads_back_empty() {
+        // wl_callback.done carries only its header.
+        let msg = Message::new(9, 0, &[]);
+        assert!(msg.body().is_empty());
+    }
 
     #[test]
     fn header_carries_size_and_opcode() {

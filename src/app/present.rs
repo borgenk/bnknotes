@@ -110,6 +110,9 @@ pub(super) struct GpuPresentation {
     pub(super) images: Vec<vulkan::GpuImage>,
     pub(super) modifiers: Vec<u64>,
     pub(super) glyphs: gpu::GlyphCache,
+    /// The frame the batcher fills, kept across frames so its vertex and batch
+    /// buffers are refilled rather than reallocated every present.
+    pub(super) frame: gpu::FrameData,
     pub(super) syncobj_manager: Option<u32>,
     pub(super) explicit_sync: Option<ExplicitSync>,
     pub(super) buffers: [u32; 2],
@@ -133,6 +136,7 @@ impl GpuPresentation {
             images: Vec::new(),
             modifiers: Vec::new(),
             glyphs: gpu::GlyphCache::new(),
+            frame: gpu::FrameData::default(),
             syncobj_manager: None,
             explicit_sync: None,
             buffers: [0, 0],
@@ -485,27 +489,31 @@ impl State {
                 return Err(Error::msg("gpu frame without gpu buffers"));
             };
             let known = |key: &gpu::ImageKey| gpu.has_image(key);
-            let frame = gpu::build_frame(
+            // Built into the frame buffer the presentation keeps, so the vertices and
+            // batches reuse last frame's capacity rather than regrowing from zero.
+            let frame = &mut self.presentation.frame;
+            gpu::build_frame(
                 &self.fonts,
                 &images,
                 &new_list,
                 &mut self.presentation.glyphs,
                 &known,
                 self.code_glyph_gamma,
+                frame,
             );
             match self.presentation.explicit_sync.as_ref() {
                 Some(es) => {
                     let release_wait = es.release_fence(idx)?;
                     gpu.render_list_explicit(
                         img,
-                        &frame,
+                        frame,
                         color_f32(BACKGROUND),
                         glyph_gamma,
                         release_wait,
                     )?
                 }
                 None => {
-                    gpu.render_list(img, &frame, color_f32(BACKGROUND), glyph_gamma)?;
+                    gpu.render_list(img, frame, color_f32(BACKGROUND), glyph_gamma)?;
                     None
                 }
             }

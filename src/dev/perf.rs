@@ -283,14 +283,18 @@ fn measure() -> Result<Vec<Sample>> {
     // This runs even without a GPU, so the harness can hold it; the GPU-side
     // frame time is only observable via BNKNOTES_STATS on a live run.
     let mut glyph_cache = crate::render::gpu::GlyphCache::new();
+    // One frame buffer across the runs, as the app keeps one across presents, so the
+    // steady state this measures is the pooled one.
+    let mut gpu_frame = crate::render::gpu::FrameData::default();
     // Warm the atlases so the steady state (no uploads) is what is measured.
-    let _ = crate::render::gpu::build_frame(
+    crate::render::gpu::build_frame(
         &fonts,
         &[&images],
         &frame_list,
         &mut glyph_cache,
         &|_| true,
         1.0,
+        &mut gpu_frame,
     );
     out.push(sample("gpu_batch_frame", 500, || {
         crate::render::gpu::build_frame(
@@ -300,9 +304,9 @@ fn measure() -> Result<Vec<Sample>> {
             &mut glyph_cache,
             &|_| true,
             1.0,
-        )
-        .vertices
-        .len()
+            &mut gpu_frame,
+        );
+        gpu_frame.vertices.len()
     }));
 
     // Image resampling: the area/bilinear pass that scales a source bitmap to a
@@ -343,9 +347,9 @@ fn measure() -> Result<Vec<Sample>> {
             &mut glyph_cache,
             &|_| false,
             1.0,
-        )
-        .image_uploads
-        .len()
+            &mut gpu_frame,
+        );
+        gpu_frame.image_uploads.len()
     }));
 
     Ok(out)
@@ -640,13 +644,14 @@ pub fn run_lab(args: &[String]) -> Result<()> {
         let warm = Layout::build(&fonts, &rope, MARGIN, MARGIN, wrap, FONT_SIZE, (0, 0));
         let frame = build_display_list(&fonts, &warm, &rope, &params(0, None));
         let mut glyphs = crate::render::gpu::GlyphCache::new();
-        let _ = crate::render::gpu::build_frame(
+        crate::render::gpu::build_frame(
             &fonts,
             &[&images],
             &frame,
             &mut glyphs,
             &|_| true,
             1.0,
+            &mut crate::render::gpu::FrameData::default(),
         );
 
         // Windowed layout + incremental index: the per-cursor-move and per-keystroke

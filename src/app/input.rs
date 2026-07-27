@@ -21,9 +21,6 @@ use crate::platform::wire::{Arg, Reader};
 use crate::text::SOFT_TAB;
 use crate::theme::{DRAG_THRESHOLD, SCROLL_MIN_THUMB, TREE_PAD};
 
-/// How long the caret stays shown, then hidden, while idle. Activity resets it
-/// to shown, so it never blinks out mid-keystroke.
-const CARET_BLINK: Duration = Duration::from_millis(500);
 /// Pixels scrolled per unit of wl_pointer.axis value (wheel/touchpad). One wheel
 /// detent is ~15 axis units, so this lands a notch at roughly three body lines.
 const SCROLL_FACTOR: f32 = 4.0;
@@ -266,8 +263,7 @@ impl State {
                 // Lost keyboard focus: hide the caret, stop blinking, and let the
                 // loop go idle (no 500ms blink wake-ups while unfocused).
                 self.focused = false;
-                self.caret_visible = false;
-                self.caret_blink_at = None;
+                self.caret.hide();
                 self.dirty = true;
                 // Turning to another window is the user done with this one for now,
                 // so it does not wait out the idle window: what they typed is on
@@ -290,6 +286,9 @@ impl State {
         if crossed {
             self.editors[i].request_caret_snap();
         }
+        // A pane taking focus starts a fresh blink run, so the caret that was resting
+        // solid (or blinking somewhere else) marks the insertion point here.
+        self.bump_caret();
         self.refresh_title();
         self.dirty = true;
     }
@@ -1040,17 +1039,16 @@ impl State {
             if !strip.contains(px, py) {
                 continue;
             }
-            let labels = self.editors[g].tab_names();
-            let pinned = self.editors[g].tab_pinned();
+            let views: Vec<_> = self.editors[g].tab_views().collect();
             let scale = self.scale();
-            let layout = crate::paint::tab_layout(strip, &pinned, scale);
+            let layout = crate::paint::tab_layout(strip, &views, scale);
             // The pinned + button wins over any tab scrolled beneath it, so it is
             // tested first; tabs count only within the viewport lane the run is
             // clipped to, matching what the painter draws.
             if crate::paint::new_tab_button_rect(strip, layout, scale).contains(px, py) {
                 return Hit::NewTab(g);
             }
-            let tabs = crate::paint::tab_rects(strip, &labels, &pinned, scale, self.tab_scroll[g]);
+            let tabs = crate::paint::tab_rects(strip, &views, scale, self.tab_scroll[g]);
             if (px as i32) < layout.viewport_right(strip) {
                 for (i, tab) in tabs.iter().enumerate() {
                     if tab.rect.contains(px, py) {
@@ -1828,10 +1826,8 @@ impl State {
     /// painter lays them out, so a drag reorders against exactly what is drawn.
     fn tab_strip_rects(&self, g: usize) -> Option<(Rect, Vec<crate::paint::TabHit>)> {
         let strip = self.columns().tab_strips[g]?;
-        let labels = self.editors[g].tab_names();
-        let pinned = self.editors[g].tab_pinned();
-        let tabs =
-            crate::paint::tab_rects(strip, &labels, &pinned, self.scale(), self.tab_scroll[g]);
+        let views: Vec<_> = self.editors[g].tab_views().collect();
+        let tabs = crate::paint::tab_rects(strip, &views, self.scale(), self.tab_scroll[g]);
         Some((strip, tabs))
     }
 
@@ -1841,8 +1837,8 @@ impl State {
         let Some(strip) = self.columns().tab_strips[g] else {
             return;
         };
-        let pinned = self.editors[g].tab_pinned();
-        let layout = crate::paint::tab_layout(strip, &pinned, self.scale());
+        let views: Vec<_> = self.editors[g].tab_views().collect();
+        let layout = crate::paint::tab_layout(strip, &views, self.scale());
         let want = scroll::clamp(self.tab_scroll[g] + delta, layout.content, layout.avail);
         if want != self.tab_scroll[g] {
             self.tab_scroll[g] = want;
@@ -2043,39 +2039,24 @@ impl State {
 
     // --- Caret blink ------------------------------------------------------
 
-    /// Toggle the caret if its blink interval has elapsed, requesting a redraw.
-    /// The first call just arms the timer.
+    /// Advance the caret's blink clock, requesting a redraw when the caret changed
+    /// visibility.
     pub(super) fn fire_caret_blink(&mut self) {
-        // An unfocused window shows no caret and arms no blink timer, so it never
-        // wakes the loop just to toggle a caret nobody is looking at.
-        if !self.focused {
+        // Nothing draws a caret right now: an unfocused window, focus on the tree or
+        // a diff tab, or a cursor scrolled out of the painted band. Rest the clock
+        // rather than toggle a caret nobody sees, or every toggle would rebuild a
+        // frame that comes out identical.
+        let Some(in_flight) = self.drawable_caret_anim().map(CaretAnim::in_flight) else {
+            self.caret.rest();
             return;
-        }
-        let now = Instant::now();
-        // A caret still easing toward its target must not blink out mid-motion: hold
-        // it shown and defer the next toggle until it settles. Covers slow rates and
-        // a target that keeps moving while the user types.
-        if self.drawable_caret_anim().is_some_and(CaretAnim::in_flight) {
-            self.caret_visible = true;
-            self.caret_blink_at = Some(now + CARET_BLINK);
-            return;
-        }
-        match self.caret_blink_at {
-            None => self.caret_blink_at = Some(now + CARET_BLINK),
-            Some(at) if at <= now => {
-                self.caret_visible = !self.caret_visible;
-                self.caret_blink_at = Some(now + CARET_BLINK);
-                self.dirty = true;
-            }
-            Some(_) => {}
-        }
+        };
+        self.dirty |= self.caret.tick(Instant::now(), in_flight);
     }
 
-    /// Show the caret and restart its blink cycle, called on any activity that
+    /// Show the caret and restart its blink run, called on any activity that
     /// moves the caret, so it never blinks out mid-edit.
     pub(super) fn bump_caret(&mut self) {
-        self.caret_visible = true;
-        self.caret_blink_at = Some(Instant::now() + CARET_BLINK);
+        self.caret.bump(Instant::now());
     }
 
     // --- Key repeat -------------------------------------------------------

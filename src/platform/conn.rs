@@ -214,13 +214,9 @@ impl Connection {
         if buf.len() < size {
             return Ok(None);
         }
-        let body = buf[8..size].to_vec();
+        let message = Message::new(object, opcode, &buf[8..size]);
         self.in_pos += size;
-        Ok(Some(Message {
-            object,
-            opcode,
-            body,
-        }))
+        Ok(Some(message))
     }
 
     /// Discard the already-consumed prefix of the input buffer in a single shift.

@@ -35,15 +35,15 @@ use crate::config::{self, vault_name, CaretConfig, Config, IconKeys, Vault, Vaul
 use crate::icon;
 use crate::menu::{Menu, MenuAction, MenuItem};
 use crate::paint::{
-    build_display_list, build_find_paint, conflict_banner_layout, diff_columns, font_sizes,
+    build_display_list_into, build_find_paint, conflict_banner_layout, diff_columns, font_sizes,
     measure_tree, push_ai_preview, push_conflict_banner, push_diff_view, push_image_view,
     push_menu, push_palette, push_rail, push_splitter, push_top_bar, push_tree, top_bar_height,
     tree_metrics, BarCtx, CaretPaint, PaintParams, RailDragView, RailView, TabStrip,
 };
 use crate::palette::{Palette, PaletteAction, PaletteRow, Rows};
 use crate::pane::{
-    restore_group, CaretAnim, CaretFrame, Columns, Focus, Hit, PaneGroup, PaneLayout, Saved,
-    TreePane,
+    restore_group, CaretAnim, CaretBlink, CaretFrame, Columns, Focus, Hit, PaneGroup, PaneLayout,
+    Saved, TreePane,
 };
 use crate::platform::conn::{Connection, Fill};
 use crate::platform::error::{Error, Result};
@@ -423,6 +423,9 @@ struct State {
     drag_tab: Option<TabDrag>,
     /// The toplevel title last sent, so it is only re-set when it changes.
     title: String,
+    /// Where the next title is formatted before the compare, so the check that runs
+    /// after every edit costs no allocation on the common path (unchanged).
+    title_scratch: String,
 
     /// Current surface size in device pixels (the buffer size). The logical window
     /// the compositor sees lives in `scaling.logical`; at scale 1.0 the two match.
@@ -471,11 +474,11 @@ struct State {
     // the per-editor drag/selection transients live on `EditorPane`.
     pointer_x: f32,
     pointer_y: f32,
-    /// Caret blink: whether the caret is currently shown, and when it next
-    /// toggles. Activity (`bump_caret`) resets it to shown. Applies to the
-    /// focused editor's caret; other panes draw a dimmed, static caret.
-    caret_visible: bool,
-    caret_blink_at: Option<Instant>,
+    /// The caret's blink clock: whether it shows this frame, when it next toggles,
+    /// and how much of its run is left. Activity (`bump_caret`) resets it to shown
+    /// and restarts the run. Applies to the focused editor's caret; other panes draw
+    /// a dimmed, static caret.
+    caret: CaretBlink,
     /// Whether the last input that moved the caret came from the pointer. The smear
     /// is a keyboard-navigation affordance, so a pointer-driven move (click, drag)
     /// snaps instead of easing. Set false by any keyboard action and true when the
@@ -956,6 +959,7 @@ impl State {
             drag_scroll: None,
             drag_tab: None,
             title: String::new(),
+            title_scratch: String::new(),
             width: session.window.0,
             height: session.window.1,
             scaling: Scaling::new(session.window),
@@ -980,8 +984,7 @@ impl State {
             cursor_shape: 0,
             pointer_x: 0.0,
             pointer_y: 0.0,
-            caret_visible: true,
-            caret_blink_at: None,
+            caret: CaretBlink::new(),
             autosave_at: None,
             caret_from_pointer: false,
             focused: false,
@@ -1081,12 +1084,12 @@ impl State {
             };
             let count = self.editors[g].tab_count();
             let active = self.editors[g].active_index();
-            let pinned = self.editors[g].tab_pinned();
-            let layout = crate::paint::tab_layout(strip, &pinned, scale);
+            let tabs: Vec<_> = self.editors[g].tab_views().collect();
+            let layout = crate::paint::tab_layout(strip, &tabs, scale);
             if self.tab_anchor[g] != (active, count) {
                 // The run is variable-width, so the active tab's slot is the sum of
                 // the widths before it, not `active * width`.
-                let (start, size) = layout.tab_span(&pinned, active);
+                let (start, size) = layout.tab_span(&tabs, active);
                 self.tab_scroll[g] = scroll::reveal(
                     self.tab_scroll[g],
                     start,
@@ -2245,7 +2248,10 @@ impl State {
         let chip_side = crate::paint::rail_chip_side(cols.rail_chips, self.scale());
         self.sync_icons(chip_side);
         let now = Instant::now();
-        let mut list: DisplayList = Vec::new();
+        // The frame before this one is the best estimate of this one's size, so the
+        // whole window composes into a single allocation that stops growing after the
+        // first few frames.
+        let mut list: DisplayList = Vec::with_capacity(self.presentation.present_list.len());
         push_rail(
             &mut list,
             &BarCtx::new(&self.fonts, self.scale(), self.body_size),
@@ -2295,14 +2301,16 @@ impl State {
             if self.editors[i].active_is_diff() {
                 let (scale, body_size) = (self.scale(), self.body_size);
                 let dc = diff_columns(rect, scale, body_size, &self.fonts);
-                let content_h = {
-                    let dv = self.editors[i].active_diff_mut().expect("active diff");
-                    dv.ensure_layouts(&self.fonts, &dc, scale, body_size);
-                    dv.scroll_y = scroll::clamp(dv.scroll_y, dv.content_height(), rect.h);
-                    dv.content_height()
+                let Some(dv) = self.editors[i].active_diff_mut() else {
+                    continue;
                 };
+                dv.ensure_layouts(&self.fonts, &dc, scale, body_size);
+                dv.scroll_y = scroll::clamp(dv.scroll_y, dv.content_height(), rect.h);
+                let content_h = dv.content_height();
                 tick_scrollbar(&mut self.editors[i].scrollbar, content_h, rect.h, now);
-                let dv = self.editors[i].active_diff().expect("active diff");
+                let Some(dv) = self.editors[i].active_diff() else {
+                    continue;
+                };
                 push_diff_view(
                     &mut list,
                     &self.fonts,
@@ -2365,12 +2373,7 @@ impl State {
                 diff: None,
             };
             if let Some(layout) = ed.layout_cache.as_ref() {
-                list.append(&mut build_display_list(
-                    &self.fonts,
-                    layout,
-                    ed.text.rope(),
-                    &params,
-                ));
+                build_display_list_into(&mut list, &self.fonts, layout, ed.text.rope(), &params);
             }
             // The disk-conflict banner floats over the pane's top edge, so it goes
             // after the content. Only the active tab's conflict is shown here.
@@ -2393,15 +2396,14 @@ impl State {
         let top = self.top_bar_h();
         if top > 0 {
             let bar = cols.bar;
-            let labels = [self.editors[0].tab_names(), self.editors[1].tab_names()];
-            let dirty = [self.editors[0].tab_dirty(), self.editors[1].tab_dirty()];
-            let pinned = [self.editors[0].tab_pinned(), self.editors[1].tab_pinned()];
+            let views = [
+                self.editors[0].tab_views().collect::<Vec<_>>(),
+                self.editors[1].tab_views().collect::<Vec<_>>(),
+            ];
             let strip = |g: usize| {
                 cols.tab_strips[g].map(|rect| TabStrip {
                     rect,
-                    labels: &labels[g],
-                    dirty: &dirty[g],
-                    pinned: &pinned[g],
+                    tabs: &views[g],
                     active: self.editors[g].active_index(),
                     hovered: self.hovered_tab.and_then(|h| h.tab_in(g)),
                     close_hover: self.hovered_tab.and_then(|h| h.close_in(g)),
@@ -2488,7 +2490,7 @@ impl State {
         let scale = self.scale();
         let body_size = self.body_size;
         let config = self.caret_config;
-        let visible = self.caret_visible;
+        let visible = self.caret.visible();
         let from_pointer = self.caret_from_pointer;
         let fonts = &self.fonts;
         let ed = &mut self.editors[i];
@@ -2607,7 +2609,7 @@ impl State {
     }
 
     fn handle(&mut self, msg: Message) -> Result<()> {
-        let mut r = Reader::new(&msg.body);
+        let mut r = Reader::new(msg.body());
 
         if msg.object == protocol::WL_DISPLAY {
             match msg.opcode {
@@ -2973,35 +2975,49 @@ impl State {
         }
     }
 
-    /// The toplevel title: the focused editor's file name (or just the app name
-    /// for an unnamed buffer), with a leading dot when it has unsaved changes.
-    fn window_title(&self) -> String {
+    /// Write the toplevel title into the scratch buffer: the focused editor's file
+    /// name (or just the app name for an unnamed buffer), with a leading dot when it
+    /// has unsaved changes. Formatting into a buffer the state keeps means the
+    /// per-keystroke refresh below compares without allocating.
+    fn write_window_title(&mut self) {
+        use std::fmt::Write as _;
         let pane = &self.editors[self.active_editor()];
-        if !pane.has_tabs() {
-            return "bnknotes".to_string();
+        let mut title = std::mem::take(&mut self.title_scratch);
+        title.clear();
+        if pane.has_tabs() {
+            if pane.text.is_modified() {
+                title.push_str("• ");
+            }
+            match pane.path.as_ref().and_then(|p| p.file_name()) {
+                Some(name) => {
+                    let _ = write!(title, "{} - bnknotes", name.to_string_lossy());
+                }
+                None => title.push_str("bnknotes"),
+            }
+        } else {
+            title.push_str("bnknotes");
         }
-        let modified = if pane.text.is_modified() { "• " } else { "" };
-        match pane.path.as_ref().and_then(|p| p.file_name()) {
-            Some(name) => format!("{modified}{} - bnknotes", name.to_string_lossy()),
-            None => format!("{modified}bnknotes"),
-        }
+        self.title_scratch = title;
     }
 
     /// Send the toplevel title only if it changed, so the modified indicator and
     /// filename stay current without re-setting an identical string each frame.
     /// The title tracks the active pane, its file, and its modified flag, so every
-    /// focus change routes through `focus_pane` to call this; the `desired`
-    /// compare then dedupes the protocol request on the unchanged common path.
+    /// focus change routes through `focus_pane` to call this; the compare then
+    /// dedupes the protocol request on the unchanged common path.
     fn refresh_title(&mut self) {
-        let desired = self.window_title();
-        if desired != self.title {
-            self.conn.request(
-                self.toplevel,
-                xdg_toplevel::SET_TITLE,
-                &[Arg::Str(&desired)],
-            );
-            self.title = desired;
+        self.write_window_title();
+        if self.title_scratch == self.title {
+            return;
         }
+        self.conn.request(
+            self.toplevel,
+            xdg_toplevel::SET_TITLE,
+            &[Arg::Str(&self.title_scratch)],
+        );
+        // The two buffers trade places, so the old title becomes next call's scratch
+        // and neither is reallocated.
+        std::mem::swap(&mut self.title, &mut self.title_scratch);
     }
 
     /// How long to block for input: the soonest of the next key-repeat, the next
@@ -3024,7 +3040,7 @@ impl State {
         // leave a past deadline that spins the loop.
         let caret = self
             .focused
-            .then_some(self.caret_blink_at)
+            .then(|| self.caret.wake_at())
             .flatten()
             .map(until);
         // A caret still easing needs a follow-up tick, but only when no compositor

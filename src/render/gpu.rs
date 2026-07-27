@@ -76,7 +76,10 @@ pub struct AtlasUpload {
     pub bytes: Vec<u8>,
 }
 
-/// Everything the Vulkan renderer needs to draw one frame.
+/// Everything the Vulkan renderer needs to draw one frame. Owned across frames by
+/// the presentation and refilled by [`build_frame`], so a steady-state frame reuses
+/// the vertex and batch capacity it grew instead of regrowing it from zero.
+#[derive(Default)]
 pub struct FrameData {
     pub vertices: Vec<Vertex>,
     pub batches: Vec<Batch>,
@@ -91,7 +94,16 @@ pub struct FrameData {
     pub image_uploads: Vec<(ImageKey, Vec<u32>)>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+impl FrameData {
+    /// Empty the per-frame buffers, keeping their capacity for the refill.
+    fn clear(&mut self) {
+        self.vertices.clear();
+        self.batches.clear();
+        self.image_uploads.clear();
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct AtlasInfo {
     pub width: u32,
     pub height: u32,
@@ -313,11 +325,12 @@ impl GlyphCache {
     }
 }
 
-/// Build one frame's GPU data from the display list. `known_images` is the
-/// set of image textures the renderer already holds; missing ones get their
-/// bitmaps attached to the result. Restarts internally if an atlas grows
-/// mid-build, so the returned vertices always reference current atlas
-/// coordinates.
+/// Build one frame's GPU data from the display list into `out`, whose buffers are
+/// cleared and refilled (the caller keeps it across frames, so a steady-state frame
+/// allocates nothing). `known_images` is the set of image textures the renderer
+/// already holds; missing ones get their bitmaps attached to the result. Restarts
+/// internally if an atlas grows mid-build, so the vertices always reference current
+/// atlas coordinates.
 pub fn build_frame(
     fonts: &Fonts,
     stores: &[&ImageStore],
@@ -325,24 +338,27 @@ pub fn build_frame(
     cache: &mut GlyphCache,
     known_images: &dyn Fn(&ImageKey) -> bool,
     code_glyph_gamma: f32,
-) -> FrameData {
+    out: &mut FrameData,
+) {
     loop {
         let glyphs_gen = cache.glyphs.generation;
         let emoji_gen = cache.emoji.generation;
-        let mut b = Batcher {
-            fonts,
-            stores,
-            cache,
-            vertices: Vec::new(),
-            batches: Vec::new(),
-            image_uploads: Vec::new(),
-            known_images,
-            code_glyph_gamma,
-        };
-        for cmd in list {
-            b.command(cmd);
+        out.clear();
+        {
+            let mut b = Batcher {
+                fonts,
+                stores,
+                cache,
+                vertices: &mut out.vertices,
+                batches: &mut out.batches,
+                image_uploads: &mut out.image_uploads,
+                known_images,
+                code_glyph_gamma,
+            };
+            for cmd in list {
+                b.command(cmd);
+            }
         }
-        let (vertices, batches, image_uploads) = (b.vertices, b.batches, b.image_uploads);
         // An atlas grew (and wiped) during the build: earlier quads reference
         // dead coordinates. Clear the stale slot records and rebuild; the
         // second pass fits by construction (or skips at the cap).
@@ -350,15 +366,11 @@ pub fn build_frame(
             cache.reset_for(glyphs_gen, emoji_gen);
             continue;
         }
-        return FrameData {
-            vertices,
-            batches,
-            glyph_atlas: cache.glyphs.info(),
-            emoji_atlas: cache.emoji.info(),
-            glyph_upload: cache.glyphs.take_upload(),
-            emoji_upload: cache.emoji.take_upload(),
-            image_uploads,
-        };
+        out.glyph_atlas = cache.glyphs.info();
+        out.emoji_atlas = cache.emoji.info();
+        out.glyph_upload = cache.glyphs.take_upload();
+        out.emoji_upload = cache.emoji.take_upload();
+        return;
     }
 }
 
@@ -366,9 +378,9 @@ struct Batcher<'a> {
     fonts: &'a Fonts,
     stores: &'a [&'a ImageStore],
     cache: &'a mut GlyphCache,
-    vertices: Vec<Vertex>,
-    batches: Vec<Batch>,
-    image_uploads: Vec<(ImageKey, Vec<u32>)>,
+    vertices: &'a mut Vec<Vertex>,
+    batches: &'a mut Vec<Batch>,
+    image_uploads: &'a mut Vec<(ImageKey, Vec<u32>)>,
     known_images: &'a dyn Fn(&ImageKey) -> bool,
     /// Per-glyph mask gamma for code runs, baked into the vertex `extra.x` so the
     /// shader thins them less than the prose gamma it carries as a push constant.
@@ -779,6 +791,29 @@ fn color_f32(color: u32) -> [f32; 4] {
 mod tests {
     use super::*;
 
+    /// Build one frame into a fresh buffer. The app keeps one across frames; a test
+    /// wants each build on its own, so this hands back what it produced.
+    fn built(
+        fonts: &Fonts,
+        stores: &[&ImageStore],
+        list: &[DrawCmd],
+        cache: &mut GlyphCache,
+        known_images: &dyn Fn(&ImageKey) -> bool,
+        code_glyph_gamma: f32,
+    ) -> FrameData {
+        let mut out = FrameData::default();
+        build_frame(
+            fonts,
+            stores,
+            list,
+            cache,
+            known_images,
+            code_glyph_gamma,
+            &mut out,
+        );
+        out
+    }
+
     #[test]
     fn atlas_packs_onto_shelves_and_tracks_dirty() {
         let mut a = Atlas::new(1);
@@ -822,7 +857,7 @@ mod tests {
             },
             color: 0x00ff_0000,
         }];
-        let f = build_frame(&fonts, &[&images], &list, &mut cache, &|_| false, 1.0);
+        let f = built(&fonts, &[&images], &list, &mut cache, &|_| false, 1.0);
         assert_eq!(f.vertices.len(), 6);
         assert_eq!(f.batches.len(), 1);
         assert_eq!(
@@ -868,7 +903,7 @@ mod tests {
             }),
             text(FaceKey::Code { size: 16 }),
         ];
-        let f = build_frame(
+        let f = built(
             &fonts,
             &[&images],
             &list,
@@ -912,14 +947,14 @@ mod tests {
             text: "abcabc".to_string(),
             clip_x: None,
         }];
-        let f1 = build_frame(&fonts, &[&images], &list, &mut cache, &|_| false, 1.0);
+        let f1 = built(&fonts, &[&images], &list, &mut cache, &|_| false, 1.0);
         assert!(f1.glyph_upload.is_some(), "first frame uploads new glyphs");
         assert!(
             !f1.vertices.is_empty(),
             "glyph quads were emitted ({} vertices)",
             f1.vertices.len()
         );
-        let f2 = build_frame(&fonts, &[&images], &list, &mut cache, &|_| false, 1.0);
+        let f2 = built(&fonts, &[&images], &list, &mut cache, &|_| false, 1.0);
         assert!(f2.glyph_upload.is_none(), "steady state uploads nothing");
         assert_eq!(f1.vertices, f2.vertices, "same list, same geometry");
     }
@@ -957,7 +992,7 @@ mod tests {
                 clip_x: None,
             },
         ];
-        let f = build_frame(&fonts, &[&images], &list, &mut cache, &|_| false, 1.0);
+        let f = built(&fonts, &[&images], &list, &mut cache, &|_| false, 1.0);
         assert_eq!(
             f.batches.len(),
             1,
@@ -984,7 +1019,7 @@ mod tests {
             radius: 4,
             corners: RoundedCorners::Top,
         }];
-        let f = build_frame(&fonts, &[&images], &list, &mut cache, &|_| false, 1.0);
+        let f = built(&fonts, &[&images], &list, &mut cache, &|_| false, 1.0);
         assert_eq!(f.vertices.len(), 6);
         let v = &f.vertices[0];
         assert_eq!(v.mode, MODE_ROUND);
@@ -1009,7 +1044,7 @@ mod tests {
             color: 0x0011_2233,
             down: true,
         }];
-        let f = build_frame(&fonts, &[&images], &list, &mut cache, &|_| false, 1.0);
+        let f = built(&fonts, &[&images], &list, &mut cache, &|_| false, 1.0);
         assert_eq!(f.vertices.len(), 6);
         let v = &f.vertices[0];
         assert_eq!(v.mode, MODE_CHEVRON);
@@ -1032,7 +1067,7 @@ mod tests {
             radius: 0,
             corners: RoundedCorners::Both,
         }];
-        let f = build_frame(&fonts, &[&images], &list, &mut cache, &|_| false, 1.0);
+        let f = built(&fonts, &[&images], &list, &mut cache, &|_| false, 1.0);
         assert!(f.vertices.iter().all(|v| v.mode == MODE_SOLID));
     }
 
@@ -1066,7 +1101,7 @@ mod tests {
             },
             fill,
         ];
-        let f = build_frame(&fonts, &[&images], &list, &mut cache, &|_| false, 1.0);
+        let f = built(&fonts, &[&images], &list, &mut cache, &|_| false, 1.0);
         assert_eq!(f.batches.len(), 3, "solid / image / solid: {:?}", f.batches);
         // The texture is uploaded at the image's native 2x2 size (the GPU scales
         // it to the 8x8 quad); the key is that native size, so a resize reuses it.
@@ -1076,7 +1111,7 @@ mod tests {
         assert_eq!(f.image_uploads[0].0, key);
         assert_eq!(f.image_uploads[0].1.len(), 4, "2x2 native bitmap");
         // A renderer that already has the texture gets no upload.
-        let f2 = build_frame(&fonts, &[&images], &list, &mut cache, &|k| *k == key, 1.0);
+        let f2 = built(&fonts, &[&images], &list, &mut cache, &|k| *k == key, 1.0);
         assert!(f2.image_uploads.is_empty());
         assert_eq!(f2.batches.len(), 3, "batches still split around the image");
     }
@@ -1107,8 +1142,8 @@ mod tests {
             }]
         };
         let mut cache = GlyphCache::new();
-        let full = build_frame(&fonts, &[&images], &run(None), &mut cache, &|_| false, 1.0);
-        let clipped = build_frame(
+        let full = built(&fonts, &[&images], &run(None), &mut cache, &|_| false, 1.0);
+        let clipped = built(
             &fonts,
             &[&images],
             &run(Some([20, 60])),
@@ -1151,7 +1186,7 @@ mod tests {
             },
             path: "nope.png".to_string(),
         }];
-        let f = build_frame(&fonts, &[&images], &list, &mut cache, &|_| false, 1.0);
+        let f = built(&fonts, &[&images], &list, &mut cache, &|_| false, 1.0);
         assert!(f.vertices.is_empty());
         assert!(f.batches.is_empty());
         assert!(f.image_uploads.is_empty());
@@ -1179,7 +1214,7 @@ mod tests {
             text: "😀".to_string(),
             clip_x: None,
         }];
-        let f = build_frame(&fonts, &[&images], &list, &mut cache, &|_| false, 1.0);
+        let f = built(&fonts, &[&images], &list, &mut cache, &|_| false, 1.0);
         // With an emoji font installed the cluster takes MODE_EMOJI; without
         // one it renders as per-character glyphs. Either way it must not
         // crash, and with color output there must be an emoji upload.

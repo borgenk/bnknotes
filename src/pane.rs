@@ -227,6 +227,116 @@ pub(crate) struct CaretFrame {
     pub(crate) key: CaretGeomKey,
 }
 
+/// How long the caret stays shown, then hidden, while idle. Activity resets it to
+/// shown, so it never blinks out mid-keystroke.
+const CARET_BLINK: Duration = Duration::from_millis(500);
+/// How many toggles a blink run lasts before the caret rests shown, about ten
+/// seconds at the cadence above. Resting takes an untouched focused window to no
+/// timers at all, so it stops waking the loop, and a solid caret still marks where
+/// typing goes.
+const CARET_BLINK_TOGGLES: u32 = 20;
+
+/// The window's blink clock: whether the caret shows this frame, when it next
+/// toggles, and how many toggles the run has left. A run is spent by the toggles
+/// alone, so an untouched window ends up solid and timerless; any caret activity
+/// ([`Self::bump`]) starts a fresh one.
+///
+/// ```text
+///   bump ──▶ blinking ──20 toggles──▶ rested (shown, no deadline)
+///     ▲                                   │
+///     └────────── caret activity ◀────────┘
+/// ```
+pub(crate) struct CaretBlink {
+    /// Whether the caret is drawn this frame.
+    visible: bool,
+    /// When the next toggle is due, or `None` while rested or hidden.
+    at: Option<Instant>,
+    /// Toggles left in this run; zero means rested, and nothing is armed.
+    left: u32,
+}
+
+impl CaretBlink {
+    pub(crate) fn new() -> Self {
+        Self {
+            visible: true,
+            at: None,
+            left: CARET_BLINK_TOGGLES,
+        }
+    }
+
+    /// Whether the caret is drawn this frame.
+    pub(crate) fn visible(&self) -> bool {
+        self.visible
+    }
+
+    /// When the loop must come back to toggle, or `None` when nothing is armed (the
+    /// run is spent, or there is no caret to blink).
+    pub(crate) fn wake_at(&self) -> Option<Instant> {
+        self.at
+    }
+
+    /// Activity moved the caret: show it and start a fresh run, so it is visible at
+    /// once rather than caught mid-blink.
+    pub(crate) fn bump(&mut self, now: Instant) {
+        self.visible = true;
+        self.at = Some(now + CARET_BLINK);
+        self.left = CARET_BLINK_TOGGLES;
+    }
+
+    /// The window lost keyboard focus: no caret, no timer.
+    pub(crate) fn hide(&mut self) {
+        self.visible = false;
+        self.at = None;
+        self.left = 0;
+    }
+
+    /// Nothing draws the caret right now (focus is on the tree or a diff tab, or the
+    /// cursor scrolled out of the painted band): rest it shown and armed for nothing,
+    /// so no frame is rebuilt for a caret that is not there and it comes back solid.
+    pub(crate) fn rest(&mut self) {
+        self.visible = true;
+        self.at = None;
+        self.left = 0;
+    }
+
+    /// Advance the clock, returning whether the caret's visibility changed (the only
+    /// reason a blink repaints). `in_flight` is the smooth caret still easing, which
+    /// holds the caret shown and re-runs the cycle, so it never blinks out mid-motion
+    /// and gets a full run once it settles.
+    pub(crate) fn tick(&mut self, now: Instant, in_flight: bool) -> bool {
+        if in_flight {
+            let changed = !self.visible;
+            self.bump(now);
+            return changed;
+        }
+        if self.left == 0 {
+            return false;
+        }
+        match self.at {
+            // A run with no deadline yet: the first tick only arms it.
+            None => {
+                self.at = Some(now + CARET_BLINK);
+                false
+            }
+            Some(at) if at <= now => {
+                self.left -= 1;
+                let was = self.visible;
+                if self.left == 0 {
+                    // The run is spent: rest shown, so the caret settles solid rather
+                    // than on whichever half the last toggle landed.
+                    self.visible = true;
+                    self.at = None;
+                } else {
+                    self.visible = !self.visible;
+                    self.at = Some(now + CARET_BLINK);
+                }
+                self.visible != was
+            }
+            Some(_) => false,
+        }
+    }
+}
+
 /// The smooth-caret animation for one document: the rendered caret box whose edges
 /// ease toward its live target, plus the bookkeeping the app loop reads to keep
 /// feeding it frames until it settles. The edge leading the direction of travel
@@ -293,12 +403,16 @@ impl CaretAnim {
         self.last_cursor = Some(cursor);
 
         // Hard snap: no smear ever. Animation off, a requested snap (focus/tab/open),
-        // the first frame, or a geometry reflow (resize, DPI, column move).
-        if !config.animate || self.snap_next || self.pos.is_none() || reflowed {
+        // or a geometry reflow (resize, DPI, column move).
+        if !config.animate || self.snap_next || reflowed {
             self.snap_to(target_box);
             return;
         }
-        let cur = self.pos.expect("pos is Some past the hard-snap guard");
+        // The first frame has no rendered box to ease from, so it seeds at the target.
+        let Some(cur) = self.pos else {
+            self.snap_to(target_box);
+            return;
+        };
 
         if self.in_flight {
             // Mid-smear. A pointer move cuts it short and snaps to where it pointed; a
@@ -1126,13 +1240,12 @@ impl EditorPane {
 
     /// The tab's label: the file's name without its .md suffix (matching the
     /// tree), or "untitled" for a file-less scratch buffer.
-    fn tab_name(&self) -> String {
+    fn tab_name(&self) -> &str {
         self.path
             .as_deref()
             .and_then(Path::file_stem)
             .and_then(|s| s.to_str())
-            .map(str::to_string)
-            .unwrap_or_else(|| "untitled".to_string())
+            .unwrap_or("untitled")
     }
 
     /// Whether this is a fresh, untouched scratch tab (no file, empty buffer), so
@@ -1272,11 +1385,10 @@ impl EditorPane {
                     if x == rect.x && w == rect.w && fsize == self.body_size
                         && f120 == self.scale.factor_120()
             );
-            let incremental =
-                geometry_same && self.line_index.is_some() && self.prev_rope.is_some();
-            if incremental {
-                let mut index = self.line_index.take().expect("checked");
-                let prev = self.prev_rope.take().expect("checked");
+            let incremental = geometry_same
+                .then(|| self.line_index.take().zip(self.prev_rope.take()))
+                .flatten();
+            if let Some((mut index, prev)) = incremental {
                 let ctx = LayoutCtx::for_index(
                     fonts,
                     self.text.rope(),
@@ -1413,7 +1525,9 @@ impl EditorPane {
         let wrap_width = rect.w - 2 * margin;
         let layout = {
             let ctx = self.layout_ctx(fonts, active, wrap_width);
-            let index = self.line_index.as_ref().expect("index built above");
+            let Some(index) = self.line_index.as_ref() else {
+                return;
+            };
             let seed = rect.y + margin + index.logical_top(start, adjust);
             Layout::build_window(&ctx, rect.x + margin, seed, index, start, end)
         };
@@ -2452,6 +2566,19 @@ pub(crate) enum TabContent {
     Diff(Box<DiffView>),
 }
 
+/// One tab as the strip reads it: what to draw, without the content behind it. The
+/// label borrows from the tab (a document's path, a review's own label), so a frame
+/// composes the strip without building a string per tab.
+#[derive(Clone, Copy)]
+pub(crate) struct TabView<'a> {
+    pub label: &'a str,
+    /// Whether the tab has unsaved edits, for the strip's dot.
+    pub dirty: bool,
+    /// Whether the tab is pinned, so it takes the compact width and wears a pin
+    /// badge in its close slot.
+    pub pinned: bool,
+}
+
 /// One tab: its content, kept apart from the strip identity (the title and unsaved
 /// dot the strip draws) so a pane can hold a view that is not a document. The content
 /// answers what the strip needs through [`Self::title`] and [`Self::is_dirty`].
@@ -2520,11 +2647,12 @@ impl Tab {
         }
     }
 
-    /// The label the tab strip draws.
-    fn title(&self) -> String {
+    /// The label the tab strip draws, borrowed from the document's path (or the
+    /// review's own label), so a frame does not build a string per tab.
+    fn title(&self) -> &str {
         match &self.content {
             TabContent::Doc(doc) => doc.tab_name(),
-            TabContent::Diff(view) => view.label.to_string(),
+            TabContent::Diff(view) => view.label,
         }
     }
 
@@ -2707,19 +2835,15 @@ impl PaneGroup {
         }
     }
 
-    /// Each tab's label, in order, for the tab strip.
-    pub(crate) fn tab_names(&self) -> Vec<String> {
-        self.tabs.iter().map(Tab::title).collect()
-    }
-
-    /// Whether each tab has unsaved edits, in order, for the tab strip's dot.
-    pub(crate) fn tab_dirty(&self) -> Vec<bool> {
-        self.tabs.iter().map(Tab::is_dirty).collect()
-    }
-
-    /// Whether each tab is pinned, in order, for the tab strip's pin badge.
-    pub(crate) fn tab_pinned(&self) -> Vec<bool> {
-        self.tabs.iter().map(|t| t.pinned).collect()
+    /// Each tab as the strip sees it, in order: its label, whether it has unsaved
+    /// edits (the dot), and whether it is pinned (the badge, and the compact width).
+    /// Borrowed, so composing a frame costs no string per tab.
+    pub(crate) fn tab_views(&self) -> impl Iterator<Item = TabView<'_>> {
+        self.tabs.iter().map(|t| TabView {
+            label: t.title(),
+            dirty: t.is_dirty(),
+            pinned: t.pinned,
+        })
     }
 
     /// Whether tab `i` is pinned. An out-of-range index reads as unpinned, so a
@@ -4036,6 +4160,16 @@ run
         g.docs().map(|d| d.scroll_y).collect()
     }
 
+    /// The strip's labels, in order.
+    fn tab_labels(g: &PaneGroup) -> Vec<&str> {
+        g.tab_views().map(|t| t.label).collect()
+    }
+
+    /// Which tabs are pinned, in order.
+    fn pinned_flags(g: &PaneGroup) -> Vec<bool> {
+        g.tab_views().map(|t| t.pinned).collect()
+    }
+
     #[test]
     fn move_tab_reorders_and_carries_the_active_document() {
         // Documents 0..4; make document 1 (the second) active, then drag the first
@@ -4094,12 +4228,12 @@ run
         let mut g = marked_group(3);
         assert!(!g.is_pinned(1));
         g.toggle_pin(1);
-        assert_eq!(g.tab_pinned(), vec![false, true, false]);
+        assert_eq!(pinned_flags(&g), vec![false, true, false]);
         g.toggle_pin(1);
         assert!(!g.is_pinned(1));
         // An out-of-range toggle changes nothing and reads as unpinned.
         g.toggle_pin(9);
-        assert_eq!(g.tab_pinned(), vec![false, false, false]);
+        assert_eq!(pinned_flags(&g), vec![false, false, false]);
         assert!(!g.is_pinned(9));
     }
 
@@ -4111,7 +4245,7 @@ run
         g.toggle_pin(0);
         g.move_tab(0, 3);
         assert_eq!(order(&g), vec![1, 2, 3, 0]);
-        assert_eq!(g.tab_pinned(), vec![false, false, false, true]);
+        assert_eq!(pinned_flags(&g), vec![false, false, false, true]);
     }
 
     #[test]
@@ -4341,23 +4475,23 @@ run
         // An empty pane has no tabs; opening a file gives it its first tab.
         assert!(!group.has_tabs());
         group.open_or_focus(&a).expect("open a");
-        assert_eq!(group.tab_names(), vec!["a".to_string()]);
+        assert_eq!(tab_labels(&group), vec!["a"]);
         assert_eq!(group.active_index(), 0);
         // A second, different file stacks a new tab and focuses it.
         group.open_or_focus(&b).expect("open b");
-        assert_eq!(group.tab_names(), vec!["a".to_string(), "b".to_string()]);
+        assert_eq!(tab_labels(&group), vec!["a", "b"]);
         assert_eq!(group.active_index(), 1);
         // Reopening the first file focuses its existing tab, no duplicate.
         group.open_or_focus(&a).expect("reopen a");
-        assert_eq!(group.tab_names().len(), 2);
+        assert_eq!(tab_labels(&group).len(), 2);
         assert_eq!(group.active_index(), 0);
         // A fresh blank tab (the new-tab button) is replaced in place by an open.
         group.new_tab(Scale::ONE, FONT_SIZE);
-        assert_eq!(group.tab_names(), vec!["a", "b", "untitled"]);
+        assert_eq!(tab_labels(&group), vec!["a", "b", "untitled"]);
         let c = dir.join("c.md");
         std::fs::write(&c, b"gamma").expect("write c");
         group.open_or_focus(&c).expect("open c");
-        assert_eq!(group.tab_names(), vec!["a", "b", "c"]);
+        assert_eq!(tab_labels(&group), vec!["a", "b", "c"]);
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -4376,8 +4510,8 @@ run
         // Pinning the blank tab asks to keep it: the open stacks a new tab rather
         // than filling the blank in place.
         group.open_or_focus(&a).expect("open a");
-        assert_eq!(group.tab_names(), vec!["untitled", "a"]);
-        assert_eq!(group.tab_pinned(), vec![true, false]);
+        assert_eq!(tab_labels(&group), vec!["untitled", "a"]);
+        assert_eq!(pinned_flags(&group), vec![true, false]);
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -4402,7 +4536,7 @@ run
         assert!(group.has_tabs());
         group.close(0);
         assert!(!group.has_tabs());
-        assert!(group.tab_names().is_empty());
+        assert!(tab_labels(&group).is_empty());
     }
 
     #[test]
@@ -4425,7 +4559,7 @@ run
         // Active is the third tab (index 2); closing the first slides it to 1.
         assert_eq!(group.active_index(), 2);
         group.close(0);
-        assert_eq!(group.tab_names(), vec!["b".to_string(), "c".to_string()]);
+        assert_eq!(tab_labels(&group), vec!["b", "c"]);
         assert_eq!(group.active_index(), 1);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -4454,10 +4588,7 @@ run
         // It is active, is a diff, sits right after its source, and shows the label.
         assert!(group.active_is_diff());
         assert_eq!(group.active_index(), 1);
-        assert_eq!(
-            group.tab_names(),
-            vec!["note".to_string(), "Fix spelling & grammar".to_string()]
-        );
+        assert_eq!(tab_labels(&group), vec!["note", "Fix spelling & grammar"]);
         // The document list skips it, so a search or the watcher never sees it.
         assert_eq!(group.docs().count(), 1);
         // Only the document persists; the active index maps into the doc-only list, so
@@ -4693,6 +4824,136 @@ run
             spring: 0.65,
             max_jump_lines,
         }
+    }
+
+    /// Drive the blink past one interval, the way the loop's timer wake does.
+    fn blink_step(b: &mut CaretBlink, t: &mut Instant) -> bool {
+        *t += CARET_BLINK;
+        b.tick(*t, false)
+    }
+
+    #[test]
+    fn blink_toggles_on_the_interval() {
+        let mut t = Instant::now();
+        let mut b = CaretBlink::new();
+        b.bump(t);
+        assert!(b.visible(), "activity shows the caret");
+        // Short of the deadline nothing moves; past it the caret toggles and asks
+        // for the repaint.
+        t += CARET_BLINK / 2;
+        assert!(!b.tick(t, false));
+        assert!(b.visible());
+        assert!(blink_step(&mut b, &mut t), "a toggle repaints");
+        assert!(!b.visible(), "the caret blinks off");
+        assert!(blink_step(&mut b, &mut t));
+        assert!(b.visible(), "and back on");
+    }
+
+    #[test]
+    fn blink_holds_the_caret_shown_while_it_eases() {
+        let mut t = Instant::now();
+        let mut b = CaretBlink::new();
+        b.bump(t);
+        // Long enough to be several toggles overdue: an easing caret must not blink
+        // out mid-motion, and it comes out of the ease with a full run.
+        t += CARET_BLINK * 3;
+        assert!(!b.tick(t, true), "already shown, so nothing repaints");
+        assert!(b.visible());
+        assert_eq!(b.wake_at(), Some(t + CARET_BLINK));
+        for _ in 0..(CARET_BLINK_TOGGLES - 1) {
+            blink_step(&mut b, &mut t);
+        }
+        assert!(b.wake_at().is_some(), "the ease re-ran the whole run");
+    }
+
+    #[test]
+    fn blink_rests_shown_and_timerless_after_its_run() {
+        let mut t = Instant::now();
+        let mut b = CaretBlink::new();
+        b.bump(t);
+        for _ in 0..CARET_BLINK_TOGGLES {
+            blink_step(&mut b, &mut t);
+        }
+        assert!(
+            b.visible(),
+            "an untouched caret rests shown, not blinked off"
+        );
+        assert_eq!(b.wake_at(), None, "a rested caret arms no timer");
+        // Later ticks stay quiet: this is the state that takes an idle focused
+        // window to zero wake-ups.
+        assert!(!blink_step(&mut b, &mut t));
+        assert!(!blink_step(&mut b, &mut t));
+        assert!(b.visible());
+        assert_eq!(b.wake_at(), None);
+    }
+
+    #[test]
+    fn blink_resumes_on_activity_after_resting() {
+        let mut t = Instant::now();
+        let mut b = CaretBlink::new();
+        b.bump(t);
+        for _ in 0..CARET_BLINK_TOGGLES {
+            blink_step(&mut b, &mut t);
+        }
+        assert_eq!(b.wake_at(), None);
+        b.bump(t);
+        assert_eq!(b.wake_at(), Some(t + CARET_BLINK));
+        assert!(blink_step(&mut b, &mut t), "typing starts a fresh run");
+        assert!(!b.visible());
+    }
+
+    #[test]
+    fn blink_hidden_by_a_lost_focus_shows_nothing_and_arms_nothing() {
+        let mut t = Instant::now();
+        let mut b = CaretBlink::new();
+        b.bump(t);
+        b.hide();
+        assert!(!b.visible());
+        assert_eq!(b.wake_at(), None);
+        assert!(
+            !blink_step(&mut b, &mut t),
+            "an unfocused window never toggles"
+        );
+        assert!(!b.visible());
+    }
+
+    #[test]
+    fn blink_rest_brings_the_caret_back_shown() {
+        let mut t = Instant::now();
+        let mut b = CaretBlink::new();
+        b.bump(t);
+        blink_step(&mut b, &mut t);
+        assert!(!b.visible(), "caught on the blinked-off half");
+        // Focus moves to the tree: the caret rests shown, so it is solid when the
+        // editor takes focus back rather than invisible for half a cycle.
+        b.rest();
+        assert!(b.visible());
+        assert_eq!(b.wake_at(), None);
+    }
+
+    #[test]
+    fn blink_reports_a_repaint_only_when_the_caret_changed() {
+        let mut t = Instant::now();
+        let mut b = CaretBlink::new();
+        b.bump(t);
+        // The tick that only arms, and every tick short of the deadline, changes
+        // nothing: a blink must not rebuild a frame that comes out identical.
+        assert!(!b.tick(t, false));
+        t += CARET_BLINK / 4;
+        assert!(!b.tick(t, false));
+        assert!(blink_step(&mut b, &mut t));
+        // The last toggle of a run lands on shown, which is a change only when the
+        // caret was off.
+        let mut spent = CaretBlink::new();
+        let mut u = Instant::now();
+        spent.bump(u);
+        let changes = (0..CARET_BLINK_TOGGLES)
+            .filter(|_| blink_step(&mut spent, &mut u))
+            .count();
+        assert_eq!(
+            changes as u32, CARET_BLINK_TOGGLES,
+            "every toggle of a run flips the caret"
+        );
     }
 
     #[test]

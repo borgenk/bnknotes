@@ -9,9 +9,12 @@
 //!   normalizes every `\r\n` and lone `\r` to `\n`, and records the file's
 //!   original conventions in a [`FileFormat`] so a round-trip preserves them.
 //! - [`encode`] is its inverse: it re-applies the recorded line ending and BOM.
-//! - [`save_atomic`] writes bytes durably, by writing a sibling temp file,
-//!   flushing it, and renaming it over the target. A crash mid-write leaves
-//!   either the old file or the complete new one, never a half-written file.
+//! - [`save_atomic`] replaces a file's contents atomically, by writing a sibling
+//!   temp file, flushing it to disk, and renaming it over the target. A reader,
+//!   or a crash, sees either the old file or the complete new one, never a
+//!   half-written one. The rename itself is not fsynced, so a crash immediately
+//!   after a save can still leave the previous version in place; what is ruled out
+//!   is a corrupt file, not the loss of the last write.
 //! - [`FileLock`] serializes a read-modify-write against another instance, for
 //!   the files two bnknotes share (the state file, the config's vault list).
 //!

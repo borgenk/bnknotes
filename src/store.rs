@@ -93,13 +93,14 @@ impl VaultPrefs {
 
     /// The entry for `root`, inserting a first-run one if this vault is new.
     fn entry_mut(&mut self, root: &Path) -> &mut VaultSession {
-        match self.vaults.iter().position(|v| v.root == root) {
-            Some(i) => &mut self.vaults[i],
+        let i = match self.vaults.iter().position(|v| v.root == root) {
+            Some(i) => i,
             None => {
                 self.vaults.push(VaultSession::new(root.to_path_buf()));
-                self.vaults.last_mut().expect("just pushed an entry")
+                self.vaults.len() - 1
             }
-        }
+        };
+        &mut self.vaults[i]
     }
 
     /// Whether `root`'s file tree lists folders with no notes. A vault seen for the

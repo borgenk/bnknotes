@@ -13,7 +13,7 @@
 //! does not reach every filesystem), so the re-stat is the source of truth and
 //! this is only the nudge that triggers it.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::os::fd::RawFd;
 use std::path::{Path, PathBuf};
 
@@ -35,8 +35,13 @@ pub(crate) struct FileWatcher {
     /// descriptor and how many open files it holds.
     dirs: HashMap<PathBuf, DirWatch>,
     /// The file paths currently watched (through their parent directories), so a
-    /// [`Self::sync`] can diff the new desired set against it.
-    files: HashSet<PathBuf>,
+    /// [`Self::sync`] can diff the new desired set against it. Each carries the last
+    /// [`Self::watches_exactly`] pass that yielded it, which is how that compare
+    /// counts a path once when two panes hold it.
+    files: HashMap<PathBuf, u64>,
+    /// Bumped by every [`Self::watches_exactly`], so the stamps of the pass before
+    /// it read as stale rather than as this pass's.
+    pass: u64,
     /// Reusable read buffer, so draining a burst of events allocates nothing.
     buf: Vec<u8>,
 }
@@ -55,7 +60,8 @@ impl FileWatcher {
         Self {
             inotify,
             dirs: HashMap::new(),
-            files: HashSet::new(),
+            files: HashMap::new(),
+            pass: 0,
             buf: vec![0u8; 8192],
         }
     }
@@ -69,18 +75,28 @@ impl FileWatcher {
     /// Whether the given open-file paths are exactly the set already watched, so
     /// the caller can skip a reconcile (and its allocation) in the steady state.
     /// A no-op watcher (no inotify) always reports in sync, so nothing churns.
-    pub(crate) fn watches_exactly<'a, I: Iterator<Item = &'a Path>>(&self, paths: I) -> bool {
+    ///
+    /// The paths arrive per tab, so one note open in two panes is yielded twice.
+    /// Stamping each entry with this pass and counting it only the first time is
+    /// what makes the compare see a set rather than a multiset: a raw count would
+    /// never match, and the reconcile would then run on every loop pass forever.
+    pub(crate) fn watches_exactly<'a, I: Iterator<Item = &'a Path>>(&mut self, paths: I) -> bool {
         if self.inotify.is_none() {
             return true;
         }
-        let mut n = 0;
+        self.pass += 1;
+        let pass = self.pass;
+        let mut distinct = 0;
         for p in paths {
-            n += 1;
-            if !self.files.contains(p) {
+            let Some(seen) = self.files.get_mut(p) else {
                 return false;
+            };
+            if *seen != pass {
+                *seen = pass;
+                distinct += 1;
             }
         }
-        n == self.files.len()
+        distinct == self.files.len()
     }
 
     /// Reconcile the watched directories with the current set of open file paths:
@@ -91,16 +107,16 @@ impl FileWatcher {
         if self.inotify.is_none() {
             return;
         }
-        let desired: HashSet<PathBuf> = paths.map(Path::to_path_buf).collect();
+        let desired: HashMap<PathBuf, u64> = paths.map(|p| (p.to_path_buf(), 0)).collect();
         let added: Vec<PathBuf> = desired
-            .iter()
-            .filter(|f| !self.files.contains(*f))
+            .keys()
+            .filter(|f| !self.files.contains_key(*f))
             .cloned()
             .collect();
         let removed: Vec<PathBuf> = self
             .files
-            .iter()
-            .filter(|f| !desired.contains(*f))
+            .keys()
+            .filter(|f| !desired.contains_key(*f))
             .cloned()
             .collect();
         for f in removed {
@@ -189,7 +205,7 @@ impl FileWatcher {
             return;
         };
         self.dirs.remove(&dir);
-        self.files.retain(|f| canonical_parent(f) != dir);
+        self.files.retain(|f, _| canonical_parent(f) != dir);
     }
 }
 
@@ -264,6 +280,47 @@ mod tests {
         assert!(
             !w.drain(),
             "a change to an unwatched file must not wake the watcher"
+        );
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn one_file_open_twice_still_reads_as_in_sync() {
+        let dir = tmp_dir("twice");
+        let file = dir.join("note.md");
+        fs::write(&file, b"x").unwrap();
+
+        let mut w = FileWatcher::new();
+        w.sync([file.as_path()].into_iter());
+        // The same note open in both panes yields its path once per tab. The fast
+        // path must still hold, or every loop pass would re-run the reconcile.
+        assert!(
+            w.watches_exactly([file.as_path(), file.as_path()].into_iter()),
+            "a path yielded twice must count once against the watched set"
+        );
+        assert!(
+            w.watches_exactly([file.as_path(), file.as_path()].into_iter()),
+            "the compare must hold on every later pass too"
+        );
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_changed_open_set_breaks_the_fast_path() {
+        let dir = tmp_dir("changed");
+        let (a, b) = (dir.join("a.md"), dir.join("b.md"));
+        fs::write(&a, b"a").unwrap();
+        fs::write(&b, b"b").unwrap();
+
+        let mut w = FileWatcher::new();
+        w.sync([a.as_path()].into_iter());
+        assert!(
+            !w.watches_exactly([a.as_path(), b.as_path()].into_iter()),
+            "a newly opened file must fall through to the reconcile"
+        );
+        assert!(
+            !w.watches_exactly(std::iter::empty()),
+            "a closed file must fall through to the reconcile"
         );
         fs::remove_dir_all(&dir).ok();
     }

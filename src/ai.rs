@@ -558,9 +558,7 @@ impl Job {
         // both into the command's args and into the job that reads it back.
         let answer_path = match provider.output() {
             OutputMode::Stdout => None,
-            OutputMode::LastMessageFile => Some(
-                std::env::temp_dir().join(format!("bnknotes-ai-{}.answer", std::process::id())),
-            ),
+            OutputMode::LastMessageFile => Some(scratch_path("answer")),
         };
         let cmd = provider.command(instruction, answer_path.as_deref());
         Job::spawn_command(cmd, provider.program(), input, wake, answer_path)
@@ -579,10 +577,15 @@ impl Job {
     ) -> Result<Job> {
         // stderr goes to a scratch file rather than a second pipe: reading two pipes
         // from the one worker could deadlock, and the file is read only on failure.
-        let stderr_path =
-            std::env::temp_dir().join(format!("bnknotes-ai-{}.stderr", std::process::id()));
+        let stderr_path = scratch_path("stderr");
         let stderr_file = std::fs::File::create(&stderr_path)
             .map_err(|e| Error::msg(format!("cannot open a scratch file: {e}")))?;
+        // The answer file starts absent, so a file left behind by a killed job (or by
+        // an earlier process that held this pid) can never be read back as this job's
+        // answer when the child exits without writing one.
+        if let Some(path) = &answer_path {
+            let _ = std::fs::remove_file(path);
+        }
 
         let mut child = cmd
             .stdin(Stdio::piped())
@@ -701,7 +704,22 @@ impl Drop for Job {
         let _ = self.child.kill();
         let _ = self.child.wait();
         let _ = std::fs::remove_file(&self.stderr_path);
+        if let Some(path) = &self.answer_path {
+            let _ = std::fs::remove_file(path);
+        }
     }
+}
+
+/// A scratch file for one job: `$XDG_RUNTIME_DIR` when the session has one (a
+/// per-user directory nobody else can reach, which a Wayland client always has),
+/// else the shared temp directory. The name carries the pid so two editors keep
+/// their own, and [`Job::spawn_command`] clears the path before the child runs.
+fn scratch_path(suffix: &str) -> PathBuf {
+    let dir = std::env::var_os("XDG_RUNTIME_DIR")
+        .filter(|d| !d.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir);
+    dir.join(format!("bnknotes-ai-{}.{suffix}", std::process::id()))
 }
 
 /// A failure message: the given summary, plus the last non-empty stderr line when
@@ -1033,5 +1051,60 @@ mod tests {
             Outcome::Revised(text) => assert_eq!(text, "file answer"),
             Outcome::Failed(msg) => panic!("sh failed: {msg}"),
         }
+    }
+
+    #[test]
+    fn a_stale_answer_file_is_never_read_as_an_answer() {
+        use std::process::Command;
+
+        // A leftover answer file from a killed job, and a child that exits 0 without
+        // writing one: the job must report a failure, not the stale text.
+        let path =
+            std::env::temp_dir().join(format!("bnknotes-ai-stale-{}.answer", std::process::id()));
+        std::fs::write(&path, b"stale answer").expect("plant a stale answer");
+        let mut cmd = Command::new("sh");
+        cmd.args(["-c", "cat > /dev/null; echo session chatter"]);
+        let wake = Wake::new().expect("wake pipe");
+        let mut job = Job::spawn_command(cmd, "sh", "input\n", wake.write_fd(), Some(path.clone()))
+            .expect("spawn sh");
+        match await_outcome(&mut job, &wake) {
+            Outcome::Revised(text) => panic!("read a stale answer: {text}"),
+            Outcome::Failed(_) => {}
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_dropped_job_removes_its_scratch_files() {
+        use std::process::Command;
+        use std::time::Duration;
+
+        // Escape on a running action drops the job: it must leave neither its stderr
+        // file nor the answer file the tool had already written.
+        let answer =
+            std::env::temp_dir().join(format!("bnknotes-ai-drop-{}.answer", std::process::id()));
+        let mut cmd = Command::new("sh");
+        cmd.args(["-c", "sleep 30"]);
+        let wake = Wake::new().expect("wake pipe");
+        let job = Job::spawn_command(cmd, "sh", "", wake.write_fd(), Some(answer.clone()))
+            .expect("spawn sh");
+        let stderr = job.stderr_path.clone();
+        // Stand in for the tool having written its answer before the cancel.
+        std::fs::write(&answer, b"half an answer").expect("write the answer file");
+        assert!(stderr.exists(), "the job opens its stderr file at spawn");
+
+        drop(job);
+        assert!(!stderr.exists(), "a dropped job removes its stderr file");
+        assert!(!answer.exists(), "a dropped job removes its answer file");
+
+        // The killed child's worker still writes its wake byte as it unwinds. Wait for
+        // it here, while this pipe is still open: the app holds one wake pipe for its
+        // whole life, but a test that returned first would close this one and let the
+        // fd number be recycled under the thread still holding it.
+        let ready =
+            crate::platform::ffi::poll_readable(&[wake.read_fd()], Some(Duration::from_secs(5)))
+                .expect("poll the wake pipe");
+        assert_ne!(ready, 0, "the worker wakes the loop as the job ends");
+        wake.drain();
     }
 }

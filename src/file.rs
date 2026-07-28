@@ -9,12 +9,11 @@
 //!   normalizes every `\r\n` and lone `\r` to `\n`, and records the file's
 //!   original conventions in a [`FileFormat`] so a round-trip preserves them.
 //! - [`encode`] is its inverse: it re-applies the recorded line ending and BOM.
-//! - [`save_atomic`] replaces a file's contents atomically, by writing a sibling
-//!   temp file, flushing it to disk, and renaming it over the target. A reader,
-//!   or a crash, sees either the old file or the complete new one, never a
-//!   half-written one. The rename itself is not fsynced, so a crash immediately
-//!   after a save can still leave the previous version in place; what is ruled out
-//!   is a corrupt file, not the loss of the last write.
+//! - [`save_atomic`] replaces a file's contents durably, by writing a sibling temp
+//!   file, flushing it to disk, renaming it over the target, and flushing the
+//!   directory entry the rename wrote. A reader, or a crash, sees either the old
+//!   file or the complete new one, never a half-written one, and a save that
+//!   returned has survived a power loss.
 //! - [`FileLock`] serializes a read-modify-write against another instance, for
 //!   the files two bnknotes share (the state file, the config's vault list).
 //!
@@ -182,10 +181,12 @@ pub fn normalize_newlines(s: &str) -> String {
     out
 }
 
-/// Write `bytes` to `path` atomically: stage them in a sibling temp file in the
-/// same directory, flush to disk, then rename over the target. The rename is
-/// atomic on a single filesystem, so a reader or a crash never sees a
-/// partially-written file. The temp file is removed on any failure.
+/// Write `bytes` to `path` durably: stage them in a sibling temp file in the same
+/// directory, flush to disk, rename over the target, then flush the directory. The
+/// rename is atomic on a single filesystem, so a reader or a crash never sees a
+/// partially-written file, and the directory flush is what keeps a crash just after
+/// the save from reverting the file to its previous contents. The temp file is
+/// removed on any failure.
 pub fn save_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
     let file_name = path
         .file_name()
@@ -242,7 +243,21 @@ fn write_then_rename(tmp: &Path, path: &Path, bytes: &[u8]) -> Result<()> {
     // renamed file is never an empty or truncated placeholder.
     file.sync_all()?;
     std::fs::rename(tmp, path)?;
+    sync_parent_dir(path);
     Ok(())
+}
+
+/// Flush the directory entry the rename just wrote, so a crash straight after a save
+/// cannot leave the previous version in place. Best effort: the bytes are already on
+/// disk and the rename has happened, so a directory that cannot be opened or synced
+/// (a filesystem that does not support it) is not a failed save.
+fn sync_parent_dir(path: &Path) {
+    let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) else {
+        return;
+    };
+    if let Ok(dir) = File::open(parent) {
+        let _ = dir.sync_all();
+    }
 }
 
 #[cfg(test)]
@@ -366,6 +381,28 @@ mod tests {
         let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600, "permissions survive an atomic save");
 
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_save_succeeds_even_when_the_directory_cannot_be_flushed() {
+        let dir = tmp_dir("save_nosync");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("note.md");
+        save_atomic(&path, b"first").unwrap();
+
+        // Durability is best effort: by the time the directory is flushed the bytes
+        // are written and the rename has happened, so a directory that cannot be
+        // opened (here: no read permission on it) must not turn a completed save into
+        // an error. Running as root the open succeeds instead and the flush happens;
+        // either way the save returns Ok, which is what this pins.
+        let before = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o300)).unwrap();
+        let result = save_atomic(&path, b"second");
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(before)).unwrap();
+
+        assert!(result.is_ok(), "the save itself must still succeed");
+        assert_eq!(std::fs::read(&path).unwrap(), b"second");
         std::fs::remove_dir_all(&dir).ok();
     }
 

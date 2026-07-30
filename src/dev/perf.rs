@@ -203,6 +203,30 @@ fn measure() -> Result<Vec<Sample>> {
             .len()
     }));
 
+    // The same windowed build over a large table. A table's rows share one set of
+    // column widths, so a row's geometry depends on the whole block: the guard is
+    // that a window into a big table stays bounded by the window, like the scenario
+    // above, instead of paying for every row of the table on every frame.
+    let table_rope = Rope::from_str(&table_fixture(400, 3));
+    let table_index = LineIndex::build(&fonts, &table_rope, wrap, FONT_SIZE, &images, Scale::ONE);
+    let table_ctx = LayoutCtx::new(
+        &fonts,
+        &table_rope,
+        wrap,
+        FONT_SIZE,
+        (0, 0),
+        &images,
+        ImageUi::default(),
+        FoldMap::NONE,
+        Scale::ONE,
+    );
+    let table_band = 40.min(table_index.len());
+    out.push(sample("layout_table_window", 20, || {
+        Layout::build_window(&table_ctx, MARGIN, MARGIN, &table_index, 0, table_band)
+            .lines()
+            .len()
+    }));
+
     // Incremental index update after a one-character edit: the per-keystroke cost
     // that replaces a full `layout_build`. It re-measures only the edited line and
     // reuses the rest, so it stays flat as documents grow. (The clone per iteration
@@ -1042,6 +1066,28 @@ fn rendered_as_code() {
 
 "#;
     BLOCK.repeat(13)
+}
+
+/// A markdown table of `rows` body rows and `cols` columns, generated so the
+/// baseline carries the shape rather than a committed file. Cell text varies by
+/// row and column so the columns fit to real content.
+fn table_fixture(rows: usize, cols: usize) -> String {
+    let mut s = String::new();
+    for c in 0..cols {
+        let _ = write!(s, "| header {c} ");
+    }
+    s.push_str("|\n");
+    for _ in 0..cols {
+        s.push_str("| --- ");
+    }
+    s.push_str("|\n");
+    for r in 0..rows {
+        for c in 0..cols {
+            let _ = write!(s, "| cell {r}.{c} ");
+        }
+        s.push_str("|\n");
+    }
+    s
 }
 
 // ---------------------------------------------------------------------------

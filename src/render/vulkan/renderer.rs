@@ -1,5 +1,5 @@
 use crate::platform::error::{Error, Result};
-use crate::render::gpu::{ImageKey, Vertex};
+use crate::render::gpu::{ImageId, Vertex};
 use crate::render::vulkan::abi::*;
 
 /// One sampled texture (an atlas, an image, or the 1x1 dummy) and whether its
@@ -41,9 +41,13 @@ pub(super) struct Renderer {
     /// CPU mirror generation they were created for.
     pub(super) glyph_tex: Option<(Texture, u32)>,
     pub(super) emoji_tex: Option<(Texture, u32)>,
-    /// One texture and descriptor set per distinct visible image, mirroring
-    /// the CPU path's unbounded resample cache.
-    pub(super) images: std::collections::HashMap<ImageKey, (Texture, VkDescriptorSet)>,
+    /// One texture and descriptor set per uploaded image id. This map is what
+    /// says whether an id is resident: eviction removes from it, and the batcher
+    /// re-attaches the bitmap for anything it does not find here.
+    pub(super) images: std::collections::HashMap<ImageId, (Texture, VkDescriptorSet)>,
+    /// Whether the "no room for another image texture" line has been printed. The
+    /// condition repeats every frame; the report does not.
+    pub(super) image_capacity_warned: bool,
 }
 
 /// The full-image color subresource range every barrier and view here uses.

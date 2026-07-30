@@ -11,6 +11,7 @@
 
 use crate::markdown;
 use crate::rope::Rope;
+use std::borrow::Cow;
 
 /// A table block's logical-line extent: the header row, the delimiter row just
 /// below it, and one past the last body row (the body is `delim + 1 .. end`).
@@ -35,10 +36,25 @@ pub struct Cell {
     pub end: usize,
 }
 
-/// The content text of logical line `line` (without its trailing newline).
-fn line_text(rope: &Rope, line: usize) -> String {
+/// The content text of logical line `line` (without its trailing newline),
+/// borrowed when the line sits inside one rope leaf.
+fn line_text(rope: &Rope, line: usize) -> Cow<'_, str> {
     let (s, e) = rope.line_content_range(line);
-    rope.byte_slice(s..e)
+    rope.slice(s..e).as_cow()
+}
+
+/// Whether logical line `line` carries an unescaped pipe, the test that decides
+/// how far a table's run of rows reaches. [`block_at`] runs it per line while it
+/// walks to both ends of the run, so it reads the rope's own bytes: a line inside
+/// one leaf is a borrow, and one that straddles feeds its chunks to the same
+/// predicate rather than being copied out.
+fn row_has_pipe(rope: &Rope, line: usize) -> bool {
+    let (s, e) = rope.line_content_range(line);
+    let slice = rope.slice(s..e);
+    match slice.as_str() {
+        Some(text) => markdown::is_table_row(text),
+        None => markdown::has_unescaped_pipe_bytes(slice.chunks().flat_map(str::bytes)),
+    }
 }
 
 /// The table block containing logical line `i`, or `None`. Detection scans the
@@ -48,15 +64,15 @@ fn line_text(rope: &Rope, line: usize) -> String {
 /// lines with no pipe are not in a table.
 pub fn block_at(rope: &Rope, i: usize) -> Option<Block> {
     let n = rope.len_lines();
-    if i >= n || !markdown::is_table_row(&line_text(rope, i)) {
+    if i >= n || !row_has_pipe(rope, i) {
         return None;
     }
     let mut run_start = i;
-    while run_start > 0 && markdown::is_table_row(&line_text(rope, run_start - 1)) {
+    while run_start > 0 && row_has_pipe(rope, run_start - 1) {
         run_start -= 1;
     }
     let mut run_end = i;
-    while run_end + 1 < n && markdown::is_table_row(&line_text(rope, run_end + 1)) {
+    while run_end + 1 < n && row_has_pipe(rope, run_end + 1) {
         run_end += 1;
     }
     let mut header = run_start;
@@ -241,6 +257,59 @@ mod tests {
     /// The line index of the first row of the sample table's header.
     fn header_line(r: &Rope) -> usize {
         r.byte_to_line(r.byte_slice(0..r.len()).find("| A ").unwrap())
+    }
+
+    #[test]
+    fn row_has_pipe_matches_the_string_predicate() {
+        // Both feeds of the one predicate, over a table row, a pipeless paragraph, a
+        // blank line, and a line whose only pipe is escaped.
+        let r = rope("| a | b |\nprose without one\n\nx \\| y\n");
+        for line in 0..r.len_lines() {
+            let text = line_text(&r, line);
+            assert_eq!(
+                row_has_pipe(&r, line),
+                markdown::is_table_row(&text),
+                "line {line}: {text:?}"
+            );
+        }
+        assert!(row_has_pipe(&r, 0));
+        for line in [1, 2, 3] {
+            assert!(!row_has_pipe(&r, line), "line {line}");
+        }
+    }
+
+    #[test]
+    fn row_has_pipe_reads_a_line_that_straddles_rope_leaves() {
+        // A line long enough to span leaves takes the chunk-feeding path; the pipe
+        // sits past the first leaf so a single-leaf read alone would miss it.
+        let filler = "x".repeat(8 * 1024);
+        let r = rope(&format!("{filler}|tail\nplain {filler}\n"));
+        assert!(r.slice(0..r.line_content_range(0).1).as_str().is_none());
+        assert!(row_has_pipe(&r, 0));
+        assert!(!row_has_pipe(&r, 1));
+    }
+
+    #[test]
+    fn cell_queries_resolve_deep_inside_a_large_table() {
+        // Every keystroke in a table asks `cell_at` where the caret is, and the
+        // answer walks the whole pipe run to both ends. Reading the run's lines out
+        // of the rope keeps that walk allocation-free; this pins the answer itself,
+        // far enough down that a row-by-row scan is the work being done.
+        let rows = 500;
+        let mut doc = String::from("| a | b |\n| - | - |\n");
+        for i in 0..rows {
+            doc.push_str(&format!("| r{i} | s{i} |\n"));
+        }
+        let r = rope(&doc);
+        let last = 1 + rows; // the header, the delimiter, then the body rows
+        let cells = row_cells(&r, last);
+        let cell = cell_at(&r, cells[1].0).expect("a cell");
+        assert_eq!((cell.row, cell.col, cell.cols), (last, 1, 2));
+        assert_eq!(cell.block.header, 0);
+        assert_eq!(cell.block.end, last + 1);
+        assert_eq!(&doc[cell.start..cell.end], &format!("s{}", rows - 1));
+        // And a step off the last cell leaves the table rather than running on.
+        assert_eq!(next_cell_start(&r, cell), None);
     }
 
     #[test]

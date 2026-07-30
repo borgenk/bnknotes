@@ -59,12 +59,23 @@ pub struct Vertex {
 pub struct Batch {
     pub start: u32,
     pub count: u32,
-    pub image: Option<ImageKey>,
+    pub image: Option<ImageId>,
 }
 
-/// Identifies one uploaded image texture: the markdown destination plus the
-/// display size it was resampled to (the same key the CPU resample cache uses).
-pub type ImageKey = (String, u32, u32);
+/// One uploaded image texture, interned by [`GlyphCache`] per destination path and
+/// native size. A frame's quads carry the id rather than the path, so batching an
+/// image costs no string and binding one hashes four bytes.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct ImageId(u32);
+
+/// An image bitmap the renderer does not hold yet: its id, its native size, and
+/// straight ARGB words (uploadable as B8G8R8A8 bytes verbatim).
+pub struct ImageUpload {
+    pub id: ImageId,
+    pub width: u32,
+    pub height: u32,
+    pub pixels: Vec<u32>,
+}
 
 /// A rectangle of an atlas that changed and needs a texture upload, with its
 /// bytes extracted row-contiguous from the mirror.
@@ -89,9 +100,8 @@ pub struct FrameData {
     /// Dirty-region uploads for the two atlases, if any.
     pub glyph_upload: Option<AtlasUpload>,
     pub emoji_upload: Option<AtlasUpload>,
-    /// Display-size image bitmaps the renderer does not have yet (straight
-    /// ARGB words, uploadable as B8G8R8A8 bytes verbatim).
-    pub image_uploads: Vec<(ImageKey, Vec<u32>)>,
+    /// Native-size image bitmaps the renderer does not have yet.
+    pub image_uploads: Vec<ImageUpload>,
 }
 
 impl FrameData {
@@ -302,6 +312,11 @@ pub struct GlyphCache {
     /// steady-state frame takes the per-character path without re-consulting
     /// the `Face`.
     cluster_slots: HashMap<FaceKey, HashMap<String, Option<PackedGlyph>>>,
+    /// Image texture ids, by native size then by path: the same nesting as
+    /// `cluster_slots` and for the same reason, so a frame's image lookup borrows
+    /// the path instead of building a key.
+    image_ids: HashMap<(u32, u32), HashMap<String, ImageId>>,
+    next_image_id: u32,
 }
 
 impl GlyphCache {
@@ -311,7 +326,24 @@ impl GlyphCache {
             emoji: Atlas::new(4),
             scalar_slots: HashMap::new(),
             cluster_slots: HashMap::new(),
+            image_ids: HashMap::new(),
+            next_image_id: 0,
         }
+    }
+
+    /// The id of `path`'s texture at its native size, minting one the first time
+    /// the pair is seen. Ids are permanent: the renderer's own texture map is what
+    /// says whether an id is uploaded right now, so an evicted image comes back
+    /// under the id it had.
+    fn image_id(&mut self, path: &str, width: u32, height: u32) -> ImageId {
+        let by_path = self.image_ids.entry((width, height)).or_default();
+        if let Some(&id) = by_path.get(path) {
+            return id;
+        }
+        let id = ImageId(self.next_image_id);
+        self.next_image_id += 1;
+        by_path.insert(path.to_string(), id);
+        id
     }
 
     /// Drop every slot record (after an atlas grew and wiped its content).
@@ -336,7 +368,7 @@ pub fn build_frame(
     stores: &[&ImageStore],
     list: &[DrawCmd],
     cache: &mut GlyphCache,
-    known_images: &dyn Fn(&ImageKey) -> bool,
+    known_images: &dyn Fn(ImageId) -> bool,
     code_glyph_gamma: f32,
     out: &mut FrameData,
 ) {
@@ -380,8 +412,8 @@ struct Batcher<'a> {
     cache: &'a mut GlyphCache,
     vertices: &'a mut Vec<Vertex>,
     batches: &'a mut Vec<Batch>,
-    image_uploads: &'a mut Vec<(ImageKey, Vec<u32>)>,
-    known_images: &'a dyn Fn(&ImageKey) -> bool,
+    image_uploads: &'a mut Vec<ImageUpload>,
+    known_images: &'a dyn Fn(ImageId) -> bool,
     /// Per-glyph mask gamma for code runs, baked into the vertex `extra.x` so the
     /// shader thins them less than the prose gamma it carries as a push constant.
     /// Zero in the vertex means "use the push default"; a code run writes this.
@@ -467,7 +499,7 @@ impl Batcher<'_> {
         color: u32,
         uv: [f32; 4],
         extra: [f32; 4],
-        image: Option<ImageKey>,
+        image: Option<ImageId>,
     ) {
         if rect.w <= 0 || rect.h <= 0 {
             return;
@@ -509,7 +541,7 @@ impl Batcher<'_> {
 
     /// Append `count` vertices to the current batch, or open a new one when
     /// the bound image texture would change.
-    fn extend_batch(&mut self, image: Option<ImageKey>, count: u32) {
+    fn extend_batch(&mut self, image: Option<ImageId>, count: u32) {
         let start = self.vertices.len() as u32 - count;
         if let Some(last) = self.batches.last_mut() {
             if last.image == image {
@@ -748,9 +780,14 @@ impl Batcher<'_> {
         let Some(img) = self.stores.iter().find_map(|s| s.get(path)) else {
             return;
         };
-        let key: ImageKey = (path.to_string(), img.width, img.height);
-        if !(self.known_images)(&key) && !self.image_uploads.iter().any(|(k, _)| *k == key) {
-            self.image_uploads.push((key.clone(), img.pixels.clone()));
+        let id = self.cache.image_id(path, img.width, img.height);
+        if !(self.known_images)(id) && !self.image_uploads.iter().any(|u| u.id == id) {
+            self.image_uploads.push(ImageUpload {
+                id,
+                width: img.width,
+                height: img.height,
+                pixels: img.pixels.clone(),
+            });
         }
         // Normalized UVs so texture() samples the whole native texture across the
         // display rect (quad.frag mode 3, which ignores the vertex color).
@@ -760,7 +797,7 @@ impl Batcher<'_> {
             0,
             [0.0, 0.0, 1.0, 1.0],
             [0.0; 4],
-            Some(key),
+            Some(id),
         );
     }
 }
@@ -798,7 +835,7 @@ mod tests {
         stores: &[&ImageStore],
         list: &[DrawCmd],
         cache: &mut GlyphCache,
-        known_images: &dyn Fn(&ImageKey) -> bool,
+        known_images: &dyn Fn(ImageId) -> bool,
         code_glyph_gamma: f32,
     ) -> FrameData {
         let mut out = FrameData::default();
@@ -1104,16 +1141,64 @@ mod tests {
         let f = built(&fonts, &[&images], &list, &mut cache, &|_| false, 1.0);
         assert_eq!(f.batches.len(), 3, "solid / image / solid: {:?}", f.batches);
         // The texture is uploaded at the image's native 2x2 size (the GPU scales
-        // it to the 8x8 quad); the key is that native size, so a resize reuses it.
-        let key = ("tiny.png".to_string(), 2, 2);
-        assert_eq!(f.batches[1].image.as_ref(), Some(&key));
+        // it to the 8x8 quad), under the id the batch carries.
+        let id = f.batches[1]
+            .image
+            .expect("the image batch names its texture");
         assert_eq!(f.image_uploads.len(), 1);
-        assert_eq!(f.image_uploads[0].0, key);
-        assert_eq!(f.image_uploads[0].1.len(), 4, "2x2 native bitmap");
-        // A renderer that already has the texture gets no upload.
-        let f2 = built(&fonts, &[&images], &list, &mut cache, &|k| *k == key, 1.0);
+        assert_eq!(f.image_uploads[0].id, id);
+        assert_eq!(
+            (f.image_uploads[0].width, f.image_uploads[0].height),
+            (2, 2)
+        );
+        assert_eq!(f.image_uploads[0].pixels.len(), 4, "2x2 native bitmap");
+        // A renderer that already has the texture gets no upload, and the same path
+        // batches under the same id: no per-frame key is built for it.
+        let f2 = built(&fonts, &[&images], &list, &mut cache, &|k| k == id, 1.0);
         assert!(f2.image_uploads.is_empty());
         assert_eq!(f2.batches.len(), 3, "batches still split around the image");
+        assert_eq!(f2.batches[1].image, Some(id), "the id is stable per path");
+    }
+
+    #[test]
+    fn two_sizes_of_one_path_get_their_own_ids() {
+        // The id interns (path, native size), so a store that re-decodes a path at a
+        // different size cannot draw the old texture under the new geometry.
+        let fonts = Fonts::new(&[16]).expect("default font");
+        let rect = Rect {
+            x: 0,
+            y: 0,
+            w: 8,
+            h: 8,
+        };
+        let list = vec![DrawCmd::Image {
+            rect,
+            path: "tiny.png".to_string(),
+        }];
+        let mut cache = GlyphCache::new();
+        let small = ImageStore::from_decoded(vec![(
+            "tiny.png".to_string(),
+            crate::render::image::Image {
+                pixels: vec![0xffff_ffff; 4],
+                width: 2,
+                height: 2,
+            },
+        )]);
+        let large = ImageStore::from_decoded(vec![(
+            "tiny.png".to_string(),
+            crate::render::image::Image {
+                pixels: vec![0xffff_ffff; 16],
+                width: 4,
+                height: 4,
+            },
+        )]);
+        let a = built(&fonts, &[&small], &list, &mut cache, &|_| false, 1.0);
+        let b = built(&fonts, &[&large], &list, &mut cache, &|_| false, 1.0);
+        assert_ne!(a.batches[0].image, b.batches[0].image);
+        assert_eq!(
+            (b.image_uploads[0].width, b.image_uploads[0].height),
+            (4, 4)
+        );
     }
 
     #[test]

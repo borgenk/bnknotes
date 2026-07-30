@@ -488,7 +488,7 @@ impl State {
             let Some(img) = self.presentation.images.get_mut(idx) else {
                 return Err(Error::msg("gpu frame without gpu buffers"));
             };
-            let known = |key: &gpu::ImageKey| gpu.has_image(key);
+            let known = |id: gpu::ImageId| gpu.has_image(id);
             // Built into the frame buffer the presentation keeps, so the vertices and
             // batches reuse last frame's capacity rather than regrowing from zero.
             let frame = &mut self.presentation.frame;

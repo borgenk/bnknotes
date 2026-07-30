@@ -10,7 +10,7 @@
 //! allocated. The zune decoders' own built-in dimension cap (16384 square) sits
 //! above that as a hard backstop, so an absurd size is refused even sooner.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::io::Cursor;
 use std::path::{Path, PathBuf};
 
@@ -321,8 +321,22 @@ pub struct ImageStore {
     /// Decoded images by raw path. A `None` value is a negative entry: the path
     /// was tried and could not be read or decoded.
     cache: HashMap<String, Option<Image>>,
+    /// The paths of the decoded images, oldest first, and the pixels they hold:
+    /// the accounting behind [`Self::trim`].
+    order: VecDeque<String>,
+    pixels: usize,
+    /// Decoded pixels this store keeps before it evicts, [`PIXEL_BUDGET`] outside
+    /// tests.
+    budget: usize,
     limits: Limits,
 }
+
+/// Total decoded pixels the store holds before it starts evicting: 512 MiB of
+/// ARGB8888. [`Limits`] bounds one picture (8192 square, 256 MiB decoded); this
+/// bounds a note that embeds several of them, which is the one place a legitimate
+/// document can run the process out of memory. An evicted path is decoded again the
+/// next time a layout references it, so eviction costs work, never content.
+const PIXEL_BUDGET: usize = 512 * 1024 * 1024 / 4;
 
 /// Attachment subfolders tried under the vault root when a relative embed name is
 /// not beside the note: the folder names notes apps commonly default to. The vault
@@ -337,6 +351,9 @@ impl ImageStore {
             dir,
             vault: None,
             cache: HashMap::new(),
+            order: VecDeque::new(),
+            pixels: 0,
+            budget: PIXEL_BUDGET,
             limits: Limits::default(),
         }
     }
@@ -346,12 +363,50 @@ impl ImageStore {
     /// drawn the way every other image is, so it is stored the way every other image
     /// is. `key` is the caller's to keep unique and to [`remove`](Self::remove).
     pub fn insert(&mut self, key: String, image: Image) {
-        self.cache.insert(key, Some(image));
+        self.store(key, Some(image));
     }
 
     /// Drop what [`insert`](Self::insert) put under `key`, once nothing draws it.
     pub fn remove(&mut self, key: &str) {
-        self.cache.remove(key);
+        self.forget(key);
+    }
+
+    /// Put `decoded` under `key`, replacing whatever was there, and evict down to
+    /// the budget. The one way an entry enters the cache, so the pixel accounting
+    /// cannot be bypassed.
+    fn store(&mut self, key: String, decoded: Option<Image>) {
+        self.forget(&key);
+        if let Some(img) = &decoded {
+            self.pixels += img.pixels.len();
+            self.order.push_back(key.clone());
+        }
+        self.cache.insert(key, decoded);
+        self.trim();
+    }
+
+    /// Drop `key`'s entry and everything it accounted for. A negative entry costs
+    /// no pixels and holds no place in the order.
+    fn forget(&mut self, key: &str) {
+        if let Some(Some(img)) = self.cache.remove(key) {
+            self.pixels -= img.pixels.len();
+            if let Some(i) = self.order.iter().position(|k| k == key) {
+                self.order.remove(i);
+            }
+        }
+    }
+
+    /// Evict decoded images, oldest first, until the store is back inside its
+    /// budget. The most recent image is never evicted, so a single picture larger
+    /// than the whole budget still draws.
+    fn trim(&mut self) {
+        while self.pixels > self.budget && self.order.len() > 1 {
+            let Some(oldest) = self.order.pop_front() else {
+                break;
+            };
+            if let Some(Some(img)) = self.cache.remove(&oldest) {
+                self.pixels -= img.pixels.len();
+            }
+        }
     }
 
     /// Point the store at the vault root, the base for attachment lookups,
@@ -363,6 +418,8 @@ impl ImageStore {
         if self.vault != vault {
             self.vault = vault;
             self.cache.clear();
+            self.order.clear();
+            self.pixels = 0;
         }
     }
 
@@ -374,7 +431,7 @@ impl ImageStore {
             return;
         }
         let decoded = self.load(raw_path);
-        self.cache.insert(raw_path.to_string(), decoded);
+        self.store(raw_path.to_string(), decoded);
     }
 
     fn load(&self, raw_path: &str) -> Option<Image> {
@@ -444,12 +501,20 @@ impl ImageStore {
     /// A store pre-populated with already-decoded images, bypassing the filesystem:
     /// used by tests and the performance harness.
     pub(crate) fn from_decoded(items: Vec<(String, Image)>) -> Self {
-        let cache = items.into_iter().map(|(k, v)| (k, Some(v))).collect();
+        let mut store = Self::new(None);
+        for (key, image) in items {
+            store.insert(key, image);
+        }
+        store
+    }
+
+    /// Test-only: a store whose budget is small enough to reach eviction without
+    /// decoding half a gigabyte of pixels.
+    #[cfg(test)]
+    fn with_budget(budget: usize) -> Self {
         Self {
-            dir: None,
-            vault: None,
-            cache,
-            limits: Limits::default(),
+            budget,
+            ..Self::new(None)
         }
     }
 }
@@ -482,6 +547,40 @@ mod tests {
     /// A solid image of one color.
     fn solid(w: u32, h: u32, color: u32) -> Image {
         built(w, h, |_, _| color)
+    }
+
+    #[test]
+    fn the_store_evicts_the_oldest_images_past_its_budget() {
+        // Room for two 4x4 images, so the third pushes the first out.
+        let mut store = ImageStore::with_budget(2 * 16);
+        for name in ["a", "b"] {
+            store.insert(name.to_string(), solid(4, 4, 0xffff_ffff));
+        }
+        assert!(store.get("a").is_some() && store.get("b").is_some());
+        store.insert("c".to_string(), solid(4, 4, 0xffff_ffff));
+        assert!(store.get("a").is_none(), "the oldest went first");
+        assert!(store.get("b").is_some() && store.get("c").is_some());
+        assert_eq!(store.pixels, 2 * 16, "the accounting follows the eviction");
+        // Re-inserting a held path replaces it rather than double-counting, and
+        // takes its place at the back of the queue.
+        store.insert("b".to_string(), solid(4, 4, 0));
+        assert_eq!(store.pixels, 2 * 16);
+        store.insert("d".to_string(), solid(4, 4, 0));
+        assert!(store.get("c").is_none(), "c is now the oldest");
+        assert!(store.get("b").is_some() && store.get("d").is_some());
+        // Removing gives the space back.
+        store.remove("b");
+        assert_eq!(store.pixels, 16);
+    }
+
+    #[test]
+    fn a_single_image_larger_than_the_budget_still_draws() {
+        // The budget bounds a document that embeds many pictures; it must never
+        // leave the one picture on screen undrawable.
+        let mut store = ImageStore::with_budget(4);
+        store.insert("big".to_string(), solid(8, 8, 0xffff_ffff));
+        assert!(store.get("big").is_some());
+        assert_eq!(store.pixels, 64);
     }
 
     #[test]

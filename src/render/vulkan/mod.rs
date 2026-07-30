@@ -24,7 +24,7 @@ use core::ffi::{c_char, CStr};
 
 use crate::platform::error::{Error, Result};
 use crate::platform::ffi::DynLib;
-use crate::render::gpu::ImageKey;
+use crate::render::gpu::ImageId;
 use crate::render::vulkan::abi::*;
 use crate::render::vulkan::renderer::{create_renderer, Renderer};
 
@@ -229,10 +229,10 @@ impl Gpu {
             .collect()
     }
 
-    /// Whether an image texture for `key` is already uploaded (the batcher
-    /// asks, and attaches bitmaps only for the ones this renderer lacks).
-    pub fn has_image(&self, key: &ImageKey) -> bool {
-        self.renderer.images.contains_key(key)
+    /// Whether the texture for `id` is already uploaded (the batcher asks, and
+    /// attaches bitmaps only for the ones this renderer lacks).
+    pub fn has_image(&self, id: ImageId) -> bool {
+        self.renderer.images.contains_key(&id)
     }
 
     /// Block until the queue drains; teardown and resize use this so nothing

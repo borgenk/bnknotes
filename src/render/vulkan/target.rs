@@ -2,7 +2,7 @@ use core::ffi::c_void;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 
 use crate::platform::error::{Error, Result};
-use crate::render::gpu::{AtlasInfo, AtlasUpload, FrameData, ImageKey};
+use crate::render::gpu::{AtlasInfo, AtlasUpload, FrameData, ImageId};
 use crate::render::vulkan::abi::*;
 use crate::render::vulkan::renderer::{
     allocate_set, color_range, destroy_texture, write_image_set, HostBuffer, Texture,
@@ -901,8 +901,8 @@ impl Gpu {
                 // do not rebind the dummy.
                 let mut bound: VkDescriptorSet = 0;
                 for batch in &frame.batches {
-                    let set = match &batch.image {
-                        Some(key) => match self.renderer.images.get(key) {
+                    let set = match batch.image {
+                        Some(id) => match self.renderer.images.get(&id) {
                             Some((_, set)) => *set,
                             // The frame data always carries missing bitmaps,
                             // so this is unreachable; skipping the batch is
@@ -1113,16 +1113,34 @@ impl Gpu {
             &mut uploads,
         );
 
-        // New image textures, one per (path, display size).
-        for (key, argb) in &frame.image_uploads {
-            if self.renderer.images.contains_key(key) {
+        // New image textures, one per image id (a path at its native size).
+        for up in &frame.image_uploads {
+            if self.renderer.images.contains_key(&up.id) {
                 continue;
             }
-            let (w, h) = (key.1, key.2);
+            let (w, h) = (up.width, up.height);
             // sRGB format: the sampler decodes and linear-filters when scaling
             // the image to its display size, matching the linear-space blend.
-            let tex = self.create_texture(VK_FORMAT_B8G8R8A8_SRGB, w, h)?;
-            let set = self.allocate_image_set(tex.view)?;
+            //
+            // An image the device cannot hold is skipped: it draws nothing this
+            // frame, and the next frame tries again. A frame drawing more distinct
+            // images than the descriptor pool has sets cannot evict its way out
+            // (every set is in use), and a missing picture is a bad frame where a
+            // propagated error would end the session. The atlas paths above keep
+            // propagating, since without an atlas there is no text at all.
+            let Ok(tex) = self.create_texture(VK_FORMAT_B8G8R8A8_SRGB, w, h) else {
+                self.warn_image_capacity();
+                continue;
+            };
+            let set = match self.allocate_image_set(tex.view) {
+                Ok(set) => set,
+                Err(_) => {
+                    self.warn_image_capacity();
+                    // Never referenced by a command buffer, so it needs no drain.
+                    destroy_texture(&self.fns, self.device.raw, tex);
+                    continue;
+                }
+            };
             uploads.push(PendingUpload {
                 image: tex.image,
                 was_initialized: false,
@@ -1133,12 +1151,12 @@ impl Gpu {
                 h,
             });
             // ARGB words are B,G,R,A bytes in memory: B8G8R8A8 verbatim.
-            for px in argb {
+            for px in &up.pixels {
                 staging.extend_from_slice(&px.to_ne_bytes());
             }
             let mut stored = tex;
             stored.initialized = true;
-            self.renderer.images.insert(key.clone(), (stored, set));
+            self.renderer.images.insert(up.id, (stored, set));
         }
 
         self.evict_unused_images(frame);
@@ -1206,26 +1224,34 @@ impl Gpu {
         }
     }
 
-    /// Bound the image-texture cache: resizes mint new (path, size) keys, and the
-    /// descriptor pool is finite. On overflow, evict everything this frame does
-    /// not draw (their sets return to the pool). The queue drain makes eviction
-    /// safe against the other slot's in-flight frame.
+    /// Report, once per session, that an image could not be given a texture. The
+    /// frames that follow stay silent: the condition repeats every frame, and a
+    /// log line per frame would be its own problem.
+    fn warn_image_capacity(&mut self) {
+        if !self.renderer.image_capacity_warned {
+            self.renderer.image_capacity_warned = true;
+            eprintln!("bnknotes: out of image texture capacity; some pictures will not draw");
+        }
+    }
+
+    /// Bound the image-texture cache: a vault holds more images than the finite
+    /// descriptor pool has sets. On overflow, evict everything this frame does not
+    /// draw (their sets return to the pool); an evicted image re-uploads under the
+    /// same id the next time it is drawn. The queue drain makes eviction safe
+    /// against the other slot's in-flight frame.
     fn evict_unused_images(&mut self, frame: &FrameData) {
         const IMAGE_TEXTURE_CAP: usize = 64;
         if self.renderer.images.len() <= IMAGE_TEXTURE_CAP {
             return;
         }
-        let used: std::collections::HashSet<&ImageKey> = frame
-            .batches
-            .iter()
-            .filter_map(|b| b.image.as_ref())
-            .collect();
-        let evict: Vec<ImageKey> = self
+        let used: std::collections::HashSet<ImageId> =
+            frame.batches.iter().filter_map(|b| b.image).collect();
+        let evict: Vec<ImageId> = self
             .renderer
             .images
             .keys()
             .filter(|k| !used.contains(k))
-            .cloned()
+            .copied()
             .collect();
         if evict.is_empty() {
             return;

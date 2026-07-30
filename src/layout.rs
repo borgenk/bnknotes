@@ -856,6 +856,7 @@ impl Layout {
         let n = ctx.rope.len_lines();
         let mut box_top = box_top_seed;
         let mut pool = LayoutScratch::default();
+        let mut tables = TableMemo::default();
         let mut lines = Vec::new();
         let mut i = start;
         while i < end {
@@ -870,7 +871,15 @@ impl Layout {
             }
             let line = LogicalLine::at(ctx.rope, i, n);
             box_top += lay_line(
-                ctx, line, i, box_top, &mut carry, &mut pool, false, &mut lines,
+                ctx,
+                line,
+                i,
+                box_top,
+                &mut carry,
+                &mut pool,
+                &mut tables,
+                false,
+                &mut lines,
             );
             i += 1;
         }
@@ -2150,7 +2159,10 @@ pub(crate) fn active_reveals_marker(
 ///
 /// `pool` supplies the per-line scratch buffers (`clusters`, `segments`), owned by
 /// the caller's build loop and reused across every line so laying out a line
-/// clears and refills them instead of allocating fresh Vecs.
+/// clears and refills them instead of allocating fresh Vecs. `tables` is the same
+/// idea for the one table being walked: per-table work reached from this per-line
+/// path (block detection, column fitting) is paid by a table's first row and read
+/// by the rest.
 #[allow(clippy::too_many_arguments)]
 fn lay_line(
     ctx: &LayoutCtx,
@@ -2159,6 +2171,7 @@ fn lay_line(
     box_top: i32,
     carry: &mut LineCarry,
     pool: &mut LayoutScratch,
+    tables: &mut TableMemo,
     // When true the caller only wants each line's height and image flag (the
     // `LineIndex` build), so the styled runs are skipped: `clip_runs` allocates a
     // `Vec` per visual row that measurement would immediately discard.
@@ -2187,14 +2200,14 @@ fn lay_line(
     if carry.fence.is_none() {
         // A table renders as a grid of widget rows: its delimiter row draws
         // nothing, and every other row is one table widget line. A table ends any
-        // open list. Detection is by rope scan (`table_block_at`), so no table state
-        // threads the carry.
-        if let Some(block) = table_block_at(ctx.rope, line_no) {
+        // open list. Detection is by rope scan (`TableMemo::locate`), so no table
+        // state threads the carry.
+        if let Some((span, role)) = tables.locate(ctx.rope, line_no) {
             carry.list_depth = None;
-            return match block.role {
+            return match role {
                 TableRole::Delimiter => 0,
                 TableRole::Header | TableRole::Body => {
-                    lay_table_row(ctx, &block, line_no, box_top, measure_only, pool, out)
+                    lay_table_row(ctx, span, line_no, box_top, measure_only, pool, tables, out)
                 }
             };
         }
@@ -2412,6 +2425,7 @@ fn measure_chunk(
 ) -> ChunkOut {
     let mut scratch: Vec<VisualLine> = Vec::new();
     let mut pool = LayoutScratch::default();
+    let mut tables = TableMemo::default();
     let mut recs = Vec::with_capacity(hi - lo);
     for i in lo..hi {
         recs.push(LineIndex::measure_line(
@@ -2420,6 +2434,7 @@ fn measure_chunk(
             n,
             &mut carry,
             &mut pool,
+            &mut tables,
             &mut scratch,
         ));
     }
@@ -2516,18 +2531,20 @@ impl LineIndex {
     /// Measure one logical line `i`'s record, advancing the carry state
     /// (`fence`/`list_depth`) through it. Shared by [`Self::build`] and
     /// [`Self::update`] so the incremental path can never disagree with a rebuild.
+    #[allow(clippy::too_many_arguments)]
     fn measure_line(
         ctx: &LayoutCtx,
         i: usize,
         n: usize,
         carry: &mut LineCarry,
         pool: &mut LayoutScratch,
+        tables: &mut TableMemo,
         scratch: &mut Vec<VisualLine>,
     ) -> LineRec {
         let logical = LogicalLine::at(ctx.rope, i, n);
         let carry_in = *carry;
         scratch.clear();
-        let height = lay_line(ctx, logical, i, 0, carry, pool, true, scratch);
+        let height = lay_line(ctx, logical, i, 0, carry, pool, tables, true, scratch);
         // Read the heading level off the measured rows before the reveal pass
         // below reuses `scratch`. A wrapped heading repeats its level on every row.
         let heading_level = scratch.iter().find_map(|v| v.heading).unwrap_or(0);
@@ -2546,6 +2563,7 @@ impl LineIndex {
                 0,
                 &mut revealed_carry,
                 pool,
+                tables,
                 true,
                 scratch,
             );
@@ -2760,6 +2778,7 @@ impl LineIndex {
         let mut mid: Vec<LineRec> = Vec::new();
         let mut scratch: Vec<VisualLine> = Vec::new();
         let mut pool = LayoutScratch::default();
+        let mut tables = TableMemo::default();
         let mut i = front;
         let converge_old = loop {
             let old_i = i as isize - delta;
@@ -2781,6 +2800,7 @@ impl LineIndex {
                 new_n,
                 &mut carry,
                 &mut pool,
+                &mut tables,
                 &mut scratch,
             ));
             i += 1;
@@ -3205,11 +3225,15 @@ fn wrap_segments(
 //
 // A markdown table lays out as a run of widget lines, one per source row (the
 // header and each body row; the delimiter row is structural and draws nothing).
-// Column widths are shared across the whole table, so each row measures the block
-// to find them, then wraps its own cells to those widths and takes the tallest
-// cell as its height. `table_block_at` recovers the block from any of its lines by
-// a bounded rope scan, so a row's geometry is a pure function of the table text
-// and the wrap width, and the windowed index needs no cross-line table state.
+// Column widths are shared across the whole table, so the block is measured once to
+// fit them, then each row wraps its own cells to those widths and takes the tallest
+// cell as its height. The block is recovered from any of its lines by a bounded rope
+// scan, so a row's geometry is a pure function of the table text and the wrap width,
+// and the windowed index needs no cross-line table state.
+//
+// Both of those are per-table work reached from a per-line path, so a build carries
+// a `TableMemo` beside its scratch: it holds the one table being walked, and every
+// row of that table reads the detection and the fitted widths the first row paid for.
 
 /// Where a queried line sits within a table block.
 enum TableRole {
@@ -3218,66 +3242,138 @@ enum TableRole {
     Body,
 }
 
-/// A table block located around a logical line: the header and delimiter line
-/// numbers, one past the last body row, the column alignments, and the queried
-/// line's role.
-struct TableBlock {
+/// A table block's logical-line extent: the header row, the delimiter row below it,
+/// and one past the last body row.
+#[derive(Clone, Copy)]
+struct TableSpan {
     header: usize,
     delim: usize,
     end: usize,
-    aligns: Vec<markdown::Align>,
-    role: TableRole,
 }
 
-impl TableBlock {
+impl TableSpan {
     /// The drawn rows in order: the header, then every body row. The delimiter is
     /// skipped, since it renders nothing.
     fn drawn_rows(&self) -> impl Iterator<Item = usize> {
         std::iter::once(self.header).chain(self.delim + 1..self.end)
     }
+
+    /// Where logical line `i` sits in this block.
+    fn role(&self, i: usize) -> TableRole {
+        if i == self.header {
+            TableRole::Header
+        } else if i == self.delim {
+            TableRole::Delimiter
+        } else {
+            TableRole::Body
+        }
+    }
 }
 
-/// If logical line `i` belongs to a table, the block around it, with its column
-/// alignments and `i`'s role. The line extent comes from [`crate::table::block_at`]
-/// (shared with the editing model, so caret navigation and rendering agree on a
-/// table's bounds); the alignments and role are resolved here for layout.
-fn table_block_at(rope: &Rope, i: usize) -> Option<TableBlock> {
-    let block = crate::table::block_at(rope, i)?;
-    let text = |k: usize| {
-        let l = LogicalLine::at(rope, k, rope.len_lines());
-        rope.slice(l.start..l.end).as_cow()
-    };
-    let aligns = markdown::table_head(&text(block.header), &text(block.delim))?;
-    let role = if i == block.header {
-        TableRole::Header
-    } else if i == block.delim {
-        TableRole::Delimiter
-    } else {
-        TableRole::Body
-    };
-    Some(TableBlock {
-        header: block.header,
-        delim: block.delim,
-        end: block.end,
-        aligns,
-        role,
-    })
+/// The one table a build is walking: the block it last located, that block's column
+/// alignments, and the fitted column geometry once a row has asked for it. A build
+/// visits a table's rows in order, so holding a single table collapses what was a
+/// block re-detection and a re-measure of every cell in the table, per row.
+///
+/// Created and dropped with the [`LayoutScratch`] beside it, so it lives for exactly
+/// one build. The rope cannot change inside a build; the geometry can (the diff view
+/// lays the same text out at two widths through one build), so the stored widths
+/// carry the geometry they were fitted under and a change re-measures.
+#[derive(Default)]
+struct TableMemo {
+    block: Option<MemoBlock>,
 }
 
-/// The shared, positioned column geometry of `block`, fitted to the wrap width.
-/// Each column's natural width is its widest unwrapped cell; if the columns overflow
-/// the available width they shrink proportionally, never past [`TABLE_MIN_COL`], so
-/// wide cells wrap.
-fn table_columns(ctx: &LayoutCtx, block: &TableBlock, pool: &mut LayoutScratch) -> Vec<Column> {
+/// The located block: its extent, its per-column alignments, and its fitted columns
+/// keyed by the geometry they were measured under.
+struct MemoBlock {
+    span: TableSpan,
+    aligns: Vec<markdown::Align>,
+    columns: Option<(ColumnKey, Vec<Column>)>,
+}
+
+/// The geometry [`table_columns`] reads besides the table's own text: the wrap width,
+/// the body font size, and the display scale. Everything else it touches (the fonts,
+/// the rope) is fixed for a build.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct ColumnKey {
+    wrap_width: i32,
+    body_size: u32,
+    scale_120: u32,
+}
+
+impl TableMemo {
+    /// Point the memo at the table containing logical line `i` and report the line's
+    /// role in it, or `None` when the line is not in a table. A line inside the block
+    /// already held costs nothing; anything else re-detects and drops the old block's
+    /// measurements. The extent comes from [`crate::table::block_at`] (shared with
+    /// the editing model, so caret navigation and rendering agree on a table's
+    /// bounds); the alignments are resolved here for layout.
+    fn locate(&mut self, rope: &Rope, i: usize) -> Option<(TableSpan, TableRole)> {
+        if let Some(held) = &self.block {
+            if i >= held.span.header && i < held.span.end {
+                return Some((held.span, held.span.role(i)));
+            }
+        }
+        let block = crate::table::block_at(rope, i)?;
+        let text = |k: usize| {
+            let l = LogicalLine::at(rope, k, rope.len_lines());
+            rope.slice(l.start..l.end).as_cow()
+        };
+        let aligns = markdown::table_head(&text(block.header), &text(block.delim))?;
+        let span = TableSpan {
+            header: block.header,
+            delim: block.delim,
+            end: block.end,
+        };
+        self.block = Some(MemoBlock {
+            span,
+            aligns,
+            columns: None,
+        });
+        Some((span, span.role(i)))
+    }
+
+    /// The shared column geometry of the block the memo holds, fitted to `ctx`'s wrap
+    /// width, measured on the first row that asks and reused by the rest. Empty when
+    /// no block is held (`locate` returned `None`), which no caller reaches.
+    fn columns(&mut self, ctx: &LayoutCtx, pool: &mut LayoutScratch) -> &[Column] {
+        let Some(block) = &mut self.block else {
+            return &[];
+        };
+        let key = ColumnKey {
+            wrap_width: ctx.wrap_width,
+            body_size: ctx.body_size,
+            scale_120: ctx.scale.factor_120(),
+        };
+        if block.columns.as_ref().is_none_or(|(k, _)| *k != key) {
+            let columns = table_columns(ctx, block.span, &block.aligns, pool);
+            block.columns = Some((key, columns));
+        }
+        block.columns.as_ref().map_or(&[], |(_, c)| c.as_slice())
+    }
+}
+
+/// The shared, positioned column geometry of the block at `span`, fitted to the wrap
+/// width. Each column's natural width is its widest unwrapped cell; if the columns
+/// overflow the available width they shrink proportionally, never past
+/// [`TABLE_MIN_COL`], so wide cells wrap. Measures every cell of the table, so it is
+/// reached through [`TableMemo::columns`] rather than called per row.
+fn table_columns(
+    ctx: &LayoutCtx,
+    span: TableSpan,
+    aligns: &[markdown::Align],
+    pool: &mut LayoutScratch,
+) -> Vec<Column> {
     let n = ctx.rope.len_lines();
-    let cols = block.aligns.len();
+    let cols = aligns.len();
     let mut natural = vec![0i32; cols];
     let mut ranges: Vec<(usize, usize)> = Vec::new();
-    for row in block.drawn_rows() {
+    for row in span.drawn_rows() {
         let l = LogicalLine::at(ctx.rope, row, n);
         let line = ctx.rope.slice(l.start..l.end).as_cow();
         markdown::table_row_cells(&line, &mut ranges);
-        let header = row == block.header;
+        let header = row == span.header;
         for (c, &(s, e)) in ranges.iter().take(cols).enumerate() {
             let w = cell_measure_width(ctx, &line[s..e], header, pool);
             natural[c] = natural[c].max(w);
@@ -3295,7 +3391,7 @@ fn table_columns(ctx: &LayoutCtx, block: &TableBlock, pool: &mut LayoutScratch) 
     let widths = fit_columns(&natural, avail, min_col);
     let mut out = Vec::with_capacity(cols);
     let mut x = border;
-    for (&w, &align) in widths.iter().zip(&block.aligns) {
+    for (&w, &align) in widths.iter().zip(aligns) {
         let cx = x + cell_pad_x;
         let w = w.max(1);
         out.push(Column {
@@ -3361,27 +3457,32 @@ fn fit_columns(natural: &[i32], avail: i32, min_col: i32) -> Vec<i32> {
         .collect()
 }
 
-/// Lay out one table row (`row_line`, a header or body row) at content-space top
-/// `box_top`, appending its widget line to `out` (unless `measure_only`) and
-/// returning the row's box height. Cells wrap to the shared column widths; the row
-/// is as tall as its tallest cell.
+/// Lay out one table row (`row_line`, a header or body row of the block `tables`
+/// holds) at content-space top `box_top`, appending its widget line to `out` (unless
+/// `measure_only`) and returning the row's box height. Cells wrap to the shared
+/// column widths; the row is as tall as its tallest cell.
+#[allow(clippy::too_many_arguments)]
 fn lay_table_row(
     ctx: &LayoutCtx,
-    block: &TableBlock,
+    span: TableSpan,
     row_line: usize,
     box_top: i32,
     measure_only: bool,
     pool: &mut LayoutScratch,
+    tables: &mut TableMemo,
     out: &mut Vec<VisualLine>,
 ) -> i32 {
     let n = ctx.rope.len_lines();
-    let cols = block.aligns.len();
     let size = ctx.body_size;
     let metrics = ctx.fonts.metrics(size);
-    let columns = table_columns(ctx, block, pool);
+    // The whole table's fitted widths, measured by whichever of its rows got here
+    // first. `tables` stays borrowed for the cell loop below; `pool` is a separate
+    // value, so the cells still take it mutably.
+    let columns = tables.columns(ctx, pool);
+    let cols = columns.len();
     let l = LogicalLine::at(ctx.rope, row_line, n);
     let line = ctx.rope.slice(l.start..l.end).as_cow();
-    let header = row_line == block.header;
+    let header = row_line == span.header;
     // The cursor is on this row: reveal its cells' raw markers, the same live-preview
     // test an ordinary line uses, so the grid stays but the backticks become visible.
     let revealed = ctx.active.0 <= l.end && ctx.active.1 >= l.start;
@@ -3413,7 +3514,7 @@ fn lay_table_row(
         // a column's content and right padding), and the right outer edge.
         let mut borders = Vec::with_capacity(columns.len() + 1);
         borders.push(0);
-        for col in &columns {
+        for col in columns {
             borders.push(col.x + col.width + ctx.scale.px(TABLE_CELL_PAD_X));
         }
         let width = borders.last().copied().unwrap_or(0) + ctx.scale.px(TABLE_BORDER);
@@ -3437,8 +3538,10 @@ fn lay_table_row(
             image: None,
             table: Some(TableRow {
                 header,
-                first: row_line == block.header,
-                columns,
+                first: row_line == span.header,
+                // The drawn row keeps its own copy of the shared geometry, so the
+                // painter and the hit-test read a line's columns off the line.
+                columns: columns.to_vec(),
                 cells,
                 borders,
                 width,
@@ -3639,6 +3742,155 @@ mod tests {
     /// Reveal-specific tests build explicitly with a narrower active range.
     fn layout(f: &Fonts, r: &Rope) -> Layout {
         Layout::build(f, r, LEFT, TOP, 1_000_000, BODY, (0, r.len()))
+    }
+
+    /// Lay out the whole document the way [`Layout::build_range`] does, but with a
+    /// fresh [`TableMemo`] per line, so a table's rows share no measurement: the
+    /// shape the build had before the memo existed.
+    fn build_unmemoized(ctx: &LayoutCtx, left: i32, top: i32) -> Layout {
+        let n = ctx.rope.len_lines();
+        let mut pool = LayoutScratch::default();
+        let mut carry = LineCarry::default();
+        let mut lines = Vec::new();
+        let mut box_top = top;
+        for i in 0..n {
+            let logical = LogicalLine::at(ctx.rope, i, n);
+            let mut tables = TableMemo::default();
+            box_top += lay_line(
+                ctx,
+                logical,
+                i,
+                box_top,
+                &mut carry,
+                &mut pool,
+                &mut tables,
+                false,
+                &mut lines,
+            );
+        }
+        Layout {
+            lines,
+            runs: pool.runs,
+            left,
+            text_height: box_top - top,
+            scale: ctx.scale,
+        }
+    }
+
+    /// A ctx over `r` at `wrap`, reveal-free, with no images and no folds.
+    fn table_ctx<'a>(
+        f: &'a Fonts,
+        r: &'a Rope,
+        images: &'a ImageStore,
+        wrap: i32,
+    ) -> LayoutCtx<'a> {
+        LayoutCtx::new(
+            f,
+            r,
+            wrap,
+            BODY,
+            NO_REVEAL,
+            images,
+            ImageUi::default(),
+            FoldMap::NONE,
+            Scale::ONE,
+        )
+    }
+
+    /// The total x extent of a table row's columns, which is what the fitted widths
+    /// move when the geometry changes.
+    fn columns_span(v: &VisualLine) -> i32 {
+        let t = v.table.as_ref().expect("a table row");
+        t.columns.last().map_or(0, |c| c.x + c.width)
+    }
+
+    #[test]
+    fn a_table_lays_out_the_same_with_and_without_the_memo() {
+        // The memo may only save work, never change output: every row of the memoized
+        // build must be pixel-identical to one measured on its own. Two tables of
+        // different natural widths, so a leaked measurement would show.
+        let f = fonts();
+        let images = ImageStore::new(None);
+        let r = Rope::from_str(&format!(
+            "intro\n\n{}\nbetween\n\n| x | y |\n| - | - |\n| 1 | 2 |\n\nafter\n",
+            table_doc(6)
+        ));
+        for &w in &[240, 500, 1_000_000] {
+            let ctx = table_ctx(&f, &r, &images, w);
+            assert_eq!(
+                fingerprint(&Layout::build_with_images(&ctx, LEFT, TOP)),
+                fingerprint(&build_unmemoized(&ctx, LEFT, TOP)),
+                "memoized and per-row builds must agree (width {w})"
+            );
+        }
+    }
+
+    #[test]
+    fn a_table_memo_survives_a_geometry_change() {
+        // The stored widths carry the geometry they were fitted under, so the same
+        // table laid out at a second wrap width through the *same* memo re-measures
+        // instead of handing back the first width's columns.
+        let f = fonts();
+        let images = ImageStore::new(None);
+        let r = Rope::from_str(&table_doc(3));
+        let mut pool = LayoutScratch::default();
+        let mut tables = TableMemo::default();
+        let n = r.len_lines();
+        let header = LogicalLine::at(&r, 0, n);
+        let lay = |wrap: i32, pool: &mut LayoutScratch, tables: &mut TableMemo| {
+            let ctx = table_ctx(&f, &r, &images, wrap);
+            let mut out = Vec::new();
+            let mut carry = LineCarry::default();
+            lay_line(
+                &ctx, header, 0, 0, &mut carry, pool, tables, false, &mut out,
+            );
+            out
+        };
+        let wide = lay(1_000_000, &mut pool, &mut tables);
+        let narrow = lay(300, &mut pool, &mut tables);
+        assert!(
+            columns_span(&narrow[0]) < columns_span(&wide[0]),
+            "the narrow build must refit: {} vs {}",
+            columns_span(&narrow[0]),
+            columns_span(&wide[0])
+        );
+        // And the refit is the one a fresh memo would produce.
+        let fresh = lay(300, &mut pool, &mut TableMemo::default());
+        assert_eq!(columns_span(&narrow[0]), columns_span(&fresh[0]));
+    }
+
+    #[test]
+    fn two_tables_in_one_document_each_get_their_own_columns() {
+        // Walking off one table and onto another must drop the first table's widths:
+        // each row lands under its own table's geometry. A wide wrap keeps both at
+        // their natural widths, so the two are far apart.
+        let f = fonts();
+        let images = ImageStore::new(None);
+        let r = Rope::from_str(
+            "| short | s |\n| - | - |\n| a | b |\n\n\
+             | a much wider header cell | and another wide one |\n| - | - |\n\
+             | with equally wide body text in it | and more of the same here |\n",
+        );
+        let ctx = table_ctx(&f, &r, &images, 1_000_000);
+        let l = Layout::build_with_images(&ctx, LEFT, TOP);
+        let rows: Vec<&VisualLine> = l.lines().iter().filter(|v| v.table.is_some()).collect();
+        assert_eq!(rows.len(), 4, "two header rows and two body rows");
+        let (narrow, wide) = (columns_span(rows[0]), columns_span(rows[2]));
+        assert_eq!(columns_span(rows[1]), narrow, "the first table's body row");
+        assert_eq!(columns_span(rows[3]), wide, "the second table's body row");
+        assert!(
+            narrow < wide,
+            "each table keeps its own width: {narrow} vs {wide}"
+        );
+    }
+
+    /// A generated table document of `rows` body rows and three columns.
+    fn table_doc(rows: usize) -> String {
+        let mut s = String::from("| head one | head two | head three |\n| --- | --- | --- |\n");
+        for i in 0..rows {
+            s.push_str(&format!("| cell {i} a | cell {i} b | cell {i} c |\n"));
+        }
+        s
     }
 
     #[test]

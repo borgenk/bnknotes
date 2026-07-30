@@ -1049,12 +1049,13 @@ pub enum Align {
     Right,
 }
 
-/// Whether `line` holds a `|` that is not backslash-escaped, the mark of a table
+/// Whether `bytes` hold a `|` that is not backslash-escaped, the mark of a table
 /// row. A run of backslashes toggles the escape, so `\|` is escaped but `\\|` is
-/// a live pipe.
-fn has_unescaped_pipe(line: &str) -> bool {
+/// a live pipe. Takes an iterator so a caller with the line in hand and one
+/// reading it out of a rope share the one state machine.
+pub fn has_unescaped_pipe_bytes(bytes: impl Iterator<Item = u8>) -> bool {
     let mut escaped = false;
-    for &b in line.as_bytes() {
+    for b in bytes {
         match b {
             b'\\' => escaped = !escaped,
             b'|' if !escaped => return true,
@@ -1062,6 +1063,11 @@ fn has_unescaped_pipe(line: &str) -> bool {
         }
     }
     false
+}
+
+/// [`has_unescaped_pipe_bytes`] over a line already in memory.
+fn has_unescaped_pipe(line: &str) -> bool {
+    has_unescaped_pipe_bytes(line.bytes())
 }
 
 /// Whether `line` can continue a table body: it carries an unescaped pipe. A

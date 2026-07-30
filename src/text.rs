@@ -25,6 +25,7 @@
 //! it, so the buffer reads as clean again the moment an edit is undone back to
 //! the saved state.
 
+use std::borrow::Cow;
 use std::collections::VecDeque;
 
 use crate::markdown;
@@ -482,23 +483,26 @@ impl TextBuffer {
     }
 
     /// The content of the logical line containing `byte` (excluding any trailing
-    /// `'\n'`), as `(content_start, content_end, text)`. Materializes just that
-    /// one line of the rope: the shared "resolve the line, take its bounds, slice
-    /// it" step behind the list and markdown line inspections.
-    fn content_line_at(&self, byte: usize) -> (usize, usize, String) {
+    /// `'\n'`), as `(content_start, content_end, text)`. The shared "resolve the
+    /// line, take its bounds, read it" step behind the list and markdown line
+    /// inspections. The text is borrowed out of the rope whenever the line sits in
+    /// one leaf, so inspecting a long paragraph copies nothing; a caller that needs
+    /// the line to outlive an edit takes `into_owned` at its own call site.
+    fn content_line_at(&self, byte: usize) -> (usize, usize, Cow<'_, str>) {
         let (ls, le) = self.text.line_content_range(self.text.byte_to_line(byte));
-        (ls, le, self.text.byte_slice(ls..le))
+        (ls, le, self.text.slice(ls..le).as_cow())
     }
 
     /// The full logical line containing `byte`, through its trailing `'\n'` (so
     /// the newline is present as its own cluster), as `(line_start, text)`. A
     /// grapheme cluster never spans a `'\n'`, so this one-line window is all the
-    /// cursor-boundary scans need.
-    fn full_line_at(&self, byte: usize) -> (usize, String) {
+    /// cursor-boundary scans need. Borrowed like [`Self::content_line_at`], which
+    /// matters most here: every cursor move runs this.
+    fn full_line_at(&self, byte: usize) -> (usize, Cow<'_, str>) {
         let line = self.text.byte_to_line(byte);
         let ls = self.text.line_to_byte(line);
         let le = self.text.line_to_byte(line + 1);
-        (ls, self.text.byte_slice(ls..le))
+        (ls, self.text.slice(ls..le).as_cow())
     }
 
     /// Whether the cursor's line is a list item (bullet or ordered, perhaps

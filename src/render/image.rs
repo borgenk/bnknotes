@@ -284,9 +284,27 @@ fn pack(bytes: Vec<u8>, w: u32, h: u32) -> Result<Image> {
     let channels = bytes.len() / count;
     let mut pixels = Vec::with_capacity(count);
     match channels {
-        4 => pixels.extend(bytes.chunks_exact(4).map(|p| argb(p[3], p[0], p[1], p[2]))),
-        3 => pixels.extend(bytes.chunks_exact(3).map(|p| argb(255, p[0], p[1], p[2]))),
-        2 => pixels.extend(bytes.chunks_exact(2).map(|p| argb(p[1], p[0], p[0], p[0]))),
+        4 => pixels.extend(
+            bytes
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|p| argb(p[3], p[0], p[1], p[2])),
+        ),
+        3 => pixels.extend(
+            bytes
+                .as_chunks::<3>()
+                .0
+                .iter()
+                .map(|p| argb(255, p[0], p[1], p[2])),
+        ),
+        2 => pixels.extend(
+            bytes
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|p| argb(p[1], p[0], p[0], p[0])),
+        ),
         1 => pixels.extend(bytes.iter().map(|&g| argb(255, g, g, g))),
         _ => return Err(Error::msg("unexpected channel count")),
     }

@@ -1,3 +1,7 @@
+# panic = "immediate-abort" on the release profile is still unstable, so the
+# manifest has to opt in. That is what pins this project to nightly.
+cargo-features = ["panic-immediate-abort"]
+
 [package]
 name = "bnknotes"
 version = "0.1.0"
@@ -24,10 +28,19 @@ zune-jpeg = { version = "0.5", default-features = false, features = ["std"] }
 # `make perf-lab` enable it.
 perf-alloc = []
 
+# A release panic aborts where it happens and prints nothing: no message, no location,
+# no backtrace. That leaves out the unwinding tables, the panic formatter and std's
+# backtrace symbolizer, about a twelfth of the binary. The editor can afford it because
+# no panics outside tests is a prime directive, so a release panic is a bug either way,
+# and nothing in the tree calls catch_unwind, sets a panic hook, or uses should_panic.
+# The strategy sits on this profile, so debug builds and the test harness keep unwinding
+# panics with their messages.
+#
+# For a profile with symbols, build with --config profile.release.strip=false
+# --config profile.release.debug=1. A readable panic needs a debug build.
 [profile.release]
 opt-level = 3
-lto = true             # Link-time optimization (better perf + smaller binary)
-codegen-units = 1      # Single codegen unit for better optimization
-panic = "abort"        # No unwinding, smaller binary
-debug = 1              # Line tables for readable crash backtraces
-strip = "debuginfo"    # Strip DWARF info, keep symbol names for backtraces
+lto = true
+codegen-units = 1
+panic = "immediate-abort"
+strip = true

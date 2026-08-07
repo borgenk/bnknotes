@@ -4,7 +4,8 @@
 //! The buffer is one string with `'\n'` separators. This pass splits it on those
 //! newlines into logical lines, then soft-wraps each to the available width with
 //! a greedy word wrap (break after the last space that fits; an over-long word
-//! breaks mid-word at a grapheme boundary). The result is a flat list of
+//! breaks after a link's last URL separator, else mid-word at a grapheme
+//! boundary). The result is a flat list of
 //! [`VisualLine`]s, each with a baseline and a `hard` flag distinguishing a real
 //! newline from a soft wrap. Everything geometric lives here so the editor model
 //! stays free of font metrics:
@@ -35,9 +36,15 @@
 //! `*`/`_`). Markers live-preview: on a line the cursor has left they collapse
 //! (`Run::visible` is false, zero width), drawing only the styled text; they
 //! reappear when the cursor returns. The exception is a list or quote block
-//! marker, which persists (it is the only sign the line is a list or quote). Wrapping
-//! always measures the source text, so this collapse only shifts runs
-//! horizontally within a line, never reflowing the document.
+//! marker, which persists (it is the only sign the line is a list or quote).
+//!
+//! Wrapping measures what a row draws, so a collapsed marker takes no width and a
+//! link's hidden destination does not blow a hole in the paragraph. Revealing a
+//! line can therefore re-wrap it: the [`LineIndex`] measures every line collapsed
+//! and records what its reveal would cost (`wrap_extra`), which [`Adjust`] adds
+//! back for the lines the cursor or selection touches. A table cell is the
+//! exception and wraps to its source, since its column width was fitted from the
+//! source too.
 //!
 //! A list or quote item also hangs its wrapped continuations under the text: each
 //! visual line past the first is inset by the marker's width (`VisualLine::indent`)
@@ -880,7 +887,8 @@ impl Layout {
                 &mut tables,
                 false,
                 &mut lines,
-            );
+            )
+            .height;
             i += 1;
         }
         Self {
@@ -2005,6 +2013,23 @@ impl LineClass {
         }
     }
 
+    /// Whether markup starting at line-relative `off` draws under this line's
+    /// reveal state. Text always draws; a marker draws only on a revealed line,
+    /// except the block marker (the leading `[0, block_marker)` bytes) when it
+    /// persists as a list bullet or quote bar. Both the wrap (which measures what
+    /// draws) and [`clip_runs_into`] (which decides what to paint) ask this, so a
+    /// row can never be wrapped against markup it does not show.
+    fn draws(&self, kind: markdown::SpanKind, off: usize) -> bool {
+        if !matches!(kind, markdown::SpanKind::Marker) {
+            return true;
+        }
+        if off < self.block_marker {
+            self.revealed || self.block_persists
+        } else {
+            self.revealed
+        }
+    }
+
     /// True to draw a horizontal rule: a thematic break whose cursor has left, so
     /// its raw `---` is collapsed (on the line itself the editable source shows).
     fn rule(&self) -> bool {
@@ -2148,14 +2173,25 @@ pub(crate) fn active_reveals_marker(
     }
 }
 
+/// What laying out one logical line produced.
+struct Laid {
+    /// The height it added: the amount to advance `box_top` before the next line.
+    height: i32,
+    /// The extra height the same line takes with its markup revealed, since a row
+    /// is wrapped to what it draws. Zero on a line that is already revealed and on
+    /// one whose markup fits the rows it already has. A revealed image's source
+    /// rows are not counted here; [`LineIndex::measure_line`] prices those.
+    wrap_extra: i32,
+}
+
 /// Lay out one logical line `[ls, le)` starting at content-space top `box_top`,
-/// appending its visual line(s) to `out` and returning the height it added (the
-/// amount to advance `box_top` before the next line). `fence` and `list_depth` are
+/// appending its visual line(s) to `out`. `fence` and `list_depth` are
 /// the only cross-line carry, threaded by `&mut`; everything else is a pure
-/// function of this line's text plus `active`/`image_ui`, which affect reveal and
-/// image widgets only, never wrap points or baselines. This is the single per-line
-/// unit shared by the full [`Layout::build_with_images`] loop and (later) the
-/// windowed build, so the two can never disagree on a line's shape.
+/// function of this line's text plus `active`/`image_ui`, which decide which markup
+/// the line draws (and so where it wraps) and whether an image shows its source.
+/// This is the single per-line unit shared by the full
+/// [`Layout::build_with_images`] loop and the windowed build, so the two can never
+/// disagree on a line's shape.
 ///
 /// `pool` supplies the per-line scratch buffers (`clusters`, `segments`), owned by
 /// the caller's build loop and reused across every line so laying out a line
@@ -2177,7 +2213,7 @@ fn lay_line(
     // `Vec` per visual row that measurement would immediately discard.
     measure_only: bool,
     out: &mut Vec<VisualLine>,
-) -> i32 {
+) -> Laid {
     let (ls, le, has_newline) = (logical.start, logical.end, logical.has_newline);
     // Running box top within this logical line; the return value is how far it
     // advanced past the incoming `box_top`.
@@ -2204,11 +2240,17 @@ fn lay_line(
         // state threads the carry.
         if let Some((span, role)) = tables.locate(ctx.rope, line_no) {
             carry.list_depth = None;
-            return match role {
+            // A table cell wraps against its source, so a row's height is the same
+            // revealed or not and there is nothing for a reveal to reflow.
+            let height = match role {
                 TableRole::Delimiter => 0,
                 TableRole::Header | TableRole::Body => {
                     lay_table_row(ctx, span, line_no, box_top, measure_only, pool, tables, out)
                 }
+            };
+            return Laid {
+                height,
+                wrap_extra: 0,
             };
         }
         if let Some(link) = markdown::standalone_image(&line) {
@@ -2244,7 +2286,10 @@ fn lay_line(
                         image,
                     ));
                     y += image.box_height();
-                    return y - box_top;
+                    return Laid {
+                        height: y - box_top,
+                        wrap_extra: 0,
+                    };
                 }
             }
         }
@@ -2303,22 +2348,24 @@ fn lay_line(
         ctx.wrap_width
     };
     // `wrap_segments` returns ranges relative to the line; offset them back to
-    // absolute buffer positions. It measures the source text, so clipping spans to
-    // each segment never disagrees with the breaks, and reveal state (which only
-    // hides markers) never reflows the document.
-    wrap_segments(
+    // absolute buffer positions. It measures what the line draws, so a collapsed
+    // marker's width is not reserved and the rows hold the text the reader sees;
+    // revealing the line reflows it, by `reveal_rows` extra rows.
+    let reveal_rows = wrap_segments(
         ctx.fonts,
         size,
         &line,
         &pool.spans,
+        &class,
+        WrapBasis::Drawn,
         line_wrap,
         block_indent,
         heading.is_some(),
-        !code_block,
         ctx.scale,
         &mut pool.clusters,
         &mut pool.segments,
-    );
+    )
+    .saturating_sub(pool.segments.len());
     let last = pool.segments.len() - 1;
     // A bullet keeps its dot and a task its checkbox while you edit the label, so a
     // list stays a list. The decoration gives way to the raw marker only where the
@@ -2391,7 +2438,10 @@ fn lay_line(
         ));
         y += image.box_height();
     }
-    y - box_top
+    Laid {
+        height: y - box_top,
+        wrap_extra: reveal_rows as i32 * metrics.line_height,
+    }
 }
 
 /// An `active` range that reveals nothing: `MAX <= le` is always false, so every
@@ -2449,7 +2499,12 @@ struct LineRec {
     /// Extra height the source text adds above a standalone picture when its line
     /// is revealed; 0 for every non-image line. Applied as a per-query overlay so
     /// the base height stays a pure function of `(version, width)`.
-    reveal_extra: i32,
+    image_extra: i32,
+    /// Extra height the line's own text gains when its markup is revealed and the
+    /// rows re-wrap against the wider source; 0 where the markup fits the rows it
+    /// already has. The same overlay applies it, over the whole active range rather
+    /// than its ends, since every line the range touches reveals.
+    wrap_extra: i32,
     /// Open code-fence backtick count entering this line (0 = not in a fence).
     fence_in: u16,
     /// List nesting depth entering this line (-1 = not in a list).
@@ -2460,13 +2515,17 @@ struct LineRec {
     heading: u8,
 }
 
-/// A ≤2-line overlay of the extra height revealed image sources add on top of the
-/// base [`LineIndex`] geometry (the cursor's image line, and a raw-pinned one).
-/// Empty is the base geometry.
+/// What is revealed right now, on top of the base [`LineIndex`] geometry: the
+/// image sources shown (the cursor's image line and a raw-pinned one, never more
+/// than two), and the logical lines whose markup shows raw. Empty is the base
+/// geometry.
 #[derive(Clone, Copy, Default)]
 pub struct RevealAdjust {
     entries: [(usize, i32); 2],
     len: usize,
+    /// The logical lines the cursor or selection touches, inclusive. Their markup
+    /// draws raw, so each is as tall as the index recorded it would re-wrap to.
+    active: Option<(usize, usize)>,
 }
 
 impl RevealAdjust {
@@ -2482,11 +2541,14 @@ impl RevealAdjust {
         }
     }
 
-    fn total(&self) -> i32 {
-        self.entries[..self.len].iter().map(|&(_, e)| e).sum()
+    /// Record that logical lines `lo..=hi` show their markup raw, so their rows
+    /// wrap against the source rather than what they draw collapsed.
+    pub fn reveal_lines(&mut self, lo: usize, hi: usize) {
+        self.active = Some((lo.min(hi), hi.max(lo)));
     }
 
-    fn before(&self, line: usize) -> i32 {
+    /// The image height revealed strictly above `line`.
+    fn images_before(&self, line: usize) -> i32 {
         self.entries[..self.len]
             .iter()
             .filter(|&&(l, _)| l < line)
@@ -2517,14 +2579,20 @@ impl<'a> Adjust<'a> {
 /// every line once via [`lay_line`], it computes total content height, maps a
 /// logical line to a content-space position, and seeds a windowed layout that
 /// starts mid-document, all without keeping the whole document's runs. A cursor
-/// move or scroll reuses the index unchanged (heights do not depend on reveal);
-/// only an edit or resize rebuilds it.
+/// move or scroll reuses the index unchanged (the base heights are collapsed ones,
+/// and what a reveal adds is priced per line and applied by [`Adjust`]); only an
+/// edit or resize rebuilds it.
 #[derive(Clone)]
 pub struct LineIndex {
     recs: Vec<LineRec>,
     /// Cumulative base height: `tops[i]` is the content-space top of logical line
     /// `i` (0-relative); `tops[len]` is the total base height.
     tops: Vec<i32>,
+    /// Cumulative [`LineRec::wrap_extra`], indexed the same way, so the re-wrap a
+    /// reveal costs over any run of lines is one subtraction rather than a walk. A
+    /// selection may reveal the whole document, and a scroll queries the geometry
+    /// per frame, so this stays O(1).
+    wrap_tops: Vec<i32>,
 }
 
 impl LineIndex {
@@ -2544,15 +2612,17 @@ impl LineIndex {
         let logical = LogicalLine::at(ctx.rope, i, n);
         let carry_in = *carry;
         scratch.clear();
-        let height = lay_line(ctx, logical, i, 0, carry, pool, tables, true, scratch);
+        let laid = lay_line(ctx, logical, i, 0, carry, pool, tables, true, scratch);
         // Read the heading level off the measured rows before the reveal pass
         // below reuses `scratch`. A wrapped heading repeats its level on every row.
         let heading_level = scratch.iter().find_map(|v| v.heading).unwrap_or(0);
-        // Only a decoded standalone image changes height when revealed; measure
-        // that once here. Re-running from the pre-line carry reproduces the same
-        // state mutation (an image forces list_depth=None, fence must be None), so
-        // the throwaway `revealed_carry` is discarded.
-        let reveal_extra = if scratch.iter().any(|v| v.image.is_some()) {
+        // A decoded standalone image is the one line whose reveal adds whole rows of
+        // its own (its editable source), so it is measured revealed here. Re-running
+        // from the pre-line carry reproduces the same state mutation (an image forces
+        // list_depth=None, fence must be None), so the throwaway `revealed_carry` is
+        // discarded. Every other line's reveal only re-wraps, which `lay_line`
+        // already priced.
+        let image_extra = if scratch.iter().any(|v| v.image.is_some()) {
             let mut revealed_carry = carry_in;
             let revealed_ctx = ctx.with_active((logical.start, logical.end));
             scratch.clear();
@@ -2567,34 +2637,43 @@ impl LineIndex {
                 true,
                 scratch,
             );
-            revealed - height
+            revealed.height - laid.height
         } else {
             0
         };
         LineRec {
-            height,
-            reveal_extra,
+            height: laid.height,
+            image_extra,
+            wrap_extra: laid.wrap_extra,
             fence_in: carry_in.fence.map_or(0, |f| f.packed()),
             depth_in: carry_in.list_depth.map_or(-1, |d| d as i16),
             heading: heading_level,
         }
     }
 
-    /// Build the cumulative-height prefix (`tops`) from a record list.
+    /// Build the cumulative prefixes (`tops`, `wrap_tops`) from a record list.
     fn from_recs(recs: Vec<LineRec>) -> Self {
         let mut tops = Vec::with_capacity(recs.len() + 1);
-        let mut acc = 0;
+        let mut wrap_tops = Vec::with_capacity(recs.len() + 1);
+        let (mut acc, mut wrap_acc) = (0, 0);
         for rec in &recs {
             tops.push(acc);
+            wrap_tops.push(wrap_acc);
             acc += rec.height;
+            wrap_acc += rec.wrap_extra;
         }
         tops.push(acc);
-        LineIndex { recs, tops }
+        wrap_tops.push(wrap_acc);
+        LineIndex {
+            recs,
+            tops,
+            wrap_tops,
+        }
     }
 
     /// Measure every logical line's base geometry and carry state. `images` is the
     /// pane's decoded-image store, so a standalone `![](...)` line is recognized as
-    /// a picture (and its `reveal_extra` recorded) exactly as the full build sees it.
+    /// a picture (and its `image_extra` recorded) exactly as the full build sees it.
     pub fn build(
         fonts: &Fonts,
         rope: &Rope,
@@ -2820,22 +2899,23 @@ impl LineIndex {
         self.recs.len()
     }
 
-    /// The heap bytes the index holds: the per-line records and their prefix-sum
-    /// tops. For the memory report.
+    /// The heap bytes the index holds: the per-line records and their prefix sums.
+    /// For the memory report.
     pub fn heap_bytes(&self) -> usize {
         self.recs.capacity() * std::mem::size_of::<LineRec>()
-            + self.tops.capacity() * std::mem::size_of::<i32>()
+            + (self.tops.capacity() + self.wrap_tops.capacity()) * std::mem::size_of::<i32>()
     }
 
-    /// Total content height, less what the overlay's folds hide and plus any image
-    /// sources it reveals.
+    /// Total content height, less what the overlay's folds hide and plus everything
+    /// it reveals.
     pub fn content_height(&self, adjust: Adjust) -> i32 {
-        self.tops[self.recs.len()] - adjust.folds.hidden_total() + adjust.reveal.total()
+        self.tops[self.recs.len()] - adjust.folds.hidden_total()
+            + self.revealed_before(self.recs.len(), adjust)
     }
 
     /// Content-space top of logical line `line` (0-relative), pulled up by every
-    /// fold above it and pushed down by any earlier revealed image. A line inside a
-    /// fold resolves to the position the fold itself occupies, so all of a hidden
+    /// fold above it and pushed down by everything revealed above it. A line inside
+    /// a fold resolves to the position the fold itself occupies, so all of a hidden
     /// section shares one top and the result stays monotonic in `line` (which is
     /// what lets [`Self::line_at_y`] binary search it).
     pub fn logical_top(&self, line: usize, adjust: Adjust) -> i32 {
@@ -2844,7 +2924,29 @@ impl LineIndex {
             Some((start, hidden_above)) => self.tops[start] - hidden_above,
             None => self.tops[line] - adjust.folds.hidden_before(line),
         };
-        base + adjust.reveal.before(line)
+        base + self.revealed_before(line, adjust)
+    }
+
+    /// The height the current reveal adds strictly above `line`: the image sources
+    /// shown there, plus the re-wrap of every active line above it that a fold does
+    /// not hide (a hidden line draws nothing, so its markup reflows nothing).
+    fn revealed_before(&self, line: usize, adjust: Adjust) -> i32 {
+        let images = adjust.reveal.images_before(line);
+        let Some((lo, hi)) = adjust.reveal.active else {
+            return images;
+        };
+        // `hi` is inclusive; the prefix sums want a half-open range, clamped to the
+        // lines that lie above `line` and inside the document.
+        let end = (hi + 1).min(line).min(self.recs.len());
+        if end <= lo {
+            return images;
+        }
+        let hidden: i32 = adjust
+            .folds
+            .hidden_spans_in(lo, end)
+            .map(|(s, e)| self.wrap_tops[e] - self.wrap_tops[s])
+            .sum();
+        images + (self.wrap_tops[end] - self.wrap_tops[lo]) - hidden
     }
 
     /// The logical line whose row band contains content-space `y`: the last line
@@ -2869,8 +2971,8 @@ impl LineIndex {
 
     /// The extra height logical line `line` gains when its image source is revealed
     /// (0 for a non-image line). The pane uses this to build a [`RevealAdjust`].
-    pub fn reveal_extra(&self, line: usize) -> i32 {
-        self.recs.get(line).map_or(0, |r| r.reveal_extra)
+    pub fn image_extra(&self, line: usize) -> i32 {
+        self.recs.get(line).map_or(0, |r| r.image_extra)
     }
 
     /// The cross-line carry state entering logical line `line`: the open fence (its
@@ -3062,10 +3164,8 @@ fn code_block_spans_into(
 }
 
 /// Clip line-relative `spans` to the visual segment `[seg_start, seg_end)`,
-/// offsetting to absolute by `ls`. Text runs always show. A marker shows only on
-/// a revealed line, except the block marker (the leading `[0, block_marker)`
-/// bytes) when `block_persists`: a list bullet or quote `>` stays on screen even
-/// off the active line. Empty overlaps are dropped, so the runs tile the segment.
+/// offsetting to absolute by `ls`, and mark each run visible per
+/// [`LineClass::draws`]. Empty overlaps are dropped, so the runs tile the segment.
 #[allow(clippy::too_many_arguments)]
 fn clip_runs_into(
     spans: &[markdown::Span],
@@ -3081,20 +3181,11 @@ fn clip_runs_into(
         if s >= e {
             continue;
         }
-        let is_marker = matches!(span.kind, markdown::SpanKind::Marker);
-        // The block marker occupies the line's leading `[0, block_marker)` bytes;
-        // inline markers (code, emphasis) start past it.
-        let is_block_marker = is_marker && span.start < class.block_marker;
-        let visible = if is_block_marker {
-            class.revealed || class.block_persists
-        } else {
-            !is_marker || class.revealed
-        };
         out.push(Run {
             start: ls + s,
             end: ls + e,
             kind: span.kind,
-            visible,
+            visible: class.draws(span.kind, span.start),
         });
     }
 }
@@ -3105,24 +3196,51 @@ struct Cluster {
     /// Byte offset within the line.
     off: usize,
     /// Advance in the cluster's own face, with an inline code span's pill pads
-    /// folded onto the span's first cluster.
+    /// folded onto the span's first cluster. What the cluster costs a row that shows
+    /// it; a row that collapses it (see `drawn`) is charged nothing.
     w: f32,
+    /// Whether the row draws this cluster: false for markup the line collapses,
+    /// which takes no width until the line is revealed.
+    drawn: bool,
     /// A space, so a wrap may break after it.
     space: bool,
     /// Markup rather than text: a block marker (`> `, `# `, `- `) or an inline
     /// delimiter. It collapses off the cursor's line, so a segment holding nothing
     /// but markers draws an empty row.
     marker: bool,
+    /// A separator inside a link, so a URL with no space in it may break after this
+    /// cluster instead of mid-token.
+    url_sep: bool,
 }
 
-/// Greedily word-wrap the logical `line` to `wrap_width` pixels, returning the
-/// byte ranges of its visual segments. Breaks after the last space that fits and
-/// has text before it; a word wider than `wrap_width` breaks at a grapheme
-/// boundary, so every segment holds at least one cluster and no segment is markup
-/// alone. `wrap_width <= 0` disables wrapping. Each cluster is measured in its
-/// run's face (per `spans` and `size`), so bold/italic widths wrap correctly; the
-/// source text is measured in full (markers included), so hiding markers later
-/// never reflows the line.
+/// The punctuation a URL may break after: every ASCII separator RFC 3986 builds a
+/// URL from. What lies between them is a name, which breaks no better than any
+/// other word.
+const URL_SEPARATORS: &[u8] = b"/-_.~:?#[]@!$&'()*+,;=%";
+
+/// Which widths a wrap measures.
+#[derive(Clone, Copy, PartialEq)]
+enum WrapBasis {
+    /// What the row draws: markup the line collapses measures zero, so a row is
+    /// wrapped to the text the reader sees.
+    Drawn,
+    /// The source in full, markup included. A table cell wraps this way, so the
+    /// column width fitted from its natural (source) width and the wrap inside it
+    /// agree, and a table's geometry does not shift as the caret enters a row. It is
+    /// also what a revealed line costs, which is how the reveal's reflow is priced.
+    Source,
+}
+
+/// Greedily word-wrap the logical `line` to `wrap_width` pixels, filling `segments`
+/// with the byte ranges of its visual rows and returning how many rows the same line
+/// takes once its markup is revealed (equal to `segments.len()` on an already
+/// revealed line, and under [`WrapBasis::Source`]).
+///
+/// Breaks after the last space that fits and has text before it; a word wider than
+/// `wrap_width` breaks after the last URL separator inside a link, else at a
+/// grapheme boundary, so every row holds at least one cluster and no row is markup
+/// alone. `wrap_width <= 0` disables wrapping. Each cluster is measured in its run's
+/// face (per `spans` and `size`), so bold/italic widths wrap correctly.
 ///
 /// `block_indent` is the hanging indent of a list or quote item: the first
 /// segment uses the full `wrap_width` (its marker sits in that width), and every
@@ -3134,59 +3252,111 @@ fn wrap_segments(
     size: u32,
     line: &str,
     spans: &[markdown::Span],
+    class: &LineClass,
+    basis: WrapBasis,
     wrap_width: i32,
     block_indent: i32,
     heading: bool,
-    pad_code: bool,
     scale: Scale,
     clusters: &mut Vec<Cluster>,
     segments: &mut Vec<(usize, usize)>,
-) {
+) -> usize {
     segments.clear();
     if wrap_width <= 0 || line.is_empty() {
         segments.push((0, line.len()));
-        return;
+        return 1;
     }
     // Measure each cluster once. The pooled buffer is cleared and refilled, so it
     // reuses its capacity across lines instead of allocating one sized to the line
     // on every call.
     clusters.clear();
     let mut prev_code = false;
+    // Whether anything on the line is collapsed, so revealing it could reflow. A
+    // plain line (most of a document) has nothing to reveal and skips the second
+    // pass entirely.
+    let mut collapses = false;
     clusters.extend(grapheme::graphemes(line).map(|(off, cluster)| {
         let kind = kind_at(spans, off);
         let face = run_face(fonts, size, kind, heading);
         let mut w = shape::text_advance(face, cluster);
         // Fold both of an inline code span's pill pads onto its first cluster, so a
         // wrap keeps the pill's full width on one line. The exact placement within
-        // the run does not change the total width the line has to fit. A fenced block
-        // and a table cell draw no pill and pass `pad_code` false, skipping this.
+        // the run does not change the total width the line has to fit. A fenced
+        // block draws no pill, so it reserves no pad.
         let is_code = matches!(kind, markdown::SpanKind::Text(markdown::Emphasis::Code));
-        if pad_code && is_code && !prev_code {
+        if !class.code_block && is_code && !prev_code {
             w += (2 * scale.px(crate::theme::CODE_PAD_X)) as f32;
         }
         prev_code = is_code;
+        let drawn = basis == WrapBasis::Source || class.draws(kind, off);
+        collapses |= !drawn;
         Cluster {
             off,
             w,
+            drawn,
             space: cluster == " ",
             marker: matches!(kind, markdown::SpanKind::Marker),
+            url_sep: matches!(kind, markdown::SpanKind::Text(markdown::Emphasis::Link))
+                && matches!(cluster.as_bytes(), [b] if URL_SEPARATORS.contains(b)),
         }
     }));
     if clusters.is_empty() {
         segments.push((0, line.len()));
-        return;
+        return 1;
     }
+    let rows = wrap_rows(
+        clusters,
+        basis,
+        line.len(),
+        wrap_width,
+        block_indent,
+        Some(segments),
+    );
+    // What the line would cost with its markup shown: a second walk over clusters
+    // already measured, so the reflow a reveal causes is priced without laying the
+    // line out twice. Nothing collapsed means nothing to reflow.
+    if collapses {
+        wrap_rows(
+            clusters,
+            WrapBasis::Source,
+            line.len(),
+            wrap_width,
+            block_indent,
+            None,
+        )
+    } else {
+        rows
+    }
+}
 
+/// One greedy pass over the measured `clusters` on `basis`, filling rows to
+/// `wrap_width` and returning the row count. `out`, when given, collects each row's
+/// byte range; without it the pass only counts, which is how the reveal's reflow is
+/// priced.
+fn wrap_rows(
+    clusters: &[Cluster],
+    basis: WrapBasis,
+    line_len: usize,
+    wrap_width: i32,
+    block_indent: i32,
+    mut out: Option<&mut Vec<(usize, usize)>>,
+) -> usize {
+    let mut rows = 0;
     let mut i = 0;
     while i < clusters.len() {
         // The first segment gets the full width; continuations are narrower by
         // the hanging indent, since they render inset by it.
-        let limit = (wrap_width - if segments.is_empty() { 0 } else { block_indent }).max(1) as f32;
+        let limit = (wrap_width - if rows == 0 { 0 } else { block_indent }).max(1) as f32;
         let seg_start = clusters[i].off;
         let mut width = 0.0;
         // Cluster index that would start the next segment if we break at the
         // last fitting space; `None` until a space is seen in this segment.
         let mut last_break: Option<usize> = None;
+        // The same, for the last URL separator that fits. A long link holds no
+        // space to break at, so it breaks after its last `/` or `-` instead of
+        // mid-token. Only reached when there is no space break, so a link that
+        // would fit whole on the next row still moves there in one piece.
+        let mut last_url_break: Option<usize> = None;
         // Whether the segment has any text to keep yet. A space before there is any
         // is no break opportunity: breaking there would leave a segment of markup
         // that draws nothing, so `> <long url>` would hand the quote's first row to
@@ -3195,30 +3365,48 @@ fn wrap_segments(
         let mut j = i;
         while j < clusters.len() {
             let c = clusters[j];
+            let w = if c.drawn || basis == WrapBasis::Source {
+                c.w
+            } else {
+                0.0
+            };
             // Always keep at least one cluster (j > i) before allowing a break.
-            if width + c.w > limit && j > i {
+            if width + w > limit && j > i {
                 break;
             }
-            width += c.w;
+            width += w;
             j += 1;
             match (c.space, c.marker) {
                 (true, _) if text => last_break = Some(j),
-                (false, false) => text = true,
+                (false, false) => {
+                    text = true;
+                    if c.url_sep {
+                        last_url_break = Some(j);
+                    }
+                }
                 _ => {}
             }
         }
+        rows += 1;
         if j >= clusters.len() {
-            segments.push((seg_start, line.len()));
+            if let Some(out) = out.as_mut() {
+                out.push((seg_start, line_len));
+            }
             break;
         }
-        // Break after the last space if there was one, else mid-word at j.
-        let next = match last_break {
-            Some(b) if b > i => b,
+        // Break after the last space if there was one, else after the last URL
+        // separator, else mid-word at j.
+        let next = match (last_break, last_url_break) {
+            (Some(b), _) if b > i => b,
+            (_, Some(b)) if b > i => b,
             _ => j,
         };
-        segments.push((seg_start, clusters[next].off));
+        if let Some(out) = out.as_mut() {
+            out.push((seg_start, clusters[next].off));
+        }
         i = next;
     }
+    rows
 }
 
 // --- Table layout -----------------------------------------------------------
@@ -3657,12 +3845,15 @@ fn build_cell(
             size,
             piece,
             &pool.spans,
+            &class,
+            // A column is fitted to its cells' natural (source) widths, so the wrap
+            // inside one measures the source too. Otherwise a row's cells would
+            // re-wrap as the caret entered it, under a column width fitted for text
+            // that is no longer what the cell draws.
+            WrapBasis::Source,
             width,
             0,
             header,
-            // Inline code in a cell draws the same padded pill prose does, so reserve
-            // its pad in the wrap; the run-walks below fold the same pad in.
-            true,
             ctx.scale,
             &mut pool.clusters,
             &mut pool.segments,
@@ -3766,7 +3957,8 @@ mod tests {
                 &mut tables,
                 false,
                 &mut lines,
-            );
+            )
+            .height;
         }
         Layout {
             lines,
@@ -4110,6 +4302,116 @@ mod tests {
                 assert_eq!(a, b, "layout build must be deterministic (width {w})");
             }
         }
+    }
+
+    #[test]
+    fn the_reveal_overlay_matches_a_revealed_build() {
+        // The index measures collapsed lines, so revealing one re-wraps it. What the
+        // overlay adds for that must be exactly what a revealed build lays out, or a
+        // scroll position drifts the moment the caret lands on a link. Checked with
+        // the caret on a spread of lines, and with the whole document selected.
+        let f = fonts();
+        let no_images = ImageStore::new(None);
+        for r in oracle_docs() {
+            let n = r.len_lines();
+            let spots: Vec<(usize, usize)> = (0..n)
+                .step_by((n / 6).max(1))
+                .map(|l| (l, l))
+                .chain(std::iter::once((0, n - 1)))
+                .collect();
+            for &w in ORACLE_WIDTHS {
+                let idx = LineIndex::build(&f, &r, w, BODY, &no_images, Scale::ONE);
+                for &(lo, hi) in &spots {
+                    let active = (r.line_content_range(lo).0, r.line_content_range(hi).1);
+                    let full = Layout::build(&f, &r, LEFT, TOP, w, BODY, active);
+                    let mut reveal = RevealAdjust::default();
+                    reveal.reveal_lines(lo, hi);
+                    let adjust = Adjust::new(reveal, FoldMap::NONE);
+                    assert_eq!(
+                        idx.content_height(adjust),
+                        full.text_height(),
+                        "content height revealing lines {lo}..={hi} (width {w})"
+                    );
+                    let mut last = None;
+                    for v in full.lines() {
+                        let li = r.byte_to_line(v.start);
+                        if Some(li) != last {
+                            let top = v.baseline
+                                - f.metrics(v.size).ascent
+                                - heading_pad(&f, v, li)
+                                - TOP;
+                            assert_eq!(
+                                idx.logical_top(li, adjust),
+                                top,
+                                "top of line {li} revealing {lo}..={hi} (width {w})"
+                            );
+                            last = Some(li);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_revealed_link_line_costs_the_rows_its_source_adds() {
+        // The concrete case the overlay exists for: collapsed, the line is one row
+        // of drawn text; revealed, the destination shows and pushes it to more.
+        let f = fonts();
+        let no_images = ImageStore::new(None);
+        let src = "see [docs](https://example.com/a/very/long/path/goes/on/forever) ok\n";
+        let r = rope(src);
+        let w = wrap_after(&f, "see docs ok and some room to spare");
+        let idx = LineIndex::build(&f, &r, w, BODY, &no_images, Scale::ONE);
+        let collapsed = Layout::build(&f, &r, LEFT, TOP, w, BODY, NO_REVEAL);
+        assert_eq!(
+            collapsed.lines().len(),
+            2,
+            "collapsed, the drawn text fits one row (plus the empty last line)"
+        );
+        let revealed = Layout::build(&f, &r, LEFT, TOP, w, BODY, (0, 0));
+        assert!(
+            revealed.lines().len() > collapsed.lines().len(),
+            "the raw destination pushes the line onto more rows"
+        );
+        let mut reveal = RevealAdjust::default();
+        reveal.reveal_lines(0, 0);
+        assert_eq!(
+            idx.content_height(Adjust::new(reveal, FoldMap::NONE)),
+            revealed.text_height(),
+            "the overlay prices exactly the rows the reveal added"
+        );
+        assert_eq!(
+            idx.content_height(base_adjust(FoldMap::NONE)),
+            collapsed.text_height(),
+            "and the base geometry stays the collapsed one"
+        );
+    }
+
+    #[test]
+    fn a_folded_lines_reveal_costs_nothing() {
+        // A selection can run across a folded section. Those lines draw nothing, so
+        // their markup reflows nothing and the overlay must not charge for it.
+        let f = fonts();
+        let no_images = ImageStore::new(None);
+        let src = "# H\nsee [docs](https://example.com/a/very/long/path/goes/on) ok\n# H2\n";
+        let r = rope(src);
+        let w = wrap_after(&f, "see docs ok and some room to spare");
+        let idx = LineIndex::build(&f, &r, w, BODY, &no_images, Scale::ONE);
+        let map = FoldMap::build(&crate::fold::Folds::from_lines([0]), &idx);
+        assert!(map.hides(1), "the link line is inside the folded section");
+        let mut reveal = RevealAdjust::default();
+        reveal.reveal_lines(0, r.len_lines() - 1);
+        assert!(
+            idx.content_height(Adjust::new(reveal, FoldMap::NONE))
+                > idx.content_height(base_adjust(FoldMap::NONE)),
+            "unfolded, the same reveal does cost rows"
+        );
+        assert_eq!(
+            idx.content_height(Adjust::new(reveal, &map)),
+            idx.content_height(base_adjust(&map)),
+            "a hidden line's re-wrap is not part of the document's height"
+        );
     }
 
     #[test]
@@ -4530,11 +4832,11 @@ mod tests {
         let img_line = 1;
         let idx = LineIndex::build(&f, &r, w, BODY, &s, Scale::ONE);
         assert!(
-            idx.reveal_extra(img_line) > 0,
+            idx.image_extra(img_line) > 0,
             "revealing the source adds height"
         );
-        assert_eq!(idx.reveal_extra(0), 0, "a text line has no reveal extra");
-        assert_eq!(idx.reveal_extra(2), 0);
+        assert_eq!(idx.image_extra(0), 0, "a text line has no reveal extra");
+        assert_eq!(idx.image_extra(2), 0);
 
         // Base height (nothing revealed) matches a full no-reveal build.
         let base_ctx = LayoutCtx::for_index(&f, &r, w, BODY, &s, Scale::ONE);
@@ -4561,7 +4863,7 @@ mod tests {
         );
         let revealed = Layout::build_with_images(&revealed_ctx, LEFT, TOP);
         let mut adj = RevealAdjust::default();
-        adj.push(img_line, idx.reveal_extra(img_line));
+        adj.push(img_line, idx.image_extra(img_line));
         assert_eq!(
             idx.content_height(Adjust::new(adj, FoldMap::NONE)),
             revealed.text_height()
@@ -4603,6 +4905,50 @@ mod tests {
                     assert_eq!(fingerprint(&win), expected, "window [{bs},{be}) width {w}");
                 }
             }
+        }
+    }
+
+    #[test]
+    fn a_revealed_window_matches_the_revealed_full_build() {
+        // What the pane actually runs: a window laid out under the live reveal,
+        // seeded from the index's adjusted top. The caret sits on a link line, so
+        // that line re-wraps and every band below it must still land where the full
+        // build puts it.
+        let f = fonts();
+        let no_images = ImageStore::new(None);
+        let src = "intro line here\n\
+                   see [docs](https://example.com/a/very/long/path/goes/on) ok\n\
+                   another [ref](https://example.com/some/other/long/path/here) line\n\
+                   tail\n";
+        let r = rope(src);
+        let n = r.len_lines();
+        let w = wrap_after(&f, "see docs ok and some room to spare");
+        let idx = LineIndex::build(&f, &r, w, BODY, &no_images, Scale::ONE);
+        let caret = r.line_content_range(1).0;
+        let active = (caret, caret);
+        let full = Layout::build(&f, &r, LEFT, TOP, w, BODY, active);
+        assert!(
+            full.lines().len() > n,
+            "the revealed line must actually re-wrap, or the bands below it never move"
+        );
+        let full_fp = fingerprint(&full);
+        let mut reveal = RevealAdjust::default();
+        reveal.reveal_lines(1, 1);
+        let adjust = Adjust::new(reveal, FoldMap::NONE);
+        for (bs, be) in [(0, n), (1, n), (2, n), (n - 1, n)] {
+            let seed = TOP + idx.logical_top(bs, adjust);
+            let win_ctx =
+                LayoutCtx::for_index(&f, &r, w, BODY, &no_images, Scale::ONE).with_active(active);
+            let win = Layout::build_window(&win_ctx, LEFT, seed, &idx, bs, be);
+            let expected: Vec<_> = full_fp
+                .iter()
+                .filter(|fp| {
+                    let li = r.byte_to_line(fp.start);
+                    li >= bs && li < be
+                })
+                .cloned()
+                .collect();
+            assert_eq!(fingerprint(&win), expected, "revealed window [{bs},{be})");
         }
     }
 
@@ -4873,6 +5219,81 @@ mod tests {
     }
 
     #[test]
+    fn a_long_url_breaks_after_its_last_separator() {
+        let f = fonts();
+        // The row fits two more clusters than the last `/`, so a mid-word break
+        // would cut "bbbb" in half.
+        let src = "https://example.com/aaaa/bbbb";
+        let r = rope(src);
+        let l = Layout::build(
+            &f,
+            &r,
+            LEFT,
+            TOP,
+            wrap_after(&f, "https://example.com/aaaa/bb"),
+            BODY,
+            (usize::MAX, usize::MAX),
+        );
+        let lines = l.lines();
+        assert_eq!(
+            &src[..lines[0].end],
+            "https://example.com/aaaa/",
+            "the row ends after the last separator that fits"
+        );
+        assert_eq!(&src[lines[1].start..], "bbbb", "the name stays whole");
+    }
+
+    #[test]
+    fn a_url_that_fits_the_next_row_moves_there_whole() {
+        let f = fonts();
+        // A separator break is the fallback, not a preference: the space still
+        // wins, so a link only splits when it cannot fit a row of its own.
+        let src = "aaa https://example.com/b";
+        let r = rope(src);
+        let l = Layout::build(
+            &f,
+            &r,
+            LEFT,
+            TOP,
+            wrap_after(&f, "https://example.com/b"),
+            BODY,
+            (usize::MAX, usize::MAX),
+        );
+        let lines = l.lines();
+        assert_eq!(lines.len(), 2, "one break, at the space");
+        assert_eq!(
+            &src[..lines[0].end],
+            "aaa ",
+            "the space keeps the first row"
+        );
+        assert_eq!(
+            &src[lines[1].start..],
+            "https://example.com/b",
+            "the whole URL on the second"
+        );
+    }
+
+    #[test]
+    fn a_long_word_that_is_not_a_link_still_breaks_mid_word() {
+        let f = fonts();
+        // The same punctuation outside a link is ordinary prose, so it is no break
+        // opportunity and the word breaks where it stops fitting.
+        let src = "path/to/aaaa/bbbb";
+        let r = rope(src);
+        let l = Layout::build(
+            &f,
+            &r,
+            LEFT,
+            TOP,
+            wrap_after(&f, "path/to/aaaa/bb"),
+            BODY,
+            (usize::MAX, usize::MAX),
+        );
+        let lines = l.lines();
+        assert_eq!(&src[..lines[0].end], "path/to/aaaa/bb", "a mid-word break");
+    }
+
+    #[test]
     fn caret_affinity_puts_a_soft_boundary_on_the_next_line() {
         let f = fonts();
         let m = f.metrics(BODY);
@@ -5048,18 +5469,37 @@ mod tests {
     }
 
     #[test]
-    fn reveal_state_does_not_change_vertical_layout() {
-        // Wrapping uses the source text, so collapsing markers never reflows the
-        // document: line count, baselines, and height are reveal-independent.
+    fn a_reveal_reflows_its_own_line_and_pushes_what_follows() {
+        // Wrapping measures what a line draws, so revealing its markup can cost rows.
+        // The reflow is local: nothing above the revealed line moves, and everything
+        // below it shifts down by exactly the rows it gained.
         let f = fonts();
-        let r = rope("# A longer heading that might wrap\nbody text below the heading");
-        let hidden = Layout::build(&f, &r, LEFT, TOP, 200, BODY, (99, 99));
-        let shown = Layout::build(&f, &r, LEFT, TOP, 200, BODY, (0, 0));
-        assert_eq!(hidden.lines().len(), shown.lines().len());
-        for (h, s) in hidden.lines().iter().zip(shown.lines()) {
-            assert_eq!(h.baseline, s.baseline, "baselines are reveal-independent");
-        }
-        assert_eq!(hidden.text_height(), shown.text_height());
+        let src = "intro\nsee [docs](https://example.com/a/very/long/path/goes/on) ok\ntail";
+        let r = rope(src);
+        let w = wrap_after(&f, "see docs ok and some room to spare");
+        let hidden = Layout::build(&f, &r, LEFT, TOP, w, BODY, NO_REVEAL);
+        let caret = r.line_content_range(1).0;
+        let shown = Layout::build(&f, &r, LEFT, TOP, w, BODY, (caret, caret));
+        let gained = shown.lines().len() - hidden.lines().len();
+        assert!(gained > 0, "the raw destination costs the line a row");
+        assert_eq!(
+            hidden.lines()[0].baseline,
+            shown.lines()[0].baseline,
+            "the line above the reveal does not move"
+        );
+        let line_height = f.metrics(BODY).line_height;
+        assert_eq!(
+            shown.lines().last().map(|l| l.baseline),
+            hidden
+                .lines()
+                .last()
+                .map(|l| l.baseline + gained as i32 * line_height),
+            "the tail moves down by the rows the reveal added"
+        );
+        assert_eq!(
+            shown.text_height(),
+            hidden.text_height() + gained as i32 * line_height
+        );
     }
 
     // --- List marker reveal -----------------------------------------------

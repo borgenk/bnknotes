@@ -294,6 +294,21 @@ impl FoldMap {
         }
     }
 
+    /// The hidden line runs overlapping `[lo, hi)`, clipped to it and ascending. A
+    /// caller pricing something per line (the height a reveal re-wraps to) subtracts
+    /// these, since a hidden line is not on screen to reveal. Folds are few, so the
+    /// scan is over a handful of spans.
+    pub fn hidden_spans_in(
+        &self,
+        lo: usize,
+        hi: usize,
+    ) -> impl Iterator<Item = (usize, usize)> + '_ {
+        self.hidden
+            .iter()
+            .filter(move |s| s.start < hi && s.end > lo)
+            .map(move |s| (s.start.max(lo), s.end.min(hi)))
+    }
+
     /// Where a hidden `line` collapses to, as the span's first line paired with the
     /// height hidden above that. Every line in a span shares one position (the
     /// span's own top), so the caller resolves them all the same way.

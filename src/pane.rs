@@ -1321,16 +1321,21 @@ impl EditorPane {
         Adjust::new(self.reveal_adjust(), &self.fold_map)
     }
 
-    /// The ≤2-line overlay of image sources revealed right now (the reveal range's
-    /// ends and the raw-pinned line), so the index reports heights and positions
-    /// under the current reveal. Empty (and free) for the common no-image case.
-    /// A source inside a folded section is skipped: it is not on screen to reveal.
+    /// What the index's geometry queries must add for the current reveal: the lines
+    /// the cursor or selection touches (whose markup draws raw, so their rows wrap
+    /// wider), and the ≤2 image sources shown (the reveal range's ends and the
+    /// raw-pinned line). A source inside a folded section is skipped: it is not on
+    /// screen to reveal.
     fn reveal_adjust(&self) -> RevealAdjust {
         let mut adjust = RevealAdjust::default();
         let Some(index) = self.line_index.as_ref() else {
             return adjust;
         };
         let rope = self.text.rope();
+        let (lo, hi) = self.reveal_range();
+        // Every line the range touches shows its markup, drag or not, so every one
+        // of them re-wraps.
+        adjust.reveal_lines(rope.byte_to_line(lo), rope.byte_to_line(hi));
         // A drag holds every image source collapsed so the geometry under the
         // pointer stays put (matching the window build's `image_ui.dragging`); only
         // a corner-pinned source below still expands. Off a drag the reveal range's
@@ -1338,11 +1343,10 @@ impl EditorPane {
         let mut expand = |off: usize| {
             let line = rope.byte_to_line(off);
             if !self.fold_map.hides(line) {
-                adjust.push(line, index.reveal_extra(line));
+                adjust.push(line, index.image_extra(line));
             }
         };
         if !self.dragging() {
-            let (lo, hi) = self.reveal_range();
             expand(lo);
             expand(hi);
         }

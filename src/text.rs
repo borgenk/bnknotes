@@ -1460,33 +1460,52 @@ fn prev_word_rope(rope: &Rope, pos: usize) -> usize {
 
 /// The byte range of the word (or run of separators) at `offset`, for
 /// double-click selection: the maximal run of clusters sharing the clicked
-/// cluster's class (word vs separator). A click at a word's trailing edge, or at
-/// the buffer end, still selects the word to the left. Scans the rope outward
-/// from the click instead of materializing the whole document.
+/// cluster's class (word vs separator), bounded by the clicked line. A click at a
+/// word's trailing edge, or at the buffer end, still selects the word to the
+/// left. Scans the rope outward from the click instead of materializing the whole
+/// document.
 fn word_range_rope(rope: &Rope, offset: usize) -> (usize, usize) {
     let len = rope.len();
     if len == 0 {
         return (0, 0);
     }
-    let offset = offset.min(len);
-    let (c_start, c_is_word, prev_is_word) = clicked_cluster(rope, offset);
+    let c = clicked_cluster(rope, offset.min(len));
     // A separator under the click with a word immediately to its left selects
     // that word (so a click on a word's trailing edge or the space after it still
-    // grabs the word): expand the word run that ends at the click.
-    if !c_is_word && prev_is_word == Some(true) {
-        return (class_run_start(rope, c_start, true), c_start);
+    // grabs the word): expand the word run that ends at the click. A word run
+    // stops at the newline on its own, so only the general case needs clamping.
+    if !c.is_word && c.prev_is_word == Some(true) {
+        return (class_run_start(rope, c.start, true), c.start);
     }
-    let start = class_run_start(rope, c_start, c_is_word);
-    let end = class_run_end(rope, c_start, c_is_word);
+    // The run stays on the clicked line: a separator run is otherwise unbounded by
+    // line breaks, so double-clicking a `---` rule (or any punctuation run flanked
+    // by blank lines) would reach through the newlines and take the paragraphs on
+    // both sides.
+    let (ls, le) = c.line;
+    let start = class_run_start(rope, c.start, c.is_word).max(ls);
+    let end = class_run_end(rope, c.start, c.is_word).min(le);
     (start, end)
 }
 
-/// The cluster a double-click at byte `offset` lands on: its start offset and
-/// class, plus the class of the cluster immediately to its left (for the
-/// word-to-the-left preference). A click at the buffer end falls on the last
-/// cluster; for a click at a line start the left neighbor is the previous line's
-/// terminating `'\n'`, a separator. Materializes only the click's logical line.
-fn clicked_cluster(rope: &Rope, offset: usize) -> (usize, bool, Option<bool>) {
+/// The cluster a double-click landed on, and the context a word range grows out
+/// of it with.
+struct Clicked {
+    /// The cluster's start offset.
+    start: usize,
+    /// Whether the cluster is a word cluster rather than a separator.
+    is_word: bool,
+    /// The class of the cluster immediately to its left, `None` at the buffer
+    /// start.
+    prev_is_word: Option<bool>,
+    /// The content range of the logical line it sits on, newline excluded.
+    line: (usize, usize),
+}
+
+/// The cluster a double-click at byte `offset` lands on. A click at the buffer
+/// end falls on the last cluster; for a click at a line start the left neighbor
+/// is the previous line's terminating `'\n'`, a separator. Materializes only the
+/// click's logical line.
+fn clicked_cluster(rope: &Rope, offset: usize) -> Clicked {
     let len = rope.len();
     let probe = if offset >= len {
         len.saturating_sub(1)
@@ -1503,7 +1522,7 @@ fn clicked_cluster(rope: &Rope, offset: usize) -> (usize, bool, Option<bool>) {
             .position(|&(abs, _)| abs == offset)
             .unwrap_or(clusters.len().saturating_sub(1))
     };
-    let (c_start, c_is_word) = clusters
+    let (start, is_word) = clusters
         .get(idx)
         .copied()
         .unwrap_or((rope.line_to_byte(line), false));
@@ -1515,7 +1534,12 @@ fn clicked_cluster(rope: &Rope, offset: usize) -> (usize, bool, Option<bool>) {
     } else {
         None
     };
-    (c_start, c_is_word, prev_is_word)
+    Clicked {
+        start,
+        is_word,
+        prev_is_word,
+        line: rope.line_content_range(line),
+    }
 }
 
 /// The start byte offset of the maximal run of class `word` that contains the
@@ -2698,18 +2722,13 @@ mod tests {
     }
 
     #[test]
-    fn double_click_separator_run_spans_a_newline() {
-        // A separator run a double-click selects can cross a line break. In
-        // "a \n b" the space, '\n', and space form one run (bytes 1..4). Clicking
-        // the '\n' (offset 2) selects the whole run; clicking the space right
-        // after "a" would instead prefer the word "a" to its left.
+    fn double_click_separator_run_stops_at_the_line_break() {
+        // A separator run a double-click selects is bounded by its line. In
+        // "a \n b" the space, '\n', and space are one run by class, but clicking
+        // the '\n' (offset 2) takes only what is on that line: the space before it.
         let mut b = TextBuffer::from_text("a \n b".to_string());
         b.select_word_at(2);
-        assert_eq!(
-            b.selection(),
-            Some((1, 4)),
-            "space, newline, space as one run"
-        );
+        assert_eq!(b.selection(), Some((1, 2)), "the space, not the run below");
     }
 
     #[test]
@@ -2824,6 +2843,32 @@ mod tests {
         b.insert_str("foo bar");
         b.select_word_at(3); // the space starts here; the word is to the left
         assert_eq!(b.selected_text().as_deref(), Some("foo"));
+    }
+
+    #[test]
+    fn double_click_on_a_rule_takes_only_its_dashes() {
+        // The reported bug: `---` is a separator run like the blank lines around
+        // it, so an unbounded run swallowed both paragraphs. The click takes the
+        // rule and nothing else, wherever on it it lands.
+        let mut b = TextBuffer::from_text("above\n\n---\n\nbelow\n".to_string());
+        for offset in 7..=10 {
+            b.select_word_at(offset);
+            assert_eq!(
+                b.selected_text().as_deref(),
+                Some("---"),
+                "a click at {offset} takes the rule alone"
+            );
+        }
+    }
+
+    #[test]
+    fn double_click_on_a_blank_line_selects_nothing() {
+        // Nothing on the line to take, and the runs above and below are out of
+        // reach, so the click is a plain caret.
+        let mut b = TextBuffer::from_text("above\n\nbelow".to_string());
+        b.select_word_at(6);
+        assert_eq!(b.selection(), None);
+        assert_eq!(b.cursor(), 6);
     }
 
     #[test]

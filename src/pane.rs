@@ -4177,6 +4177,35 @@ run
     }
 
     #[test]
+    fn double_clicking_a_rendered_rule_keeps_the_selection_on_the_rule() {
+        // The reported bug: the first click selects the rule, and that selection
+        // reveals its raw `---`, so the second click finds text where the rule was
+        // and falls through to the word gesture. The dashes are separators like the
+        // blank lines flanking them, so the selection ran out through both
+        // paragraphs.
+        let (mut pane, fonts, rect) = laid_out("above\n\n---\n\nbelow\n", 0);
+        let rule_y = {
+            let layout = pane.layout_cache.as_ref().expect("a layout");
+            layout.lines()[2].baseline as f32
+        };
+
+        assert!(
+            pane.press_rule(&fonts, rect, rule_y),
+            "the first click lands on the rendered rule"
+        );
+        assert_eq!(pane.text.selection(), Some((7, 10)));
+
+        // Same pointer, second click: the source now shows, so no rule is hit.
+        pane.ensure_layout(&fonts, rect);
+        assert!(
+            !pane.press_rule(&fonts, rect, rule_y),
+            "the revealed line is editable text, not a rule"
+        );
+        pane.press_word(&fonts, rect, 10_000.0, rule_y);
+        assert_eq!(pane.text.selected_text().as_deref(), Some("---"));
+    }
+
+    #[test]
     fn a_drag_after_a_double_click_extends_by_whole_words() {
         let (mut pane, fonts, rect) = laid_out("alpha beta gamma delta\n", 0);
         // The double-click takes "beta" (bytes 6..10).

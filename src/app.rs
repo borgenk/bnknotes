@@ -2890,11 +2890,16 @@ impl State {
         Ok(())
     }
 
-    /// Common bookkeeping after a buffer edit: request a redraw, keep the caret
-    /// on screen, and refresh the title's modified indicator.
+    /// Common bookkeeping after a buffer edit: request a redraw, open any section
+    /// the edit wrote into, keep the caret on screen, and refresh the title's
+    /// modified indicator. Opening comes first, since the section it reveals changes
+    /// where the caret sits on screen.
     fn after_edit(&mut self) {
         self.dirty = true;
         self.bump_caret();
+        let i = self.active_editor();
+        let rect = self.editor_rect(i);
+        self.editors[i].open_folds_at_cursor(&self.fonts, rect);
         self.reveal_active_caret();
         self.refresh_title();
     }

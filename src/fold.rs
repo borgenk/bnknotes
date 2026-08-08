@@ -75,11 +75,19 @@ impl Folds {
         self.revision
     }
 
+    /// Unfold the heading on `line`. Returns whether it was folded.
+    pub fn open(&mut self, line: usize) -> bool {
+        if !self.lines.remove(&line) {
+            return false;
+        }
+        self.revision += 1;
+        true
+    }
+
     /// Fold or unfold the heading on `line`. Returns whether anything changed,
     /// which is false only when folding a set already at [`MAX_FOLDS`].
     pub fn toggle(&mut self, line: usize) -> bool {
-        if self.lines.remove(&line) {
-            self.revision += 1;
+        if self.open(line) {
             return true;
         }
         if self.lines.len() >= MAX_FOLDS {

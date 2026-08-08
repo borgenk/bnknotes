@@ -1746,6 +1746,35 @@ impl EditorPane {
         self.text.set_cursor_changed(target, false)
     }
 
+    /// Open every fold hiding the cursor, so an edit that landed the caret inside a
+    /// collapsed section puts what it wrote on screen. Pressing Enter on a folded
+    /// heading is the case that matters: the line it opens is the section's own
+    /// first line, so there is nowhere to put it that the fold does not hide.
+    ///
+    /// Each pass drops the outermost heading still hiding the cursor and re-resolves,
+    /// which in turn opens a nested fold underneath it; the chain is at most one fold
+    /// per heading level, and stops as soon as the cursor is visible, so a nested
+    /// section the edit did not reach stays folded.
+    pub(crate) fn open_folds_at_cursor(&mut self, fonts: &Fonts, rect: Rect) {
+        if self.folds.is_empty() {
+            return;
+        }
+        // The map has to answer for the text as the edit left it, anchors and all.
+        self.ensure_index(fonts, rect);
+        loop {
+            let line = self.text.rope().byte_to_line(self.text.cursor());
+            if !self.fold_map.hides(line) {
+                return;
+            }
+            let heading = self.fold_map.first_visible_at_or_before(line);
+            if !self.folds.open(heading) {
+                return;
+            }
+            self.fold_map_key = None;
+            self.ensure_fold_map();
+        }
+    }
+
     /// Step the cursor clear of a folded section it just walked into, continuing the
     /// direction it was traveling: forward lands on the first line past the fold,
     /// backward on the end of the heading that hides it. Arrowing over a folded
@@ -3628,6 +3657,95 @@ run
         assert!(pane.toggle_fold_at(&fonts, rect, pane.text.rope().line_to_byte(2)));
         let line = pane.text.rope().byte_to_line(pane.text.cursor());
         assert_eq!(line, 2);
+    }
+
+    #[test]
+    fn pressing_enter_on_a_folded_heading_opens_the_section() {
+        // The reported bug: Enter at the end of a collapsed heading put the new line
+        // inside the section, where the fold hid it, so the caret and everything
+        // typed next vanished behind the heading. The section it belongs to opens.
+        let fonts = Fonts::new(&markdown::all_sizes(FONT_SIZE)).expect("a default font");
+        let rect = fold_rect();
+        let mut pane = pane_of(FOLDABLE);
+        let ls = pane.text.rope().line_to_byte(2);
+        assert!(pane.toggle_fold_at(&fonts, rect, ls));
+        pane.ensure_layout(&fonts, rect);
+        assert_eq!(drawn_lines(&pane), vec![0, 1, 2, 6, 7, 8]);
+
+        pane.text
+            .set_cursor(pane.text.rope().line_content_range(2).1, false);
+        pane.text.enter();
+        pane.open_folds_at_cursor(&fonts, rect);
+        pane.ensure_layout(&fonts, rect);
+        assert!(
+            pane.folds.is_empty(),
+            "`## Setup` opened around the new line"
+        );
+        assert_eq!(
+            pane.text.rope().byte_to_line(pane.text.cursor()),
+            3,
+            "the caret is on the line Enter made"
+        );
+        assert_eq!(
+            drawn_lines(&pane),
+            (0..10).collect::<Vec<_>>(),
+            "and that line is on screen"
+        );
+    }
+
+    #[test]
+    fn opening_a_section_around_an_edit_leaves_the_folds_it_did_not_reach() {
+        // Only what hides the caret opens: the new line sits in `# Guide`'s section,
+        // so `# Guide` opens, while `## Setup` nested below it stays collapsed.
+        let fonts = Fonts::new(&markdown::all_sizes(FONT_SIZE)).expect("a default font");
+        let rect = fold_rect();
+        let mut pane = pane_of(FOLDABLE);
+        for line in [0, 2] {
+            let ls = pane.text.rope().line_to_byte(line);
+            assert!(pane.toggle_fold_at(&fonts, rect, ls));
+        }
+        pane.ensure_layout(&fonts, rect);
+        assert_eq!(drawn_lines(&pane), vec![0]);
+
+        pane.text
+            .set_cursor(pane.text.rope().line_content_range(0).1, false);
+        pane.text.enter();
+        pane.open_folds_at_cursor(&fonts, rect);
+        pane.ensure_layout(&fonts, rect);
+        assert_eq!(
+            pane.folds.lines().collect::<Vec<_>>(),
+            vec![3],
+            "`## Setup`, ridden down a line by the edit, is still folded"
+        );
+        assert_eq!(drawn_lines(&pane), vec![0, 1, 2, 3, 7, 8, 9]);
+    }
+
+    #[test]
+    fn backspacing_into_a_folded_section_opens_every_fold_over_it() {
+        // Joining the first visible line back into the section above drags the caret
+        // into text two folds deep, so both open: one pass per level, until the
+        // caret is somewhere the user can see it.
+        let fonts = Fonts::new(&markdown::all_sizes(FONT_SIZE)).expect("a default font");
+        let rect = fold_rect();
+        let mut pane = pane_of(FOLDABLE);
+        for line in [2, 4] {
+            let ls = pane.text.rope().line_to_byte(line);
+            assert!(pane.toggle_fold_at(&fonts, rect, ls));
+        }
+        pane.ensure_layout(&fonts, rect);
+        assert_eq!(drawn_lines(&pane), vec![0, 1, 2, 6, 7, 8]);
+
+        // At the start of `## Usage`, the first line past both folds.
+        pane.text
+            .set_cursor(pane.text.rope().line_to_byte(6), false);
+        pane.text.backspace();
+        pane.open_folds_at_cursor(&fonts, rect);
+        pane.ensure_layout(&fonts, rect);
+        assert!(
+            pane.folds.is_empty(),
+            "both `## Setup` and `### Notes` open"
+        );
+        assert_eq!(drawn_lines(&pane), (0..8).collect::<Vec<_>>());
     }
 
     #[test]

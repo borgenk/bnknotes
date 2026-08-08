@@ -4,9 +4,8 @@ use crate::ai::{self, DiffKind, Preview};
 use crate::config::{Vault, VaultKind};
 use crate::find::{self, FindState};
 use crate::layout::{
-    aligned_x, backtick_reveal_shift, cell_line_top, face_key, image_button_rect, inline_code_pad,
-    is_code_marker, row_max_lines, CellLine, Gutter, Layout, TableRow, TABLE_BORDER,
-    TABLE_CELL_PAD_Y,
+    aligned_x, cell_line_top, face_key, image_button_rect, is_code_marker, row_max_lines, CellLine,
+    Gutter, Layout, TableRow, TABLE_BORDER, TABLE_CELL_PAD_Y,
 };
 use crate::markdown;
 use crate::menu::{Menu, MenuLayout};
@@ -2826,18 +2825,14 @@ impl<'a> Painter<'a> {
                 };
                 // Code backgrounds (inline panels and the full-width block panel)
                 // are emitted in the pre-pass above, beneath the selection; here we
-                // only draw the glyphs over them. An inline code run's glyphs sit its
-                // pill pad in from the pen, and the pen clears the pad after them, so
-                // the panel (drawn from the same geometry) frames the code without
+                // only draw the glyphs over them. A run's glyphs sit its leading pill
+                // pad in from the pen, and the pen clears the trailing one after them,
+                // so the panel (drawn from the same geometry) frames the code without
                 // painting over the spaces around it.
-                let pad = inline_code_pad(run.kind, line.code_block, self.scale);
-                // A revealed backtick delimiter is nudged in against the code so it
-                // hugs the glyphs inside the pill; the nudge is draw-only, so the pen
-                // still advances by the run's true width (subtract the shift back out).
-                let shift = backtick_reveal_shift(rope, runs, i, self.scale);
-                let run_x = pen + pad + shift;
+                let (lead, trail) = run.pads.px(self.scale);
+                let run_x = pen + lead;
                 let run_end = self.push_text(fk, run_x, baseline, color, slice.into_owned(), m);
-                pen = run_end + pad - shift;
+                pen = run_end + trail;
                 // Inline decorations over the glyphs, each spanning the run's drawn
                 // width: a link is underlined and struck text gets a line through its
                 // middle, both in the run's own color. Thickness scales with the
@@ -2947,7 +2942,7 @@ impl<'a> Painter<'a> {
         m: Metrics,
     ) {
         let mut pen = x;
-        for (i, run) in cl.runs.iter().enumerate() {
+        for run in &cl.runs {
             if !run.visible {
                 continue;
             }
@@ -2960,13 +2955,11 @@ impl<'a> Painter<'a> {
                 markdown::SpanKind::Text(markdown::Emphasis::Link) => LINK_COLOR,
                 markdown::SpanKind::Text(_) => FOREGROUND,
             };
-            // An inline code run's glyphs sit its pill pad in from the pen, and the
-            // pen clears the pad after them, so the tint panel frames the code without
-            // covering the text around it, the same as the body loop. A revealed
-            // backtick is nudged in against the code (draw-only, advance unchanged).
-            let pad = inline_code_pad(run.kind, false, self.scale);
-            let shift = backtick_reveal_shift(self.rope, &cl.runs, i, self.scale);
-            let run_x = pen + pad + shift;
+            // A run's glyphs sit its leading pill pad in from the pen, and the pen
+            // clears the trailing one after them, so the tint panel frames the code
+            // without covering the text around it, the same as the body loop.
+            let (lead, trail) = run.pads.px(self.scale);
+            let run_x = pen + lead;
             let run_end = self.push_text(
                 fk,
                 run_x,
@@ -2975,7 +2968,7 @@ impl<'a> Painter<'a> {
                 self.rope.byte_slice(run.start..run.end),
                 m,
             );
-            pen = run_end + pad - shift;
+            pen = run_end + trail;
             let deco = match run.kind {
                 markdown::SpanKind::Text(markdown::Emphasis::Link) => {
                     Some(baseline + m.descent / 3)

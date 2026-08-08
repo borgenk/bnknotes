@@ -398,25 +398,55 @@ pub enum Gutter {
     QuoteBar { marker: bool },
 }
 
-/// One inline run of a visual line: an absolute byte range, what it is, and
-/// whether it is drawn. A marker run is hidden (`visible == false`) on a line
-/// the cursor has left, the live-preview collapse; text runs are always visible.
+/// One inline run of a visual line: an absolute byte range, what it is, whether it
+/// is drawn, and which sides of it carry an inline code span's pill pad. A marker
+/// run is hidden (`visible == false`) on a line the cursor has left, the
+/// live-preview collapse; text runs are always visible.
 #[derive(Clone, Copy)]
 pub struct Run {
     pub start: usize,
     pub end: usize,
     pub kind: markdown::SpanKind,
     pub visible: bool,
+    pub pads: PillPads,
+}
+
+/// Which sides of a run reserve an inline code span's pill padding. The pad is
+/// horizontal space outside the span's delimiters: with the backticks collapsed the
+/// code run carries both sides, and on the cursor's line each revealed backtick takes
+/// the outer one and the code run drops that side. The span reserves the same total
+/// width either way, so a reveal moves the pad without reflowing the line.
+///
+/// Every walk (advance, hit-test, pill, draw pen) reads these flags, which is what
+/// keeps the caret and a click on the same pixel as the glyph the painter put there.
+///
+/// ```text
+///   collapsed:  [pad] c o d e [pad]
+///   revealed:   [pad] ` c o d e ` [pad]
+/// ```
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub struct PillPads {
+    pub lead: bool,
+    pub trail: bool,
+}
+
+impl PillPads {
+    /// The leading and trailing pad in pixels at `scale`.
+    pub(crate) fn px(self, scale: Scale) -> (i32, i32) {
+        let pad = scale.px(crate::theme::CODE_PAD_X);
+        (
+            if self.lead { pad } else { 0 },
+            if self.trail { pad } else { 0 },
+        )
+    }
 }
 
 /// What a walk over a line's runs needs to lay them the way the painter did: the
-/// size and heading flag that pick each run's face, and whether the line is a fenced
-/// code block (where inline code draws no pill pad).
+/// size and heading flag that pick each run's face.
 #[derive(Clone, Copy)]
 struct RunStyle {
     size: u32,
     heading: bool,
-    code_block: bool,
 }
 
 impl RunStyle {
@@ -424,17 +454,14 @@ impl RunStyle {
         Self {
             size: line.size,
             heading: line.heading.is_some(),
-            code_block: line.code_block,
         }
     }
 
-    /// A table cell draws prose at the row's size, bold in a header row, and never
-    /// as a code block.
+    /// A table cell draws prose at the row's size, bold in a header row.
     fn of_cell(line: &VisualLine, t: &TableRow) -> Self {
         Self {
             size: line.size,
             heading: t.header,
-            code_block: false,
         }
     }
 }
@@ -462,13 +489,13 @@ pub(crate) fn run_face(fonts: &Fonts, size: u32, kind: markdown::SpanKind, headi
     fonts.face_for(face_key(size, kind, heading))
 }
 
-/// An inline code run's tinted pill extends [`crate::theme::CODE_PAD_X`] beyond its
-/// glyphs on each side. That padding is real horizontal space: the glyphs sit it in
-/// from the run's flow start and text after the span clears the pill, so the panel
-/// frames the code without painting over the ordinary spaces around it. Every
-/// run-walk (advance, hit-test, panel, draw pen) folds it in so they agree. Zero for
-/// a fenced line (its own full-width panel, drawn by the app) and for anything but
-/// inline code. The local [`CODE_PAD_X`] here is the unrelated fenced-block inset.
+/// The pill padding an inline code span reserves on each side of itself: the tinted
+/// panel extends [`crate::theme::CODE_PAD_X`] beyond the outermost glyphs it frames,
+/// and that is real horizontal space, so the text around the span clears the pill
+/// instead of sitting under it. Which run carries each side is [`PillPads`]; a
+/// measure that only needs a span's total counts this twice. Zero for a fenced line
+/// (its own full-width panel, drawn by the app) and for anything but inline code. The
+/// local [`CODE_PAD_X`] here is the unrelated fenced-block inset.
 pub(crate) fn inline_code_pad(kind: markdown::SpanKind, code_block: bool, scale: Scale) -> i32 {
     if !code_block && matches!(kind, markdown::SpanKind::Text(markdown::Emphasis::Code)) {
         scale.px(crate::theme::CODE_PAD_X)
@@ -477,22 +504,12 @@ pub(crate) fn inline_code_pad(kind: markdown::SpanKind, code_block: bool, scale:
     }
 }
 
-/// True when `run` is a visible marker made only of backtick characters, i.e. an
-/// inline code span's flanking delimiter. Used to grow the pill around a revealed
-/// delimiter and to nudge it in against the code, so the two stay in agreement.
-fn run_is_backticks(rope: &Rope, run: &Run) -> bool {
-    if !run.visible || !matches!(run.kind, markdown::SpanKind::Marker) {
-        return false;
-    }
-    let text = rope.slice(run.start..run.end).as_cow();
-    !text.is_empty() && text.bytes().all(|b| b == b'`')
-}
-
-/// The drawn width of a code span's flanking backtick marker, for growing the
+/// The drawn width of a code span's flanking backtick delimiter, for growing the
 /// pill in [`Layout::code_rects`] to enclose the revealed delimiters. `after`
 /// picks the run just after the code run at `code` rather than the one before.
-/// Zero unless that neighbor is a visible run of only backticks: a hidden marker
-/// (off the cursor's line) or a different delimiter leaves the pill on the content.
+/// Zero unless that neighbor is the span's revealed delimiter, which is exactly
+/// the marker holding the pill's outer pad on that side: off the cursor's line the
+/// delimiters are collapsed and the pill hugs the content.
 fn backtick_marker_width(
     runs: &[Run],
     code: usize,
@@ -510,7 +527,9 @@ fn backtick_marker_width(
     let Some(run) = runs.get(idx) else {
         return 0.0;
     };
-    if !run_is_backticks(rope, run) {
+    let delimiter = matches!(run.kind, markdown::SpanKind::Marker)
+        && if after { run.pads.trail } else { run.pads.lead };
+    if !delimiter {
         return 0.0;
     }
     let text = rope.slice(run.start..run.end).as_cow();
@@ -523,33 +542,6 @@ fn backtick_marker_width(
 /// code panel's darker tint, while the other muted markers keep [`MARKER_COLOR`].
 pub(crate) fn is_code_marker(rope: &Rope, run: &Run) -> bool {
     matches!(run.kind, markdown::SpanKind::Marker) && rope.byte(run.start) == Some(b'`')
-}
-
-/// The draw-only x nudge for a revealed backtick delimiter at run `i`, pulling it in
-/// against the code so it hugs the glyphs inside the pill instead of floating a pad
-/// width away outside it. The pill pad becomes the pill's outer breathing room. The
-/// run's flow advance is unchanged, so measurement, hit-test, and the pill geometry
-/// stay put; only the drawn glyph moves. Positive for the opening delimiter before
-/// the code, negative for the closing one after it, zero otherwise.
-pub(crate) fn backtick_reveal_shift(rope: &Rope, runs: &[Run], i: usize, scale: Scale) -> i32 {
-    let Some(run) = runs.get(i) else {
-        return 0;
-    };
-    if !run_is_backticks(rope, run) {
-        return 0;
-    }
-    let is_code = |j: usize| {
-        runs.get(j).is_some_and(|r| {
-            r.visible && matches!(r.kind, markdown::SpanKind::Text(markdown::Emphasis::Code))
-        })
-    };
-    if is_code(i + 1) {
-        scale.px(crate::theme::CODE_PAD_X)
-    } else if i > 0 && is_code(i - 1) {
-        -scale.px(crate::theme::CODE_PAD_X)
-    } else {
-        0
-    }
 }
 
 /// The [`FaceKey`] a run of `kind` at `size` draws in, the borrow-free twin of
@@ -1092,15 +1084,16 @@ impl Layout {
                 continue;
             }
             let face = run_face(fonts, style.size, run.kind, style.heading);
-            let pad = inline_code_pad(run.kind, style.code_block, self.scale) as f32;
-            pen += pad;
+            let (lead, trail) = run.pads.px(self.scale);
+            pen += lead as f32;
             let (s, e) = (span.0.max(run.start), span.1.min(run.end));
             if s < e {
                 let x0 = pen + shape::text_advance(face, &rope.slice(run.start..s).as_cow());
                 let x1 = x0 + shape::text_advance(face, &rope.slice(s..e).as_cow());
                 drawn = Some((drawn.map_or(x0, |(a, _)| a), x1));
             }
-            pen += shape::text_advance(face, &rope.slice(run.start..run.end).as_cow()) + pad;
+            pen +=
+                shape::text_advance(face, &rope.slice(run.start..run.end).as_cow()) + trail as f32;
         }
         drawn
     }
@@ -1443,12 +1436,12 @@ impl Layout {
                     continue;
                 }
                 // `advance_to(run.start)` lands at the run's flow start; the glyphs
-                // (and so the panel the app expands from them) sit the pill pad in
+                // (and so the panel the app expands from them) sit its leading pad in
                 // from there, leaving the space before the span uncovered.
                 let x0 = self.left as f32
                     + line.indent as f32
                     + self.advance_to(fonts, rope, line, run.start)
-                    + inline_code_pad(run.kind, line.code_block, self.scale) as f32;
+                    + run.pads.px(self.scale).0 as f32;
                 let w = shape::text_advance(
                     run_face(fonts, line.size, run.kind, heading),
                     &rope.slice(run.start..run.end).as_cow(),
@@ -1500,11 +1493,11 @@ impl Layout {
                     if !run.visible {
                         continue;
                     }
-                    // A code run's glyphs sit its pill pad in from the pen, matching
-                    // the draw walk; the pill (which paint then expands by the pad)
-                    // starts at the glyphs and grows over any revealed backticks.
-                    let pad = inline_code_pad(run.kind, false, self.scale);
-                    let glyph_x = pen + pad;
+                    // A run's glyphs sit its leading pad in from the pen, matching the
+                    // draw walk; the pill (which paint then expands by the pad) starts
+                    // at the glyphs and grows over any revealed backticks.
+                    let (lead, trail) = run.pads.px(self.scale);
+                    let glyph_x = pen + lead;
                     let face = run_face(fonts, line.size, run.kind, t.header);
                     let w = shape::text_advance(face, &rope.slice(run.start..run.end).as_cow());
                     if matches!(run.kind, markdown::SpanKind::Text(markdown::Emphasis::Code)) {
@@ -1521,7 +1514,7 @@ impl Layout {
                             h: m.ascent + m.descent,
                         });
                     }
-                    pen = glyph_x + w.round() as i32 + pad;
+                    pen = glyph_x + w.round() as i32 + trail;
                 }
             }
         }
@@ -1594,11 +1587,11 @@ impl Layout {
             drew_text = true;
             let face = run_face(fonts, line.size, run.kind, line.heading.is_some());
             let text = rope.slice(run.start..run.end).as_cow();
-            // A code run's pill pad sits before its glyphs, so a click in that gap
-            // lands at the run start; the trailing pad pushes the pen past the glyphs
-            // so a click there lands after the span.
-            let pad = inline_code_pad(run.kind, line.code_block, self.scale) as f32;
-            acc += pad;
+            // A pill pad sits before the run's glyphs, so a click in that gap lands at
+            // the run start; the trailing pad pushes the pen past the glyphs so a click
+            // there lands after the span.
+            let (lead, trail) = run.pads.px(self.scale);
+            acc += lead as f32;
             for (off, cluster) in grapheme::graphemes(&text) {
                 let w = shape::text_advance(face, cluster);
                 if x < acc + w / 2.0 {
@@ -1606,7 +1599,7 @@ impl Layout {
                 }
                 acc += w;
             }
-            acc += pad;
+            acc += trail as f32;
         }
         // Past every glyph: a line that drew text ends at its logical end, which
         // sits *after* any trailing collapsed marker (the closing `*` of `*word*`);
@@ -1633,15 +1626,16 @@ impl Layout {
                 continue;
             }
             let face = run_face(fonts, line.size, run.kind, line.heading.is_some());
-            let pad = inline_code_pad(run.kind, line.code_block, self.scale) as f32;
-            // A run fully before the offset contributes its glyphs plus its pill pad
-            // on both sides; one containing the offset contributes its leading pad
-            // plus the glyphs up to the offset.
+            let (lead, trail) = run.pads.px(self.scale);
+            // A run fully before the offset contributes its glyphs plus its pill pads;
+            // one containing the offset contributes its leading pad plus the glyphs up
+            // to the offset.
             if offset >= run.end {
-                x +=
-                    2.0 * pad + shape::text_advance(face, &rope.slice(run.start..run.end).as_cow());
+                x += (lead + trail) as f32
+                    + shape::text_advance(face, &rope.slice(run.start..run.end).as_cow());
             } else {
-                x += pad + shape::text_advance(face, &rope.slice(run.start..offset).as_cow());
+                x += lead as f32
+                    + shape::text_advance(face, &rope.slice(run.start..offset).as_cow());
             }
         }
         x
@@ -1716,14 +1710,14 @@ impl Layout {
             if !run.visible || offset <= run.start {
                 continue;
             }
-            // A code run's glyphs sit its pill pad in from the pen; add that leading
-            // pad on entry, and the trailing pad once the offset is past the run.
-            let pad = inline_code_pad(run.kind, false, self.scale) as f32;
+            // A run's glyphs sit its leading pill pad in from the pen; add that on
+            // entry, and the trailing pad once the offset is past the run.
+            let (lead, trail) = run.pads.px(self.scale);
             let end = offset.min(run.end);
             let face = run_face(fonts, size, run.kind, header);
-            adv += pad + shape::text_advance(face, &rope.slice(run.start..end).as_cow());
+            adv += lead as f32 + shape::text_advance(face, &rope.slice(run.start..end).as_cow());
             if offset >= run.end {
-                adv += pad;
+                adv += trail as f32;
             }
         }
         (k, adv, cl.width)
@@ -1850,10 +1844,10 @@ impl Layout {
             if !run.visible {
                 continue;
             }
-            // The pill pad frames a code run's glyphs; a click in the leading pad
+            // The pill pad frames a code span's glyphs; a click in the leading pad
             // falls to the run's first cluster, one in the trailing pad past it.
-            let pad = inline_code_pad(run.kind, false, self.scale) as f32;
-            acc += pad;
+            let (lead, trail) = run.pads.px(self.scale);
+            acc += lead as f32;
             let face = run_face(fonts, line.size, run.kind, t.header);
             let text = rope.slice(run.start..run.end).as_cow();
             for (off, cluster) in grapheme::graphemes(&text) {
@@ -1863,7 +1857,7 @@ impl Layout {
                 }
                 acc += w;
             }
-            acc += pad;
+            acc += trail as f32;
         }
         // Past every glyph: the end of the last visible run, else the cell start.
         cl.runs
@@ -2400,7 +2394,7 @@ fn lay_line(
         // measure-only path (the index build) wants no runs, leaving an empty range.
         let runs_start = pool.runs.len() as u32;
         if !measure_only {
-            clip_runs_into(&pool.spans, start, end, ls, &class, &mut pool.runs);
+            clip_runs_into(&pool.spans, &line, start, end, ls, &class, &mut pool.runs);
         }
         out.push(VisualLine {
             start: ls + start,
@@ -3164,17 +3158,20 @@ fn code_block_spans_into(
 }
 
 /// Clip line-relative `spans` to the visual segment `[seg_start, seg_end)`,
-/// offsetting to absolute by `ls`, and mark each run visible per
-/// [`LineClass::draws`]. Empty overlaps are dropped, so the runs tile the segment.
+/// offsetting to absolute by `ls`, marking each run visible per [`LineClass::draws`]
+/// and giving it its pill pads. Empty overlaps are dropped, so the runs tile the
+/// segment. `line` is the logical line the spans index into.
 #[allow(clippy::too_many_arguments)]
 fn clip_runs_into(
     spans: &[markdown::Span],
+    line: &str,
     seg_start: usize,
     seg_end: usize,
     ls: usize,
     class: &LineClass,
     out: &mut Vec<Run>,
 ) {
+    let base = out.len();
     for span in spans {
         let s = span.start.max(seg_start);
         let e = span.end.min(seg_end);
@@ -3186,7 +3183,56 @@ fn clip_runs_into(
             end: ls + e,
             kind: span.kind,
             visible: class.draws(span.kind, span.start),
+            pads: PillPads::default(),
         });
+    }
+    assign_pill_pads(&mut out[base..], line, ls, class.code_block);
+}
+
+/// Give each run the sides on which it carries an inline code span's pill pad. A
+/// code run takes the pad on every side its delimiter does not cover, and a revealed
+/// backtick takes it on its outer side, so the pad always falls outside the
+/// delimiters and a span reserves the same total width either way. `runs` is one
+/// visual row's slice, `line` the logical line at buffer offset `ls`. A fenced line
+/// draws no pill and so reserves nothing.
+fn assign_pill_pads(runs: &mut [Run], line: &str, ls: usize, code_block: bool) {
+    if code_block {
+        return;
+    }
+    let text_of = |r: &Run| -> &str {
+        r.start
+            .checked_sub(ls)
+            .zip(r.end.checked_sub(ls))
+            .and_then(|(s, e)| line.get(s..e))
+            .unwrap_or("")
+    };
+    let is_code =
+        |r: &Run| r.visible && matches!(r.kind, markdown::SpanKind::Text(markdown::Emphasis::Code));
+    // A delimiter is a shown marker of nothing but backticks, the run the inline
+    // parser emits on each side of a code span.
+    let is_tick = |r: &Run| {
+        r.visible
+            && matches!(r.kind, markdown::SpanKind::Marker)
+            && !text_of(r).is_empty()
+            && text_of(r).bytes().all(|b| b == b'`')
+    };
+    for i in 0..runs.len() {
+        let before = i.checked_sub(1).map(|j| runs[j]);
+        let after = runs.get(i + 1).copied();
+        let run = runs[i];
+        runs[i].pads = if is_code(&run) {
+            PillPads {
+                lead: !before.is_some_and(|r| is_tick(&r)),
+                trail: !after.is_some_and(|r| is_tick(&r)),
+            }
+        } else if is_tick(&run) {
+            PillPads {
+                lead: after.is_some_and(|r| is_code(&r)),
+                trail: before.is_some_and(|r| is_code(&r)),
+            }
+        } else {
+            PillPads::default()
+        };
     }
 }
 
@@ -3862,7 +3908,7 @@ fn build_cell(
             let (ss, se) = pool.segments[k];
             let mut runs = Vec::new();
             if !measure_only {
-                clip_runs_into(&pool.spans, ss, se, piece_abs, &class, &mut runs);
+                clip_runs_into(&pool.spans, piece, ss, se, piece_abs, &class, &mut runs);
             }
             let width = if measure_only {
                 0
@@ -3876,17 +3922,18 @@ fn build_cell(
 }
 
 /// The drawn width of a cell line: the sum of its visible runs' advances, in the
-/// faces they draw in, each code run widened by its pill pad on both sides. Feeds the
-/// painter's right/center alignment.
+/// faces they draw in, each widened by the pill pads it carries. Feeds the painter's
+/// right/center alignment.
 fn cell_line_width(ctx: &LayoutCtx, size: u32, runs: &[Run], header: bool) -> i32 {
     let mut w = 0.0;
     for run in runs {
         if !run.visible {
             continue;
         }
-        let pad = inline_code_pad(run.kind, false, ctx.scale) as f32;
+        let (lead, trail) = run.pads.px(ctx.scale);
         let face = run_face(ctx.fonts, size, run.kind, header);
-        w += pad + shape::text_advance(face, &ctx.rope.slice(run.start..run.end).as_cow()) + pad;
+        w += (lead + trail) as f32
+            + shape::text_advance(face, &ctx.rope.slice(run.start..run.end).as_cow());
     }
     w.round() as i32
 }
@@ -5829,16 +5876,163 @@ mod tests {
         let r = rope("`b`");
         let hidden = Layout::build(&f, &r, LEFT, TOP, 1_000_000, BODY, (99, 99));
         let shown = Layout::build(&f, &r, LEFT, TOP, 1_000_000, BODY, (0, 0));
-        // Offset 1 is "b", just past the opening backtick. Collapsed it sits at
-        // the margin; shown it sits one backtick-width to the right.
+        // Offset 1 is "b", just past the opening backtick. Collapsed it sits at the
+        // margin (the pill's leading pad is drawn space the caret sits before); shown
+        // it sits past that pad and the backtick, which the pad now falls outside of.
         let (x_hidden, _, _) = hidden.caret(&f, &r, 1);
         let (x_shown, _, _) = shown.caret(&f, &r, 1);
         assert_eq!(x_hidden, LEFT, "collapsed: code text at the margin");
         let tick_w = shape::text_advance(f.face(BODY, FontStyle::Regular), "`").round() as i32;
         assert_eq!(
             x_shown - x_hidden,
-            tick_w,
-            "shown: shifted by the backtick width"
+            tick_w + crate::theme::CODE_PAD_X,
+            "shown: shifted by the backtick and the pad that moved outside it"
+        );
+    }
+
+    /// The four caret stops around a revealed `` `cd` ``, read off the pill the
+    /// painter draws: its edges are the delimiters' outer edges, so an offset that
+    /// agrees with them agrees with the glyphs. Byte layout is `ab `cd``, so 3 is the
+    /// opening backtick, 4 the code start, 6 the code end, 7 past the closing one.
+    fn revealed_span(l: &Layout, f: &Fonts, r: &Rope) -> ([i32; 4], Rect) {
+        let pill = l.code_rects(f, r);
+        let carets = [
+            l.caret(f, r, 3).0,
+            l.caret(f, r, 4).0,
+            l.caret(f, r, 6).0,
+            l.caret(f, r, 7).0,
+        ];
+        (carets, pill[0])
+    }
+
+    #[test]
+    fn a_caret_inside_a_revealed_code_span_lands_on_the_drawn_delimiters() {
+        let f = fonts();
+        let src = "ab `cd`";
+        let r = rope(src);
+        // Cursor inside the span, so both backticks are revealed and drawn.
+        let l = Layout::build(&f, &r, LEFT, TOP, 1_000_000, BODY, (5, 5));
+        let ([before, code_start, code_end, after], pill) = revealed_span(&l, &f, &r);
+        let tick = shape::text_advance(f.face(BODY, FontStyle::Regular), "`").round() as i32;
+        let pad = crate::theme::CODE_PAD_X;
+        // The pill runs from the opening backtick's left edge to the closing one's
+        // right edge, so each caret stop is a fixed step in from an edge.
+        assert_eq!(before, pill.x - pad, "before the opening backtick");
+        assert_eq!(
+            code_start,
+            pill.x + tick,
+            "between the backtick and the code"
+        );
+        assert_eq!(
+            code_end,
+            pill.x + pill.w - tick,
+            "between the code and the closing backtick"
+        );
+        assert_eq!(after, pill.x + pill.w + pad, "past the closing backtick");
+    }
+
+    #[test]
+    fn a_click_on_a_revealed_backtick_can_land_on_either_side_of_it() {
+        let f = fonts();
+        let src = "ab `cd`";
+        let r = rope(src);
+        let l = Layout::build(&f, &r, LEFT, TOP, 1_000_000, BODY, (5, 5));
+        let y = l.lines()[0].baseline as f32;
+        let (_, pill) = revealed_span(&l, &f, &r);
+        let tick = shape::text_advance(f.face(BODY, FontStyle::Regular), "`").round() as i32;
+        // The opening backtick's own glyph box: its left half places the caret before
+        // it and its right half after it, so a drag over the delimiter selects it.
+        let open = pill.x as f32;
+        assert_eq!(
+            l.offset_at(&f, &r, open + 1.0, y),
+            3,
+            "left of the opening `"
+        );
+        assert_eq!(
+            l.offset_at(&f, &r, open + tick as f32 - 1.0, y),
+            4,
+            "right of the opening `"
+        );
+        // And the closing one, whose right edge is the pill's.
+        let close = (pill.x + pill.w - tick) as f32;
+        assert_eq!(
+            l.offset_at(&f, &r, close + 1.0, y),
+            6,
+            "left of the closing `"
+        );
+        assert_eq!(
+            l.offset_at(&f, &r, close + tick as f32 - 1.0, y),
+            7,
+            "right of the closing `"
+        );
+    }
+
+    #[test]
+    fn clicks_round_trip_across_a_revealed_code_span() {
+        let f = fonts();
+        let r = rope("ab `cd`");
+        let l = Layout::build(&f, &r, LEFT, TOP, 1_000_000, BODY, (5, 5));
+        let y = l.lines()[0].baseline as f32;
+        // Every offset in and around the revealed span, the delimiters' own included,
+        // is a caret stop a click can reach again.
+        for off in 0..=7 {
+            let x = l.caret(&f, &r, off).0 as f32;
+            assert_eq!(
+                l.offset_at(&f, &r, x, y),
+                off,
+                "caret x at {off} maps back to {off}"
+            );
+        }
+    }
+
+    #[test]
+    fn revealing_a_code_span_leaves_the_text_after_it_put() {
+        let f = fonts();
+        let src = "ab `cd` ef";
+        let r = rope(src);
+        let hidden = Layout::build(&f, &r, LEFT, TOP, 1_000_000, BODY, (99, 99));
+        let shown = Layout::build(&f, &r, LEFT, TOP, 1_000_000, BODY, (5, 5));
+        let tick = shape::text_advance(f.face(BODY, FontStyle::Regular), "`").round() as i32;
+        // The span reserves the same pad either way, so revealing the delimiters
+        // pushes what follows right by exactly the two backticks, no more.
+        let ef = src.find("ef").expect("the trailing word");
+        assert_eq!(
+            shown.caret(&f, &r, ef).0 - hidden.caret(&f, &r, ef).0,
+            2 * tick,
+            "the following text shifts by the delimiters alone"
+        );
+    }
+
+    #[test]
+    fn a_revealed_cell_code_span_agrees_with_its_pill() {
+        let f = fonts();
+        // Cursor inside the cell's code span, so the row reveals its backticks.
+        let src = "| h |\n| - |\n| `cd` |\n";
+        let r = rope(src);
+        let tick_open = src.rfind("`cd`").expect("the cell's code span");
+        let l = Layout::build(
+            &f,
+            &r,
+            LEFT,
+            TOP,
+            1_000_000,
+            BODY,
+            (tick_open + 2, tick_open + 2),
+        );
+        let pill = l.code_rects(&f, &r);
+        assert_eq!(pill.len(), 1, "one pill behind the cell's inline code");
+        let tick = shape::text_advance(f.face(BODY, FontStyle::Regular), "`").round() as i32;
+        // The cell walk lays runs the same way the line walk does, so the caret stops
+        // sit on the drawn delimiters here too.
+        assert_eq!(
+            l.caret(&f, &r, tick_open + 1).0,
+            pill[0].x + tick,
+            "between the backtick and the code"
+        );
+        assert_eq!(
+            l.caret(&f, &r, tick_open + 3).0,
+            pill[0].x + pill[0].w - tick,
+            "between the code and the closing backtick"
         );
     }
 

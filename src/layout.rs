@@ -68,7 +68,7 @@ use std::ops::Range;
 
 use crate::fold::FoldMap;
 use crate::markdown;
-use crate::platform::freetype::{Face, FaceKey, FontStyle, Fonts, Metrics};
+use crate::platform::freetype::{CodeInk, Face, FaceKey, FontStyle, Fonts, Metrics};
 use crate::platform::geom::Rect;
 use crate::platform::grapheme;
 use crate::platform::shape;
@@ -547,12 +547,19 @@ pub(crate) fn is_code_marker(rope: &Rope, run: &Run) -> bool {
 /// The [`FaceKey`] a run of `kind` at `size` draws in, the borrow-free twin of
 /// [`run_face`]: the display list records this so a painted run can resolve its
 /// face later without holding a borrow of [`Fonts`]. Same decision as `run_face`,
-/// so the two never disagree on which face (hence which width) a run uses.
+/// so the two never disagree on which face (hence which width) a run uses. The two
+/// code kinds pick the same face and part on ink alone: a fenced block's token is
+/// [`CodeInk::Block`], an inline span is [`CodeInk::Inline`].
 pub(crate) fn face_key(size: u32, kind: markdown::SpanKind, heading: bool) -> FaceKey {
     match kind {
-        markdown::SpanKind::Text(markdown::Emphasis::Code) | markdown::SpanKind::Code(_) => {
-            FaceKey::Code { size }
-        }
+        markdown::SpanKind::Text(markdown::Emphasis::Code) => FaceKey::Code {
+            size,
+            ink: CodeInk::Inline,
+        },
+        markdown::SpanKind::Code(_) => FaceKey::Code {
+            size,
+            ink: CodeInk::Block,
+        },
         markdown::SpanKind::Text(_) if heading => FaceKey::Prose {
             size,
             style: embolden(font_style(kind)),
@@ -7003,13 +7010,40 @@ mod tests {
         let r = rope("```\ncode\n```");
         let l = layout(&f, &r);
         // The middle line is the code content; its run resolves to the code face,
-        // the same one inline code uses, not the prose face.
+        // the same one inline code uses, not the prose face. It inks as a block, so
+        // the renderer thins it less than the prose (and than an inline span).
         let content = &l.lines()[1];
         let run = l.run_slice(content).first().expect("a content run");
         assert_eq!(
             face_key(content.size, run.kind, content.heading.is_some()),
-            FaceKey::Code { size: content.size },
+            FaceKey::Code {
+                size: content.size,
+                ink: CodeInk::Block
+            },
             "code block text draws in the code face, matching inline code"
+        );
+    }
+
+    #[test]
+    fn an_inline_code_span_inks_like_the_prose_it_sits_in() {
+        let f = fonts();
+        let r = rope("a `b` c");
+        let l = layout(&f, &r);
+        let line = &l.lines()[0];
+        let code = l
+            .run_slice(line)
+            .iter()
+            .find(|run| matches!(run.kind, markdown::SpanKind::Text(markdown::Emphasis::Code)))
+            .expect("the code run");
+        // Same face and size as a fenced block's tokens, but inline ink: it sits at
+        // the prose size in a line of prose, so it takes the prose thinning rather
+        // than the gentler one a block's smaller stems need.
+        assert_eq!(
+            face_key(line.size, code.kind, line.heading.is_some()),
+            FaceKey::Code {
+                size: line.size,
+                ink: CodeInk::Inline
+            }
         );
     }
 

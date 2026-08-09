@@ -104,6 +104,18 @@ pub enum FontStyle {
     BoldItalic,
 }
 
+/// How a run of code is inked. Both draw in the same face at the same size; they
+/// differ only in how much the renderer thins their anti-aliased edges. A block of
+/// code sits at a reduced size where thin monospace stems are almost all edge, so
+/// it takes a gentler mask gamma; an inline run sits at the prose size, in a line of
+/// prose, so it thins with the prose beside it or it reads heavier than its own
+/// sentence.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum CodeInk {
+    Inline,
+    Block,
+}
+
 /// A self-contained description of which [`Face`] a run draws in, with no borrow
 /// of [`Fonts`]. The display list stores this (rather than a `&Face`) so a built
 /// frame outlives the borrow and can be diffed across frames; [`Fonts::face_for`]
@@ -112,14 +124,27 @@ pub enum FontStyle {
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum FaceKey {
     Prose { size: u32, style: FontStyle },
-    Code { size: u32 },
+    Code { size: u32, ink: CodeInk },
 }
 
 impl FaceKey {
     /// The pixel size this face is drawn at, carried by both arms.
     pub fn size(self) -> u32 {
         match self {
-            FaceKey::Prose { size, .. } | FaceKey::Code { size } => size,
+            FaceKey::Prose { size, .. } | FaceKey::Code { size, .. } => size,
+        }
+    }
+
+    /// The key a glyph's raster caches under. The ink class chooses how coverage is
+    /// blended, not what is rasterized, so the two code inks share one atlas entry
+    /// where they land on the same size.
+    pub fn raster(self) -> Self {
+        match self {
+            FaceKey::Code { size, .. } => FaceKey::Code {
+                size,
+                ink: CodeInk::Inline,
+            },
+            prose => prose,
         }
     }
 }
@@ -896,7 +921,7 @@ impl Fonts {
     pub fn face_for(&self, key: FaceKey) -> &Face {
         match key {
             FaceKey::Prose { size, style } => self.face(size, style),
-            FaceKey::Code { size } => self.code_face(size),
+            FaceKey::Code { size, .. } => self.code_face(size),
         }
     }
 

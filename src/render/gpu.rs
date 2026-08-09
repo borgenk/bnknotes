@@ -16,7 +16,7 @@
 
 use std::collections::HashMap;
 
-use crate::platform::freetype::{Face, FaceKey, Fonts};
+use crate::platform::freetype::{CodeInk, Face, FaceKey, Fonts};
 use crate::platform::geom::Rect;
 use crate::platform::grapheme;
 use crate::render::display::DrawCmd;
@@ -589,13 +589,20 @@ impl Batcher<'_> {
         clip_x: Option<[i32; 2]>,
     ) {
         let face = self.fonts.face_for(face_key);
-        // Code runs thin less than prose (their small stems read as faint under the
-        // prose gamma), so a code run overrides the push-constant gamma per glyph.
-        // Zero means "use the push default", the prose path.
+        // A block of code thins less than prose (its small stems read as faint under
+        // the prose gamma), so it overrides the push-constant gamma per glyph. Zero
+        // means "use the push default": prose, and inline code, which sits at the
+        // prose size inside a line of prose and thins with it.
         let gamma = match face_key {
-            FaceKey::Code { .. } => self.code_glyph_gamma,
-            FaceKey::Prose { .. } => 0.0,
+            FaceKey::Code {
+                ink: CodeInk::Block,
+                ..
+            } => self.code_glyph_gamma,
+            FaceKey::Code { .. } | FaceKey::Prose { .. } => 0.0,
         };
+        // The ink class picked the gamma; the raster is the same either way, so the
+        // glyph cache sees one key per face and size.
+        let face_key = face_key.raster();
         let mut pen = x as f32;
         if text.is_ascii() {
             for ch in text.chars() {
@@ -912,7 +919,7 @@ mod tests {
     }
 
     #[test]
-    fn code_glyphs_carry_the_gamma_override_prose_does_not() {
+    fn block_code_glyphs_carry_the_gamma_override_prose_and_inline_code_do_not() {
         // One size opens both the prose and code faces at 16.
         let fonts = Fonts::new(&[16]).expect("default font");
         let images = ImageStore::new(None);
@@ -933,32 +940,87 @@ mod tests {
             clip_x: None,
         };
         const CODE_GAMMA: f32 = 1.3;
-        let list = vec![
-            text(FaceKey::Prose {
-                size: 16,
-                style: crate::platform::freetype::FontStyle::Regular,
-            }),
-            text(FaceKey::Code { size: 16 }),
-        ];
-        let f = built(
+        let prose = text(FaceKey::Prose {
+            size: 16,
+            style: crate::platform::freetype::FontStyle::Regular,
+        });
+        let inline = text(FaceKey::Code {
+            size: 16,
+            ink: CodeInk::Inline,
+        });
+        let block = text(FaceKey::Code {
+            size: 16,
+            ink: CodeInk::Block,
+        });
+        let overrides = |list: &[DrawCmd], cache: &mut GlyphCache| {
+            let f = built(&fonts, &[&images], list, cache, &|_| false, CODE_GAMMA);
+            let g: Vec<f32> = f
+                .vertices
+                .iter()
+                .filter(|v| v.mode == MODE_GLYPH)
+                .map(|v| v.extra[0])
+                .collect();
+            assert!(!g.is_empty(), "some glyph quads were emitted");
+            g
+        };
+        // A block of code carries the per-run override; prose and inline code pass
+        // zero and defer to the shader's push default.
+        assert!(
+            overrides(&[block], &mut cache)
+                .iter()
+                .all(|&g| g == CODE_GAMMA),
+            "block code glyphs carry the per-run gamma override"
+        );
+        assert!(
+            overrides(&[prose, inline], &mut cache)
+                .iter()
+                .all(|&g| g == 0.0),
+            "prose and inline code defer to the push default (extra.x == 0)"
+        );
+    }
+
+    #[test]
+    fn the_two_code_inks_share_one_atlas_slot() {
+        let fonts = Fonts::new(&[16]).expect("default font");
+        let images = ImageStore::new(None);
+        let mut cache = GlyphCache::new();
+        let text = |ink| DrawCmd::Text {
+            bounds: Rect {
+                x: 0,
+                y: 0,
+                w: 100,
+                h: 20,
+            },
+            x: 0,
+            baseline: 16,
+            face: FaceKey::Code { size: 16, ink },
+            color: 0x00ff_ffff,
+            text: "xy".to_string(),
+            clip_x: None,
+        };
+        // The ink class only picks a gamma, so the same glyphs at the same size are
+        // rasterized once however they are inked.
+        built(
             &fonts,
             &[&images],
-            &list,
+            &[text(CodeInk::Inline)],
             &mut cache,
             &|_| false,
-            CODE_GAMMA,
+            1.3,
         );
-        // Every glyph vertex is MODE_GLYPH; prose ones carry a zero override (the
-        // shader then uses its push default), code ones carry the code gamma.
-        let glyphs: Vec<&Vertex> = f.vertices.iter().filter(|v| v.mode == MODE_GLYPH).collect();
-        assert!(!glyphs.is_empty(), "some glyph quads were emitted");
-        assert!(
-            glyphs.iter().any(|v| v.extra[0] == 0.0),
-            "prose glyphs defer to the push default (extra.x == 0)"
+        let packed = cache.scalar_slots.len();
+        built(
+            &fonts,
+            &[&images],
+            &[text(CodeInk::Block)],
+            &mut cache,
+            &|_| false,
+            1.3,
         );
-        assert!(
-            glyphs.iter().any(|v| v.extra[0] == CODE_GAMMA),
-            "code glyphs carry the per-run gamma override"
+        assert_eq!(
+            cache.scalar_slots.len(),
+            packed,
+            "the other ink reuses the rasters"
         );
     }
 

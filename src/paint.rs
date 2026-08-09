@@ -11,7 +11,7 @@ use crate::markdown;
 use crate::menu::{Menu, MenuLayout};
 use crate::palette::{self, Palette, PaletteLayout};
 use crate::pane::{DiffColumns, DiffView, DiskConflict, TabView, TreePane};
-use crate::platform::freetype::{Face, FaceKey, FontStyle, Fonts, Metrics};
+use crate::platform::freetype::{CodeInk, Face, FaceKey, FontStyle, Fonts, Metrics};
 use crate::platform::geom::Rect;
 use crate::platform::grapheme;
 use crate::platform::pixel;
@@ -3446,7 +3446,10 @@ fn push_image_chrome(
         corners: display::RoundedCorners::Both,
     });
     // Center the glyph in both axes from the code-face metrics.
-    let fk = FaceKey::Code { size: body_size };
+    let fk = FaceKey::Code {
+        size: body_size,
+        ink: CodeInk::Inline,
+    };
     let face = fonts.face_for(fk);
     let glyph = "</>";
     let advance = shape::text_advance(face, glyph).round() as i32;

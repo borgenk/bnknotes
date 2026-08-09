@@ -400,10 +400,13 @@ pub struct Config {
     /// beside it; raising coverage to this power thins the anti-aliased edges back
     /// to a matching weight. Higher is thinner; 1.0 disables it.
     pub glyph_coverage_gamma: f32,
-    /// The same mask gamma for fenced-code and inline-code glyphs. Code is a
-    /// smaller face on the code panel, where its thin monospace stems are almost
-    /// all anti-aliased edge, so the prose thinning leaves them faint; a gentler
-    /// value keeps code as crisp as the prose beside it. Higher is thinner.
+    /// The same mask gamma for a fenced block's glyphs. A block renders a step
+    /// smaller on the code panel, where its thin monospace stems are almost all
+    /// anti-aliased edge, so the prose thinning leaves them faint; a gentler value
+    /// keeps a block as crisp as the prose beside it. Higher is thinner. An inline
+    /// code span is not covered: it renders at the prose size inside a line of
+    /// prose, so it takes [`Self::glyph_coverage_gamma`] and reads at the weight of
+    /// its own sentence.
     pub code_glyph_coverage_gamma: f32,
     /// Line height as a multiple of the font size, the CSS model. Each line box is
     /// grown to at least this many times its size (never below the font's own line
@@ -494,8 +497,9 @@ impl Default for Config {
             // stays under both, so prose keeps some of the fattening: bolder,
             // with edges a little heavier than the browser's.
             glyph_coverage_gamma: 1.5,
-            // Code renders at a smaller size where the prose thinning reads as
-            // faint, so it takes almost none: 1.0 leaves the coverage untouched.
+            // A fenced block renders at a smaller size where the prose thinning
+            // reads as faint, so it takes almost none: 1.0 leaves the coverage
+            // untouched.
             code_glyph_coverage_gamma: 1.0,
             line_height_scale: 1.5,
             caret: CaretConfig::default(),

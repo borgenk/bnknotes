@@ -8,9 +8,9 @@
 //!   larger; a bullet (`- `), ordered (`1. `), or quote (`> `) line carries a
 //!   leading marker. [`crate::layout`] resolves the style to a pixel size and a
 //!   marker length and stamps them onto every visual line the logical line wraps
-//!   into, sharing all the cursor and selection math. A heading hides its marker
-//!   once the cursor leaves; a list or quote marker persists (see
-//!   [`block_marker_persists`]).
+//!   into, sharing all the cursor and selection math. A heading with text hides
+//!   its marker once the cursor leaves; an empty heading's marker, and a list or
+//!   quote marker, persist (see [`block_marker_persists`]).
 //! - **Inline spans** ([`inline_spans`]): code spans, inline links, emphasis
 //!   (`*`/`_`), and strikethrough (`~~`) style interior runs of a line, with their
 //!   delimiters hidden once the cursor leaves the line.
@@ -122,15 +122,19 @@ pub fn is_thematic_break(line: &str) -> bool {
     count >= 3
 }
 
-/// Whether `style`'s block marker stays visible once the cursor leaves the line.
-/// A heading hides its `#`s (the large text reads cleaner bare), but a list
-/// bullet or quote `>` is the only thing marking the line as a list or quote, so
-/// it persists; otherwise the line would read as an ordinary paragraph.
-pub fn block_marker_persists(style: LineStyle) -> bool {
-    matches!(
-        style,
-        LineStyle::Bullet | LineStyle::Ordered | LineStyle::Quote | LineStyle::Task { .. }
-    )
+/// Whether the block marker of `line` stays visible once the cursor leaves it,
+/// given the `style` and `marker` length [`classify`] found. A list bullet or
+/// quote `>` is the only thing marking the line as a list or quote, so it
+/// persists; otherwise the line would read as an ordinary paragraph. A heading
+/// hides its `#`s (the large text reads cleaner bare) as long as it has text to
+/// read: an empty heading keeps them, since hiding the only glyphs on the line
+/// would leave a blank the writer cannot see or click into.
+pub fn block_marker_persists(line: &str, style: LineStyle, marker: usize) -> bool {
+    match style {
+        LineStyle::Bullet | LineStyle::Ordered | LineStyle::Quote | LineStyle::Task { .. } => true,
+        LineStyle::Heading(_) => line.get(marker..).unwrap_or("").trim().is_empty(),
+        LineStyle::Body | LineStyle::Rule => false,
+    }
 }
 
 /// The marker that should open the next item when Enter is pressed on `line`,
@@ -1190,6 +1194,13 @@ mod tests {
         classify(line).1
     }
 
+    /// Whether `line` keeps its block marker off the cursor's line, classified
+    /// the way [`crate::layout`] does it.
+    fn persists(line: &str) -> bool {
+        let (style, marker) = classify(line);
+        block_marker_persists(line, style, marker)
+    }
+
     #[test]
     fn recognizes_each_heading_level() {
         for level in 1..=6u8 {
@@ -1321,15 +1332,37 @@ mod tests {
 
     #[test]
     fn headings_win_over_other_blocks_and_lists_persist() {
-        // A `#` line is a heading, not a list, and a heading hides its marker.
+        // A `#` line is a heading, not a list, and a heading with text hides its
+        // marker.
         assert_eq!(style_of("# h"), LineStyle::Heading(1));
-        assert!(!block_marker_persists(LineStyle::Heading(1)));
-        assert!(!block_marker_persists(LineStyle::Body));
+        assert!(!persists("# h"));
+        assert!(!persists("plain"));
         // Lists and quotes keep their markers on screen.
-        for style in [LineStyle::Bullet, LineStyle::Ordered, LineStyle::Quote] {
-            assert!(block_marker_persists(style), "{style:?} persists");
-            assert_eq!(font_size(style, 32), 32, "{style:?} is body size");
+        for line in ["- item", "1. item", "> quoted"] {
+            assert!(persists(line), "{line:?} persists");
+            assert_eq!(font_size(style_of(line), 32), 32, "{line:?} is body size");
         }
+    }
+
+    #[test]
+    fn an_empty_headings_marker_persists() {
+        // Nothing but the `#`s on the line: hiding them would render the line
+        // blank, so they stay on screen like a bullet's disc does.
+        for line in ["#", "##", "###### ", "##   "] {
+            assert!(persists(line), "{line:?} keeps its marker");
+        }
+        // The first character of text is enough to earn the bare headline.
+        for line in ["# a", "##  x  ", "#### -"] {
+            assert!(!persists(line), "{line:?} hides its marker");
+        }
+    }
+
+    #[test]
+    fn a_thematic_break_does_not_persist_its_marker() {
+        // A rule collapses to a drawn line, which is visible on its own; the
+        // dashes must not linger next to it.
+        assert!(!persists("---"));
+        assert!(!persists("- - -"));
     }
 
     #[test]
@@ -1423,12 +1456,9 @@ mod tests {
 
     #[test]
     fn a_task_is_body_sized_and_its_marker_persists() {
-        for style in [
-            LineStyle::Task { checked: false },
-            LineStyle::Task { checked: true },
-        ] {
-            assert!(block_marker_persists(style), "{style:?} persists");
-            assert_eq!(font_size(style, 32), 32, "{style:?} is body size");
+        for line in ["- [ ] todo", "- [x] done"] {
+            assert!(persists(line), "{line:?} persists");
+            assert_eq!(font_size(style_of(line), 32), 32, "{line:?} is body size");
         }
     }
 

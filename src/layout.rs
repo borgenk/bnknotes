@@ -2017,9 +2017,9 @@ impl LineClass {
     /// Whether markup starting at line-relative `off` draws under this line's
     /// reveal state. Text always draws; a marker draws only on a revealed line,
     /// except the block marker (the leading `[0, block_marker)` bytes) when it
-    /// persists as a list bullet or quote bar. Both the wrap (which measures what
-    /// draws) and [`clip_runs_into`] (which decides what to paint) ask this, so a
-    /// row can never be wrapped against markup it does not show.
+    /// persists ([`markdown::block_marker_persists`]). Both the wrap (which
+    /// measures what draws) and [`clip_runs_into`] (which decides what to paint)
+    /// ask this, so a row can never be wrapped against markup it does not show.
     fn draws(&self, kind: markdown::SpanKind, off: usize) -> bool {
         if !matches!(kind, markdown::SpanKind::Marker) {
             return true;
@@ -2135,7 +2135,7 @@ fn classify_line(
             style,
             size: markdown::font_size(style, ctx.body_size),
             block_marker: marker,
-            block_persists: markdown::block_marker_persists(style),
+            block_persists: markdown::block_marker_persists(line, style, marker),
             revealed: on_line,
             code_block: false,
             list_depth: carry.list_depth.unwrap_or(0),
@@ -5460,6 +5460,33 @@ mod tests {
                 .iter()
                 .all(|r| matches!(r.kind, markdown::SpanKind::Text(_))),
             "body has no marker to hide"
+        );
+    }
+
+    #[test]
+    fn an_empty_headings_marker_stays_on_screen() {
+        // A heading with no text has nothing left once its `#`s collapse, so it
+        // keeps them: the line the writer just opened stays visible and clickable.
+        let f = fonts();
+        let src = "## \nbody";
+        let r = rope(src);
+        let off = src.find("body").expect("body line");
+        let l = Layout::build(&f, &r, LEFT, TOP, 1_000_000, BODY, (off, off));
+        assert!(
+            !marker_hidden(&l, &l.lines()[0]),
+            "the empty heading shows its `##`"
+        );
+        // The hashes advance the pen, so the line is not a blank of zero width.
+        let (x, _, _) = l.caret(&f, &r, 3);
+        assert!(x > LEFT, "the drawn hashes take width");
+        // A word of text earns the bare headline back.
+        let src = "## Title\nbody";
+        let r = rope(src);
+        let off = src.find("body").expect("body line");
+        let l = Layout::build(&f, &r, LEFT, TOP, 1_000_000, BODY, (off, off));
+        assert!(
+            marker_hidden(&l, &l.lines()[0]),
+            "text hides the marker again"
         );
     }
 

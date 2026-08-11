@@ -1553,11 +1553,21 @@ impl EditorPane {
     /// from the index. Cursor operations run the ordinary [`Layout`] methods on
     /// this, so their logic is shared with the full build; it is built on demand and
     /// is O(viewport), never O(document). Requires the index (call `ensure_index`).
+    ///
+    /// `None` when the index is unavailable, and when a fold hides the cursor's
+    /// line: it has no caret box to answer with, and a section deeper than the
+    /// window would leave nothing laid out to ask. Callers that move or reveal the
+    /// caret restore it to a visible line first (see
+    /// [`Self::open_folds_at_cursor`]), so this is the floor under them, not a path
+    /// the editor works from.
     fn cursor_window(&self, fonts: &Fonts, rect: Rect) -> Option<Layout> {
         let index = self.line_index.as_ref()?;
         let adjust = self.adjust();
         let active = self.reveal_range();
         let cursor_line = self.text.rope().byte_to_line(self.text.cursor());
+        if self.fold_map.hides(cursor_line) {
+            return None;
+        }
         let span = self.page_lines(fonts, rect) + 4;
         let n = index.len();
         let start = cursor_line.saturating_sub(span);
@@ -1844,12 +1854,13 @@ impl EditorPane {
             .collect()
     }
 
-    /// Whether the cursor's logical line falls inside the painted window, so a caret
-    /// drawn from that window sits at the true position rather than a clamped
-    /// fallback. Off-window (scrolled far away) means the caret is simply not drawn.
+    /// Whether the cursor's logical line falls inside the painted window and is on
+    /// screen at all, so a caret drawn from that window sits at the true position
+    /// rather than a clamped fallback. Off-window (scrolled far away) or behind a
+    /// fold means the caret is simply not drawn.
     pub(crate) fn cursor_in_window(&self) -> bool {
         let line = self.text.rope().byte_to_line(self.text.cursor());
-        self.layout_band.0 <= line && line < self.layout_band.1
+        self.layout_band.0 <= line && line < self.layout_band.1 && !self.fold_map.hides(line)
     }
 
     /// This document's caret animation, for the app loop to read its flight state
@@ -3768,6 +3779,104 @@ run
         pane.text.move_left(false);
         pane.step_over_folds(false, false);
         assert_eq!(pane.text.cursor(), end);
+    }
+
+    /// A note whose one section is longer than any cursor window, so a caret parked
+    /// in the middle of it has no laid-out line anywhere near it while it is folded.
+    fn long_section() -> String {
+        let mut text = String::from("# Guide\n");
+        for i in 0..200 {
+            text.push_str(&format!("body line {i}\n"));
+        }
+        text
+    }
+
+    /// What the app does to bring a caret on screen after landing it at an offset
+    /// the view did not pick: `State::reveal_active_caret`.
+    fn reveal_caret(pane: &mut EditorPane, fonts: &Fonts, rect: Rect) {
+        pane.open_folds_at_cursor(fonts, rect);
+        pane.scroll_caret_into_view(fonts, rect);
+    }
+
+    #[test]
+    fn a_search_hit_inside_a_folded_section_opens_it() {
+        // The reported crash: a Ctrl+Shift+F hit landed the caret deep inside a
+        // collapsed section, where the window built around it laid out nothing (every
+        // line in the band was hidden) and asking that empty window for the caret's
+        // box took the process down. The section the hit is in opens, so the caret has
+        // a line on screen to sit on.
+        let fonts = Fonts::new(&markdown::all_sizes(FONT_SIZE)).expect("a default font");
+        let rect = fold_rect();
+        let mut pane = pane_of(&long_section());
+        assert!(pane.toggle_fold_at(&fonts, rect, 0));
+        pane.ensure_layout(&fonts, rect);
+        assert_eq!(drawn_lines(&pane), vec![0], "the whole body is folded away");
+
+        // The palette's OpenMatch: the caret goes straight to the hit's offset.
+        let hit = pane.text.rope().line_to_byte(150);
+        pane.text.set_cursor(hit, false);
+        reveal_caret(&mut pane, &fonts, rect);
+        pane.ensure_layout(&fonts, rect);
+
+        assert!(pane.folds.is_empty(), "the section holding the hit opened");
+        assert!(
+            drawn_lines(&pane).contains(&150),
+            "the hit's line is laid out"
+        );
+        assert!(pane.cursor_in_window(), "and the caret is drawn on it");
+    }
+
+    #[test]
+    fn a_find_match_inside_a_folded_section_opens_it() {
+        // The same for Ctrl+F: the bar's match is an offset the view did not pick, so
+        // a match inside a collapsed section has to open it rather than select text
+        // nobody can see.
+        let fonts = Fonts::new(&markdown::all_sizes(FONT_SIZE)).expect("a default font");
+        let rect = fold_rect();
+        let mut pane = pane_of(FOLDABLE);
+        let ls = pane.text.rope().line_to_byte(2);
+        assert!(pane.toggle_fold_at(&fonts, rect, ls));
+        pane.ensure_layout(&fonts, rect);
+        assert_eq!(drawn_lines(&pane), vec![0, 1, 2, 6, 7, 8]);
+
+        // Ctrl+F, then a query that only matches inside the folded section.
+        let target = {
+            let cursor = pane.text.cursor();
+            pane.find.open_at(cursor, &pane.text);
+            let mut target = None;
+            for c in "detail".chars() {
+                target = pane.find.push(c, &pane.text);
+            }
+            target.expect("the query matches inside the fold")
+        };
+        pane.text.select_range(target.0, target.1);
+        reveal_caret(&mut pane, &fonts, rect);
+        pane.ensure_layout(&fonts, rect);
+
+        assert!(pane.folds.is_empty(), "the match's section opened");
+        assert!(drawn_lines(&pane).contains(&5), "the match's line is drawn");
+        assert!(pane.cursor_in_window());
+    }
+
+    #[test]
+    fn a_caret_left_behind_a_fold_has_no_caret_box_rather_than_no_editor() {
+        // The floor under the openers above, for any offset that reaches the caret
+        // without passing them (a session restored against a note edited elsewhere).
+        // A hidden line is not on screen, so it has no caret box and nothing scrolls;
+        // what it must never do is ask a window that laid out nothing.
+        let fonts = Fonts::new(&markdown::all_sizes(FONT_SIZE)).expect("a default font");
+        let rect = fold_rect();
+        let mut pane = pane_of(&long_section());
+        assert!(pane.toggle_fold_at(&fonts, rect, 0));
+        pane.ensure_layout(&fonts, rect);
+
+        pane.text
+            .set_cursor(pane.text.rope().line_to_byte(150), false);
+        assert!(!pane.scroll_caret_into_view(&fonts, rect));
+        assert!(!pane.move_vertical(&fonts, rect, 1, false));
+        assert!(!pane.move_line_edge(&fonts, rect, true, false));
+        pane.ensure_layout(&fonts, rect);
+        assert!(!pane.cursor_in_window(), "no caret is drawn for it");
     }
 
     #[test]

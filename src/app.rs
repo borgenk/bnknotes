@@ -1172,13 +1172,18 @@ impl State {
         self.set_scale_120(factor_120);
     }
 
-    /// Ensure the focused editor's layout is current, then keep its caret on
-    /// screen and repaint if that scrolled. The routed equivalent of the old
-    /// `scroll_caret_into_view`, for the many call sites that acted on "the
-    /// current editor".
+    /// Bring the focused editor's caret on screen: open every section hiding it,
+    /// then scroll the minimum to reveal it, repainting if that scrolled.
+    ///
+    /// Opening comes first because a caret inside a collapsed section has nowhere on
+    /// screen to scroll to. Every way a caret arrives at an offset the view did not
+    /// pick (an edit, a search hit, a find match, an applied revision) ends here, so
+    /// this is where the "the caret is never on a line a fold hides" invariant is
+    /// restored.
     fn reveal_active_caret(&mut self) {
         let i = self.active_editor();
         let rect = self.editor_rect(i);
+        self.editors[i].open_folds_at_cursor(&self.fonts, rect);
         if self.editors[i].scroll_caret_into_view(&self.fonts, rect) {
             // A keyboard scroll is a scroll: show the bar moving, the way the wheel does.
             self.flash_scrollbar(Focus::Editor(i));
@@ -2890,16 +2895,12 @@ impl State {
         Ok(())
     }
 
-    /// Common bookkeeping after a buffer edit: request a redraw, open any section
-    /// the edit wrote into, keep the caret on screen, and refresh the title's
-    /// modified indicator. Opening comes first, since the section it reveals changes
-    /// where the caret sits on screen.
+    /// Common bookkeeping after a buffer edit: request a redraw, bring the caret on
+    /// screen (which opens any section the edit wrote into), and refresh the title's
+    /// modified indicator.
     fn after_edit(&mut self) {
         self.dirty = true;
         self.bump_caret();
-        let i = self.active_editor();
-        let rect = self.editor_rect(i);
-        self.editors[i].open_folds_at_cursor(&self.fonts, rect);
         self.reveal_active_caret();
         self.refresh_title();
     }

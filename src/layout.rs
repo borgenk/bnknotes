@@ -67,6 +67,7 @@
 use std::ops::Range;
 
 use crate::fold::FoldMap;
+use crate::frontmatter;
 use crate::markdown;
 use crate::platform::freetype::{CodeInk, Face, FaceKey, FontStyle, Fonts, Metrics};
 use crate::platform::geom::Rect;
@@ -624,6 +625,10 @@ pub struct LayoutCtx<'a> {
     /// The sections folded away right now. A build skips their lines outright; the
     /// index paths hold this empty so base geometry stays fold-free.
     folds: &'a FoldMap,
+    /// How many logical lines the document's frontmatter block covers, if it opens
+    /// with one. Those lines are raw metadata rather than markdown, which only the
+    /// document's shape can say (see [`crate::frontmatter`]).
+    frontmatter: Option<usize>,
     /// The display scale, so the layout's pixel constants (indents, paddings,
     /// table borders) land at the right device size. Identity at [`Scale::ONE`].
     scale: Scale,
@@ -651,8 +656,15 @@ impl<'a> LayoutCtx<'a> {
             images,
             image_ui,
             folds,
+            frontmatter: frontmatter::extent(rope),
             scale,
         }
+    }
+
+    /// Whether logical line `line` sits in the document's frontmatter block, and so
+    /// is metadata drawn verbatim rather than a line of markdown.
+    fn in_frontmatter(&self, line: usize) -> bool {
+        self.frontmatter.is_some_and(|end| line < end)
     }
 
     fn with_active(self, active: (usize, usize)) -> Self {
@@ -2080,8 +2092,9 @@ impl LineClass {
     }
 }
 
-/// Classify one logical `line` for [`lay_line`]: resolve its block style (fenced
-/// code continuation, a fence opener, or ordinary markdown with list nesting),
+/// Classify one logical `line` for [`lay_line`]: resolve its block style (raw
+/// frontmatter, fenced code continuation, a fence opener, or ordinary markdown
+/// with list nesting),
 /// fill `pool.spans` with its inline markup, and thread the cross-line carry
 /// (`fence`, `list_depth`). `on_line` is whether the cursor/selection touches the
 /// line, which controls whether a delimiter's markers are revealed.
@@ -2089,10 +2102,28 @@ fn classify_line(
     ctx: &LayoutCtx,
     line: &str,
     on_line: bool,
+    frontmatter: bool,
     carry: &mut LineCarry,
     pool: &mut LayoutScratch,
 ) -> LineClass {
-    if let Some(fence) = carry.fence {
+    if frontmatter {
+        // Raw metadata: no markdown at all, so the `---` delimiters are not thematic
+        // breaks and a value's `*` or `[..]` is not emphasis or a link. Nothing
+        // carries into the document below, which starts fresh past the block.
+        carry.fence = None;
+        carry.list_depth = None;
+        code_block_spans_into(line, false, crate::syntax::Lang::Yaml, &mut pool.spans);
+        LineClass {
+            style: markdown::LineStyle::Body,
+            size: markdown::code_size(ctx.body_size),
+            block_marker: 0,
+            block_persists: false,
+            revealed: true,
+            code_block: true,
+            list_depth: 0,
+            list_continuation: false,
+        }
+    } else if let Some(fence) = carry.fence {
         // Inside a fence: literal code, not markdown. Only a delimiter line has
         // backticks to hide, and it reveals them on the cursor's own line.
         carry.list_depth = None;
@@ -2234,7 +2265,11 @@ fn lay_line(
     // text (the reveal case). The no-reveal case pushes its widget and returns,
     // never reaching the text path.
     let mut pending_image: Option<ImageBox> = None;
-    if carry.fence.is_none() {
+    // A frontmatter line is metadata, not markdown, so none of the block widgets
+    // may claim it: a YAML value carrying a `|` is not a table row, and one shaped
+    // like `![alt](path)` is not a picture.
+    let frontmatter = ctx.in_frontmatter(line_no);
+    if carry.fence.is_none() && !frontmatter {
         // A table renders as a grid of widget rows: its delimiter row draws
         // nothing, and every other row is one table widget line. A table ends any
         // open list. Detection is by rope scan (`TableMemo::locate`), so no table
@@ -2299,7 +2334,7 @@ fn lay_line(
     // pass and renders as one code run. The ``` fence lines hide their backticks off
     // the cursor's line, like a heading's `#`. A code line carries `Body` as an
     // inert style (its gutter is unused).
-    let mut class = classify_line(ctx, &line, on_line, carry, pool);
+    let mut class = classify_line(ctx, &line, on_line, frontmatter, carry, pool);
     // A revealed image's source always shows verbatim (its markers, if any, are not
     // hidden), so the text above the picture reads as written.
     class.revealed |= pending_image.is_some();
@@ -2594,6 +2629,9 @@ pub struct LineIndex {
     /// selection may reveal the whole document, and a scroll queries the geometry
     /// per frame, so this stays O(1).
     wrap_tops: Vec<i32>,
+    /// The frontmatter extent the records were measured against, so everything
+    /// downstream reads the document's one answer rather than rescanning for it.
+    frontmatter: Option<usize>,
 }
 
 impl LineIndex {
@@ -2653,7 +2691,7 @@ impl LineIndex {
     }
 
     /// Build the cumulative prefixes (`tops`, `wrap_tops`) from a record list.
-    fn from_recs(recs: Vec<LineRec>) -> Self {
+    fn from_recs(recs: Vec<LineRec>, frontmatter: Option<usize>) -> Self {
         let mut tops = Vec::with_capacity(recs.len() + 1);
         let mut wrap_tops = Vec::with_capacity(recs.len() + 1);
         let (mut acc, mut wrap_acc) = (0, 0);
@@ -2669,6 +2707,7 @@ impl LineIndex {
             recs,
             tops,
             wrap_tops,
+            frontmatter,
         }
     }
 
@@ -2686,7 +2725,7 @@ impl LineIndex {
         let n = rope.len_lines();
         let ctx = LayoutCtx::for_index(fonts, rope, wrap_width, body_size, images, scale);
         let out = measure_chunk(&ctx, 0, n, n, LineCarry::default());
-        Self::from_recs(out.recs)
+        Self::from_recs(out.recs, ctx.frontmatter)
     }
 
     /// Build the index across up to `threads` worker threads, for a large
@@ -2802,7 +2841,7 @@ impl LineIndex {
                 carry = re.end;
             }
         }
-        Self::from_recs(recs)
+        Self::from_recs(recs, ctx.frontmatter)
     }
 
     /// Incrementally bring the index up to date after an edit turned `prev` into
@@ -2825,7 +2864,11 @@ impl LineIndex {
         let new = ctx.rope;
         let new_n = new.len_lines();
         let old_n = self.recs.len();
-        if old_n != prev.len_lines() {
+        // A moved frontmatter extent reclassifies lines above the edit: deleting the
+        // closing `---` turns the whole block back into markdown. The incremental
+        // path keeps every record before the change, so it cannot see that; rebuild
+        // instead. The extent only moves when a delimiter itself is edited.
+        if old_n != prev.len_lines() || self.frontmatter != ctx.frontmatter {
             *self = Self::build(
                 ctx.fonts,
                 new,
@@ -2890,7 +2933,7 @@ impl LineIndex {
         recs.extend_from_slice(&self.recs[..front]);
         recs.append(&mut mid);
         recs.extend_from_slice(&self.recs[converge_old..]);
-        *self = Self::from_recs(recs);
+        *self = Self::from_recs(recs, ctx.frontmatter);
     }
 
     // A document always has at least one logical line, so there is no meaningful
@@ -2995,6 +3038,13 @@ impl LineIndex {
         self.recs
             .get(line)
             .map_or((0, -1), |rec| (rec.fence_in, rec.depth_in))
+    }
+
+    /// How many logical lines the document's frontmatter block covers, if it has
+    /// one: lines `0..end` are raw metadata. Recorded at build time so the fold
+    /// resolution and the layout agree on one answer.
+    pub fn frontmatter(&self) -> Option<usize> {
+        self.frontmatter
     }
 
     /// The ATX heading level of logical line `line`, or `None` where it is not a
@@ -4320,6 +4370,7 @@ mod tests {
         "```\ncode line\nmore code\n```\nafter the fence\n",
         "```rust\nunterminated fence runs to EOF\nstill code\nand more\n",
         "---\n***\n___\n",
+        "---\ntitle: Work log\ntags: [Notebooks/Work]\nlist: - not a bullet\n---\n\n# Monday\nran the numbers\n",
         "a\nb\nc\nd\ne\nf\ng\nh\n",
         "trailing line with no newline",
         "windows\r\nline\r\nendings\r\n",
@@ -5045,6 +5096,73 @@ mod tests {
                 "records after {needle:?} -> {repl:?}"
             );
             assert_eq!(index.tops, rebuilt.tops, "prefix sums after {needle:?}");
+        }
+    }
+
+    #[test]
+    fn a_frontmatter_block_is_metadata_rather_than_markdown() {
+        // Nothing in the block runs through the markdown passes: its `---`
+        // delimiters are not thematic breaks, and a value shaped like a link or
+        // wrapped in `*` is neither. Below the block markdown resumes.
+        let f = fonts();
+        let r = rope("---\ntags: [Notebooks/Work](x)\nnote: *not italic*\n---\n\n---\n");
+        let l = Layout::build(&f, &r, LEFT, TOP, 1_000_000, BODY, NO_REVEAL);
+        let mut rules = Vec::new();
+        for v in l.lines() {
+            let line = r.byte_to_line(v.start);
+            if line < 4 {
+                assert!(v.code_block, "logical line {line} is metadata");
+                for run in l.run_slice(v) {
+                    assert!(
+                        matches!(run.kind, markdown::SpanKind::Code(_)),
+                        "logical line {line} run {:?} went through the inline pass",
+                        run.kind
+                    );
+                }
+            }
+            if v.rule {
+                rules.push(line);
+            }
+        }
+        assert_eq!(rules, vec![5], "only the `---` below the block is a rule");
+    }
+
+    #[test]
+    fn an_edit_that_moves_the_frontmatter_extent_rebuilds_the_index() {
+        // Breaking the closing delimiter turns the block back into markdown, which
+        // reclassifies the lines *above* the edit. The incremental path keeps every
+        // record before the change and so cannot see that on its own; the index must
+        // still match a full build. The line count never moves here, so the rebuild
+        // is the extent check and nothing else.
+        let f = fonts();
+        let no_images = ImageStore::new(None);
+        let w = 300;
+        let mut text = String::from("---\ntitle: Work log\n---\n# Monday\nran the numbers\n");
+        let mut rope = Rope::from_str(&text);
+        let mut index = LineIndex::build(&f, &rope, w, BODY, &no_images, Scale::ONE);
+        assert_eq!(index.frontmatter(), Some(3));
+
+        let edits: &[(&str, &str)] = &[
+            ("---\n# Monday", "-- \n# Monday"), // break the closer: no block at all
+            ("-- \n# Monday", "---\n# Monday"), // restore it
+            ("---\ntitle", "-- \ntitle"),       // break the opener instead
+        ];
+        for (needle, repl) in edits {
+            let pos = text
+                .find(needle)
+                .unwrap_or_else(|| panic!("needle {needle:?} not found"));
+            let prev = rope.clone();
+            text.replace_range(pos..pos + needle.len(), repl);
+            rope = Rope::from_str(&text);
+            assert_eq!(rope.len_lines(), prev.len_lines(), "the line count holds");
+            let ctx = LayoutCtx::for_index(&f, &rope, w, BODY, &no_images, Scale::ONE);
+            index.update(&ctx, &prev);
+            let rebuilt = LineIndex::build(&f, &rope, w, BODY, &no_images, Scale::ONE);
+            assert_eq!(
+                index.recs, rebuilt.recs,
+                "records after {needle:?} -> {repl:?}"
+            );
+            assert_eq!(index.frontmatter(), rebuilt.frontmatter());
         }
     }
 

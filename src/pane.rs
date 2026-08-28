@@ -6,6 +6,7 @@ use crate::config::CaretConfig;
 use crate::file::{self, FileFormat};
 use crate::find::FindState;
 use crate::fold::{self, FoldMap, Folds};
+use crate::frontmatter;
 use crate::layout::{
     Adjust, ImageUi, Layout, LayoutCtx, LineIndex, RevealAdjust, VisualLine, NO_REVEAL,
 };
@@ -1124,14 +1125,39 @@ impl EditorPane {
     pub(crate) fn open(path: &Path) -> Result<Self> {
         let (contents, format) = load(path)?;
         let image_dir = path.parent().map(Path::to_path_buf);
-        Ok(Self {
+        let mut doc = Self {
             text: TextBuffer::from_text(contents),
             path: Some(path.to_path_buf()),
             format,
             disk: file::DiskSnapshot::of(path),
             images: ImageStore::new(image_dir),
             ..Self::empty()
-        })
+        };
+        doc.park_past_frontmatter();
+        Ok(doc)
+    }
+
+    /// Move a caret sitting in the frontmatter block down to the note's first
+    /// content line, so opening a note shows the note. The block hides while the
+    /// caret is outside it, and a caret at the document start (a fresh open, or a
+    /// session that saved one there) would be inside and hold it open.
+    ///
+    /// Every caret inside the block parks, not just one at the start: a saved caret
+    /// is not a deliberate gesture the way a fold is, and a note that always reopens
+    /// on its content beats one that sometimes reopens on its metadata.
+    ///
+    /// A document that is nothing but frontmatter has no content line to park on, so
+    /// the caret stays inside and the block shows: there is nothing else to see.
+    fn park_past_frontmatter(&mut self) {
+        let rope = self.text.rope();
+        let Some(end) = frontmatter::extent(rope) else {
+            return;
+        };
+        if rope.byte_to_line(self.text.cursor()) >= end {
+            return;
+        }
+        let target = rope.line_to_byte(end);
+        self.text.set_cursor(target, false);
     }
 
     /// Whether the buffer changed since this was last asked, latching the version it
@@ -1434,13 +1460,21 @@ impl EditorPane {
         }
     }
 
-    /// Re-resolve what the folds hide when the content or the fold set has moved
-    /// under them, dropping any anchor whose heading is gone. Cheap to check and,
-    /// with nothing folded, cheap to do.
+    /// Re-resolve what the document hides when the content, the fold set, or the
+    /// caret has moved under them, dropping any anchor whose heading is gone. Cheap
+    /// to check and, with nothing hidden, cheap to do.
+    ///
+    /// The frontmatter block's state is settled here first, because it is the caret
+    /// that decides it: the block shows while the caret is inside it and hides again
+    /// when it leaves. Writing it into [`Folds`] moves the revision, so the fold map
+    /// and the windowed layout both rebuild on the same key they already watch.
     fn ensure_fold_map(&mut self) {
         let Some(index) = self.line_index.as_ref() else {
             return;
         };
+        let cursor_line = self.text.rope().byte_to_line(self.text.cursor());
+        let in_frontmatter = index.frontmatter().is_some_and(|end| cursor_line < end);
+        self.folds.set_frontmatter_open(in_frontmatter);
         let key = (self.text.version(), self.folds.revision());
         if self.fold_map_key == Some(key) {
             return;
@@ -1766,6 +1800,9 @@ impl EditorPane {
     /// per heading level, and stops as soon as the cursor is visible, so a nested
     /// section the edit did not reach stays folded.
     pub(crate) fn open_folds_at_cursor(&mut self, fonts: &Fonts, rect: Rect) {
+        // Only sections reach here. A frontmatter block hiding the caret cannot
+        // happen: resolving what the document hides shows the block wherever the
+        // caret is inside it, which is settled before this asks.
         if self.folds.is_empty() {
             return;
         }
@@ -1790,13 +1827,17 @@ impl EditorPane {
     /// backward on the end of the heading that hides it. Arrowing over a folded
     /// heading therefore steps across the whole section rather than through its
     /// hidden text. Reports whether the cursor moved.
+    ///
+    /// A hidden frontmatter block is not stepped over: it is hidden only until the
+    /// caret arrives, so arrowing back into it from the first line of the note is
+    /// how you open it.
     pub(crate) fn step_over_folds(&mut self, forward: bool, extend: bool) -> bool {
         if self.fold_map.is_empty() {
             return false;
         }
         let rope = self.text.rope();
         let line = rope.byte_to_line(self.text.cursor());
-        if !self.fold_map.hides(line) {
+        if !self.fold_map.steps_over(line) {
             return false;
         }
         let target = if forward {
@@ -3172,6 +3213,7 @@ fn restore_doc(saved: &store::PaneSession) -> EditorPane {
         None => EditorPane::empty(),
     };
     doc.text.set_cursor(saved.cursor as usize, false);
+    doc.park_past_frontmatter();
     doc.scroll_y = saved.scroll_y.max(0);
     doc.folds = Folds::from_lines(saved.folds.iter().map(|&l| l as usize));
     doc
@@ -3592,6 +3634,16 @@ detail
 run
 ";
 
+    const WITH_FRONT: &str = "\
+---
+title: Work log
+tags: [Notebooks/Work]
+---
+
+# Monday
+ran the numbers
+";
+
     fn fold_rect() -> Rect {
         Rect {
             x: 0,
@@ -3668,6 +3720,126 @@ run
         assert!(pane.toggle_fold_at(&fonts, rect, pane.text.rope().line_to_byte(2)));
         let line = pane.text.rope().byte_to_line(pane.text.cursor());
         assert_eq!(line, 2);
+    }
+
+    #[test]
+    fn a_note_opens_on_its_content_with_its_metadata_hidden() {
+        // Opening a note shows the note: the caret is parked past the block, which
+        // is what keeps the block shut, and no line of it is drawn.
+        let fonts = Fonts::new(&markdown::all_sizes(FONT_SIZE)).expect("a default font");
+        let rect = fold_rect();
+        let mut pane = pane_of(WITH_FRONT);
+        pane.park_past_frontmatter();
+        pane.ensure_layout(&fonts, rect);
+        assert_eq!(
+            pane.text.rope().byte_to_line(pane.text.cursor()),
+            4,
+            "the caret sits on the first line below the block"
+        );
+        assert_eq!(
+            drawn_lines(&pane).first().copied(),
+            Some(4),
+            "the document starts at its content"
+        );
+    }
+
+    #[test]
+    fn the_caret_entering_the_block_shows_it_and_leaving_shuts_it_again() {
+        // The live-preview rule at block scale. Arrowing back off the note's first
+        // line is the way in: the block is not stepped over the way a folded section
+        // is, so the caret lands on its closing delimiter and the metadata appears.
+        let fonts = Fonts::new(&markdown::all_sizes(FONT_SIZE)).expect("a default font");
+        let rect = fold_rect();
+        let mut pane = pane_of(WITH_FRONT);
+        pane.park_past_frontmatter();
+        pane.ensure_layout(&fonts, rect);
+
+        pane.text.move_left(false);
+        assert!(
+            !pane.step_over_folds(false, false),
+            "the block opens rather than being stepped over"
+        );
+        pane.ensure_layout(&fonts, rect);
+        assert_eq!(
+            pane.text.rope().byte_to_line(pane.text.cursor()),
+            3,
+            "the caret is on the closing delimiter"
+        );
+        assert_eq!(
+            drawn_lines(&pane).first().copied(),
+            Some(0),
+            "the whole block is on screen to edit"
+        );
+        assert!(
+            pane.cursor_window(&fonts, rect).is_some(),
+            "and the caret has a line to measure against"
+        );
+
+        // Back onto the note and the block shuts behind it.
+        let content = pane.text.rope().line_to_byte(5);
+        pane.text.set_cursor(content, false);
+        pane.ensure_layout(&fonts, rect);
+        assert_eq!(drawn_lines(&pane).first().copied(), Some(4));
+    }
+
+    #[test]
+    fn an_arrival_inside_the_block_finds_a_caret_to_scroll_to() {
+        // The twin of the collapsed-section search bug: a caret that arrives at an
+        // offset the view did not pick (a find match, a search hit, an applied
+        // revision) must not land on a line nothing draws. Settling the block is part
+        // of resolving what the document hides, so it happens before anything asks
+        // where the caret is.
+        let fonts = Fonts::new(&markdown::all_sizes(FONT_SIZE)).expect("a default font");
+        let rect = fold_rect();
+        let mut pane = pane_of(WITH_FRONT);
+        pane.park_past_frontmatter();
+        pane.ensure_layout(&fonts, rect);
+        assert_eq!(
+            drawn_lines(&pane).first().copied(),
+            Some(4),
+            "shut to begin"
+        );
+
+        let hit = pane.text.rope().line_to_byte(2) + 3;
+        pane.text.set_cursor(hit, false);
+        pane.scroll_caret_into_view(&fonts, rect);
+        assert!(
+            pane.cursor_window(&fonts, rect).is_some(),
+            "the hit's line is laid out"
+        );
+        pane.ensure_layout(&fonts, rect);
+        assert_eq!(drawn_lines(&pane).first().copied(), Some(0));
+    }
+
+    #[test]
+    fn any_restored_caret_inside_the_block_is_parked_on_the_content() {
+        // A session's caret is not a gesture the way a fold is: the common saved
+        // value is the document start, from a note opened and never moved in, and
+        // restoring that with the metadata showing is worse than losing the rarer
+        // caret someone really left in a tag. Both park, so a note always reopens
+        // the same way.
+        let mut pane = pane_of(WITH_FRONT);
+        for saved in [0, pane.text.rope().line_to_byte(1)] {
+            pane.text.set_cursor(saved, false);
+            pane.park_past_frontmatter();
+            assert_eq!(
+                pane.text.rope().byte_to_line(pane.text.cursor()),
+                4,
+                "a caret saved at {saved}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_document_that_is_only_metadata_still_shows_it() {
+        // There is no content line to park on, so the caret stays inside and the
+        // block draws: hiding it would leave an empty pane with nowhere to type.
+        let fonts = Fonts::new(&markdown::all_sizes(FONT_SIZE)).expect("a default font");
+        let rect = fold_rect();
+        let mut pane = pane_of("---\ntitle: Work log\n---");
+        pane.park_past_frontmatter();
+        pane.ensure_layout(&fonts, rect);
+        assert_eq!(drawn_lines(&pane), vec![0, 1, 2]);
     }
 
     #[test]

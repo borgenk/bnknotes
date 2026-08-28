@@ -8,6 +8,7 @@ mod dev;
 mod file;
 mod find;
 mod fold;
+mod frontmatter;
 mod icon;
 mod keymap;
 mod layout;

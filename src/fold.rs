@@ -46,6 +46,11 @@ pub const MAX_FOLDS: usize = 4096;
 #[derive(Clone, Debug, Default)]
 pub struct Folds {
     lines: BTreeSet<usize>,
+    /// Whether the document's frontmatter block is showing. Unlike the anchors it
+    /// is not the user's choice and is not persisted: the caret decides it (see
+    /// [`Self::set_frontmatter_open`]). It lives here so that flipping it moves the
+    /// revision, and every cache already keyed on that rebuilds.
+    frontmatter_open: bool,
     revision: u64,
 }
 
@@ -56,6 +61,7 @@ impl Folds {
     pub fn from_lines(lines: impl IntoIterator<Item = usize>) -> Self {
         Self {
             lines: lines.into_iter().take(MAX_FOLDS).collect(),
+            frontmatter_open: false,
             revision: 0,
         }
     }
@@ -67,6 +73,23 @@ impl Folds {
 
     pub fn is_empty(&self) -> bool {
         self.lines.is_empty()
+    }
+
+    /// Show or hide the frontmatter block, reporting whether that changed. A note's
+    /// metadata is hidden exactly while the caret is outside it: the block-scale
+    /// form of the live-preview rule that gives a heading back its `#` when the
+    /// caret arrives and takes it away again when it leaves.
+    pub fn set_frontmatter_open(&mut self, open: bool) -> bool {
+        if self.frontmatter_open == open {
+            return false;
+        }
+        self.frontmatter_open = open;
+        self.revision += 1;
+        true
+    }
+
+    pub fn frontmatter_open(&self) -> bool {
+        self.frontmatter_open
     }
 
     /// Changes whenever the anchor set does. A [`FoldMap`] built from this set is
@@ -167,11 +190,22 @@ impl Folds {
     }
 }
 
+/// What a hidden run of lines is, which decides what the caret may do with it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Hide {
+    /// A folded heading's section. The user asked for it, so it stays shut and the
+    /// caret steps over it rather than through it.
+    Section,
+    /// The frontmatter block. It is hidden only while the caret is elsewhere, so the
+    /// caret entering it is what opens it and there is nothing to step over.
+    Frontmatter,
+}
+
 /// One hidden run of logical lines: a folded heading's section, having swallowed
-/// any nested section folded inside it.
+/// any nested section folded inside it, or the document's frontmatter block.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct HiddenSpan {
-    /// First hidden line, always the line after the folded heading.
+    /// First hidden line: the line after a folded heading, or 0 for frontmatter.
     start: usize,
     /// One past the last hidden line.
     end: usize,
@@ -185,10 +219,13 @@ struct HiddenSpan {
     /// windowed layout that jumps this span resumes in the state the skipped lines
     /// would have left it. Without it a fence opened inside a fold would leak.
     exit: (u16, i16),
+    hide: Hide,
 }
 
-/// What a document's [`Folds`] hide right now, resolved against its [`LineIndex`]:
-/// the merged line spans and the height they remove. Empty when nothing is folded,
+/// What a document hides right now, resolved against its [`LineIndex`]: the merged
+/// line spans and the height they remove. Every hidden line in the editor is one of
+/// these, so a query that has to skip over hidden text (layout, caret motion,
+/// content height) asks this and nothing else. Empty when a document hides nothing,
 /// which is the common case and costs nothing to build or consult.
 #[derive(Clone, Debug, Default)]
 pub struct FoldMap {
@@ -201,20 +238,36 @@ impl FoldMap {
     /// and for callers with no fold state of their own.
     pub const NONE: &'static FoldMap = &FoldMap { hidden: Vec::new() };
 
-    /// Resolve `folds` against `index` into the spans they hide.
+    /// Resolve what `folds` hide against `index` into spans.
     ///
-    /// Walks the anchors in ascending order, scanning forward from each for the
-    /// heading that ends its section. An anchor already covered by the span in hand
-    /// is skipped, which is what merges a nested fold into the outer one that
-    /// swallows it. The scan is the only cost, so it is proportional to the lines
-    /// actually hidden and is skipped entirely when nothing is folded.
+    /// A closed frontmatter block comes first, hiding the lines it covers from the
+    /// document's very top. Then the folded headings, walked in ascending order and
+    /// scanned forward for the heading that ends each section. An anchor already
+    /// covered by the span in hand is skipped, which is what merges a nested fold
+    /// into the outer one that swallows it. Frontmatter lines are never headings, so
+    /// no anchor can land inside that first span. The scans are the only cost, so
+    /// this is proportional to the lines actually hidden and is skipped entirely
+    /// when a document hides nothing.
     pub fn build(folds: &Folds, index: &LineIndex) -> Self {
-        if folds.is_empty() {
+        let frontmatter = index.frontmatter().filter(|_| !folds.frontmatter_open());
+        if folds.is_empty() && frontmatter.is_none() {
             return Self::default();
         }
         let n = index.len();
         let mut hidden: Vec<HiddenSpan> = Vec::new();
         let mut before = 0;
+        if let Some(end) = frontmatter {
+            let height = index.span_height(0, end);
+            hidden.push(HiddenSpan {
+                start: 0,
+                end,
+                height,
+                before,
+                exit: index.entry_packed(end),
+                hide: Hide::Frontmatter,
+            });
+            before += height;
+        }
         for anchor in folds.lines() {
             let Some(level) = index.heading_at(anchor) else {
                 continue;
@@ -240,6 +293,7 @@ impl FoldMap {
                 height,
                 before,
                 exit: index.entry_packed(end),
+                hide: Hide::Section,
             });
             before += height;
         }
@@ -253,6 +307,16 @@ impl FoldMap {
     /// Whether `line` is hidden by a fold.
     pub fn hides(&self, line: usize) -> bool {
         self.span_containing(line).is_some()
+    }
+
+    /// Whether the caret must step over the span hiding `line` rather than land in
+    /// it. A folded section is stepped over: it stays shut, so a caret inside it
+    /// would sit on text nobody can see. The frontmatter block is the other way
+    /// round, hidden only until the caret arrives, so the caret is let in and the
+    /// next resolution shows the block.
+    pub fn steps_over(&self, line: usize) -> bool {
+        self.span_containing(line)
+            .is_some_and(|s| s.hide == Hide::Section)
     }
 
     /// Whether the heading on `line` is folded, that is, whether it is the anchor
@@ -421,6 +485,24 @@ run
     fn folded(text: &str, anchors: &[usize]) -> FoldMap {
         let (_, idx) = index(text);
         FoldMap::build(&Folds::from_lines(anchors.iter().copied()), &idx)
+    }
+
+    /// A document opening with frontmatter, resolved with the block shut or open.
+    const WITH_FRONT: &str = "\
+---
+title: Work log
+tags: [Notebooks/Work]
+---
+
+# Monday
+ran the numbers
+";
+
+    fn front_map(text: &str, anchors: &[usize], open: bool) -> FoldMap {
+        let (_, idx) = index(text);
+        let mut folds = Folds::from_lines(anchors.iter().copied());
+        folds.set_frontmatter_open(open);
+        FoldMap::build(&folds, &idx)
     }
 
     /// Which lines a fold map hides, as a list, so a failure names the lines.
@@ -693,5 +775,66 @@ run
         // A visible line resolves to itself in both directions.
         assert_eq!(map.first_visible_at_or_before(7), 7);
         assert_eq!(map.first_visible_at_or_after(7), 7);
+    }
+
+    #[test]
+    fn a_shut_frontmatter_block_hides_itself_whole() {
+        // Both `---` delimiters go with it: what the block covers is metadata, and
+        // the note starts at the first line below.
+        let map = front_map(WITH_FRONT, &[], false);
+        assert_eq!(hidden_lines(&map, 7), vec![0, 1, 2, 3]);
+        assert!(map.hidden_total() > 0, "its height leaves the document");
+        assert_eq!(map.first_visible_at_or_after(0), 4);
+    }
+
+    #[test]
+    fn an_open_frontmatter_block_hides_nothing() {
+        // The caret is inside it, so the block shows and the map is empty: nothing
+        // downstream has to know why, only that no line is hidden.
+        let map = front_map(WITH_FRONT, &[], true);
+        assert!(map.is_empty());
+        assert_eq!(map.hidden_total(), 0);
+    }
+
+    #[test]
+    fn a_document_without_frontmatter_hides_nothing_extra() {
+        let map = front_map(NESTED, &[], false);
+        assert!(map.is_empty(), "a `#` on line 0 is not a block opener");
+    }
+
+    #[test]
+    fn frontmatter_and_a_folded_section_stack_without_overlapping() {
+        // The block's span comes first and the section's after it, so the running
+        // `before` heights stay ordered and a query still resolves in one search.
+        let map = front_map(WITH_FRONT, &[5], false);
+        assert_eq!(hidden_lines(&map, 7), vec![0, 1, 2, 3, 6]);
+        let alone = front_map(WITH_FRONT, &[], false);
+        let section = front_map(WITH_FRONT, &[5], true);
+        assert_eq!(
+            map.hidden_total(),
+            alone.hidden_total() + section.hidden_total(),
+            "each span's height is counted once"
+        );
+    }
+
+    #[test]
+    fn the_caret_steps_over_a_section_but_into_frontmatter() {
+        // A folded section stays shut, so the caret is moved clear of it. The
+        // frontmatter block is hidden only until the caret arrives, so the caret is
+        // let in and the block opens on the next resolution.
+        let sections = folded(NESTED, &[0]);
+        assert!(sections.steps_over(1));
+        let front = front_map(WITH_FRONT, &[5], false);
+        assert!(!front.steps_over(1), "the block opens instead");
+        assert!(front.steps_over(6), "a section still steps over");
+    }
+
+    #[test]
+    fn a_shut_block_carries_the_state_the_lines_it_skips_would_have_left() {
+        // Layout jumps the block whole, so it must resume in ground state: no fence
+        // is open and no list is nesting, whatever the metadata looked like.
+        let text = "---\ncmd: ```\nlist: - one\n---\n# Monday\n";
+        let map = front_map(text, &[], false);
+        assert_eq!(map.skip_from(0), Some((4, (0, -1))));
     }
 }

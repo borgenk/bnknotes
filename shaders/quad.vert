@@ -1,6 +1,7 @@
 // The one vertex shader: every display-list primitive is an axis-aligned quad
 // in surface pixels, mapped to clip space by the viewport push constant.
-// Attribute meanings per mode are documented in src/gpu.rs (the batcher).
+// gpu::Vertex and the batcher that fills it document what each attribute carries
+// per mode.
 #version 450
 
 layout(location = 0) in vec2 in_pos;

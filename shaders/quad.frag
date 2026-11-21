@@ -1,4 +1,4 @@
-// The one fragment shader. Modes (src/gpu.rs): 0 solid fill, 1 glyph coverage
+// The one fragment shader. Modes: 0 solid fill, 1 glyph coverage
 // from the R8 atlas, 2 emoji from the BGRA atlas, 3 an image texture,
 // 4 rounded-rect coverage, 5 a task check mark, 6 a disclosure chevron,
 // 7 diagonal hatching, 8 a pin marker. Glyph and emoji reads are texelFetch at integer

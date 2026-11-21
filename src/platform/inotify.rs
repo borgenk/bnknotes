@@ -11,12 +11,13 @@
 //! poll as the compositor socket and drains it with [`Inotify::for_each_event`]
 //! only when it signals readable.
 
-use std::ffi::{CString, c_char, c_int, c_void};
+use std::ffi::{CString, c_char, c_int};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 
 use crate::platform::error::{Error, Result};
+use crate::platform::ffi;
 
 // The subset of event bits the watcher acts on. A directory watch reports these
 // for the entries inside it (CLOSE_WRITE, the moves, CREATE, DELETE) and for the
@@ -54,7 +55,6 @@ unsafe extern "C" {
     fn inotify_init1(flags: c_int) -> c_int;
     fn inotify_add_watch(fd: c_int, pathname: *const c_char, mask: u32) -> c_int;
     fn inotify_rm_watch(fd: c_int, wd: c_int) -> c_int;
-    fn read(fd: c_int, buf: *mut c_void, count: usize) -> isize;
 }
 
 /// A watch descriptor: the kernel's handle for one `add_watch`, used to match an
@@ -128,29 +128,11 @@ impl Inotify {
     /// never splits an event across reads, so each read yields whole records.
     pub fn for_each_event<F: FnMut(Event)>(&self, buf: &mut [u8], mut f: F) -> Result<()> {
         loop {
-            // SAFETY: buf is a valid, writable slice of the given length; read
-            // writes at most that many bytes and returns the count.
-            let n = unsafe {
-                read(
-                    self.fd.as_raw_fd(),
-                    buf.as_mut_ptr().cast::<c_void>(),
-                    buf.len(),
-                )
-            };
-            if n < 0 {
-                let e = std::io::Error::last_os_error();
-                match e.kind() {
-                    // Queue empty: the drain is done.
-                    std::io::ErrorKind::WouldBlock => return Ok(()),
-                    // A signal interrupted the read; retry it.
-                    std::io::ErrorKind::Interrupted => continue,
-                    _ => return Err(Error::msg(format!("inotify read failed: {e}"))),
-                }
+            match ffi::read_once(self.fd.as_raw_fd(), buf)? {
+                // Queue empty: the drain is done.
+                None | Some(0) => return Ok(()),
+                Some(n) => parse_events(&buf[..n], &mut f),
             }
-            if n == 0 {
-                return Ok(());
-            }
-            parse_events(&buf[..n as usize], &mut f);
         }
     }
 }

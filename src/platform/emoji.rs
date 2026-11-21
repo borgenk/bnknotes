@@ -7,12 +7,12 @@
 
 use core::ffi::c_uint;
 use core::ptr::NonNull;
-use std::cell::{Cell, RefCell};
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
 
 use crate::platform::freetype::{
-    CacheStats, FT_LOAD_COLOR, FT_LOAD_RENDER, FT_Load_Glyph, FT_PIXEL_MODE_BGRA, Face, FtBitmap,
+    FT_LOAD_COLOR, FT_LOAD_RENDER, FT_Load_Glyph, FT_PIXEL_MODE_BGRA, Face, FtBitmap,
 };
 use crate::platform::grapheme;
 use crate::platform::pixel::{premultiplied_over, resample_argb, straight_from_premultiplied};
@@ -97,11 +97,6 @@ pub struct EmojiFont {
     /// layout can measure off-screen emoji without rasterizing them. The GPU
     /// atlas holds the rasterized clusters, so there is no color-glyph cache here.
     advances: ClusterCache<f32>,
-    /// Cluster-cache hit and miss tallies, reported by the GPU batcher (which
-    /// owns the atlas-placement cache) through [`Face::record_cluster_hit`] and
-    /// [`Face::record_cluster_miss`]. Pure instrumentation.
-    hits: Cell<u64>,
-    misses: Cell<u64>,
 }
 
 impl EmojiFont {
@@ -120,8 +115,6 @@ impl EmojiFont {
             shaper,
             strike,
             advances: RefCell::new(HashMap::new()),
-            hits: Cell::new(0),
-            misses: Cell::new(0),
         })
     }
 
@@ -154,27 +147,6 @@ impl EmojiFont {
         f: impl FnOnce(&ColorGlyph) -> R,
     ) -> Option<R> {
         Some(f(&self.raster(cluster, target)?))
-    }
-
-    /// Record that the GPU batcher served a color cluster from its atlas cache.
-    /// Pure instrumentation.
-    pub(crate) fn record_hit(&self) {
-        self.hits.set(self.hits.get() + 1);
-    }
-
-    /// Record that the GPU batcher had to rasterize and pack a color cluster.
-    /// Pure instrumentation.
-    pub(crate) fn record_miss(&self) {
-        self.misses.set(self.misses.get() + 1);
-    }
-
-    /// This font's cluster-cache hit and miss counts, folded into the frame
-    /// stats alongside the per-character caches.
-    pub fn cache_stats(&self) -> CacheStats {
-        CacheStats {
-            hits: self.hits.get(),
-            misses: self.misses.get(),
-        }
     }
 
     /// Shape `cluster` and keep the result only when the font can really form
@@ -488,19 +460,6 @@ mod tests {
             flag < single * 2.0,
             "a flag is one glyph, not two letter symbols"
         );
-    }
-
-    #[test]
-    fn cluster_stats_count_reported_hits_and_misses() {
-        let font = emoji();
-        // with_glyph rasterizes on demand (the GPU atlas holds the result); the
-        // hit and miss tallies are reported by the batcher, and both roll up
-        // through cache_stats.
-        font.with_glyph("🎉", 32, |_| ()).expect("party popper");
-        font.record_miss();
-        font.record_hit();
-        let stats = font.cache_stats();
-        assert_eq!((stats.hits, stats.misses), (1, 1));
     }
 
     #[test]

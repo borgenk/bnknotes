@@ -318,6 +318,29 @@ pub struct GlyphCache {
     /// the path instead of building a key.
     image_ids: HashMap<(u32, u32), HashMap<String, ImageId>>,
     next_image_id: u32,
+    stats: CacheStats,
+}
+
+/// Slot lookups for glyphs and emoji clusters since the cache was made. Once the
+/// visible text is packed, a steady frame adds hits and no misses.
+#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
+pub struct CacheStats {
+    pub hits: u64,
+    pub misses: u64,
+}
+
+impl CacheStats {
+    pub fn lookups(self) -> u64 {
+        self.hits + self.misses
+    }
+
+    /// 0.0 when nothing was looked up.
+    pub fn hit_rate(self) -> f32 {
+        match self.lookups() {
+            0 => 0.0,
+            total => self.hits as f32 / total as f32,
+        }
+    }
 }
 
 impl GlyphCache {
@@ -329,7 +352,12 @@ impl GlyphCache {
             cluster_slots: HashMap::new(),
             image_ids: HashMap::new(),
             next_image_id: 0,
+            stats: CacheStats::default(),
         }
+    }
+
+    pub fn stats(&self) -> CacheStats {
+        self.stats
     }
 
     /// The id of `path`'s texture at its native size, minting one the first time
@@ -650,15 +678,13 @@ impl Batcher<'_> {
 
     /// The cached placement for a scalar glyph. On the first sight of this
     /// (face, character) the glyph is rasterized once and its coverage written
-    /// straight into the atlas; later frames read the cached placement. The
-    /// atlas cache is the only glyph raster cache, so its hit and miss are
-    /// reported to the face for the frame stats.
+    /// straight into the atlas; later frames read the cached placement.
     fn packed_scalar(&mut self, face: &Face, face_key: FaceKey, ch: char) -> PackedGlyph {
         if let Some(&packed) = self.cache.scalar_slots.get(&(face_key, ch)) {
-            face.record_glyph_hit();
+            self.cache.stats.hits += 1;
             return packed;
         }
-        face.record_glyph_miss();
+        self.cache.stats.misses += 1;
         // Rasterize from the fallback face when the keyed face lacks the glyph, so a
         // scalar the prose font has no glyph for (an arrow, a maths sign) draws
         // instead of a tofu box. The advance comes from the same face, since
@@ -679,9 +705,9 @@ impl Batcher<'_> {
     /// The cached placement for an emoji cluster, or `None` when the cluster is
     /// not color emoji and the caller should draw its characters instead. The
     /// raster is packed into the color atlas on first sight and the decision
-    /// cached, so a steady-state frame neither re-shapes nor touches the `Face`
-    /// (beyond reporting the atlas hit for the frame stats). Non-emoji clusters
-    /// are not tallied, matching the pre-atlas emoji-cache accounting.
+    /// cached, so a steady-state frame neither re-shapes nor touches the `Face`.
+    /// Only clusters that draw as emoji count in the stats; the rest count on the
+    /// per-character path.
     ///
     /// A cluster that would not be emoji even where the text face lacks its glyph
     /// (a letter, an accented letter, a box-drawing character) returns None before
@@ -702,7 +728,7 @@ impl Batcher<'_> {
             .and_then(|by| by.get(cluster))
         {
             if packed.is_some() {
-                face.record_cluster_hit();
+                self.cache.stats.hits += 1;
             }
             return packed;
         }
@@ -714,7 +740,7 @@ impl Batcher<'_> {
             advance: g.advance,
         });
         if packed.is_some() {
-            face.record_cluster_miss();
+            self.cache.stats.misses += 1;
         }
         self.cache
             .cluster_slots
@@ -1061,9 +1087,12 @@ mod tests {
             "glyph quads were emitted ({} vertices)",
             f1.vertices.len()
         );
+        // Three distinct letters miss once each; their repeats hit.
+        assert_eq!(cache.stats(), CacheStats { hits: 3, misses: 3 });
         let f2 = built(&fonts, &[&images], &list, &mut cache, &|_| false, 1.0);
         assert!(f2.glyph_upload.is_none(), "steady state uploads nothing");
         assert_eq!(f1.vertices, f2.vertices, "same list, same geometry");
+        assert_eq!(cache.stats(), CacheStats { hits: 9, misses: 3 });
     }
 
     #[test]
@@ -1417,5 +1446,9 @@ mod tests {
         if f.vertices.iter().any(|v| v.mode == MODE_EMOJI) {
             assert!(f.emoji_upload.is_some(), "the color raster was uploaded");
         }
+        // The cluster, or its one scalar without an emoji font, misses once and
+        // then hits.
+        built(&fonts, &[&images], &list, &mut cache, &|_| false, 1.0);
+        assert_eq!(cache.stats(), CacheStats { hits: 1, misses: 1 });
     }
 }

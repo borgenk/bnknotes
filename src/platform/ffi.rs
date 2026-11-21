@@ -253,11 +253,9 @@ pub fn poll_readable(fds: &[RawFd], timeout: Option<Duration>) -> Result<u32> {
         slot.fd = fd;
         slot.events = POLLIN;
     }
-    // poll's timeout is milliseconds, -1 for an infinite wait; clamp the
-    // conversion so a very long duration cannot wrap the c_int.
     let ms = match timeout {
         None => -1,
-        Some(d) => d.as_millis().min(c_int::MAX as u128) as c_int,
+        Some(d) => poll_ms(d),
     };
     // SAFETY: pollfds is a valid array of fds.len() entries; poll reads events
     // and writes revents on the first nfds of them.
@@ -275,6 +273,15 @@ pub fn poll_readable(fds: &[RawFd], timeout: Option<Duration>) -> Result<u32> {
         }
     }
     Ok(ready)
+}
+
+/// A poll timeout in milliseconds, rounded up so the wait never ends early, and
+/// clamped so a very long duration cannot wrap the c_int.
+fn poll_ms(timeout: Duration) -> c_int {
+    timeout
+        .as_nanos()
+        .div_ceil(1_000_000)
+        .min(c_int::MAX as u128) as c_int
 }
 
 // ---------------------------------------------------------------------------
@@ -537,22 +544,24 @@ pub fn wake_pipe() -> Result<(OwnedFd, OwnedFd)> {
 /// (EAGAIN) is not an error.
 pub fn drain(fd: RawFd) -> Result<()> {
     let mut buf = [0u8; 64];
+    // A short read leaves the pipe empty; a full one may have more queued.
+    while read_once(fd, &mut buf)? == Some(buf.len()) {}
+    Ok(())
+}
+
+/// One read of fd into buf, restarted when a signal interrupts it: the byte count,
+/// 0 at end of file, or None when fd is non-blocking and has nothing queued.
+pub fn read_once(fd: RawFd, buf: &mut [u8]) -> Result<Option<usize>> {
     loop {
-        // SAFETY: buf is a live writable array of buf.len() bytes.
-        let n = unsafe { read(fd, buf.as_mut_ptr() as *mut c_void, buf.len()) };
-        if n < 0 {
-            let e = errno();
-            if e == EINTR {
-                continue;
-            }
-            if e == EAGAIN {
-                return Ok(());
-            }
-            return Err(Error::msg(format!("drain failed: errno {e}")));
+        // SAFETY: buf is a live writable slice of buf.len() bytes.
+        let n = unsafe { read(fd, buf.as_mut_ptr().cast::<c_void>(), buf.len()) };
+        if n >= 0 {
+            return Ok(Some(n as usize));
         }
-        // A short read leaves the pipe empty; a full one may have more queued.
-        if (n as usize) < buf.len() {
-            return Ok(());
+        match errno() {
+            EINTR => continue,
+            EAGAIN => return Ok(None),
+            e => return Err(Error::msg(format!("read failed: errno {e}"))),
         }
     }
 }
@@ -605,24 +614,17 @@ pub fn read_to_end(fd: RawFd, cap: usize, idle: Duration, total: Duration) -> Re
                 format!("the sender sent nothing for {idle:?}")
             }));
         }
-        // SAFETY: buf is a live writable array of buf.len() bytes.
-        let n = unsafe { read(fd, buf.as_mut_ptr() as *mut c_void, buf.len()) };
-        if n < 0 {
-            let e = errno();
-            if e == EINTR {
-                continue;
-            }
-            return Err(Error::msg(format!("read failed: errno {e}")));
-        }
-        if n == 0 {
-            break;
-        }
+        let n = match read_once(fd, &mut buf)? {
+            Some(0) => break,
+            Some(n) => n,
+            None => continue,
+        };
         // What the far end sends is its choice, not ours, so the read is bounded:
         // refuse past the cap rather than grow a buffer until the editor dies.
-        if out.len() + n as usize > cap {
+        if out.len() + n > cap {
             return Err(Error::msg(format!("more than {cap} bytes to read")));
         }
-        out.extend_from_slice(&buf[..n as usize]);
+        out.extend_from_slice(&buf[..n]);
     }
     Ok(out)
 }
@@ -684,7 +686,7 @@ fn wait_for_events(fd: RawFd, events: c_short, timeout: Duration) -> bool {
     let deadline = Instant::now() + timeout;
     loop {
         let left = deadline.saturating_duration_since(Instant::now());
-        let ms = left.as_nanos().div_ceil(1_000_000).min(c_int::MAX as u128) as c_int;
+        let ms = poll_ms(left);
         let mut pfd = PollFd {
             fd,
             events,
@@ -1076,6 +1078,21 @@ mod tests {
         assert!(
             started.elapsed() < Duration::from_secs(1),
             "a ready fd returns at once"
+        );
+    }
+
+    #[test]
+    fn an_event_loop_poll_does_not_wake_before_its_timeout() {
+        let (read_end, _write_end) = pipe().expect("pipe");
+        // Between two whole milliseconds, where a truncating conversion wakes early.
+        let timeout = Duration::from_micros(1500);
+        let started = Instant::now();
+        let ready = poll_readable(&[read_end.as_raw_fd()], Some(timeout)).expect("poll");
+        assert_eq!(ready, 0, "nothing to read");
+        assert!(
+            started.elapsed() >= timeout,
+            "woke after {:?}",
+            started.elapsed()
         );
     }
 

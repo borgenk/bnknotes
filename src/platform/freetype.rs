@@ -441,13 +441,6 @@ pub struct Face {
     /// dominates the rebuild a selection drag triggers each frame. Interior
     /// mutability so measuring through a shared `&Face` can fill it.
     advances: RefCell<HashMap<char, f32>>,
-    /// Glyph-cache hit and miss tallies, reported by the GPU batcher (which owns
-    /// the atlas-placement cache) via [`Self::record_glyph_hit`] and
-    /// [`Self::record_glyph_miss`]. Pure instrumentation (see [`CacheStats`]): a
-    /// near-zero steady-state miss rate is the evidence that the cache is doing
-    /// its job rather than thrashing.
-    hits: Cell<u64>,
-    misses: Cell<u64>,
     /// The pixel size this face was opened at, recorded by `set_pixel_size`.
     /// The emoji face scales its color glyphs to this so an emoji sits on the
     /// same em square as the surrounding text.
@@ -457,47 +450,17 @@ pub struct Face {
     /// face-only tests, in which case emoji clusters take the per-character
     /// path (tofu, exactly the pre-emoji behavior).
     emoji: Option<Rc<EmojiFont>>,
-    /// The faces consulted, in order, for a scalar this one has no glyph for, at
-    /// this face's own size; [`Fonts::with_config`] attaches the size's chain to
-    /// every face it opens there. Empty on a fallback face itself (the chain is one
-    /// deep, so resolving cannot recurse) and in face-only tests, where a missing
-    /// scalar draws the `.notdef` box.
+    /// The faces consulted, in order, for a scalar this one has no glyph for;
+    /// [`Fonts::open`] gives every face it opens at a size that size's chain. Empty
+    /// on a fallback face itself (the chain is one deep, so resolving cannot
+    /// recurse) and in face-only tests, where a missing scalar draws the .notdef
+    /// box. A fallback face opens at the primary's pixel size but is not scaled to
+    /// its em, so a wide icon glyph keeps its natural width.
     ///
     /// A face holds its own chain so that [`Self::glyph_face`] can answer which face
     /// draws a scalar from a `&Face` alone, which is what lets measuring and drawing
     /// route through one decision (see [`Self::advance`]).
     fallback: Vec<Rc<Face>>,
-}
-
-/// A snapshot of a glyph cache's hit and miss tallies. Summing these across every
-/// face turns "scrolling feels smooth" into a number: once the working set is
-/// packed into the GPU atlas, steady-state frames add hits and almost no misses.
-#[derive(Clone, Copy, Default)]
-pub struct CacheStats {
-    pub hits: u64,
-    pub misses: u64,
-}
-
-impl CacheStats {
-    fn merge(self, other: Self) -> Self {
-        Self {
-            hits: self.hits + other.hits,
-            misses: self.misses + other.misses,
-        }
-    }
-
-    /// Total lookups (hits + misses).
-    pub fn lookups(self) -> u64 {
-        self.hits + self.misses
-    }
-
-    /// Fraction of lookups served from the cache, 0.0 when nothing was looked up.
-    pub fn hit_rate(self) -> f32 {
-        match self.lookups() {
-            0 => 0.0,
-            total => self.hits as f32 / total as f32,
-        }
-    }
 }
 
 impl Face {
@@ -561,8 +524,6 @@ impl Face {
             face,
             _data: data,
             advances: RefCell::new(HashMap::new()),
-            hits: Cell::new(0),
-            misses: Cell::new(0),
             pixel_size: Cell::new(0),
             emoji: None,
             fallback: Vec::new(),
@@ -582,43 +543,6 @@ impl Face {
             return Err(Error::msg("FT_Set_Pixel_Sizes failed"));
         }
         Ok(())
-    }
-
-    /// Record that the GPU batcher served a scalar glyph from its atlas cache
-    /// (the glyph was already packed). Pure instrumentation.
-    pub fn record_glyph_hit(&self) {
-        self.hits.set(self.hits.get() + 1);
-    }
-
-    /// Record that the GPU batcher had to rasterize and pack a scalar glyph (its
-    /// first sight of the character). Pure instrumentation.
-    pub fn record_glyph_miss(&self) {
-        self.misses.set(self.misses.get() + 1);
-    }
-
-    /// Forward a color-cluster cache hit to the shared emoji font, so its tally
-    /// rolls up through [`Fonts::cache_stats`] alongside the scalar counts. A
-    /// no-op when no emoji font is installed.
-    pub fn record_cluster_hit(&self) {
-        if let Some(emoji) = &self.emoji {
-            emoji.record_hit();
-        }
-    }
-
-    /// Forward a color-cluster cache miss (a first-time raster) to the shared
-    /// emoji font. A no-op when no emoji font is installed.
-    pub fn record_cluster_miss(&self) {
-        if let Some(emoji) = &self.emoji {
-            emoji.record_miss();
-        }
-    }
-
-    /// This face's cumulative glyph-cache hit and miss counts.
-    pub fn cache_stats(&self) -> CacheStats {
-        CacheStats {
-            hits: self.hits.get(),
-            misses: self.misses.get(),
-        }
     }
 
     /// Rasterize a character at the current pixel size, copying the coverage
@@ -874,37 +798,7 @@ struct SizedFaces {
     /// The code family's regular face at this size, or `None` when no distinct
     /// code family is installed (code then falls back to `regular`).
     code: Option<Face>,
-    /// The fallback chain at this size ([`FontConfig::fallback`]), in priority order,
-    /// holding only the faces whose files exist; empty when the config lists none.
-    /// Every face above shares it (see [`Face::fallback`]), which is how a scalar the
-    /// keyed face lacks resolves to the face that draws it.
-    ///
-    /// A fallback face carries no emoji font of its own: it draws only scalars the
-    /// primary lacks and never routes a color cluster.
-    ///
-    /// It opens at the primary `size` and its glyphs rasterize at the font's own
-    /// natural proportions; a fallback face is deliberately NOT scaled down to the
-    /// primary's em. Nerd Font's non-"Mono" cut draws icons wider than a monospace
-    /// column, so an icon glyph (a git-branch mark, a Powerline separator) comes out
-    /// big and crisp. Proportional text advances by the drawing face's own advance,
-    /// so a natively wide glyph takes the room it needs rather than overrunning what
-    /// follows.
-    fallback: Vec<Rc<Face>>,
     metrics: Metrics,
-}
-
-impl SizedFaces {
-    /// Every face this size actually opened: the regular face plus whichever
-    /// variants, code face, and fallback faces exist. Used to roll up cache stats
-    /// across faces.
-    fn faces(&self) -> impl Iterator<Item = &Face> {
-        std::iter::once(&self.regular)
-            .chain(self.bold.as_ref())
-            .chain(self.italic.as_ref())
-            .chain(self.bold_italic.as_ref())
-            .chain(self.code.as_ref())
-            .chain(self.fallback.iter().map(|f| f.as_ref()))
-    }
 }
 
 /// A set of [`Face`]s at different pixel sizes and styles, so a document can mix
@@ -915,9 +809,6 @@ impl SizedFaces {
 /// lookup can never fail and never panics.
 pub struct Fonts {
     sized: Vec<SizedFaces>,
-    /// The color emoji font, opened once and shared by every face, or `None`
-    /// when no emoji font is installed (emoji then render as tofu, as before).
-    emoji: Option<Rc<EmojiFont>>,
     selection: FontSelection,
 }
 
@@ -999,7 +890,8 @@ impl Fonts {
                 continue;
             }
             // The chain opens first: every face at this size carries it, so each can
-            // resolve a scalar it lacks on its own.
+            // resolve a scalar it lacks on its own. A fallback face gets no emoji
+            // font, since it never routes a color cluster.
             let fallback: Vec<Rc<Face>> = fallback_files
                 .iter()
                 .filter_map(|file| open_variant(file, size, None, &[]).map(Rc::new))
@@ -1021,18 +913,13 @@ impl Fonts {
                 italic: variant(italic),
                 bold_italic: variant(bold_italic),
                 code: variant(code),
-                fallback,
                 metrics,
             });
         }
         if sized.is_empty() {
             return Err(Error::msg("opening fonts needs at least one nonzero size"));
         }
-        Ok(Self {
-            sized,
-            emoji,
-            selection,
-        })
+        Ok(Self { sized, selection })
     }
 
     /// The selection these fonts were opened from, to open the same fonts on
@@ -1102,21 +989,6 @@ impl Fonts {
     /// The metrics for `size`, or the fallback's metrics if `size` was not opened.
     pub fn metrics(&self, size: u32) -> Metrics {
         self.entry(size).metrics
-    }
-
-    /// Glyph-cache hits and misses summed over every open face (the emoji
-    /// font's cluster cache included), for frame-loop instrumentation.
-    pub fn cache_stats(&self) -> CacheStats {
-        let emoji = self
-            .emoji
-            .as_ref()
-            .map(|e| e.cache_stats())
-            .unwrap_or_default();
-        self.sized
-            .iter()
-            .flat_map(SizedFaces::faces)
-            .map(Face::cache_stats)
-            .fold(emoji, CacheStats::merge)
     }
 }
 
@@ -1364,37 +1236,6 @@ mod tests {
         assert_eq!(a.width, b.width);
         assert_eq!(a.rows, b.rows);
         assert_eq!(a.coverage, b.coverage);
-    }
-
-    #[test]
-    fn cache_stats_count_misses_then_hits() {
-        let face = open();
-        // A fresh face has been reported no lookups.
-        assert_eq!(face.cache_stats().lookups(), 0);
-        // The GPU batcher reports a miss the first time it packs a glyph into the
-        // atlas and a hit on every later frame that reuses the slot.
-        face.record_glyph_miss();
-        face.record_glyph_miss();
-        face.record_glyph_hit();
-        face.record_glyph_hit();
-        let stats = face.cache_stats();
-        assert_eq!(stats.misses, 2);
-        assert_eq!(stats.hits, 2);
-        assert!((stats.hit_rate() - 0.5).abs() < 1e-6, "2 hits of 4 lookups");
-    }
-
-    #[test]
-    fn fonts_cache_stats_sum_across_faces() {
-        let fonts = Fonts::new(&[16, 24]).expect("a default font should be available");
-        assert_eq!(fonts.cache_stats().lookups(), 0);
-        // Report through two different sizes (hence different faces); the rolled-up
-        // tally must see both faces' counts.
-        fonts.face(16, FontStyle::Regular).record_glyph_miss();
-        fonts.face(24, FontStyle::Regular).record_glyph_miss();
-        fonts.face(16, FontStyle::Regular).record_glyph_hit();
-        let stats = fonts.cache_stats();
-        assert_eq!(stats.misses, 2);
-        assert_eq!(stats.hits, 1);
     }
 
     #[test]

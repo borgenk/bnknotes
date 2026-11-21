@@ -9,6 +9,7 @@ use std::time::Duration;
 
 use crate::platform::error::{Error, Result};
 use crate::platform::ffi;
+use crate::platform::protocol::{WL_DISPLAY, wl_display};
 use crate::platform::wire::{self, Arg, Message, Reader};
 
 /// The outcome of a [`Connection::fill`]: bytes arrived (0 means the peer
@@ -42,6 +43,30 @@ fn frame_header(buf: &[u8]) -> FrameHeader {
         object: word_at(0),
         opcode: (word & 0xffff) as u16,
         size: (word >> 16) as usize,
+    }
+}
+
+/// The message at the front of buf, as its header and body, or None until all of
+/// it has arrived.
+fn frame(buf: &[u8]) -> Result<Option<(FrameHeader, &[u8])>> {
+    if buf.len() < 8 {
+        return Ok(None);
+    }
+    let header = frame_header(buf);
+    if header.size < 8 {
+        return Err(Error::msg("malformed wayland message: size < 8"));
+    }
+    Ok(buf.get(8..header.size).map(|body| (header, body)))
+}
+
+/// The error a wl_display.error event's body reports.
+pub fn protocol_error(body: &[u8]) -> Error {
+    let mut r = Reader::new(body);
+    match (r.u32(), r.u32(), r.string()) {
+        (Ok(object), Ok(code), Ok(message)) => Error::msg(format!(
+            "wayland protocol error: object {object} code {code}: {message}"
+        )),
+        _ => Error::msg("malformed wl_display.error event"),
     }
 }
 
@@ -141,27 +166,14 @@ impl Connection {
                 _ => break,
             }
         }
-        // Scan the buffered stream for wl_display@1.error (event opcode 0), whose
-        // ids are protocol-fixed, so no interface knowledge is needed here.
-        let mut off = self.in_pos;
-        while off + 8 <= self.in_buf.len() {
-            let FrameHeader {
-                object,
-                opcode,
-                size,
-            } = frame_header(&self.in_buf[off..]);
-            if size < 8 || off + size > self.in_buf.len() {
-                break;
+        // Look without consuming: the send error may not be fatal, and then every
+        // buffered event is still to be handled.
+        let mut rest = self.in_buf.get(self.in_pos..).unwrap_or_default();
+        while let Ok(Some((header, body))) = frame(rest) {
+            if header.object == WL_DISPLAY && header.opcode == wl_display::EV_ERROR {
+                return protocol_error(body);
             }
-            if object == 1 && opcode == 0 {
-                let mut r = Reader::new(&self.in_buf[off + 8..off + size]);
-                if let (Ok(obj), Ok(code), Ok(msg)) = (r.u32(), r.u32(), r.string()) {
-                    return Error::msg(format!(
-                        "wayland protocol error: object {obj} code {code}: {msg}"
-                    ));
-                }
-            }
-            off += size;
+            rest = rest.get(header.size..).unwrap_or_default();
         }
         Error::msg(format!(
             "{send_err}; the compositor closed the connection without sending a protocol error"
@@ -199,23 +211,12 @@ impl Connection {
 
     /// Pull one fully buffered message off the front of the stream, if present.
     pub fn next_message(&mut self) -> Result<Option<Message>> {
-        let buf = &self.in_buf[self.in_pos..];
-        if buf.len() < 8 {
+        let buf = self.in_buf.get(self.in_pos..).unwrap_or_default();
+        let Some((header, body)) = frame(buf)? else {
             return Ok(None);
-        }
-        let FrameHeader {
-            object,
-            opcode,
-            size,
-        } = frame_header(buf);
-        if size < 8 {
-            return Err(Error::msg("malformed wayland message: size < 8"));
-        }
-        if buf.len() < size {
-            return Ok(None);
-        }
-        let message = Message::new(object, opcode, &buf[8..size]);
-        self.in_pos += size;
+        };
+        let message = Message::new(header.object, header.opcode, body);
+        self.in_pos += header.size;
         Ok(Some(message))
     }
 
@@ -228,5 +229,88 @@ impl Connection {
         }
         self.in_buf.drain(..self.in_pos);
         self.in_pos = 0;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::Write;
+
+    use crate::platform::conn::*;
+
+    fn connected() -> (Connection, UnixStream) {
+        let (ours, theirs) = UnixStream::pair().expect("socket pair");
+        let conn = Connection {
+            stream: ours,
+            out: Vec::new(),
+            in_buf: Vec::new(),
+            in_pos: 0,
+            fds: VecDeque::new(),
+        };
+        (conn, theirs)
+    }
+
+    fn encoded(object: u32, opcode: u16, args: &[Arg]) -> Vec<u8> {
+        let mut out = Vec::new();
+        wire::encode(&mut out, object, opcode, args);
+        out
+    }
+
+    #[test]
+    fn messages_come_out_whole_and_in_order() {
+        let (mut conn, _peer) = connected();
+        let third = encoded(7, 1, &[Arg::Uint(9)]);
+        conn.in_buf.extend(encoded(5, 2, &[Arg::Uint(7)]));
+        conn.in_buf.extend(encoded(6, 0, &[]));
+        conn.in_buf.extend_from_slice(&third[..10]);
+
+        let m = conn.next_message().unwrap().expect("first");
+        assert_eq!(
+            (m.object, m.opcode, m.body()),
+            (5, 2, &7u32.to_ne_bytes()[..])
+        );
+        let m = conn.next_message().unwrap().expect("second");
+        assert_eq!((m.object, m.opcode, m.body().len()), (6, 0, 0));
+        assert!(
+            conn.next_message().unwrap().is_none(),
+            "the third has not all arrived"
+        );
+
+        conn.in_buf.extend_from_slice(&third[10..]);
+        let m = conn.next_message().unwrap().expect("third");
+        assert_eq!(
+            (m.object, m.opcode, m.body()),
+            (7, 1, &9u32.to_ne_bytes()[..])
+        );
+        assert!(conn.next_message().unwrap().is_none());
+    }
+
+    #[test]
+    fn a_size_below_the_header_is_refused() {
+        let (mut conn, _peer) = connected();
+        conn.in_buf.extend(5u32.to_ne_bytes());
+        conn.in_buf.extend((4u32 << 16).to_ne_bytes());
+        assert!(conn.next_message().is_err());
+    }
+
+    #[test]
+    fn a_failed_send_reports_the_protocol_error_and_keeps_the_events() {
+        let (mut conn, mut peer) = connected();
+        peer.write_all(&encoded(9, 3, &[])).unwrap();
+        peer.write_all(&encoded(
+            WL_DISPLAY,
+            wl_display::EV_ERROR,
+            &[Arg::Uint(9), Arg::Uint(2), Arg::Str("bad buffer")],
+        ))
+        .unwrap();
+        drop(peer);
+
+        let e = conn.diagnose_send_error(Error::msg("send failed"));
+        assert_eq!(
+            e.to_string(),
+            "wayland protocol error: object 9 code 2: bad buffer"
+        );
+        let m = conn.next_message().unwrap().expect("the event before it");
+        assert_eq!((m.object, m.opcode), (9, 3));
     }
 }

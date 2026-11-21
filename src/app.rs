@@ -31,7 +31,7 @@ use crate::pane::{
     CaretAnim, CaretBlink, CaretFrame, Columns, Focus, Hit, PaneGroup, PaneLayout, Saved, TreePane,
     restore_group,
 };
-use crate::platform::conn::{Connection, Fill};
+use crate::platform::conn::{self, Connection, Fill};
 use crate::platform::error::{Error, Result};
 use crate::platform::ffi;
 use crate::platform::freetype::{FontConfig, Fonts};
@@ -2664,14 +2664,7 @@ impl State {
 
         if msg.object == protocol::WL_DISPLAY {
             match msg.opcode {
-                wl_display::EV_ERROR => {
-                    let object = r.u32()?;
-                    let code = r.u32()?;
-                    let message = r.string()?;
-                    return Err(Error::msg(format!(
-                        "wayland protocol error: object {object} code {code}: {message}"
-                    )));
-                }
+                wl_display::EV_ERROR => return Err(conn::protocol_error(msg.body())),
                 wl_display::EV_DELETE_ID => {
                     let id = r.u32()?;
                     // Only recycle ids from the client range. A server-range id

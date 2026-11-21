@@ -5,6 +5,9 @@
 //! `xdg-open`, the freedesktop way to reach whatever the user set as their default
 //! handler, rather than hardcoding a browser.
 
+use std::fmt::Write as _;
+use std::io::Read as _;
+use std::os::unix::fs::PermissionsExt;
 use std::process::{Command, Stdio};
 
 use crate::platform::error::{Error, Result};
@@ -34,10 +37,25 @@ pub enum Refusal {
     /// the host reached is not the host written; or a file: target names another
     /// machine, where the opener would open the same path on this one.
     Host,
-    /// A file: target's path has a percent sign that is not a plain escape, or an
-    /// escape for %, / or a control character. xdg-open decodes the path and uses it
-    /// as a printf format, and an encoded slash reads as two different paths.
+    /// A file: target's path could be read more than one way (decoded_file_path):
+    /// a percent sign that is not a plain escape, an escape for / or a control
+    /// character, a query, a backslash, or bytes that are not UTF-8.
     FilePath,
+    /// A mailto: target sets a field beyond to, cc, bcc, subject and body. Mail
+    /// clients have honored attach=, which turns a click into a draft with a local
+    /// file already attached.
+    MailField,
+    /// A file: target resolves to a desktop entry, which an opener launches: a
+    /// .desktop or .kdelnk name, or a file whose content begins like one, which is
+    /// how some openers type it. Judged at the click, since it needs the filesystem.
+    Launcher,
+    /// A file: target resolves to a program an opener may run rather than show: an
+    /// ELF binary or a #! script with an exec bit, or a Windows program (by name or
+    /// by its MZ header), which wine runs with no exec bit at all. Judged at the
+    /// click.
+    Executable,
+    /// A file: target names nothing on disk. Judged at the click.
+    Missing,
 }
 
 impl Refusal {
@@ -48,6 +66,10 @@ impl Refusal {
             Refusal::Hidden => "it carries a character that does not show",
             Refusal::Host => "its host is not the one it reads as",
             Refusal::FilePath => "its path could be read more than one way",
+            Refusal::MailField => "it sets a mail field beyond to, cc, bcc, subject and body",
+            Refusal::Launcher => "it is a desktop launcher",
+            Refusal::Executable => "it is an executable file",
+            Refusal::Missing => "it names no file",
         }
     }
 }
@@ -74,31 +96,194 @@ pub fn judge(url: &str) -> core::result::Result<(), Refusal> {
         }
         Host::Name(_) | Host::Absent => {}
     }
-    if file && !escapes_are_plain(url) {
+    if file && decoded_file_path(url).is_none() {
         return Err(Refusal::FilePath);
+    }
+    if url.starts_with("mailto:") && !mail_fields_are_allowed(url) {
+        return Err(Refusal::MailField);
     }
     Ok(())
 }
 
-/// Whether every percent sign in url starts a two-digit escape that decodes to
-/// something other than %, / or a control character.
-fn escapes_are_plain(url: &str) -> bool {
-    let bytes = url.as_bytes();
-    let hex = |b: u8| char::from(b).to_digit(16);
-    bytes.iter().enumerate().all(|(i, &b)| {
-        if b != b'%' {
-            return true;
+/// What a file: target reaches on disk, judged at the click: the path resolved
+/// through every symlink, refused when it is a launcher, an executable or nothing,
+/// else a URL encoded from that resolved path, so the file checked is the file
+/// opened.
+fn judge_file(url: &str) -> core::result::Result<String, Refusal> {
+    let path = decoded_file_path(url).ok_or(Refusal::FilePath)?;
+    let resolved = std::fs::canonicalize(path).map_err(|_| Refusal::Missing)?;
+    let resolved = resolved
+        .to_str()
+        .filter(|path| plain_path(path))
+        .ok_or(Refusal::FilePath)?;
+    let name = resolved.rsplit('/').next().unwrap_or_default();
+    let has_suffix = |suffixes: &[&str]| {
+        name.rsplit_once('.')
+            .is_some_and(|(_, ext)| suffixes.iter().any(|s| ext.eq_ignore_ascii_case(s)))
+    };
+    if has_suffix(&LAUNCHER_SUFFIXES) {
+        return Err(Refusal::Launcher);
+    }
+    if has_suffix(&WINDOWS_SUFFIXES) {
+        return Err(Refusal::Executable);
+    }
+    let meta = std::fs::metadata(resolved).map_err(|_| Refusal::Missing)?;
+    // Only a regular file is read: opening a FIFO would wait for a writer.
+    if meta.is_file() {
+        let mut head = [0u8; 64];
+        let len = std::fs::File::open(resolved)
+            .and_then(|mut file| file.read(&mut head))
+            .map_err(|_| Refusal::Missing)?;
+        let head = &head[..len];
+        if is_desktop_entry(head) {
+            return Err(Refusal::Launcher);
         }
-        let (Some(&hi), Some(&lo)) = (bytes.get(i + 1), bytes.get(i + 2)) else {
-            return false;
-        };
-        match (hex(hi), hex(lo)) {
-            (Some(hi), Some(lo)) => {
-                let decoded = (hi * 16 + lo) as u8;
-                !matches!(decoded, b'%' | b'/') && !decoded.is_ascii_control()
-            }
-            _ => false,
+        let runnable = head.starts_with(b"\x7fELF") || head.starts_with(b"#!");
+        let executable = meta.permissions().mode() & 0o111 != 0;
+        if head.starts_with(b"MZ") || (executable && runnable) {
+            return Err(Refusal::Executable);
         }
+    }
+    let fragment = url.split_once('#').map(|(_, fragment)| fragment);
+    let mut target = encode_file_url(resolved);
+    if let Some(fragment) = fragment {
+        target.push('#');
+        target.push_str(fragment);
+    }
+    Ok(target)
+}
+
+/// Names an opener launches as a desktop entry.
+const LAUNCHER_SUFFIXES: [&str; 2] = ["desktop", "kdelnk"];
+
+/// Names wine runs as a Windows program, with or without an exec bit.
+const WINDOWS_SUFFIXES: [&str; 7] = ["exe", "dll", "cpl", "drv", "scr", "msi", "lnk"];
+
+/// Whether head, a file's first bytes, begins the way a desktop entry does, which
+/// is how an opener that types files by content recognizes one whatever its name.
+fn is_desktop_entry(head: &[u8]) -> bool {
+    let first = head.get(..32).unwrap_or(head);
+    first.windows(15).any(|w| w == b"[Desktop Entry]")
+        || [
+            &b"[Desktop Action"[..],
+            b"[KDE Desktop Entry]",
+            b"# Config File",
+            b"# KDE Config File",
+        ]
+        .iter()
+        .any(|magic| head.starts_with(magic))
+}
+
+/// The path a file: URL names, decoded the one way every opener agrees on: no
+/// query, every percent sign a two-digit escape for something other than / or a
+/// control character, and a plain_path result. A fragment is not part of the path,
+/// and judge_file carries it over to the URL it opens.
+fn decoded_file_path(url: &str) -> Option<String> {
+    let url = url.split_once('#').map_or(url, |(url, _)| url);
+    if url.contains('?') {
+        return None;
+    }
+    let rest = url.strip_prefix("file://")?;
+    let path = rest.get(rest.bytes().position(|b| b == b'/')?..)?;
+    if escapes_a_reserved_byte(path) {
+        return None;
+    }
+    let bytes = percent_decoded(path).collect::<Option<Vec<u8>>>()?;
+    let text = String::from_utf8(bytes).ok()?;
+    plain_path(&text).then_some(text)
+}
+
+/// Whether path holds an escape that decodes to / or a control character. An
+/// escaped slash reads as two different paths, and openers drop or reinterpret a
+/// control character.
+fn escapes_a_reserved_byte(path: &str) -> bool {
+    let bytes = path.as_bytes();
+    bytes.iter().enumerate().any(|(i, &b)| {
+        b == b'%'
+            && percent_decoded(path.get(i..i + 3).unwrap_or_default())
+                .next()
+                .flatten()
+                .is_some_and(|d| d == b'/' || d.is_ascii_control())
+    })
+}
+
+/// Whether path is absolute and holds no control character and no backslash,
+/// which openers drop or reinterpret.
+fn plain_path(path: &str) -> bool {
+    path.starts_with('/') && !path.bytes().any(|b| b < 0x20 || b == 0x7F || b == b'\\')
+}
+
+/// A file:// URL for path with every byte outside the unreserved set and / percent
+/// encoded, so an opener decodes it back to exactly path.
+fn encode_file_url(path: &str) -> String {
+    let mut url = String::from("file://");
+    for byte in path.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~' | b'/') {
+            url.push(char::from(byte));
+        } else {
+            let _ = write!(url, "%{byte:02X}");
+        }
+    }
+    url
+}
+
+/// The header fields a mailto: link may set. In-Reply-To and References are what a
+/// mailing-list archive's reply link sets.
+const MAIL_FIELDS: [&str; 7] = [
+    "to",
+    "cc",
+    "bcc",
+    "subject",
+    "body",
+    "in-reply-to",
+    "references",
+];
+
+/// Whether every field url sets is one of MAIL_FIELDS. A name is compared after
+/// percent decoding and ASCII case folding, so ATTACH and %61ttach are both attach.
+/// A second ?, which RFC 6068 does not allow and clients split differently,
+/// refuses the link too. A link setting anything else is refused rather than
+/// stripped, since a stripped link opens something other than what was written.
+fn mail_fields_are_allowed(url: &str) -> bool {
+    let Some((_, query)) = url.split_once('?') else {
+        return true;
+    };
+    !query.contains('?')
+        && query
+            .split('&')
+            .filter(|field| !field.is_empty())
+            .all(|field| {
+                let name = field.split_once('=').map_or(field, |(name, _)| name);
+                MAIL_FIELDS.iter().any(|allowed| decodes_to(name, allowed))
+            })
+}
+
+/// Whether the percent-encoded name decodes to allowed, without regard to ASCII case.
+fn decodes_to(name: &str, allowed: &str) -> bool {
+    let mut decoded = percent_decoded(name);
+    let mut wanted = allowed.bytes();
+    loop {
+        match (decoded.next(), wanted.next()) {
+            (None, None) => return true,
+            (Some(Some(got)), Some(want)) if got.eq_ignore_ascii_case(&want) => {}
+            _ => return false,
+        }
+    }
+}
+
+/// The bytes text percent-decodes to, strictly: a percent sign not followed by two
+/// hex digits yields None, and the caller decides what that means.
+fn percent_decoded(text: &str) -> impl Iterator<Item = Option<u8>> + '_ {
+    let mut bytes = text.bytes();
+    std::iter::from_fn(move || {
+        let byte = bytes.next()?;
+        if byte != b'%' {
+            return Some(Some(byte));
+        }
+        let hex = |digit: u8| char::from(digit).to_digit(16).map(|d| d as u8);
+        let high = bytes.next().and_then(hex);
+        let low = bytes.next().and_then(hex);
+        Some(high.zip(low).map(|(high, low)| high << 4 | low))
     })
 }
 
@@ -110,14 +295,16 @@ fn escapes_are_plain(url: &str) -> bool {
 /// almost immediately; it is reaped on a short-lived detached thread so it never
 /// lingers as a zombie and the launch never blocks the event loop.
 pub fn open_url(url: &str) -> Result<()> {
-    if let Err(refusal) = judge(url) {
-        return Err(Error::msg(format!(
-            "refusing to open {url:?}: {}",
-            refusal.reason()
-        )));
-    }
+    let refused =
+        |refusal: Refusal| Error::msg(format!("refusing to open {url:?}: {}", refusal.reason()));
+    judge(url).map_err(refused)?;
+    let target = if url.starts_with("file://") {
+        judge_file(url).map_err(refused)?
+    } else {
+        url.to_string()
+    };
     let mut child = Command::new("xdg-open")
-        .arg(url)
+        .arg(target)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -176,7 +363,6 @@ mod tests {
             ("https://example.com/\u{202E}fdp.exe", Refusal::Hidden),
             ("https://example.com/a\u{2066}b", Refusal::Hidden),
             ("file:///home/user/notes/report%d.pdf", Refusal::FilePath),
-            ("file:///home/user/notes/100%25.pdf", Refusal::FilePath),
             ("file:///home/user/a%2Fb.md", Refusal::FilePath),
             ("file:///home/user/a%00.md", Refusal::FilePath),
             ("file:///home/user/a%", Refusal::FilePath),
@@ -189,6 +375,149 @@ mod tests {
             assert_eq!(judge(url), Err(refusal), "{url:?}");
             assert!(!can_open(url), "{url:?} must not be offered to the pointer");
         }
+    }
+
+    #[test]
+    fn a_mail_field_beyond_the_allowlist_is_refused() {
+        for url in [
+            "mailto:a@example.com?attach=/home/user/.ssh/id_ed25519",
+            "mailto:a@example.com?ATTACH=/home/user/.ssh/id_ed25519",
+            "mailto:a@example.com?%61ttach=/home/user/.ssh/id_ed25519",
+            "mailto:a@example.com?subject=hi&x-mailer=x",
+            "mailto:a@example.com?subject=hi?attach=x",
+            "mailto:a@example.com?subject%zz=hi",
+            "mailto:a@example.com?subject%26attach=x",
+        ] {
+            assert_eq!(judge(url), Err(Refusal::MailField), "{url}");
+            assert!(!can_open(url), "{url}");
+        }
+        for url in [
+            "mailto:a@example.com",
+            "mailto:a@example.com?subject=Hi%20there&body=x",
+            "mailto:a@example.com?CC=c@example.com&Bcc=e@example.com",
+            "mailto:?to=a@example.com&%73ubject=x",
+            "mailto:a@example.com?body",
+            "mailto:a@example.com?",
+            "mailto:a@example.com?subject=x&",
+            "mailto:list@example.com?In-Reply-To=%3Cx%40y%3E&subject=Re%3A%20x",
+            "mailto:a@example.com?body=x%26attach%3D%2Fetc%2Fpasswd",
+        ] {
+            assert_eq!(judge(url), Ok(()), "{url}");
+        }
+    }
+
+    #[test]
+    fn a_file_path_read_more_than_one_way_is_refused() {
+        for url in [
+            "file:///tmp/payload.desktop%0A",
+            "file:///tmp/a%zz",
+            "file:///tmp/a%2",
+            "file:///tmp/a%5Cnb",
+            "file:///tmp/a?b",
+            "file:///tmp/a%7Fb",
+            "file:///tmp/%FF",
+        ] {
+            assert_eq!(judge(url), Err(Refusal::FilePath), "{url}");
+        }
+        assert_eq!(
+            decoded_file_path("file:///home/user/%D1%84%D0%B0%D0%B9%D0%BB.txt").as_deref(),
+            Some("/home/user/файл.txt"),
+        );
+    }
+
+    /// A directory of the test's own under the temp dir, emptied first.
+    fn scratch(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("bnknotes-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        dir.canonicalize().expect("canonical scratch dir")
+    }
+
+    #[test]
+    fn a_file_target_that_would_run_something_is_refused_at_the_click() {
+        let dir = scratch("browser-files");
+        let write = |name: &str, mode: u32| {
+            let path = dir.join(name);
+            std::fs::write(&path, "x").expect("write");
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).expect("chmod");
+            path
+        };
+        let note = write("note.txt", 0o644);
+        write("evil.desktop", 0o644);
+        write("EVIL.DESKTOP", 0o644);
+        write("setup.EXE", 0o644);
+        write("shortcut.lnk", 0o644);
+        let with = |name: &str, content: &[u8], mode: u32| {
+            let path = write(name, mode);
+            std::fs::write(&path, content).expect("write content");
+            path
+        };
+        with("plain", b"MZ\x90\x00", 0o644);
+        with("evil.dеsktop", b"[Desktop Entry]\nExec=x\n", 0o644);
+        with("tool", b"\x7fELF\x02\x01", 0o755);
+        with("run", b"#!/bin/sh\nid\n", 0o755);
+        // On exFAT, NTFS or a CIFS share every file has the exec bit: a document is
+        // still a document.
+        let pdf = with("report.pdf", b"%PDF-1.7\n", 0o755);
+        with("notes.md", b"# Notes\n", 0o755);
+        // A harmless name that leads to the launcher: the link is judged by what it
+        // reaches, not by what it is called.
+        std::os::unix::fs::symlink(dir.join("evil.desktop"), dir.join("diagram.png"))
+            .expect("symlink");
+        let url = |name: &str| format!("file://{}/{name}", dir.display());
+
+        assert_eq!(judge_file(&url("evil.desktop")), Err(Refusal::Launcher));
+        assert_eq!(judge_file(&url("EVIL.DESKTOP")), Err(Refusal::Launcher));
+        assert_eq!(judge_file(&url("diagram.png")), Err(Refusal::Launcher));
+        assert_eq!(judge_file(&url("absent.txt")), Err(Refusal::Missing));
+        assert_eq!(judge_file(&url("setup.EXE")), Err(Refusal::Executable));
+        assert_eq!(judge_file(&url("shortcut.lnk")), Err(Refusal::Executable));
+        assert_eq!(
+            judge_file(&url("plain")),
+            Err(Refusal::Executable),
+            "an MZ header"
+        );
+        assert_eq!(
+            judge_file(&url("evil.d%D0%B5sktop")),
+            Err(Refusal::Launcher),
+            "by content"
+        );
+        assert_eq!(judge_file(&url("tool")), Err(Refusal::Executable));
+        assert_eq!(judge_file(&url("run")), Err(Refusal::Executable));
+        assert_eq!(
+            judge_file(&url("report.pdf")),
+            Ok(encode_file_url(pdf.to_str().expect("utf-8 path")))
+        );
+        assert!(judge_file(&url("notes.md")).is_ok());
+        assert_eq!(
+            judge_file(&format!("{}#install", url("note.txt"))),
+            Ok(format!(
+                "{}#install",
+                encode_file_url(note.to_str().expect("utf-8"))
+            )),
+            "a fragment carries over to the URL that opens",
+        );
+        assert_eq!(
+            judge_file(&url("note.txt")),
+            Ok(encode_file_url(note.to_str().expect("utf-8 path"))),
+            "an ordinary file opens, under the URL of the file that was checked",
+        );
+        // A directory opens in the file manager, exec bit and all.
+        assert!(judge_file(&format!("file://{}", dir.display())).is_ok());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_file_url_encodes_back_to_exactly_its_path() {
+        let path = "/home/user/My Notes/50%/файл#1.md";
+        let url = encode_file_url(path);
+        assert!(url.is_ascii());
+        assert_eq!(
+            url,
+            "file:///home/user/My%20Notes/50%25/%D1%84%D0%B0%D0%B9%D0%BB%231.md"
+        );
+        let decoded: Option<Vec<u8>> = percent_decoded(&url["file://".len()..]).collect();
+        assert_eq!(decoded.as_deref(), Some(path.as_bytes()));
     }
 
     #[test]
@@ -206,6 +535,8 @@ mod tests {
             "https://fa.wikipedia.org/wiki/کتاب\u{200C}خانه",
             "https://emojipedia.org/red-heart/❤\u{FE0F}",
             "https://example.com/100%25",
+            "file:///home/user/notes/100%25.pdf",
+            "file:///home/user/manual.html#install",
         ] {
             assert_eq!(judge(url), Ok(()), "{url}");
         }

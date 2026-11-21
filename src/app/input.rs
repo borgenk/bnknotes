@@ -2028,14 +2028,19 @@ impl State {
             self.bump_caret();
             return;
         }
-        // A plain, un-chained click on a rendered link follows it.
+        // A plain, un-chained click on a rendered link follows it. One the opener
+        // refuses says why and lands as an ordinary click.
         if !chained
             && !shift
             && let Some(dest) = self.editors[i].link_under_pointer(&self.fonts, rect, px, py)
-            && crate::platform::browser::open_url(&dest).is_ok()
         {
-            self.editors[i].end_drag();
-            return;
+            match crate::platform::browser::open_url(&dest) {
+                Ok(()) => {
+                    self.editors[i].end_drag();
+                    return;
+                }
+                Err(e) => eprintln!("bnknotes: {e}"),
+            }
         }
         match click_count {
             1 => {

@@ -40,7 +40,7 @@ pub(super) struct Renderer {
     pub(super) set_dummy: VkDescriptorSet,
     pub(super) dummy: Texture,
     /// The R8 glyph atlas and BGRA emoji atlas textures, each tagged with the
-    /// CPU mirror generation they were created for.
+    /// atlas generation it was created for.
     pub(super) glyph_tex: Option<(Texture, u32)>,
     pub(super) emoji_tex: Option<(Texture, u32)>,
     /// One texture and descriptor set per uploaded image id. This map is what

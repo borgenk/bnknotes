@@ -1,9 +1,10 @@
 use core::ffi::c_void;
+use core::ops::Range;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::time::Duration;
 
 use crate::platform::error::{Error, Result};
-use crate::render::gpu::{AtlasInfo, AtlasUpload, FrameData, ImageId};
+use crate::render::gpu::{AtlasInfo, AtlasUploads, FrameData, ImageId};
 use crate::render::vulkan::Gpu;
 use crate::render::vulkan::abi::*;
 use crate::render::vulkan::renderer::{
@@ -555,7 +556,8 @@ impl Gpu {
 
         // Textures first: (re)create atlases and image textures, assemble the
         // staging bytes and the copy list.
-        let (staging_bytes, uploads) = self.sync_frame_textures(frame)?;
+        let uploads = self.sync_frame_textures(frame)?;
+        let staging_bytes = &uploads.staging;
         if !staging_bytes.is_empty() {
             self.grow_host_buffer(
                 &mut img.staging,
@@ -798,7 +800,7 @@ impl Gpu {
         &self,
         img: &GpuImage,
         frame: &FrameData,
-        uploads: &[PendingUpload],
+        uploads: &FrameUploads,
         background: [f32; 4],
         glyph_gamma: f32,
     ) -> Result<()> {
@@ -816,8 +818,9 @@ impl Gpu {
             "vkBeginCommandBuffer",
         )?;
 
-        for up in uploads {
-            self.record_upload(img, up);
+        for up in &uploads.textures {
+            let copies = uploads.copies.get(up.copies.clone()).unwrap_or_default();
+            self.record_upload(img, up, copies);
         }
 
         let range = color_range();
@@ -984,9 +987,9 @@ impl Gpu {
         )
     }
 
-    /// Record one texture upload, or the bare initialization barrier a texture
-    /// created this frame gets (an upload that carries no bytes).
-    fn record_upload(&self, img: &GpuImage, up: &PendingUpload) {
+    /// Record one texture's upload, all its regions in one copy, or the bare
+    /// initialization barrier a texture created this frame gets (no regions).
+    fn record_upload(&self, img: &GpuImage, up: &PendingUpload, copies: &[VkBufferImageCopy]) {
         let f = &self.fns;
         let range = color_range();
         let (old_layout, src_stage, src_access) = if up.was_initialized {
@@ -1028,35 +1031,14 @@ impl Gpu {
                 1,
                 &to_dst,
             );
-            if up.w > 0 && up.h > 0 {
-                let region = VkBufferImageCopy {
-                    buffer_offset: up.staging_offset as u64,
-                    buffer_row_length: 0,
-                    buffer_image_height: 0,
-                    image_subresource: VkImageSubresourceLayers {
-                        aspect_mask: VK_IMAGE_ASPECT_COLOR_BIT,
-                        mip_level: 0,
-                        base_array_layer: 0,
-                        layer_count: 1,
-                    },
-                    image_offset: VkOffset3D {
-                        x: up.x as i32,
-                        y: up.y as i32,
-                        z: 0,
-                    },
-                    image_extent: VkExtent3D {
-                        width: up.w,
-                        height: up.h,
-                        depth: 1,
-                    },
-                };
+            if !copies.is_empty() {
                 (f.cmd_copy_buffer_to_image)(
                     img.cmd,
                     img.staging.buf,
                     up.image,
                     VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-                    1,
-                    &region,
+                    copies.len() as u32,
+                    copies.as_ptr(),
                 );
             }
             let to_read = VkImageMemoryBarrier {
@@ -1089,9 +1071,8 @@ impl Gpu {
     /// Reconcile the renderer's textures with this frame's data: (re)create
     /// atlas textures on generation changes, create textures and descriptor
     /// sets for new images, and assemble the staging bytes plus copy list.
-    fn sync_frame_textures(&mut self, frame: &FrameData) -> Result<(Vec<u8>, Vec<PendingUpload>)> {
-        let mut staging = Vec::new();
-        let mut uploads = Vec::new();
+    fn sync_frame_textures(&mut self, frame: &FrameData) -> Result<FrameUploads> {
+        let mut uploads = FrameUploads::default();
 
         // The dummy texture: 1x1, never written, bound whenever a batch has
         // no image. Contents are irrelevant (no mode samples it), only the
@@ -1106,34 +1087,16 @@ impl Gpu {
                 self.renderer.sampler,
                 dummy.view,
             );
-            uploads.push(PendingUpload {
-                image: dummy.image,
-                was_initialized: false,
-                staging_offset: 0,
-                x: 0,
-                y: 0,
-                w: 0,
-                h: 0,
-            });
+            uploads.push(dummy.image, false, []);
             self.renderer.dummy = dummy;
         }
 
-        // Atlas textures follow the CPU mirrors' generations, then take any
-        // dirty-region upload for the frame.
+        // Atlas textures follow the atlases' generations, then take the rasters
+        // packed for the frame.
         self.sync_atlas(AtlasSlot::Glyph, &frame.glyph_atlas, &mut uploads)?;
         self.sync_atlas(AtlasSlot::Emoji, &frame.emoji_atlas, &mut uploads)?;
-        self.stage_atlas_upload(
-            AtlasSlot::Glyph,
-            &frame.glyph_upload,
-            &mut staging,
-            &mut uploads,
-        );
-        self.stage_atlas_upload(
-            AtlasSlot::Emoji,
-            &frame.emoji_upload,
-            &mut staging,
-            &mut uploads,
-        );
+        self.stage_atlas_uploads(AtlasSlot::Glyph, &frame.glyph_uploads, &mut uploads);
+        self.stage_atlas_uploads(AtlasSlot::Emoji, &frame.emoji_uploads, &mut uploads);
 
         // New image textures, one per image id (a path at its native size).
         for up in &frame.image_uploads {
@@ -1163,18 +1126,11 @@ impl Gpu {
                     continue;
                 }
             };
-            uploads.push(PendingUpload {
-                image: tex.image,
-                was_initialized: false,
-                staging_offset: align_staging(&mut staging),
-                x: 0,
-                y: 0,
-                w,
-                h,
-            });
+            let offset = align_staging(&mut uploads.staging);
+            uploads.push(tex.image, false, [copy_region(offset, 0, 0, w, h)]);
             // ARGB words are B,G,R,A bytes in memory: B8G8R8A8 verbatim.
             for px in &up.pixels {
-                staging.extend_from_slice(&px.to_ne_bytes());
+                uploads.staging.extend_from_slice(&px.to_ne_bytes());
             }
             let mut stored = tex;
             stored.initialized = true;
@@ -1183,12 +1139,10 @@ impl Gpu {
 
         self.evict_unused_images(frame);
 
-        // Uploads whose staging_offset was pushed before later bytes landed
-        // stay valid: offsets only ever append.
-        Ok((staging, uploads))
+        Ok(uploads)
     }
 
-    /// Rebuild an atlas texture when its CPU mirror's generation moved (or it
+    /// Rebuild an atlas texture when its atlas's generation moved (or it
     /// does not exist yet). A replacement may still be sampled by the other
     /// slot's in-flight frame, so the queue is drained before the old texture is
     /// destroyed, and the shared atlas descriptor set is repointed after the new
@@ -1200,7 +1154,7 @@ impl Gpu {
         &mut self,
         slot: AtlasSlot,
         info: &AtlasInfo,
-        uploads: &mut Vec<PendingUpload>,
+        uploads: &mut FrameUploads,
     ) -> Result<()> {
         let current = slot.texture(&mut self.renderer);
         if current.as_ref().is_some_and(|(_, g)| *g == info.generation) {
@@ -1211,46 +1165,36 @@ impl Gpu {
             destroy_texture(&self.fns, self.device.raw, old);
         }
         let mut tex = self.create_texture(slot.format(), info.width, info.height)?;
-        uploads.push(PendingUpload {
-            image: tex.image,
-            was_initialized: false,
-            staging_offset: 0,
-            x: 0,
-            y: 0,
-            w: 0,
-            h: 0,
-        });
+        uploads.push(tex.image, false, []);
         tex.initialized = true;
         *slot.texture(&mut self.renderer) = Some((tex, info.generation));
         self.update_atlas_set()
     }
 
-    /// Queue an atlas's dirty region for upload into its live texture, appending
-    /// the bytes to `staging`. A no-op when the frame carried no change for that
-    /// slot or the texture does not exist yet.
-    fn stage_atlas_upload(
+    /// Queue the rasters an atlas packed this frame for upload into its live
+    /// texture. A no-op when it packed none or the texture does not exist yet.
+    fn stage_atlas_uploads(
         &mut self,
         slot: AtlasSlot,
-        upload: &Option<AtlasUpload>,
-        staging: &mut Vec<u8>,
-        uploads: &mut Vec<PendingUpload>,
+        packed: &AtlasUploads,
+        uploads: &mut FrameUploads,
     ) {
-        let Some(up) = upload else {
+        if packed.regions.is_empty() {
+            return;
+        }
+        let Some((tex, _)) = slot.texture(&mut self.renderer) else {
             return;
         };
-        if let Some((tex, _)) = slot.texture(&mut self.renderer) {
-            uploads.push(PendingUpload {
-                image: tex.image,
-                was_initialized: tex.initialized,
-                staging_offset: align_staging(staging),
-                x: up.x,
-                y: up.y,
-                w: up.w,
-                h: up.h,
-            });
-            staging.extend_from_slice(&up.bytes);
-            tex.initialized = true;
-        }
+        // Every region's bytes are whole texels, so whole-texel offsets hold
+        // across the block.
+        let base = align_staging(&mut uploads.staging);
+        uploads.staging.extend_from_slice(&packed.bytes);
+        let regions = packed
+            .regions
+            .iter()
+            .map(|r| copy_region(base + r.offset, r.x, r.y, r.w, r.h));
+        uploads.push(tex.image, tex.initialized, regions);
+        tex.initialized = true;
     }
 
     /// Report, once per session, that an image could not be given a texture. The
@@ -1566,17 +1510,67 @@ impl Gpu {
     }
 }
 
-/// One texture copy scheduled for this frame's command buffer: which image,
-/// where its bytes sit in the staging buffer, and the destination region.
-/// A zero-sized region is a bare layout-initialization barrier.
+/// One texture's writes in this frame's command buffer: the image and its copy
+/// regions. A texture with no regions gets only its layout-initialization
+/// barrier.
 struct PendingUpload {
     image: VkImage,
     was_initialized: bool,
-    staging_offset: usize,
-    x: u32,
-    y: u32,
-    w: u32,
-    h: u32,
+    /// The texture's regions in FrameUploads::copies.
+    copies: Range<usize>,
+}
+
+/// A frame's texture uploads: the staging bytes, one entry per texture written,
+/// and the copy regions those entries slice.
+#[derive(Default)]
+struct FrameUploads {
+    staging: Vec<u8>,
+    textures: Vec<PendingUpload>,
+    copies: Vec<VkBufferImageCopy>,
+}
+
+impl FrameUploads {
+    /// Queue a write of image from staging, or with no regions its bare
+    /// initialization barrier.
+    fn push(
+        &mut self,
+        image: VkImage,
+        was_initialized: bool,
+        regions: impl IntoIterator<Item = VkBufferImageCopy>,
+    ) {
+        let start = self.copies.len();
+        self.copies.extend(regions);
+        self.textures.push(PendingUpload {
+            image,
+            was_initialized,
+            copies: start..self.copies.len(),
+        });
+    }
+}
+
+/// A copy of a w x h block of tight rows at staging offset into the image at x, y.
+fn copy_region(offset: usize, x: u32, y: u32, w: u32, h: u32) -> VkBufferImageCopy {
+    VkBufferImageCopy {
+        buffer_offset: offset as u64,
+        buffer_row_length: 0,
+        buffer_image_height: 0,
+        image_subresource: VkImageSubresourceLayers {
+            aspect_mask: VK_IMAGE_ASPECT_COLOR_BIT,
+            mip_level: 0,
+            base_array_layer: 0,
+            layer_count: 1,
+        },
+        image_offset: VkOffset3D {
+            x: x as i32,
+            y: y as i32,
+            z: 0,
+        },
+        image_extent: VkExtent3D {
+            width: w,
+            height: h,
+            depth: 1,
+        },
+    }
 }
 
 /// Every upload's bytes start on a multiple of this. A buffer-to-image copy must

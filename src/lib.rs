@@ -3,6 +3,24 @@
 //! Every module but app is private, so the compiler reports code nothing reaches as
 //! dead.
 
+/// Assert a C struct mirror's layout against numbers measured from the C headers
+/// with sizeof and offsetof: its size, unless it mirrors only the leading fields of
+/// a struct the C library allocates, and every field's offset.
+#[cfg(test)]
+macro_rules! pin_c_layout {
+    ($ty:ident, size $size:expr; $($field:ident @ $offset:expr),* $(,)?) => {{
+        assert_eq!(core::mem::size_of::<$ty>(), $size, concat!(stringify!($ty), " size"));
+        pin_c_layout!($ty, prefix; $($field @ $offset),*);
+    }};
+    ($ty:ident, prefix; $($field:ident @ $offset:expr),* $(,)?) => {{
+        $(assert_eq!(
+            core::mem::offset_of!($ty, $field),
+            $offset,
+            concat!(stringify!($ty), ".", stringify!($field))
+        );)*
+    }};
+}
+
 mod ai;
 pub mod app;
 mod cli;

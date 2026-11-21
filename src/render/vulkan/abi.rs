@@ -1588,38 +1588,93 @@ mod tests {
     /// The transcription's one real hazard is a struct size drifting from the
     /// C ABI: the driver writes past what we allocated. These sizes are from
     /// vulkan_core.h on x86_64/arm64 (LP64).
+    /// Every Vulkan struct the app hands the driver, measured from the Vulkan
+    /// 1.4.363 headers for x86-64 Linux. A field out of place is memory the driver
+    /// reads as something else.
     #[test]
-    fn struct_sizes_match_the_c_abi() {
-        assert_eq!(size_of::<VkPhysicalDeviceLimits>(), 504);
-        assert_eq!(size_of::<VkPhysicalDeviceSparseProperties>(), 20);
-        assert_eq!(size_of::<VkPhysicalDeviceProperties>(), 824);
-        assert_eq!(size_of::<VkPhysicalDeviceProperties2>(), 840);
-        assert_eq!(size_of::<VkPhysicalDeviceDrmPropertiesEXT>(), 56);
-        assert_eq!(size_of::<VkQueueFamilyProperties>(), 24);
-        assert_eq!(size_of::<VkExtensionProperties>(), 260);
-        assert_eq!(size_of::<VkApplicationInfo>(), 48);
-        assert_eq!(size_of::<VkInstanceCreateInfo>(), 64);
-        assert_eq!(size_of::<VkDeviceQueueCreateInfo>(), 40);
-        assert_eq!(size_of::<VkDeviceCreateInfo>(), 72);
-        assert_eq!(size_of::<VkPhysicalDeviceMemoryProperties>(), 520);
-        assert_eq!(size_of::<VkFormatProperties2>(), 32);
-        assert_eq!(size_of::<VkDrmFormatModifierPropertiesEXT>(), 16);
-        assert_eq!(size_of::<VkDrmFormatModifierPropertiesListEXT>(), 32);
-        assert_eq!(size_of::<VkImageCreateInfo>(), 88);
-        assert_eq!(size_of::<VkExternalMemoryImageCreateInfo>(), 24);
-        assert_eq!(size_of::<VkImageFormatListCreateInfo>(), 32);
-        assert_eq!(size_of::<VkImageDrmFormatModifierListCreateInfoEXT>(), 32);
-        assert_eq!(size_of::<VkImageDrmFormatModifierPropertiesEXT>(), 24);
-        assert_eq!(size_of::<VkMemoryRequirements>(), 24);
-        assert_eq!(size_of::<VkMemoryAllocateInfo>(), 32);
-        assert_eq!(size_of::<VkMemoryDedicatedAllocateInfo>(), 32);
-        assert_eq!(size_of::<VkMemoryGetFdInfoKHR>(), 32);
-        assert_eq!(size_of::<VkSubresourceLayout>(), 40);
-        assert_eq!(size_of::<VkCommandBufferAllocateInfo>(), 32);
-        assert_eq!(size_of::<VkImageMemoryBarrier>(), 72);
-        assert_eq!(size_of::<VkSubmitInfo>(), 72);
-        assert_eq!(size_of::<VkSemaphoreGetFdInfoKHR>(), 32);
-        assert_eq!(size_of::<VkImportSemaphoreFdInfoKHR>(), 40);
+    fn every_vulkan_struct_mirror_matches_the_c_layout() {
+        pin_c_layout!(VkApplicationInfo, size 48; s_type @ 0, p_next @ 8, p_application_name @ 16, application_version @ 24, p_engine_name @ 32, engine_version @ 40, api_version @ 44);
+        pin_c_layout!(VkInstanceCreateInfo, size 64; s_type @ 0, p_next @ 8, flags @ 16, p_application_info @ 24, enabled_layer_count @ 32, pp_enabled_layer_names @ 40, enabled_extension_count @ 48, pp_enabled_extension_names @ 56);
+        pin_c_layout!(VkDeviceQueueCreateInfo, size 40; s_type @ 0, p_next @ 8, flags @ 16, queue_family_index @ 20, queue_count @ 24, p_queue_priorities @ 32);
+        pin_c_layout!(VkDeviceCreateInfo, size 72; s_type @ 0, p_next @ 8, flags @ 16, queue_create_info_count @ 20, p_queue_create_infos @ 24, enabled_layer_count @ 32, pp_enabled_layer_names @ 40, enabled_extension_count @ 48, pp_enabled_extension_names @ 56, p_enabled_features @ 64);
+        pin_c_layout!(VkExtensionProperties, size 260; extension_name @ 0, spec_version @ 256);
+        pin_c_layout!(VkExtent3D, size 12; width @ 0, height @ 4, depth @ 8);
+        pin_c_layout!(VkQueueFamilyProperties, size 24; queue_flags @ 0, queue_count @ 4, timestamp_valid_bits @ 8, min_image_transfer_granularity @ 12);
+        pin_c_layout!(VkPhysicalDeviceLimits, size 504; max_image_dimension_1d @ 0, max_image_dimension_2d @ 4, max_image_dimension_3d @ 8, max_image_dimension_cube @ 12, max_image_array_layers @ 16, max_texel_buffer_elements @ 20, max_uniform_buffer_range @ 24, max_storage_buffer_range @ 28, max_push_constants_size @ 32, max_memory_allocation_count @ 36, max_sampler_allocation_count @ 40, buffer_image_granularity @ 48, sparse_address_space_size @ 56, max_bound_descriptor_sets @ 64, max_per_stage_descriptor_samplers @ 68, max_per_stage_descriptor_uniform_buffers @ 72, max_per_stage_descriptor_storage_buffers @ 76, max_per_stage_descriptor_sampled_images @ 80, max_per_stage_descriptor_storage_images @ 84, max_per_stage_descriptor_input_attachments @ 88, max_per_stage_resources @ 92, max_descriptor_set_samplers @ 96, max_descriptor_set_uniform_buffers @ 100, max_descriptor_set_uniform_buffers_dynamic @ 104, max_descriptor_set_storage_buffers @ 108, max_descriptor_set_storage_buffers_dynamic @ 112, max_descriptor_set_sampled_images @ 116, max_descriptor_set_storage_images @ 120, max_descriptor_set_input_attachments @ 124, max_vertex_input_attributes @ 128, max_vertex_input_bindings @ 132, max_vertex_input_attribute_offset @ 136, max_vertex_input_binding_stride @ 140, max_vertex_output_components @ 144, max_tessellation_generation_level @ 148, max_tessellation_patch_size @ 152, max_tessellation_control_per_vertex_input_components @ 156, max_tessellation_control_per_vertex_output_components @ 160, max_tessellation_control_per_patch_output_components @ 164, max_tessellation_control_total_output_components @ 168, max_tessellation_evaluation_input_components @ 172, max_tessellation_evaluation_output_components @ 176, max_geometry_shader_invocations @ 180, max_geometry_input_components @ 184, max_geometry_output_components @ 188, max_geometry_output_vertices @ 192, max_geometry_total_output_components @ 196, max_fragment_input_components @ 200, max_fragment_output_attachments @ 204, max_fragment_dual_src_attachments @ 208, max_fragment_combined_output_resources @ 212, max_compute_shared_memory_size @ 216, max_compute_work_group_count @ 220, max_compute_work_group_invocations @ 232, max_compute_work_group_size @ 236, sub_pixel_precision_bits @ 248, sub_texel_precision_bits @ 252, mipmap_precision_bits @ 256, max_draw_indexed_index_value @ 260, max_draw_indirect_count @ 264, max_sampler_lod_bias @ 268, max_sampler_anisotropy @ 272, max_viewports @ 276, max_viewport_dimensions @ 280, viewport_bounds_range @ 288, viewport_sub_pixel_bits @ 296, min_memory_map_alignment @ 304, min_texel_buffer_offset_alignment @ 312, min_uniform_buffer_offset_alignment @ 320, min_storage_buffer_offset_alignment @ 328, min_texel_offset @ 336, max_texel_offset @ 340, min_texel_gather_offset @ 344, max_texel_gather_offset @ 348, min_interpolation_offset @ 352, max_interpolation_offset @ 356, sub_pixel_interpolation_offset_bits @ 360, max_framebuffer_width @ 364, max_framebuffer_height @ 368, max_framebuffer_layers @ 372, framebuffer_color_sample_counts @ 376, framebuffer_depth_sample_counts @ 380, framebuffer_stencil_sample_counts @ 384, framebuffer_no_attachments_sample_counts @ 388, max_color_attachments @ 392, sampled_image_color_sample_counts @ 396, sampled_image_integer_sample_counts @ 400, sampled_image_depth_sample_counts @ 404, sampled_image_stencil_sample_counts @ 408, storage_image_sample_counts @ 412, max_sample_mask_words @ 416, timestamp_compute_and_graphics @ 420, timestamp_period @ 424, max_clip_distances @ 428, max_cull_distances @ 432, max_combined_clip_and_cull_distances @ 436, discrete_queue_priorities @ 440, point_size_range @ 444, line_width_range @ 452, point_size_granularity @ 460, line_width_granularity @ 464, strict_lines @ 468, standard_sample_locations @ 472, optimal_buffer_copy_offset_alignment @ 480, optimal_buffer_copy_row_pitch_alignment @ 488, non_coherent_atom_size @ 496);
+        pin_c_layout!(VkPhysicalDeviceSparseProperties, size 20; residency_standard_2d_block_shape @ 0, residency_standard_2d_multisample_block_shape @ 4, residency_standard_3d_block_shape @ 8, residency_aligned_mip_size @ 12, residency_non_resident_strict @ 16);
+        pin_c_layout!(VkPhysicalDeviceProperties, size 824; api_version @ 0, driver_version @ 4, vendor_id @ 8, device_id @ 12, device_type @ 16, device_name @ 20, pipeline_cache_uuid @ 276, limits @ 296, sparse_properties @ 800);
+        pin_c_layout!(VkPhysicalDeviceProperties2, size 840; s_type @ 0, p_next @ 8, properties @ 16);
+        pin_c_layout!(VkPhysicalDeviceDrmPropertiesEXT, size 56; s_type @ 0, p_next @ 8, has_primary @ 16, has_render @ 20, primary_major @ 24, primary_minor @ 32, render_major @ 40, render_minor @ 48);
+        pin_c_layout!(VkMemoryType, size 8; property_flags @ 0, heap_index @ 4);
+        pin_c_layout!(VkMemoryHeap, size 16; size @ 0, flags @ 8);
+        pin_c_layout!(VkPhysicalDeviceMemoryProperties, size 520; memory_type_count @ 0, memory_types @ 4, memory_heap_count @ 260, memory_heaps @ 264);
+        pin_c_layout!(VkFormatProperties, size 12; linear_tiling_features @ 0, optimal_tiling_features @ 4, buffer_features @ 8);
+        pin_c_layout!(VkFormatProperties2, size 32; s_type @ 0, p_next @ 8, format_properties @ 16);
+        pin_c_layout!(VkDrmFormatModifierPropertiesEXT, size 16; drm_format_modifier @ 0, drm_format_modifier_plane_count @ 8, drm_format_modifier_tiling_features @ 12);
+        pin_c_layout!(VkDrmFormatModifierPropertiesListEXT, size 32; s_type @ 0, p_next @ 8, drm_format_modifier_count @ 16, p_drm_format_modifier_properties @ 24);
+        pin_c_layout!(VkImageCreateInfo, size 88; s_type @ 0, p_next @ 8, flags @ 16, image_type @ 20, format @ 24, extent @ 28, mip_levels @ 40, array_layers @ 44, samples @ 48, tiling @ 52, usage @ 56, sharing_mode @ 60, queue_family_index_count @ 64, p_queue_family_indices @ 72, initial_layout @ 80);
+        pin_c_layout!(VkExternalMemoryImageCreateInfo, size 24; s_type @ 0, p_next @ 8, handle_types @ 16);
+        pin_c_layout!(VkImageFormatListCreateInfo, size 32; s_type @ 0, p_next @ 8, view_format_count @ 16, p_view_formats @ 24);
+        pin_c_layout!(VkImageDrmFormatModifierListCreateInfoEXT, size 32; s_type @ 0, p_next @ 8, drm_format_modifier_count @ 16, p_drm_format_modifiers @ 24);
+        pin_c_layout!(VkImageDrmFormatModifierPropertiesEXT, size 24; s_type @ 0, p_next @ 8, drm_format_modifier @ 16);
+        pin_c_layout!(VkMemoryRequirements, size 24; size @ 0, alignment @ 8, memory_type_bits @ 16);
+        pin_c_layout!(VkMemoryAllocateInfo, size 32; s_type @ 0, p_next @ 8, allocation_size @ 16, memory_type_index @ 24);
+        pin_c_layout!(VkExportMemoryAllocateInfo, size 24; s_type @ 0, p_next @ 8, handle_types @ 16);
+        pin_c_layout!(VkMemoryDedicatedAllocateInfo, size 32; s_type @ 0, p_next @ 8, image @ 16, buffer @ 24);
+        pin_c_layout!(VkMemoryGetFdInfoKHR, size 32; s_type @ 0, p_next @ 8, memory @ 16, handle_type @ 24);
+        pin_c_layout!(VkImageSubresource, size 12; aspect_mask @ 0, mip_level @ 4, array_layer @ 8);
+        pin_c_layout!(VkSubresourceLayout, size 40; offset @ 0, size @ 8, row_pitch @ 16, array_pitch @ 24, depth_pitch @ 32);
+        pin_c_layout!(VkCommandPoolCreateInfo, size 24; s_type @ 0, p_next @ 8, flags @ 16, queue_family_index @ 20);
+        pin_c_layout!(VkCommandBufferAllocateInfo, size 32; s_type @ 0, p_next @ 8, command_pool @ 16, level @ 24, command_buffer_count @ 28);
+        pin_c_layout!(VkCommandBufferBeginInfo, size 32; s_type @ 0, p_next @ 8, flags @ 16, p_inheritance_info @ 24);
+        pin_c_layout!(VkImageSubresourceRange, size 20; aspect_mask @ 0, base_mip_level @ 4, level_count @ 8, base_array_layer @ 12, layer_count @ 16);
+        pin_c_layout!(VkImageMemoryBarrier, size 72; s_type @ 0, p_next @ 8, src_access_mask @ 16, dst_access_mask @ 20, old_layout @ 24, new_layout @ 28, src_queue_family_index @ 32, dst_queue_family_index @ 36, image @ 40, subresource_range @ 48);
+        pin_c_layout!(VkSubmitInfo, size 72; s_type @ 0, p_next @ 8, wait_semaphore_count @ 16, p_wait_semaphores @ 24, p_wait_dst_stage_mask @ 32, command_buffer_count @ 40, p_command_buffers @ 48, signal_semaphore_count @ 56, p_signal_semaphores @ 64);
+        pin_c_layout!(VkFenceCreateInfo, size 24; s_type @ 0, p_next @ 8, flags @ 16);
+        pin_c_layout!(VkSemaphoreCreateInfo, size 24; s_type @ 0, p_next @ 8, flags @ 16);
+        pin_c_layout!(VkExportSemaphoreCreateInfo, size 24; s_type @ 0, p_next @ 8, handle_types @ 16);
+        pin_c_layout!(VkSemaphoreGetFdInfoKHR, size 32; s_type @ 0, p_next @ 8, semaphore @ 16, handle_type @ 24);
+        pin_c_layout!(VkImportSemaphoreFdInfoKHR, size 40; s_type @ 0, p_next @ 8, semaphore @ 16, flags @ 24, handle_type @ 28, fd @ 32);
+        pin_c_layout!(VkClearColorValue, size 16; float32 @ 0);
+        pin_c_layout!(VkBufferCreateInfo, size 56; s_type @ 0, p_next @ 8, flags @ 16, size @ 24, usage @ 32, sharing_mode @ 36, queue_family_index_count @ 40, p_queue_family_indices @ 48);
+        pin_c_layout!(VkComponentMapping, size 16; r @ 0, g @ 4, b @ 8, a @ 12);
+        pin_c_layout!(VkImageViewCreateInfo, size 80; s_type @ 0, p_next @ 8, flags @ 16, image @ 24, view_type @ 32, format @ 36, components @ 40, subresource_range @ 56);
+        pin_c_layout!(VkShaderModuleCreateInfo, size 40; s_type @ 0, p_next @ 8, flags @ 16, code_size @ 24, p_code @ 32);
+        pin_c_layout!(VkPipelineShaderStageCreateInfo, size 48; s_type @ 0, p_next @ 8, flags @ 16, stage @ 20, module @ 24, p_name @ 32, p_specialization_info @ 40);
+        pin_c_layout!(VkVertexInputBindingDescription, size 12; binding @ 0, stride @ 4, input_rate @ 8);
+        pin_c_layout!(VkVertexInputAttributeDescription, size 16; location @ 0, binding @ 4, format @ 8, offset @ 12);
+        pin_c_layout!(VkPipelineVertexInputStateCreateInfo, size 48; s_type @ 0, p_next @ 8, flags @ 16, vertex_binding_description_count @ 20, p_vertex_binding_descriptions @ 24, vertex_attribute_description_count @ 32, p_vertex_attribute_descriptions @ 40);
+        pin_c_layout!(VkPipelineInputAssemblyStateCreateInfo, size 32; s_type @ 0, p_next @ 8, flags @ 16, topology @ 20, primitive_restart_enable @ 24);
+        pin_c_layout!(VkViewport, size 24; x @ 0, y @ 4, width @ 8, height @ 12, min_depth @ 16, max_depth @ 20);
+        pin_c_layout!(VkOffset2D, size 8; x @ 0, y @ 4);
+        pin_c_layout!(VkExtent2D, size 8; width @ 0, height @ 4);
+        pin_c_layout!(VkRect2D, size 16; offset @ 0, extent @ 8);
+        pin_c_layout!(VkPipelineViewportStateCreateInfo, size 48; s_type @ 0, p_next @ 8, flags @ 16, viewport_count @ 20, p_viewports @ 24, scissor_count @ 32, p_scissors @ 40);
+        pin_c_layout!(VkPipelineRasterizationStateCreateInfo, size 64; s_type @ 0, p_next @ 8, flags @ 16, depth_clamp_enable @ 20, rasterizer_discard_enable @ 24, polygon_mode @ 28, cull_mode @ 32, front_face @ 36, depth_bias_enable @ 40, depth_bias_constant_factor @ 44, depth_bias_clamp @ 48, depth_bias_slope_factor @ 52, line_width @ 56);
+        pin_c_layout!(VkPipelineMultisampleStateCreateInfo, size 48; s_type @ 0, p_next @ 8, flags @ 16, rasterization_samples @ 20, sample_shading_enable @ 24, min_sample_shading @ 28, p_sample_mask @ 32, alpha_to_coverage_enable @ 40, alpha_to_one_enable @ 44);
+        pin_c_layout!(VkPipelineColorBlendAttachmentState, size 32; blend_enable @ 0, src_color_blend_factor @ 4, dst_color_blend_factor @ 8, color_blend_op @ 12, src_alpha_blend_factor @ 16, dst_alpha_blend_factor @ 20, alpha_blend_op @ 24, color_write_mask @ 28);
+        pin_c_layout!(VkPipelineColorBlendStateCreateInfo, size 56; s_type @ 0, p_next @ 8, flags @ 16, logic_op_enable @ 20, logic_op @ 24, attachment_count @ 28, p_attachments @ 32, blend_constants @ 40);
+        pin_c_layout!(VkPipelineDynamicStateCreateInfo, size 32; s_type @ 0, p_next @ 8, flags @ 16, dynamic_state_count @ 20, p_dynamic_states @ 24);
+        pin_c_layout!(VkPushConstantRange, size 12; stage_flags @ 0, offset @ 4, size @ 8);
+        pin_c_layout!(VkPipelineLayoutCreateInfo, size 48; s_type @ 0, p_next @ 8, flags @ 16, set_layout_count @ 20, p_set_layouts @ 24, push_constant_range_count @ 32, p_push_constant_ranges @ 40);
+        pin_c_layout!(VkGraphicsPipelineCreateInfo, size 144; s_type @ 0, p_next @ 8, flags @ 16, stage_count @ 20, p_stages @ 24, p_vertex_input_state @ 32, p_input_assembly_state @ 40, p_tessellation_state @ 48, p_viewport_state @ 56, p_rasterization_state @ 64, p_multisample_state @ 72, p_depth_stencil_state @ 80, p_color_blend_state @ 88, p_dynamic_state @ 96, layout @ 104, render_pass @ 112, subpass @ 120, base_pipeline_handle @ 128, base_pipeline_index @ 136);
+        pin_c_layout!(VkSamplerCreateInfo, size 80; s_type @ 0, p_next @ 8, flags @ 16, mag_filter @ 20, min_filter @ 24, mipmap_mode @ 28, address_mode_u @ 32, address_mode_v @ 36, address_mode_w @ 40, mip_lod_bias @ 44, anisotropy_enable @ 48, max_anisotropy @ 52, compare_enable @ 56, compare_op @ 60, min_lod @ 64, max_lod @ 68, border_color @ 72, unnormalized_coordinates @ 76);
+        pin_c_layout!(VkDescriptorSetLayoutBinding, size 24; binding @ 0, descriptor_type @ 4, descriptor_count @ 8, stage_flags @ 12, p_immutable_samplers @ 16);
+        pin_c_layout!(VkDescriptorSetLayoutCreateInfo, size 32; s_type @ 0, p_next @ 8, flags @ 16, binding_count @ 20, p_bindings @ 24);
+        pin_c_layout!(VkDescriptorPoolSize, size 8; descriptor_type @ 0, descriptor_count @ 4);
+        pin_c_layout!(VkDescriptorPoolCreateInfo, size 40; s_type @ 0, p_next @ 8, flags @ 16, max_sets @ 20, pool_size_count @ 24, p_pool_sizes @ 32);
+        pin_c_layout!(VkDescriptorSetAllocateInfo, size 40; s_type @ 0, p_next @ 8, descriptor_pool @ 16, descriptor_set_count @ 24, p_set_layouts @ 32);
+        pin_c_layout!(VkDescriptorImageInfo, size 24; sampler @ 0, image_view @ 8, image_layout @ 16);
+        pin_c_layout!(VkWriteDescriptorSet, size 64; s_type @ 0, p_next @ 8, dst_set @ 16, dst_binding @ 24, dst_array_element @ 28, descriptor_count @ 32, descriptor_type @ 36, p_image_info @ 40, p_buffer_info @ 48, p_texel_buffer_view @ 56);
+        pin_c_layout!(VkAttachmentDescription, size 36; flags @ 0, format @ 4, samples @ 8, load_op @ 12, store_op @ 16, stencil_load_op @ 20, stencil_store_op @ 24, initial_layout @ 28, final_layout @ 32);
+        pin_c_layout!(VkAttachmentReference, size 8; attachment @ 0, layout @ 4);
+        pin_c_layout!(VkSubpassDescription, size 72; flags @ 0, pipeline_bind_point @ 4, input_attachment_count @ 8, p_input_attachments @ 16, color_attachment_count @ 24, p_color_attachments @ 32, p_resolve_attachments @ 40, p_depth_stencil_attachment @ 48, preserve_attachment_count @ 56, p_preserve_attachments @ 64);
+        pin_c_layout!(VkRenderPassCreateInfo, size 64; s_type @ 0, p_next @ 8, flags @ 16, attachment_count @ 20, p_attachments @ 24, subpass_count @ 32, p_subpasses @ 40, dependency_count @ 48, p_dependencies @ 56);
+        pin_c_layout!(VkFramebufferCreateInfo, size 64; s_type @ 0, p_next @ 8, flags @ 16, render_pass @ 24, attachment_count @ 32, p_attachments @ 40, width @ 48, height @ 52, layers @ 56);
+        pin_c_layout!(VkRenderPassBeginInfo, size 64; s_type @ 0, p_next @ 8, render_pass @ 16, framebuffer @ 24, render_area @ 32, clear_value_count @ 48, p_clear_values @ 56);
+        pin_c_layout!(VkImageSubresourceLayers, size 16; aspect_mask @ 0, mip_level @ 4, base_array_layer @ 8, layer_count @ 12);
+        pin_c_layout!(VkOffset3D, size 12; x @ 0, y @ 4, z @ 8);
+        pin_c_layout!(VkBufferImageCopy, size 56; buffer_offset @ 0, buffer_row_length @ 8, buffer_image_height @ 12, image_subresource @ 16, image_offset @ 32, image_extent @ 44);
     }
 
     #[test]

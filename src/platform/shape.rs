@@ -192,6 +192,14 @@ impl Drop for Shaper {
 mod tests {
     use crate::platform::shape::*;
 
+    /// The HarfBuzz glyph arrays the shaper reads, measured from the HarfBuzz headers
+    /// for x86-64 Linux. Their size is the arrays' stride.
+    #[test]
+    fn harfbuzz_struct_mirrors_match_the_c_layout() {
+        pin_c_layout!(HbGlyphInfo, size 20; codepoint @ 0, mask @ 4, cluster @ 8, var1 @ 12, var2 @ 16);
+        pin_c_layout!(HbGlyphPosition, size 20; x_advance @ 0, y_advance @ 4, x_offset @ 8, y_offset @ 12, var @ 16);
+    }
+
     #[test]
     fn text_advance_is_zero_empty_and_grows_with_length() {
         let face = Face::open_default(32).expect("a default font");

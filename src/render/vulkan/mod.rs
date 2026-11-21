@@ -330,6 +330,26 @@ fn format_modifiers(
     mods
 }
 
+/// The first memory type of types (property flags per index) that allowed_bits
+/// allows and that carries every required flag; with no requirement, prefer
+/// device-local and fall back to the first allowed.
+fn pick_memory_type(types: &[u32], allowed_bits: u32, required: u32) -> Option<u32> {
+    let allowed = |i: usize| i < 32 && allowed_bits & (1u32 << i) != 0;
+    if required != 0 {
+        return types
+            .iter()
+            .enumerate()
+            .position(|(i, &flags)| allowed(i) && flags & required == required)
+            .map(|i| i as u32);
+    }
+    types
+        .iter()
+        .enumerate()
+        .position(|(i, &flags)| allowed(i) && flags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT != 0)
+        .or_else(|| (0..types.len()).find(|&i| allowed(i)))
+        .map(|i| i as u32)
+}
+
 /// Property flags per memory type index.
 fn memory_type_flags(
     get_memory_props: PfnGetPhysicalDeviceMemoryProperties,
@@ -666,23 +686,48 @@ mod tests {
 
     #[test]
     fn memory_type_picking_prefers_device_local() {
-        let gpu_types = [0u32, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, 0x6];
-        // A fake Gpu is not constructible here (it needs a live device), so
-        // test the picking logic through a copy of its rule.
-        let pick = |allowed_bits: u32| -> Option<u32> {
-            let allowed = |i: usize| allowed_bits & (1u32 << i) != 0;
-            gpu_types
-                .iter()
-                .enumerate()
-                .position(|(i, &flags)| {
-                    allowed(i) && flags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT != 0
-                })
-                .or_else(|| (0..gpu_types.len()).find(|&i| allowed(i)))
-                .map(|i| i as u32)
-        };
-        assert_eq!(pick(0b111), Some(1), "device-local wins");
-        assert_eq!(pick(0b101), Some(0), "fallback to first allowed");
-        assert_eq!(pick(0), None);
+        let types = [0u32, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, 0x6];
+        assert_eq!(
+            pick_memory_type(&types, 0b111, 0),
+            Some(1),
+            "device-local wins"
+        );
+        assert_eq!(
+            pick_memory_type(&types, 0b101, 0),
+            Some(0),
+            "fallback to first allowed"
+        );
+        assert_eq!(pick_memory_type(&types, 0, 0), None);
+    }
+
+    /// A host-visible staging buffer must land in a type with every flag it needs,
+    /// never in the device-local one the unconstrained pick prefers.
+    #[test]
+    fn memory_type_picking_honors_required_flags() {
+        let host = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+        let types = [
+            VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT,
+            host,
+            host | VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+        ];
+        assert_eq!(
+            pick_memory_type(&types, 0b1111, host),
+            Some(2),
+            "the first with both flags"
+        );
+        assert_eq!(
+            pick_memory_type(&types, 0b1011, host),
+            Some(3),
+            "only allowed types count"
+        );
+        assert_eq!(
+            pick_memory_type(&types, 0b0011, host),
+            None,
+            "no allowed type has both"
+        );
+        // Bits past the device's last memory type select nothing.
+        assert_eq!(pick_memory_type(&types, 1 << 31, 0), None);
     }
 
     #[test]

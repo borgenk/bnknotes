@@ -1169,6 +1169,26 @@ fn copy_coverage(bitmap: &FtBitmap) -> (usize, usize, Vec<u8>) {
 mod tests {
     use crate::platform::freetype::*;
 
+    /// Every FreeType struct the faces read, measured from the FreeType headers for
+    /// x86-64 Linux. FreeType allocates them, so a mirror may stop after the last field
+    /// it reads.
+    #[test]
+    fn freetype_struct_mirrors_match_the_c_layout() {
+        pin_c_layout!(FtGeneric, size 16; data @ 0, finalizer @ 8);
+        pin_c_layout!(FtVector, size 16; x @ 0, y @ 8);
+        pin_c_layout!(FtBitmap, size 40; rows @ 0, width @ 4, pitch @ 8, buffer @ 16, num_grays @ 24, pixel_mode @ 26, palette_mode @ 27, palette @ 32);
+        pin_c_layout!(FtSizeMetrics, size 56; x_ppem @ 0, y_ppem @ 2, x_scale @ 8, y_scale @ 16, ascender @ 24, descender @ 32, height @ 40, max_advance @ 48);
+        pin_c_layout!(
+            FtGlyphSlotRec,
+            prefix; library @ 0, face @ 8, next @ 16, glyph_index @ 24, generic @ 32, metrics @ 48, linear_hori_advance @ 112, linear_vert_advance @ 120, advance @ 128, format @ 144, bitmap @ 152, bitmap_left @ 192, bitmap_top @ 196);
+        pin_c_layout!(
+            FtSizeRec,
+            prefix; face @ 0, generic @ 8, metrics @ 24);
+        pin_c_layout!(
+            FtFaceRec,
+            prefix; num_faces @ 0, face_index @ 8, face_flags @ 16, style_flags @ 24, num_glyphs @ 32, family_name @ 40, style_name @ 48, num_fixed_sizes @ 56, available_sizes @ 64, num_charmaps @ 72, charmaps @ 80, generic @ 88, bbox @ 104, units_per_em @ 136, ascender @ 138, descender @ 140, height @ 142, max_advance_width @ 144, max_advance_height @ 146, underline_position @ 148, underline_thickness @ 150, glyph @ 152, size @ 160);
+    }
+
     /// A TrueType font with an outline 'A' 500 units wide on a 1000-unit em, so 8 px
     /// at 16 px, and a 1-bit bitmap strike at 16 px whose 'A' advances 11 px. No
     /// installed font pairs outlines with a strike, so the test builds one.

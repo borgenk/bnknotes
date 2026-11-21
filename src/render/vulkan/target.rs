@@ -1561,24 +1561,10 @@ impl Gpu {
         Ok(())
     }
 
-    /// The first allowed memory type carrying every `required` property flag;
-    /// with no requirement, prefer device-local and fall back to any allowed.
+    /// The device's memory type for a resource that allows allowed_bits and needs
+    /// every required property flag (see pick_memory_type).
     fn pick_memory_type(&self, allowed_bits: u32, required: u32) -> Option<u32> {
-        let allowed = |i: usize| allowed_bits & (1u32 << i) != 0;
-        if required != 0 {
-            return self
-                .memory_type_flags
-                .iter()
-                .enumerate()
-                .position(|(i, &flags)| allowed(i) && flags & required == required)
-                .map(|i| i as u32);
-        }
-        self.memory_type_flags
-            .iter()
-            .enumerate()
-            .position(|(i, &flags)| allowed(i) && flags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT != 0)
-            .or_else(|| (0..self.memory_type_flags.len()).find(|&i| allowed(i)))
-            .map(|i| i as u32)
+        crate::render::vulkan::pick_memory_type(&self.memory_type_flags, allowed_bits, required)
     }
 }
 

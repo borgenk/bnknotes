@@ -23,7 +23,9 @@ mod input;
 mod present;
 
 use std::collections::BTreeSet;
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
+use std::process::ExitCode;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
@@ -31,6 +33,7 @@ use self::clipboard::{CLIPBOARD_MIMES, ClipboardState, IMAGE_MIMES, is_text_mime
 use self::input::KeyRepeat;
 use self::present::GpuPresentation;
 use crate::ai::{self, Preview};
+use crate::cli::{Mode, USAGE};
 use crate::config::{self, CaretConfig, Config, IconKeys, Vault, VaultKind, vault_name};
 use crate::icon;
 use crate::menu::{Menu, MenuAction, MenuItem};
@@ -170,7 +173,37 @@ impl Scaling {
     }
 }
 
-pub fn run(path: Option<PathBuf>, demo_diff: bool) -> Result<()> {
+pub fn main() -> ExitCode {
+    let args: Vec<OsString> = std::env::args_os().skip(1).collect();
+    #[cfg(any(test, feature = "dev"))]
+    {
+        let dev_args: Vec<String> = args.iter().map(|a| a.to_string_lossy().into()).collect();
+        if let Some(result) = crate::dev::run(&dev_args) {
+            return report(result);
+        }
+    }
+    let result = match Mode::parse(args) {
+        Ok(Mode::Run { path, demo_diff }) => run(path, demo_diff),
+        Ok(Mode::GpuProbe) => gpu_probe(),
+        Err(arg) => {
+            eprintln!("bnknotes: unknown argument {arg:?}; {USAGE}");
+            return ExitCode::from(2);
+        }
+    };
+    report(result)
+}
+
+fn report(result: Result<()>) -> ExitCode {
+    match result {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("bnknotes: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn run(path: Option<PathBuf>, demo_diff: bool) -> Result<()> {
     let mut state = State::new(path)?;
     if demo_diff {
         state.open_demo_diff();
@@ -178,11 +211,9 @@ pub fn run(path: Option<PathBuf>, demo_diff: bool) -> Result<()> {
     state.bring_up()
 }
 
-/// `--gpu-probe`: report what the compositor offers the dmabuf presentation
-/// path (and, in later milestones, what the GPU offers), without opening a
-/// window. This is the same negotiation the editor performs at startup, so a
-/// successful probe means the GPU backend's protocol prerequisites hold.
-pub fn gpu_probe() -> Result<()> {
+/// Runs the startup negotiation without opening a window, so a successful probe
+/// means the GPU path's protocol prerequisites hold.
+fn gpu_probe() -> Result<()> {
     State::new(None)?.probe_dmabuf()
 }
 

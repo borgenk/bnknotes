@@ -6,6 +6,7 @@ use std::process::ExitCode;
 
 mod ai;
 mod app;
+mod cli;
 mod config;
 #[cfg(any(test, feature = "dev"))]
 mod dev;
@@ -36,20 +37,21 @@ mod tree;
 mod watch;
 
 pub fn main() -> ExitCode {
-    let args: Vec<String> = std::env::args().skip(1).collect();
+    let args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
     #[cfg(any(test, feature = "dev"))]
     {
-        if let Some(result) = dev::run(&args) {
+        let dev_args: Vec<String> = args.iter().map(|a| a.to_string_lossy().into()).collect();
+        if let Some(result) = dev::run(&dev_args) {
             return report(result);
         }
     }
-    // `--gpu-probe` reports what the compositor offers the GPU presentation path,
-    // without opening a window. Everything else launches the editor (with an
-    // optional file path).
-    let result = if args.iter().any(|a| a == "--gpu-probe") {
-        app::gpu_probe()
-    } else {
-        app::run()
+    let result = match cli::Mode::parse(args) {
+        Ok(cli::Mode::Run { path, demo_diff }) => app::run(path, demo_diff),
+        Ok(cli::Mode::GpuProbe) => app::gpu_probe(),
+        Err(arg) => {
+            eprintln!("bnknotes: unknown argument {arg:?}; {}", cli::USAGE);
+            return ExitCode::from(2);
+        }
     };
     report(result)
 }

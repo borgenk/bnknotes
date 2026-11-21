@@ -170,16 +170,7 @@ impl Scaling {
     }
 }
 
-pub fn run() -> Result<()> {
-    let args: Vec<String> = std::env::args().skip(1).collect();
-    // `--demo-diff` opens a demonstration diff review at startup (every diff concept in
-    // one tab), so the view can be seen and tuned without running a real AI action.
-    let demo_diff = args.iter().any(|a| a == "--demo-diff");
-    // The first non-flag argument is the file to open, if any.
-    let path = args
-        .iter()
-        .find(|a| !a.starts_with("--"))
-        .map(PathBuf::from);
+pub fn run(path: Option<PathBuf>, demo_diff: bool) -> Result<()> {
     let mut state = State::new(path)?;
     if demo_diff {
         state.open_demo_diff();

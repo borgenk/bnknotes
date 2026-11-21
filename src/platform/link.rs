@@ -75,20 +75,6 @@ pub fn urls(text: &str) -> impl Iterator<Item = Range<usize>> + '_ {
     })
 }
 
-/// The byte range of the URL covering `at` in `text`, or `None` when that offset is
-/// not inside one. `at` is a byte offset of the character being asked about (the
-/// glyph under the pointer, in the caller's case).
-///
-/// Candidates are examined left to right rather than searched outward from `at`,
-/// because a URL's extent is a function of where it *starts*: only the scheme says
-/// which characters are still part of it, so scanning backwards from a byte in the
-/// middle could not tell `?` in a query string from `?` at the end of a question. The
-/// first URL reaching past `at` therefore either covers it or begins after it, and in
-/// the latter case nothing else can cover it.
-pub fn find_at(text: &str, at: usize) -> Option<Range<usize>> {
-    urls(text).find(|r| r.end > at).filter(|r| r.start <= at)
-}
-
 /// The length of the scheme starting exactly at `at`, or `None` when no scheme does.
 ///
 /// The token-boundary check is what stops `xhttps://x` and `see-mailto:x` from reading
@@ -199,21 +185,6 @@ fn classify(c: char) -> Class {
 mod tests {
     use super::*;
 
-    /// The URL covering the first byte of `needle` in `text`, as [`find_at`] sees it.
-    /// Panics when `needle` is absent, so a typo in a case reads as a test bug.
-    fn at_needle(text: &str, needle: &str) -> Option<String> {
-        let at = text.find(needle).expect("needle not in text");
-        find_at(text, at).map(|r| text[r].to_string())
-    }
-
-    /// The URL covering the offset of the first `|` in `marked`, which is removed
-    /// before scanning. Lets a case point at the exact character being hovered.
-    fn at_cursor(marked: &str) -> Option<String> {
-        let at = marked.find('|').expect("no cursor in case");
-        let text = marked.replace('|', "");
-        find_at(&text, at).map(|r| text[r].to_string())
-    }
-
     /// Every URL in `text`, as [`urls`] yields them.
     fn all(text: &str) -> Vec<&str> {
         urls(text).map(|r| &text[r]).collect()
@@ -221,54 +192,25 @@ mod tests {
 
     #[test]
     fn a_bare_url_is_found_whole() {
-        assert_eq!(
-            at_needle("https://example.com/a/b", "https"),
-            Some("https://example.com/a/b".into())
-        );
-    }
-
-    #[test]
-    fn a_url_is_found_from_any_byte_inside_it() {
-        let text = "see https://example.com/path now";
-        // Every offset from the scheme's `h` to the path's last character resolves to
-        // the same link, so hovering anywhere along it decorates the whole thing. The
-        // word after it resolves to nothing.
-        for needle in ["https", "//", "example", "com", "/path", "now"] {
-            let at = text.find(needle).expect("needle");
-            let found = find_at(text, at).map(|r| &text[r]);
-            let expected = (needle != "now").then_some("https://example.com/path");
-            assert_eq!(found, expected, "at {needle:?}");
-        }
-    }
-
-    #[test]
-    fn an_offset_outside_every_url_finds_nothing() {
-        let text = "see https://example.com now";
-        assert_eq!(at_cursor("s|ee https://example.com now"), None);
-        assert_eq!(find_at(text, text.len()), None);
-        assert_eq!(find_at("no links here at all", 3), None);
-        assert_eq!(find_at("", 0), None);
+        assert_eq!(all("https://example.com/a/b"), ["https://example.com/a/b"]);
     }
 
     #[test]
     fn trailing_sentence_punctuation_is_left_to_the_sentence() {
         // Only punctuation follows, so none of it is part of the link.
         assert_eq!(
-            at_needle("go to https://example.com/a.", "https"),
-            Some("https://example.com/a".into())
+            all("go to https://example.com/a."),
+            ["https://example.com/a"]
         );
         assert_eq!(
-            at_needle("https://example.com/a, and then", "https"),
-            Some("https://example.com/a".into())
+            all("https://example.com/a, and then"),
+            ["https://example.com/a"]
         );
         assert_eq!(
-            at_needle("really? https://example.com/a?!", "https"),
-            Some("https://example.com/a".into())
+            all("really? https://example.com/a?!"),
+            ["https://example.com/a"]
         );
-        assert_eq!(
-            at_needle("https://example.com/a...", "https"),
-            Some("https://example.com/a".into())
-        );
+        assert_eq!(all("https://example.com/a..."), ["https://example.com/a"]);
     }
 
     #[test]
@@ -276,56 +218,47 @@ mod tests {
         // The same characters, with something other than punctuation after them, are
         // ordinary URL bytes: a dotted path, a query string, a port, a fragment.
         assert_eq!(
-            at_needle("https://example.com/a.b.c", "https"),
-            Some("https://example.com/a.b.c".into())
+            all("https://example.com/a.b.c"),
+            ["https://example.com/a.b.c"]
         );
         assert_eq!(
-            at_needle("https://example.com/s?q=a,b&n=1#top", "https"),
-            Some("https://example.com/s?q=a,b&n=1#top".into())
+            all("https://example.com/s?q=a,b&n=1#top"),
+            ["https://example.com/s?q=a,b&n=1#top"]
         );
-        // A dev server's URL has no dot in the host at all, which is why we never
-        // require one.
+        // A dev server's URL has no dot in the host at all, which is why none is
+        // required.
         assert_eq!(
-            at_needle("serving on http://localhost:3000/ ok", "http"),
-            Some("http://localhost:3000/".into())
+            all("serving on http://localhost:3000/ ok"),
+            ["http://localhost:3000/"]
         );
     }
 
     #[test]
     fn a_url_closes_the_brackets_it_opened() {
         assert_eq!(
-            at_needle("https://en.wikipedia.org/wiki/Cure_(album) rocks", "https"),
-            Some("https://en.wikipedia.org/wiki/Cure_(album)".into())
+            all("https://en.wikipedia.org/wiki/Cure_(album) rocks"),
+            ["https://en.wikipedia.org/wiki/Cure_(album)"]
         );
         // Nested, and with the sentence's own period after it.
         assert_eq!(
-            at_needle("https://example.com/a(b(c)d)e.", "https"),
-            Some("https://example.com/a(b(c)d)e".into())
+            all("https://example.com/a(b(c)d)e."),
+            ["https://example.com/a(b(c)d)e"]
         );
         // An IPv6 literal host is bracket-balanced by the same stack.
-        assert_eq!(
-            at_needle("http://[::1]:8080/x", "http"),
-            Some("http://[::1]:8080/x".into())
-        );
+        assert_eq!(all("http://[::1]:8080/x"), ["http://[::1]:8080/x"]);
     }
 
     #[test]
     fn a_bracket_the_url_did_not_open_belongs_to_the_prose() {
         assert_eq!(
-            at_needle("(see https://example.com/a)", "https"),
-            Some("https://example.com/a".into())
+            all("(see https://example.com/a)"),
+            ["https://example.com/a"]
         );
         // The parenthetical closes *and* the sentence ends.
-        assert_eq!(
-            at_needle("(https://example.com/a).", "https"),
-            Some("https://example.com/a".into())
-        );
+        assert_eq!(all("(https://example.com/a)."), ["https://example.com/a"]);
         // A bracket the URL opened but never closed takes everything after it out of
         // the link: half a bracketed path is not a path.
-        assert_eq!(
-            at_needle("https://example.com/a(b c", "https"),
-            Some("https://example.com/a".into())
-        );
+        assert_eq!(all("https://example.com/a(b c"), ["https://example.com/a"]);
     }
 
     #[test]
@@ -333,50 +266,32 @@ mod tests {
         // `<`, `>`, and `"` cannot appear in a URL, so they end one with no special
         // case: this is RFC 3986 doing the work. The `<https://x>` form is also how
         // markdown writes an autolink, so it falls out for free.
-        assert_eq!(
-            at_needle("<https://example.com/a>", "https"),
-            Some("https://example.com/a".into())
-        );
-        assert_eq!(
-            at_needle("\"https://example.com/a\"", "https"),
-            Some("https://example.com/a".into())
-        );
-        assert_eq!(
-            at_needle("'https://example.com/a'", "https"),
-            Some("https://example.com/a".into())
-        );
+        assert_eq!(all("<https://example.com/a>"), ["https://example.com/a"]);
+        assert_eq!(all("\"https://example.com/a\""), ["https://example.com/a"]);
+        assert_eq!(all("'https://example.com/a'"), ["https://example.com/a"]);
     }
 
     #[test]
     fn a_scheme_must_start_a_token() {
         // The tail of a longer word only looks like a scheme.
-        assert_eq!(at_needle("xhttps://example.com", "https"), None);
-        assert_eq!(at_needle("not-a-mailto:x@y.com", "mailto"), None);
-        assert_eq!(at_needle("1.https://example.com", "https"), None);
+        assert!(all("xhttps://example.com").is_empty());
+        assert!(all("not-a-mailto:x@y.com").is_empty());
+        assert!(all("1.https://example.com").is_empty());
         // A delimiter before it is a boundary, so this one is real.
-        assert_eq!(
-            at_needle("url=https://example.com/a", "https"),
-            Some("https://example.com/a".into())
-        );
+        assert_eq!(all("url=https://example.com/a"), ["https://example.com/a"]);
     }
 
     #[test]
-    fn only_schemes_we_can_open_are_detected() {
-        // The detect set is the open set: never decorate what we would then refuse to
-        // follow, and never make a hostile scheme reachable in the first place.
-        assert_eq!(at_needle("javascript:alert(1)", "javascript"), None);
-        assert_eq!(at_needle("data:text/html,<h1>x", "data"), None);
-        assert_eq!(at_needle("ftp://example.com/a", "ftp"), None);
-        assert_eq!(at_needle("see example.com/a", "example"), None);
-        assert_eq!(
-            at_needle("mail me at mailto:a@b.com ok", "mailto"),
-            Some("mailto:a@b.com".into())
-        );
-        assert_eq!(
-            at_needle("file:///etc/hosts", "file"),
-            Some("file:///etc/hosts".into())
-        );
-        // Whatever we do detect, the browser will in fact launch.
+    fn only_schemes_the_browser_can_open_are_detected() {
+        // The detect set is the open set: never decorate what would then be refused,
+        // and never make a hostile scheme reachable in the first place.
+        assert!(all("javascript:alert(1)").is_empty());
+        assert!(all("data:text/html,<h1>x").is_empty());
+        assert!(all("ftp://example.com/a").is_empty());
+        assert!(all("see example.com/a").is_empty());
+        assert_eq!(all("mail me at mailto:a@b.com ok"), ["mailto:a@b.com"]);
+        assert_eq!(all("file:///etc/hosts"), ["file:///etc/hosts"]);
+        // Whatever is detected, the browser will in fact launch.
         for url in all("https://a.com http://b.com file:///c mailto:d@e.com") {
             assert!(browser::can_open(url), "{url} is detected but not openable");
         }
@@ -384,10 +299,10 @@ mod tests {
 
     #[test]
     fn a_scheme_with_no_host_is_not_a_link() {
-        // `extent` collapses to the scheme itself, which covers no offset past it.
-        assert_eq!(find_at("https://", 0), None);
-        assert_eq!(find_at("say https:// then", 4), None);
-        assert_eq!(find_at("mailto:", 0), None);
+        // `extent` collapses to the scheme itself, so nothing is yielded.
+        assert!(all("https://").is_empty());
+        assert!(all("say https:// then").is_empty());
+        assert!(all("mailto:").is_empty());
         assert!(all("https:// and mailto: alone").is_empty());
     }
 
@@ -398,6 +313,7 @@ mod tests {
             ["https://one.com/x", "http://two.com/y"]
         );
         assert!(all("no links here at all").is_empty());
+        assert!(all("").is_empty());
         // A scheme nested in a query string is swallowed by the URL that contains it,
         // not reported a second time on its own.
         assert_eq!(
@@ -407,49 +323,25 @@ mod tests {
     }
 
     #[test]
-    fn the_right_url_is_returned_when_a_line_holds_several() {
-        let text = "a https://one.com/x b http://two.com/y c";
-        assert_eq!(
-            at_needle(text, "https"),
-            Some("https://one.com/x".into()),
-            "first"
-        );
-        assert_eq!(
-            at_needle(text, "http://two"),
-            Some("http://two.com/y".into()),
-            "second"
-        );
-        // The gap between them belongs to neither.
-        assert_eq!(at_cursor("a https://one.com/x |b http://two.com/y c"), None);
-        assert_eq!(
-            at_needle("https://a.com/r?to=http://b.com/x", "http://b"),
-            Some("https://a.com/r?to=http://b.com/x".into())
-        );
-    }
-
-    #[test]
     fn an_iri_keeps_its_non_ascii() {
         assert_eq!(
-            at_needle("https://de.wikipedia.org/wiki/Grüße ok", "https"),
-            Some("https://de.wikipedia.org/wiki/Grüße".into())
+            all("https://de.wikipedia.org/wiki/Grüße ok"),
+            ["https://de.wikipedia.org/wiki/Grüße"]
         );
         // A multi-byte character before a scheme is a boundary, and one that lands
         // mid-character never splits it.
-        assert_eq!(
-            at_needle("så https://example.com/a", "https"),
-            Some("https://example.com/a".into())
-        );
+        assert_eq!(all("så https://example.com/a"), ["https://example.com/a"]);
     }
 
     #[test]
     fn a_url_at_either_edge_of_the_line_is_whole() {
         assert_eq!(
-            at_needle("https://example.com/a and text", "https"),
-            Some("https://example.com/a".into())
+            all("https://example.com/a and text"),
+            ["https://example.com/a"]
         );
         assert_eq!(
-            at_needle("text and https://example.com/a", "https"),
-            Some("https://example.com/a".into())
+            all("text and https://example.com/a"),
+            ["https://example.com/a"]
         );
     }
 
@@ -458,23 +350,17 @@ mod tests {
         // Pasted text can run a URL up against a control byte; it must never be
         // swallowed into the link.
         assert_eq!(
-            at_needle("https://example.com/a\u{7}b", "https"),
-            Some("https://example.com/a".into())
+            all("https://example.com/a\u{7}b"),
+            ["https://example.com/a"]
         );
-        assert_eq!(
-            at_needle("https://example.com/a\tb", "https"),
-            Some("https://example.com/a".into())
-        );
+        assert_eq!(all("https://example.com/a\tb"), ["https://example.com/a"]);
     }
 
     #[test]
     fn absurd_bracket_nesting_is_refused_rather_than_trusted() {
-        // Past MAX_NESTING we stop believing this is a URL and keep only what was safe
-        // before the nesting ran away. Bounded work on hostile input.
+        // Past MAX_NESTING the scan stops believing this is a URL and keeps only what
+        // was safe before the nesting ran away. Bounded work on hostile input.
         let deep = format!("https://example.com/{}x", "(".repeat(MAX_NESTING + 4));
-        assert_eq!(
-            at_needle(&deep, "https"),
-            Some("https://example.com/".into())
-        );
+        assert_eq!(all(&deep), ["https://example.com/"]);
     }
 }

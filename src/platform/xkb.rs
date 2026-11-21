@@ -6,7 +6,7 @@
 //! What a key *means* belongs to the app that binds it, so this layer answers only
 //! the questions the machine can answer about a keycode: the keysym it resolves to
 //! under the current layout ([`Xkb::key_sym`]), the text it produces
-//! ([`Xkb::key_text`], [`Xkb::key_char`]), whether it auto-repeats, and which
+//! ([`Xkb::key_text`]), whether it auto-repeats, and which
 //! modifiers are held. The app turns those into its own actions, which is what keeps
 //! the app's shortcuts out of the platform layer.
 //!
@@ -90,7 +90,6 @@ unsafe extern "C" {
     fn xkb_state_key_get_utf8(st: *mut c_void, key: u32, buf: *mut c_char, size: usize) -> c_int;
     fn xkb_state_mod_name_is_active(st: *mut c_void, name: *const c_char, type_: u32) -> c_int;
     fn xkb_state_key_get_one_sym(st: *mut c_void, key: u32) -> u32;
-    fn xkb_keysym_to_utf32(keysym: u32) -> u32;
     fn xkb_keymap_key_repeats(keymap: *mut c_void, key: u32) -> c_int;
     fn xkb_compose_table_new_from_locale(
         ctx: *mut c_void,
@@ -219,24 +218,6 @@ impl Xkb {
     /// Whether (plain) Alt is currently active; the find bar's mode toggles.
     pub fn alt_active(&self) -> bool {
         self.mod_active(XKB_MOD_NAME_ALT)
-    }
-
-    /// The base character a text key produces, from its keysym: Shift and the
-    /// layout are applied (so `Shift+2` on a US layout is `'@'`), but Ctrl and
-    /// Alt are not, which leaves them to a caller that encodes modified keys
-    /// itself. `None` for a key with no printable character (a modifier, a
-    /// named key, an unresolved dead key), which the caller then treats as a
-    /// named key or ignores. Control and DEL scalars are filtered out so only
-    /// real graphic input flows through this path.
-    pub fn key_char(&self, keycode: u32) -> Option<char> {
-        let state = self.state?;
-        // SAFETY: state is valid; the sym lookup only reads it. The keysym
-        // reflects Shift and the layout but is Ctrl/Alt-independent.
-        let sym = unsafe { xkb_state_key_get_one_sym(state.as_ptr(), keycode + EVDEV_OFFSET) };
-        // SAFETY: a pure value conversion; 0 means the keysym has no Unicode form.
-        let cp = unsafe { xkb_keysym_to_utf32(sym) };
-        let c = char::from_u32(cp)?;
-        (cp >= 0x20 && c != '\u{7f}').then_some(c)
     }
 
     fn mod_active(&self, name: &[u8]) -> bool {
@@ -400,7 +381,6 @@ mod tests {
         let xkb = Xkb::new().expect("xkb context");
         assert_eq!(xkb.key_sym(30), None);
         assert_eq!(xkb.key_text(30), None);
-        assert_eq!(xkb.key_char(30), None);
         assert!(!xkb.key_repeats(30));
     }
 

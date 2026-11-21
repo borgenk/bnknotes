@@ -71,10 +71,12 @@ build-linux: build-prod
 	cd dist && sha256sum $(TARBALL) > $(TARBALL).sha256
 	@echo "Built dist/$(TARBALL), with a .sha256"
 
-# Format check, lint, and tests
+# Format check, lint, and tests. Clippy runs twice: the test build counts anything a
+# test calls as used, so only the shipping build finds code nothing else reaches.
 test:
 	cargo fmt --check
 	cargo clippy --all --benches --tests --examples --all-features -- -D clippy::all -D warnings
+	cargo clippy -- -D clippy::all -D warnings
 	cargo test
 
 # The installer, over file:// URLs, with no network.

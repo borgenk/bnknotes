@@ -357,8 +357,6 @@ pub struct Glyph {
     pub top: i32,
     pub width: usize,
     pub rows: usize,
-    /// Pen advance in pixels.
-    pub advance: f32,
     pub coverage: Vec<u8>,
 }
 
@@ -369,7 +367,6 @@ impl Glyph {
             top: 0,
             width: 0,
             rows: 0,
-            advance: 0.0,
             coverage: Vec::new(),
         }
     }
@@ -608,21 +605,17 @@ impl Face {
             return Glyph::empty();
         };
         let slot = unsafe { slot.as_ref() };
-        let advance = slot.advance.x as f32 / 64.0;
         // The blit treats coverage as one byte per pixel, true only for the gray
-        // render mode. Skip non-gray ink but keep the advance so layout holds.
+        // render mode, so other ink is skipped. Layout measures through
+        // Self::advance, so a skipped glyph still holds its place.
         if slot.bitmap.pixel_mode != FT_PIXEL_MODE_GRAY {
-            return Glyph {
-                advance,
-                ..Glyph::empty()
-            };
+            return Glyph::empty();
         }
         Glyph {
             left: slot.bitmap_left,
             top: slot.bitmap_top,
             width: slot.bitmap.width as usize,
             rows: slot.bitmap.rows as usize,
-            advance,
             coverage: copy_coverage(&slot.bitmap),
         }
     }
@@ -1104,7 +1097,7 @@ mod tests {
             g.coverage.iter().any(|&c| c > 0),
             "A should have inked pixels"
         );
-        assert!(g.advance > 0.0);
+        assert!(face.advance('A') > 0.0);
     }
 
     #[test]
@@ -1118,7 +1111,6 @@ mod tests {
         assert_eq!(a.top, b.top);
         assert_eq!(a.width, b.width);
         assert_eq!(a.rows, b.rows);
-        assert_eq!(a.advance, b.advance);
         assert_eq!(a.coverage, b.coverage);
     }
 
@@ -1172,7 +1164,7 @@ mod tests {
         let g = face.rasterize(' ');
         assert_eq!(g.rows, 0);
         assert!(g.coverage.is_empty());
-        assert!(g.advance > 0.0, "space still advances the pen");
+        assert!(face.advance(' ') > 0.0, "space still advances the pen");
     }
 
     #[test]

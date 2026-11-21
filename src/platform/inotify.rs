@@ -32,7 +32,6 @@ const IN_DELETE_SELF: u32 = 0x0000_0400;
 const IN_MOVE_SELF: u32 = 0x0000_0800;
 
 pub const IN_IGNORED: u32 = 0x0000_8000;
-pub const IN_Q_OVERFLOW: u32 = 0x0000_4000;
 
 /// The mask a directory watch is armed with: any change to the set of names in
 /// the directory, plus the directory's own disappearance. IN_MODIFY is left out
@@ -63,14 +62,10 @@ unsafe extern "C" {
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct Wd(c_int);
 
-/// One inotify event as the kernel laid it out: which watch fired, the bitmask of
-/// what happened, and the entry name (empty for an event about the directory
-/// itself). The name borrows the drain buffer, so it is only valid inside the
-/// callback.
-pub struct Event<'a> {
+/// One inotify event: which watch fired and the bitmask of what happened.
+pub struct Event {
     pub wd: Wd,
     pub mask: u32,
-    pub name: &'a [u8],
 }
 
 /// An open inotify instance. Owns the fd (closed on drop) and nothing else; the
@@ -131,7 +126,7 @@ impl Inotify {
     /// Drain every queued event into `f`, using `buf` as reusable scratch. Reads
     /// until the fd would block, so a burst is consumed in one drain. The kernel
     /// never splits an event across reads, so each read yields whole records.
-    pub fn for_each_event<F: FnMut(Event<'_>)>(&self, buf: &mut [u8], mut f: F) -> Result<()> {
+    pub fn for_each_event<F: FnMut(Event)>(&self, buf: &mut [u8], mut f: F) -> Result<()> {
         loop {
             // SAFETY: buf is a valid, writable slice of the given length; read
             // writes at most that many bytes and returns the count.
@@ -163,7 +158,7 @@ impl Inotify {
 /// Walk one read's worth of packed inotify_event records. Each record is a fixed
 /// 16-byte header (wd, mask, cookie, name length) followed by the NUL-padded
 /// name; the next record begins right after it.
-fn parse_events<F: FnMut(Event<'_>)>(bytes: &[u8], f: &mut F) {
+fn parse_events<F: FnMut(Event)>(bytes: &[u8], f: &mut F) {
     const HEADER: usize = 16;
     let mut i = 0;
     while i + HEADER <= bytes.len() {
@@ -171,23 +166,11 @@ fn parse_events<F: FnMut(Event<'_>)>(bytes: &[u8], f: &mut F) {
         let mask = u32::from_ne_bytes([bytes[i + 4], bytes[i + 5], bytes[i + 6], bytes[i + 7]]);
         let len = u32::from_ne_bytes([bytes[i + 12], bytes[i + 13], bytes[i + 14], bytes[i + 15]])
             as usize;
-        let name_start = i + HEADER;
-        let name_end = name_start + len;
+        let name_end = i + HEADER + len;
         if name_end > bytes.len() {
             break;
         }
-        // The name field is NUL-padded to align the next record; trim to the
-        // first NUL to get the real entry name (empty for a self event).
-        let raw = &bytes[name_start..name_end];
-        let name = match raw.iter().position(|&b| b == 0) {
-            Some(nul) => &raw[..nul],
-            None => raw,
-        };
-        f(Event {
-            wd: Wd(wd),
-            mask,
-            name,
-        });
+        f(Event { wd: Wd(wd), mask });
         i = name_end;
     }
 }
@@ -209,12 +192,12 @@ mod tests {
     /// Read events until at least one arrives or the attempt budget runs out.
     /// inotify delivery is asynchronous, so a single drain may see an empty queue;
     /// a short bounded poll avoids both a hang and a flake.
-    fn drain_until_event(ino: &Inotify) -> Vec<(u32, String)> {
+    fn drain_until_event(ino: &Inotify) -> Vec<u32> {
         let mut buf = [0u8; 4096];
         let mut out = Vec::new();
         for _ in 0..200 {
             ino.for_each_event(&mut buf, |e| {
-                out.push((e.mask, String::from_utf8_lossy(e.name).into_owned()));
+                out.push(e.mask);
             })
             .unwrap();
             if !out.is_empty() {
@@ -235,8 +218,8 @@ mod tests {
 
         let events = drain_until_event(&ino);
         assert!(
-            events.iter().any(|(_, name)| name == "note.md"),
-            "expected an event naming note.md, got {events:?}"
+            events.iter().any(|mask| mask & IN_CREATE != 0),
+            "expected a create event, got {events:?}"
         );
         fs::remove_dir_all(&dir).ok();
     }
@@ -257,12 +240,12 @@ mod tests {
         fs::write(&tmp, b"new").unwrap();
         fs::rename(&tmp, &target).unwrap();
 
+        // Only the rename's target receives a MOVED_TO: the temp file is created and
+        // written, then moved away.
         let events = drain_until_event(&ino);
         assert!(
-            events
-                .iter()
-                .any(|(mask, name)| name == "note.md" && mask & IN_MOVED_TO != 0),
-            "expected MOVED_TO for note.md, got {events:?}"
+            events.iter().any(|mask| mask & IN_MOVED_TO != 0),
+            "expected MOVED_TO for the target, got {events:?}"
         );
         fs::remove_dir_all(&dir).ok();
     }
@@ -281,14 +264,12 @@ mod tests {
 
         fs::write(dir.join("after.md"), b"x").unwrap();
         std::thread::sleep(std::time::Duration::from_millis(20));
-        let mut names = Vec::new();
-        ino.for_each_event(&mut buf, |e| {
-            names.push(String::from_utf8_lossy(e.name).into_owned())
-        })
-        .unwrap();
+        let mut masks = Vec::new();
+        ino.for_each_event(&mut buf, |e| masks.push(e.mask))
+            .unwrap();
         assert!(
-            !names.iter().any(|n| n == "after.md"),
-            "removed watch still reported {names:?}"
+            !masks.iter().any(|mask| mask & !IN_IGNORED != 0),
+            "removed watch still reported {masks:?}"
         );
         fs::remove_dir_all(&dir).ok();
     }
@@ -312,15 +293,7 @@ mod tests {
         record(&mut bytes, 2, IN_DELETE, "beta");
 
         let mut seen = Vec::new();
-        parse_events(&bytes, &mut |e| {
-            seen.push((e.wd.0, e.mask, String::from_utf8_lossy(e.name).into_owned()));
-        });
-        assert_eq!(
-            seen,
-            vec![
-                (1, IN_CREATE, "alpha.md".to_string()),
-                (2, IN_DELETE, "beta".to_string()),
-            ]
-        );
+        parse_events(&bytes, &mut |e| seen.push((e.wd.0, e.mask)));
+        assert_eq!(seen, vec![(1, IN_CREATE), (2, IN_DELETE)]);
     }
 }

@@ -1,32 +1,20 @@
 //! Font discovery through `libfontconfig`.
 //!
-//! This module resolves configured family names to files, and can find a fallback face
-//! for a character the selected fonts cannot draw.
-//!
-//! Family queries apply the current fontconfig configuration. Fallback discovery ranks
-//! the fonts once, scalable first, then scans the character maps of those with outlines.
-//!
-//! All C types are opaque except `FcFontSet`, whose layout is pinned against a C compiler
-//! in the tests.
+//! This module resolves configured family names to files. Family queries apply the
+//! current fontconfig configuration. All C types are opaque.
 
 use std::ffi::{CStr, CString, OsString};
 use std::os::unix::ffi::OsStringExt;
 use std::path::PathBuf;
 use std::ptr;
 
-use core::ffi::{c_char, c_int, c_uchar, c_uint};
+use core::ffi::{c_char, c_int, c_uchar};
 
 use crate::platform::freetype::FontStyle;
 
 /// An opaque fontconfig pattern: a bag of properties, both the query and the answer.
 #[repr(C)]
 struct FcPattern {
-    _opaque: [u8; 0],
-}
-
-/// An opaque set of characters: a font's coverage, which `font_for_char` queries.
-#[repr(C)]
-struct FcCharSet {
     _opaque: [u8; 0],
 }
 
@@ -40,9 +28,6 @@ struct FcConfig {
 // Property names (`fontconfig.h`). NUL-terminated because the C API takes `const char *`.
 const FC_FILE: &[u8] = b"file\0";
 const FC_INDEX: &[u8] = b"index\0";
-const FC_SCALABLE: &[u8] = b"scalable\0";
-const FC_OUTLINE: &[u8] = b"outline\0";
-const FC_CHARSET: &[u8] = b"charset\0";
 const FC_FAMILY: &[u8] = b"family\0";
 const FC_WEIGHT: &[u8] = b"weight\0";
 const FC_SLANT: &[u8] = b"slant\0";
@@ -66,7 +51,6 @@ unsafe extern "C" {
     fn FcInit() -> c_int;
     fn FcPatternCreate() -> *mut FcPattern;
     fn FcPatternDestroy(pattern: *mut FcPattern);
-    fn FcPatternAddBool(pattern: *mut FcPattern, object: *const c_char, value: c_int) -> c_int;
     fn FcPatternAddString(
         pattern: *mut FcPattern,
         object: *const c_char,
@@ -85,50 +69,13 @@ unsafe extern "C" {
         index: c_int,
         value: *mut c_int,
     ) -> c_int;
-    fn FcPatternGetBool(
-        pattern: *const FcPattern,
-        object: *const c_char,
-        index: c_int,
-        value: *mut c_int,
-    ) -> c_int;
     fn FcConfigSubstitute(config: *mut FcConfig, pattern: *mut FcPattern, kind: c_int) -> c_int;
     fn FcDefaultSubstitute(pattern: *mut FcPattern);
-    fn FcFontSort(
-        config: *mut FcConfig,
-        pattern: *mut FcPattern,
-        trim: c_int,
-        csp: *mut *mut FcCharSet,
-        result: *mut c_int,
-    ) -> *mut FcFontSet;
     fn FcFontMatch(
         config: *mut FcConfig,
         pattern: *mut FcPattern,
         result: *mut c_int,
     ) -> *mut FcPattern;
-    fn FcFontSetDestroy(set: *mut FcFontSet);
-    fn FcPatternGetCharSet(
-        pattern: *const FcPattern,
-        object: *const c_char,
-        index: c_int,
-        charset: *mut *mut FcCharSet,
-    ) -> c_int;
-    fn FcCharSetHasChar(charset: *const FcCharSet, ch: c_uint) -> c_int;
-}
-
-/// `FcFontSet` (`fontconfig.h`), the one type in the C API we touch that has a layout
-/// rather than being an opaque handle. Mirrored field for field; its size, alignment,
-/// and offsets are pinned against a C compiler in the tests below.
-///
-/// ```text
-///   nfont ─ how many fonts are in `fonts`
-///   sfont ─ how many slots are allocated (fontconfig's business, not ours)
-///   fonts ─ the patterns themselves, in preference order
-/// ```
-#[repr(C)]
-struct FcFontSet {
-    nfont: c_int,
-    sfont: c_int,
-    fonts: *mut *mut FcPattern,
 }
 
 /// A resolved font path and its FreeType face index.
@@ -303,126 +250,6 @@ fn weight_and_slant(style: FontStyle) -> (c_int, c_int) {
     }
 }
 
-/// The system's fonts, ranked once for fallback lookup, scalable ones first.
-///
-/// Later lookups scan retained character maps instead of running a new match. Fontconfig
-/// trims fonts that add no coverage beyond earlier entries.
-pub struct Fontconfig {
-    /// The ranked fonts. Owned: the charsets borrowed in [`font_for_char`](Self::font_for_char)
-    /// point into these patterns, so the set must outlive every query made against it.
-    set: *mut FcFontSet,
-}
-
-impl Fontconfig {
-    /// Rank system fallback fonts, or `None` when fontconfig is unavailable or empty.
-    pub fn new() -> Option<Self> {
-        // SAFETY: FcInit takes no arguments and is idempotent; it returns FcFalse when the
-        // configuration cannot be loaded.
-        if unsafe { FcInit() } != FC_TRUE {
-            return None;
-        }
-
-        let query = Pattern::new()?;
-        // SAFETY: query is live; the object name is a NUL-terminated literal. A bitmap face
-        // holds fixed sizes only, so it cannot be opened at the requested pixel size. Asking
-        // for scalable fonts ranks them first; the sort ranks rather than filters, so
-        // `font_for_char` skips the rest.
-        unsafe {
-            if FcPatternAddBool(query.0, FC_SCALABLE.as_ptr().cast(), FC_TRUE) != FC_TRUE {
-                return None;
-            }
-            // The standard two-step every fontconfig client performs before matching: apply
-            // the system's configured substitutions, then fill in the defaults they did not
-            // set. Skipping it does not fail loudly, it just quietly stops honoring the
-            // user's fontconfig rules, which would defeat the point of asking the system.
-            FcConfigSubstitute(ptr::null_mut(), query.0, FC_MATCH_PATTERN);
-            FcDefaultSubstitute(query.0);
-        }
-
-        let mut result: c_int = 0;
-        // SAFETY: query is live; a null config means the current (system) one; `trim` drops
-        // fonts adding no new coverage; a null `csp` declines the accumulated charset we do
-        // not need. The returned set is owned by us and freed in Drop.
-        let set = unsafe {
-            FcFontSort(
-                ptr::null_mut(),
-                query.0,
-                FC_TRUE,
-                ptr::null_mut(),
-                &mut result,
-            )
-        };
-        if set.is_null() {
-            return None;
-        }
-        // Owned before anything is checked, so Drop frees a set that is refused. With no
-        // fonts installed, fontconfig returns an empty set and no match.
-        let fonts = Fontconfig { set };
-        // SAFETY: set is non-null and was just returned by FcFontSort.
-        if result != FC_RESULT_MATCH || unsafe { (*set).nfont } <= 0 {
-            return None;
-        }
-        Some(fonts)
-    }
-
-    /// The font the system would use to draw `ch`: the first in the ranked set with
-    /// outlines whose character map contains it, or `None` when nothing installed does.
-    ///
-    /// A charset test against an in-memory bitset, per candidate, until one hits. No call
-    /// into fontconfig and no allocation, so this is cheap enough to ask per character and
-    /// let the caller memoize rather than the other way round.
-    pub fn font_for_char(&self, ch: char) -> Option<FontFile> {
-        // SAFETY: self.set is a live, owned FcFontSet with nfont > 0 (checked at
-        // construction); `fonts` points at nfont valid pattern pointers.
-        let (count, fonts) = unsafe { ((*self.set).nfont, (*self.set).fonts) };
-        for i in 0..count {
-            // SAFETY: i is in 0..nfont, so fonts[i] is one of the set's live patterns. It
-            // is borrowed, never freed here: the set owns it.
-            let font = unsafe { *fonts.add(i as usize) };
-            if font.is_null() {
-                continue;
-            }
-            let mut charset: *mut FcCharSet = ptr::null_mut();
-            // SAFETY: font is a live pattern; the object name is a NUL-terminated literal;
-            // charset is a live local fontconfig writes a *borrowed* pointer through, valid
-            // for as long as the pattern (and so the set) lives.
-            let found =
-                unsafe { FcPatternGetCharSet(font, FC_CHARSET.as_ptr().cast(), 0, &mut charset) };
-            if found != FC_RESULT_MATCH || charset.is_null() {
-                continue;
-            }
-            // SAFETY: charset is a live FcCharSet borrowed from the pattern above.
-            if unsafe { FcCharSetHasChar(charset, ch as u32) } != FC_TRUE {
-                continue;
-            }
-            // A font without outlines holds fixed sizes only and cannot open at the requested
-            // pixel size. A color emoji font is one, though fontconfig calls it scalable.
-            if pattern_bool(font, FC_OUTLINE) == Some(false) {
-                continue;
-            }
-            // A font that claims the character. Its file is the answer; a font with no file
-            // cannot be opened, so keep walking rather than give up on the character.
-            if let Some(path) = pattern_path(font, FC_FILE) {
-                return Some(FontFile {
-                    path,
-                    // No index property means a plain single-face font: face 0.
-                    index: pattern_integer(font, FC_INDEX).unwrap_or(0),
-                });
-            }
-        }
-        None
-    }
-}
-
-impl Drop for Fontconfig {
-    fn drop(&mut self) {
-        // SAFETY: self.set came from FcFontSort, is non-null (checked at construction), and
-        // is destroyed exactly once. Every charset borrowed from it is gone by now: they are
-        // only ever read inside `font_for_char`, which never lets one escape.
-        unsafe { FcFontSetDestroy(self.set) };
-    }
-}
-
 /// Every string value of a pattern property, in fontconfig preference order.
 fn pattern_strings(pattern: *const FcPattern, object: &[u8]) -> Vec<String> {
     (0..)
@@ -471,14 +298,6 @@ fn pattern_integer(pattern: *const FcPattern, object: &[u8]) -> Option<i32> {
     (result == FC_RESULT_MATCH).then_some(value)
 }
 
-/// A boolean property of a pattern, or `None` when it does not carry one.
-fn pattern_bool(pattern: *const FcPattern, object: &[u8]) -> Option<bool> {
-    let mut value: c_int = 0;
-    // SAFETY: as `pattern_string_at`; fontconfig writes the FcBool through the pointer.
-    let result = unsafe { FcPatternGetBool(pattern, object.as_ptr().cast(), 0, &mut value) };
-    (result == FC_RESULT_MATCH).then_some(value == FC_TRUE)
-}
-
 /// An owned `FcPattern`, freed on drop. Every early return in construction would otherwise
 /// leak one.
 struct Pattern(*mut FcPattern);
@@ -508,61 +327,16 @@ const _: Option<&FcConfig> = None;
 mod tests {
     use crate::platform::fontconfig::*;
 
-    /// Symbols used to exercise system fallback discovery.
-    const HOMELESS: [char; 6] = ['⏺', '⎿', '✓', '✗', '✻', '⠁'];
-
-    #[test]
-    fn fcfontset_matches_the_c_abi() {
-        // Values emitted by a C compiler for fontconfig's only nonopaque type used here.
-        assert_eq!(std::mem::size_of::<FcFontSet>(), 16);
-        assert_eq!(std::mem::align_of::<FcFontSet>(), 8);
-        let set = FcFontSet {
-            nfont: 0,
-            sfont: 0,
-            fonts: ptr::null_mut(),
-        };
-        let base = &set as *const FcFontSet as usize;
-        assert_eq!(&set.nfont as *const c_int as usize - base, 0);
-        assert_eq!(&set.sfont as *const c_int as usize - base, 4);
-        assert_eq!(&set.fonts as *const *mut *mut FcPattern as usize - base, 8);
-    }
-
-    #[test]
-    fn the_system_finds_a_font_for_symbols_a_text_font_lacks() {
-        let Some(fc) = Fontconfig::new() else {
-            eprintln!("no usable fontconfig in this environment; skipping");
-            return;
-        };
-        for ch in HOMELESS {
-            let found = fc.font_for_char(ch);
-            assert!(
-                found.is_some(),
-                "fontconfig found no font for {ch:?} (U+{:04X})",
-                ch as u32
-            );
-            let file = found.expect("just asserted");
-            assert!(
-                file.path.exists(),
-                "fontconfig named a font that is not on disk: {file:?}"
-            );
-            assert!(file.index >= 0, "a negative face index: {file:?}");
-        }
-    }
-
-    #[test]
-    fn a_plain_ascii_letter_resolves_too() {
-        let Some(fc) = Fontconfig::new() else {
-            return;
-        };
-        let found = fc
-            .font_for_char('A')
-            .expect("some font on this system has 'A'");
-        assert!(found.path.exists());
+    /// Whether fontconfig loads its configuration here; a test needing it skips when
+    /// it does not.
+    fn fontconfig_available() -> bool {
+        // SAFETY: FcInit takes no arguments and is idempotent.
+        unsafe { FcInit() == FC_TRUE }
     }
 
     #[test]
     fn the_system_resolves_its_generic_monospace() {
-        if Fontconfig::new().is_none() {
+        if !fontconfig_available() {
             eprintln!("no usable fontconfig in this environment; skipping");
             return;
         }
@@ -577,7 +351,7 @@ mod tests {
 
     #[test]
     fn every_style_resolves_to_a_file_that_exists() {
-        if Fontconfig::new().is_none() {
+        if !fontconfig_available() {
             return;
         }
         for style in [
@@ -595,7 +369,7 @@ mod tests {
     #[test]
     fn an_uninstalled_family_is_a_miss_not_a_substitute() {
         // FcFontMatch substitutes a nearby font, but named candidates must remain misses.
-        if Fontconfig::new().is_none() {
+        if !fontconfig_available() {
             return;
         }
         assert!(font_for_family("NoSuchFamilyExistsAnywhere", FontStyle::Regular).is_none());
@@ -603,7 +377,7 @@ mod tests {
 
     #[test]
     fn a_generic_alias_takes_whatever_it_resolves_to() {
-        if Fontconfig::new().is_none() {
+        if !fontconfig_available() {
             return;
         }
         for generic in GENERIC_FAMILIES {
@@ -649,13 +423,13 @@ mod tests {
 
     #[test]
     fn a_named_family_that_is_installed_comes_back() {
-        if Fontconfig::new().is_none() {
+        if !fontconfig_available() {
             return;
         }
         let Some(mono) = font_for_family("monospace", FontStyle::Regular) else {
             return;
         };
-        let Some(name) = installed_family_name(&mono) else {
+        let Some(name) = installed_family_name() else {
             return;
         };
         let by_name = font_for_family(&name, FontStyle::Regular)
@@ -663,22 +437,13 @@ mod tests {
         assert_eq!(by_name.path, mono.path);
     }
 
-    /// An installed family name derived without assuming the system's font selection.
-    fn installed_family_name(file: &FontFile) -> Option<String> {
-        let fc = Fontconfig::new()?;
-        // SAFETY: the set is live and owned by `fc`; the patterns inside are borrowed.
-        let (count, fonts) = unsafe { ((*fc.set).nfont, (*fc.set).fonts) };
-        for i in 0..count {
-            // SAFETY: i is in 0..nfont, so fonts[i] is one of the set's live patterns.
-            let font = unsafe { *fonts.add(i as usize) };
-            if font.is_null() {
-                continue;
-            }
-            if pattern_path(font, FC_FILE).as_ref() == Some(&file.path) {
-                return pattern_string_at(font, FC_FAMILY, 0);
-            }
-        }
-        None
+    /// An installed family name derived without assuming the system's font selection:
+    /// the name fontconfig gives the file the monospace alias resolves to.
+    fn installed_family_name() -> Option<String> {
+        match_family("monospace", FontStyle::Regular)?
+            .families
+            .into_iter()
+            .next()
     }
 
     #[test]
@@ -700,22 +465,5 @@ mod tests {
 
         let resolved = pattern_path(pattern.0, FC_FILE).expect("the path property");
         assert_eq!(resolved.as_os_str().as_bytes(), &path[..path.len() - 1]);
-    }
-
-    #[test]
-    fn every_call_is_independent() {
-        // A lookup only borrows the set's patterns and charsets, so a repeated query must
-        // keep answering rather than resolve once and then read a dangling or emptied
-        // pattern. Under a double free this is where it shows.
-        let Some(fc) = Fontconfig::new() else {
-            return;
-        };
-        let first = fc.font_for_char('✓');
-        let second = fc.font_for_char('✓');
-        assert_eq!(
-            first, second,
-            "the same character must resolve the same way"
-        );
-        assert!(first.is_some());
     }
 }

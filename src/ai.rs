@@ -1159,9 +1159,10 @@ mod tests {
         use std::time::Duration;
 
         // Escape on a running action drops the job: it must leave neither its stderr
-        // file nor the answer file the tool had already written.
-        let answer =
-            std::env::temp_dir().join(format!("bnknotes-ai-drop-{}.answer", std::process::id()));
+        // file nor the answer file the tool had already written. Its own directory,
+        // since a parallel test could reserve the freed name the moment it is gone.
+        let dir = private_dir("ai-drop");
+        let answer = dir.join("drop.answer");
         // sleep itself, not sh -c: a shell that forks it (dash does) leaves sleep holding
         // stdout after the kill, and the worker would wait out the whole sleep.
         let mut cmd = Command::new("sleep");
@@ -1172,7 +1173,7 @@ mod tests {
             "sleep",
             "",
             wake.write_fd(),
-            Scratch::reserve().expect("a scratch file"),
+            Scratch::reserve_in(&dir).expect("a scratch file"),
             Some(answer.clone()),
         )
         .expect("spawn sleep");
@@ -1197,6 +1198,7 @@ mod tests {
                 .expect("poll the wake pipe");
         assert_ne!(ready, 0, "the worker wakes the loop as the job ends");
         wake.drain();
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A directory of the test's own, so a test that plants or deletes scratch files

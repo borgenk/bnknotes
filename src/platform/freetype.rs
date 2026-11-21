@@ -208,13 +208,15 @@ type FtError = c_int;
 type FtLibrary = *mut c_void;
 type FtFace = *mut FtFaceRec;
 
-/// Load the glyph and metrics only, no bitmap (FT_LOAD_DEFAULT).
-const FT_LOAD_DEFAULT: i32 = 0x0;
 /// Also rasterize to an 8-bit gray coverage bitmap (FT_LOAD_RENDER).
 pub(crate) const FT_LOAD_RENDER: i32 = 1 << 2;
 /// Ignore embedded bitmap strikes so an outlined glyph renders to 8-bit gray
 /// rather than a mono/color strike (FT_LOAD_NO_BITMAP).
 const FT_LOAD_NO_BITMAP: i32 = 1 << 3;
+
+/// How a glyph loads, to measure it or to draw it, so the pen moves by the advance
+/// of the glyph whose ink is drawn. Drawing adds only FT_LOAD_RENDER.
+const GLYPH_LOAD: i32 = FT_LOAD_NO_BITMAP;
 /// Load embedded color bitmaps (the CBDT strikes a color emoji font ships)
 /// rather than skipping them (FT_LOAD_COLOR).
 pub(crate) const FT_LOAD_COLOR: i32 = 1 << 20;
@@ -275,6 +277,45 @@ pub(crate) struct FtBitmap {
     pub(crate) pixel_mode: u8,
     palette_mode: u8,
     palette: *mut c_void,
+}
+
+impl FtBitmap {
+    /// The rows top down, the first row_bytes of each, or None when FreeType gave
+    /// no buffer or a row would not fit in the pitch. A negative pitch stores the
+    /// rows bottom up, with buffer at the last.
+    pub(crate) fn rows_top_down(&self, row_bytes: usize) -> Option<impl Iterator<Item = &[u8]>> {
+        let stride = self.pitch.unsigned_abs() as usize;
+        if self.buffer.is_null() || row_bytes > stride {
+            return None;
+        }
+        let rows = self.rows as usize;
+        let bottom_up = self.pitch < 0;
+        Some((0..rows).map(move |y| {
+            let line = if bottom_up { rows - 1 - y } else { y };
+            // SAFETY: FreeType's buffer holds rows lines of |pitch| bytes in memory
+            // order, so line starts line * |pitch| bytes in and its first
+            // row_bytes <= |pitch| bytes lie inside it. The slice borrows the
+            // bitmap, whose buffer FreeType keeps until the glyph slot's next load.
+            unsafe { std::slice::from_raw_parts(self.buffer.add(line * stride), row_bytes) }
+        }))
+    }
+}
+
+#[cfg(test)]
+impl FtBitmap {
+    /// A bitmap over buffer as FreeType describes one, for the copy tests.
+    pub(crate) fn over(rows: c_uint, width: c_uint, pitch: c_int, buffer: *const u8) -> Self {
+        Self {
+            rows,
+            width,
+            pitch,
+            buffer,
+            num_grays: 256,
+            pixel_mode: 0,
+            palette_mode: 0,
+            palette: ptr::null_mut(),
+        }
+    }
 }
 
 #[repr(C)]
@@ -592,7 +633,7 @@ impl Face {
             FT_Load_Char(
                 self.face.as_ptr(),
                 ch as u32 as c_ulong,
-                FT_LOAD_RENDER | FT_LOAD_NO_BITMAP,
+                GLYPH_LOAD | FT_LOAD_RENDER,
             )
         };
         if err != 0 {
@@ -611,12 +652,13 @@ impl Face {
         if slot.bitmap.pixel_mode != FT_PIXEL_MODE_GRAY {
             return Glyph::empty();
         }
+        let (width, rows, coverage) = copy_coverage(&slot.bitmap);
         Glyph {
             left: slot.bitmap_left,
             top: slot.bitmap_top,
-            width: slot.bitmap.width as usize,
-            rows: slot.bitmap.rows as usize,
-            coverage: copy_coverage(&slot.bitmap),
+            width,
+            rows,
+            coverage,
         }
     }
 
@@ -669,10 +711,9 @@ impl Face {
     /// (no rasterization), so measuring a run never pays for scan conversion. Zero on
     /// a load failure.
     fn load_advance(&self, ch: char) -> f32 {
-        // SAFETY: face is valid; FT_LOAD_DEFAULT loads metrics into the glyph
-        // slot without rendering. The advance is read out immediately.
-        let err =
-            unsafe { FT_Load_Char(self.face.as_ptr(), ch as u32 as c_ulong, FT_LOAD_DEFAULT) };
+        // SAFETY: face is valid; without FT_LOAD_RENDER the load fills the glyph
+        // slot's metrics and renders nothing. The advance is read out immediately.
+        let err = unsafe { FT_Load_Char(self.face.as_ptr(), ch as u32 as c_ulong, GLYPH_LOAD) };
         if err != 0 {
             return 0.0;
         }
@@ -1109,33 +1150,171 @@ fn open_variant(
 }
 
 /// Copy a FreeType bitmap into a tightly packed top-down coverage buffer of
-/// `width * rows` bytes, dropping inter-row pitch padding. Row y starts at
-/// `buffer + y*pitch` for either pitch sign. Assumes one coverage byte per
-/// pixel, so the caller must confirm FT_PIXEL_MODE_GRAY first.
-fn copy_coverage(bitmap: &FtBitmap) -> Vec<u8> {
+/// width * rows bytes, dropping inter-row pitch padding, returning the width and
+/// rows it copied with it: all zero when FreeType gave no buffer, so the size
+/// never claims bytes the copy lacks. Assumes one coverage byte per pixel, so the
+/// caller must confirm FT_PIXEL_MODE_GRAY first.
+fn copy_coverage(bitmap: &FtBitmap) -> (usize, usize, Vec<u8>) {
     let width = bitmap.width as usize;
-    let rows = bitmap.rows as usize;
-    let total = rows * width;
-    if width == 0 || rows == 0 || bitmap.buffer.is_null() {
-        return Vec::new();
+    let Some(rows) = bitmap.rows_top_down(width) else {
+        return (0, 0, Vec::new());
+    };
+    let mut out = Vec::with_capacity(width * bitmap.rows as usize);
+    for row in rows {
+        out.extend_from_slice(row);
     }
-    let mut out = vec![0u8; total];
-    let pitch = bitmap.pitch as isize;
-    for y in 0..rows {
-        // SAFETY: FreeType guarantees |pitch| >= width bytes per row, so the
-        // width-byte read at buffer + y*pitch stays within that row; out is a
-        // distinct buffer.
-        unsafe {
-            let src = bitmap.buffer.offset(y as isize * pitch);
-            ptr::copy_nonoverlapping(src, out[y * width..].as_mut_ptr(), width);
-        }
-    }
-    out
+    (width, bitmap.rows as usize, out)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::platform::freetype::*;
+
+    /// A TrueType font with an outline 'A' 500 units wide on a 1000-unit em, so 8 px
+    /// at 16 px, and a 1-bit bitmap strike at 16 px whose 'A' advances 11 px. No
+    /// installed font pairs outlines with a strike, so the test builds one.
+    fn font_with_a_bitmap_strike() -> Vec<u8> {
+        let u16s = |v: &[u16]| v.iter().flat_map(|x| x.to_be_bytes()).collect::<Vec<u8>>();
+        let i16s = |v: &[i16]| v.iter().flat_map(|x| x.to_be_bytes()).collect::<Vec<u8>>();
+        let u32s = |v: &[u32]| v.iter().flat_map(|x| x.to_be_bytes()).collect::<Vec<u8>>();
+        let head = [
+            &u32s(&[0x0001_0000, 0x0001_0000, 0, 0x5F0F_3CF5])[..], // version, revision, checksum, magic
+            &u16s(&[0, 1000]),                                      // flags, units per em
+            &[0; 16],                                               // created, modified
+            &i16s(&[0, 0, 500, 700]),                               // bounding box
+            &u16s(&[0, 8]),    // mac style, smallest readable size
+            &i16s(&[2, 0, 0]), // direction hint, short loca, glyph data format
+        ]
+        .concat();
+        let hhea = [
+            &u32s(&[0x0001_0000])[..],
+            &i16s(&[800, -200, 0]), // ascender, descender, line gap
+            &u16s(&[500]),          // widest advance
+            &i16s(&[0, 0, 500, 1, 0, 0, 0, 0, 0, 0, 0]), // bearings, extent, caret, reserved, format
+            &u16s(&[2]),                                 // horizontal metrics for both glyphs
+        ]
+        .concat();
+        // Two glyphs, the outline one with 4 points in 1 contour, 2 zones.
+        let maxp = [
+            &u32s(&[0x0001_0000])[..],
+            &u16s(&[2, 4, 1, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0]),
+        ]
+        .concat();
+        let hmtx = u16s(&[500, 0, 500, 0]);
+        let cmap = [
+            &u16s(&[0, 1, 3, 1])[..],       // one encoding, Windows Unicode BMP
+            &u32s(&[12]),                   // its subtable
+            &u16s(&[4, 32, 0, 4, 4, 1, 0]), // format 4, length, language, 2 segments
+            &u16s(&[0x41, 0xFFFF, 0]),      // segment ends, pad
+            &u16s(&[0x41, 0xFFFF]),         // segment starts
+            &i16s(&[1 - 0x41, 1]),          // 'A' to glyph 1
+            &u16s(&[0, 0]),
+        ]
+        .concat();
+        // A rectangle, clockwise from the bottom left, coordinates as 16-bit deltas.
+        let glyf = [
+            &i16s(&[1, 50, 0, 450, 700])[..], // one contour, bounding box
+            &u16s(&[3, 0]),                   // last point, no instructions
+            &[1, 1, 1, 1],                    // all on the curve
+            &i16s(&[50, 0, 400, 0]),
+            &i16s(&[0, 700, 0, -700]),
+            &[0, 0],
+        ]
+        .concat();
+        let loca = u16s(&[0, 0, 18]); // glyph 0 is empty, glyph 1 is 36 bytes
+        // Ascender 13, descender -3, widest 11, caret upright, max before 13, min after -3.
+        let line_metrics = [13, 0xFD, 11, 1, 0, 0, 0, 0, 13, 0xFD, 0, 0];
+        let eblc = [
+            &u32s(&[0x0002_0000, 1])[..], // version, one strike
+            &u32s(&[56, 24, 1, 0]),       // index array offset and size, one subtable, color
+            &line_metrics,
+            &line_metrics,
+            &u16s(&[1, 1]),  // glyphs 1 to 1
+            &[16, 16, 1, 1], // 16 px, 1 bit, horizontal
+            &u16s(&[1, 1]),  // the index array: glyph 1, its subtable 8 bytes on
+            &u32s(&[8]),
+            &u16s(&[1, 1]),    // index format 1, image format 1
+            &u32s(&[4, 0, 7]), // images from EBDT offset 4, glyph 1 spans 0..7
+        ]
+        .concat();
+        // Small metrics (2 rows of 2 pixels, bearing 0 and 2, advance 11), a byte per row.
+        let ebdt = [&u32s(&[0x0002_0000])[..], &[2, 2, 0, 2, 11, 0xC0, 0xC0]].concat();
+
+        let tables = [
+            (b"EBDT", ebdt),
+            (b"EBLC", eblc),
+            (b"cmap", cmap),
+            (b"glyf", glyf),
+            (b"head", head),
+            (b"hhea", hhea),
+            (b"hmtx", hmtx),
+            (b"loca", loca),
+            (b"maxp", maxp),
+        ];
+        let directory = 12 + 16 * tables.len();
+        let mut font = [&u32s(&[0x0001_0000])[..], &u16s(&[9, 128, 3, 16])].concat();
+        let mut data = Vec::new();
+        for (tag, table) in &tables {
+            let offset = u32::try_from(directory + data.len()).unwrap();
+            let length = u32::try_from(table.len()).unwrap();
+            font.extend_from_slice(*tag);
+            font.extend(u32s(&[0, offset, length])); // FreeType does not check the checksum
+            data.extend_from_slice(table);
+            data.resize(data.len().next_multiple_of(4), 0);
+        }
+        font.extend(data);
+        font
+    }
+
+    /// The draw takes a glyph's outline even where the face has a bitmap strike, so
+    /// the measure must too. Measured from the strike, the pen moved by the strike's
+    /// width while the ink drawn was the outline's.
+    /// FreeType stores a bitmap with a negative pitch bottom up, buffer at its last
+    /// row. Read top down from buffer, its rows came from the memory before it.
+    #[test]
+    fn coverage_copies_top_down_for_either_pitch_sign() {
+        // Three rows of three bytes, four bytes apart, and a spare row of slack.
+        let down = [1, 1, 1, 0, 2, 2, 2, 0, 3, 3, 3, 0, 0, 0, 0, 0];
+        // The same rows bottom up, after two rows of something else.
+        let up = [9, 9, 9, 9, 9, 9, 9, 9, 3, 3, 3, 0, 2, 2, 2, 0, 1, 1, 1, 0];
+        let expected = vec![1, 1, 1, 2, 2, 2, 3, 3, 3];
+        assert_eq!(
+            copy_coverage(&FtBitmap::over(3, 3, 4, down.as_ptr())),
+            (3, 3, expected.clone())
+        );
+        assert_eq!(
+            copy_coverage(&FtBitmap::over(3, 3, -4, up[8..].as_ptr())),
+            (3, 3, expected)
+        );
+        // No buffer is no bytes and no size, so a consumer indexing by the size
+        // cannot run past the copy.
+        assert_eq!(
+            copy_coverage(&FtBitmap::over(3, 3, 4, ptr::null())),
+            (0, 0, Vec::new())
+        );
+        assert_eq!(
+            copy_coverage(&FtBitmap::over(3, 5, 4, down.as_ptr())),
+            (0, 0, Vec::new()),
+            "a row wider than the pitch is no bitmap FreeType makes"
+        );
+    }
+
+    #[test]
+    fn a_bitmap_strike_does_not_change_the_measured_advance() {
+        let path =
+            std::env::temp_dir().join(format!("bnknotes-strike-font-{}.ttf", std::process::id()));
+        std::fs::write(&path, font_with_a_bitmap_strike()).unwrap();
+        let face = Face::from_path_index(&path, 0);
+        std::fs::remove_file(&path).unwrap();
+        let face = face.expect("the font opens");
+        face.set_pixel_size(16).unwrap();
+        assert!(face.rasterize('A').rows > 0, "'A' draws from its outline");
+        assert_eq!(
+            face.advance('A'),
+            8.0,
+            "the outline's advance, not the strike's 11"
+        );
+    }
 
     fn open() -> Face {
         Face::open_default(16).expect("a default font should be available")

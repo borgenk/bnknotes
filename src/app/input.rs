@@ -2,7 +2,7 @@ use std::os::fd::AsRawFd;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-use super::{State, TabDrag, TabHover, VaultDrag};
+use crate::app::{State, TabDrag, TabHover, VaultDrag};
 use crate::find;
 use crate::keymap::{self, KeyAction};
 use crate::menu::{Menu, MenuLayout};

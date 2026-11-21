@@ -3638,7 +3638,7 @@ pub(crate) fn push_conflict_banner(
 mod tests {
     use std::time::{Duration, Instant};
 
-    use super::*;
+    use crate::paint::*;
     use crate::theme::{FONT_SIZE, RAIL_W, VAULT_COLORS};
 
     /// The app's real font stack at the body size, so a panel is measured against the

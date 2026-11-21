@@ -241,7 +241,7 @@ impl Atlas {
         self.next_y = 0;
         self.generation += 1;
         self.dirty = None;
-        Ok::<(), ()>(()).is_ok()
+        true
     }
 
     /// Write a raster's rows into the mirror at `slot` and extend the dirty
@@ -841,7 +841,7 @@ fn color_f32(color: u32) -> [f32; 4] {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::render::gpu::*;
 
     /// Build one frame into a fresh buffer. The app keeps one across frames; a test
     /// wants each build on its own, so this hands back what it produced.

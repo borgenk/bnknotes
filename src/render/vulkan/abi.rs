@@ -1583,7 +1583,7 @@ pub(super) unsafe fn load_device<T>(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::render::vulkan::abi::*;
 
     /// The transcription's one real hazard is a struct size drifting from the
     /// C ABI: the driver writes past what we allocated. These sizes are from

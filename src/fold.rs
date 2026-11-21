@@ -455,7 +455,7 @@ fn heading_level_at(rope: &Rope, start: usize) -> Option<u8> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::fold::*;
     use crate::markdown;
     use crate::platform::freetype::Fonts;
     use crate::render::image::ImageStore;

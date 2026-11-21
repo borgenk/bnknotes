@@ -376,12 +376,12 @@ fn on_word_boundaries(text: &str, start: usize, end: usize) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::find::*;
 
-    /// The module `scan` gained a match cap; these tests want every match, so
-    /// this shadow passes an unbounded limit.
+    /// The module's scan takes a match cap; these tests want every match, so this
+    /// shadow passes an unbounded one.
     fn scan(text: &str, query: &str) -> Vec<(usize, usize)> {
-        super::scan(text, query, usize::MAX)
+        crate::find::scan(text, query, usize::MAX)
     }
 
     /// The find methods scan the buffer the app hands them; a test drives them
@@ -426,8 +426,8 @@ mod tests {
     fn scan_stops_at_the_match_limit() {
         // The cap bounds the collected list, so a query matching a huge fraction
         // of a document cannot allocate without bound.
-        assert_eq!(super::scan("a a a a a", "a", 2).len(), 2);
-        assert_eq!(super::scan("a a a a a", "a", usize::MAX).len(), 5);
+        assert_eq!(crate::find::scan("a a a a a", "a", 2).len(), 2);
+        assert_eq!(crate::find::scan("a a a a a", "a", usize::MAX).len(), 5);
     }
 
     #[test]

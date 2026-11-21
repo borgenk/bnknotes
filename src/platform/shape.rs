@@ -190,7 +190,7 @@ impl Drop for Shaper {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::platform::shape::*;
 
     #[test]
     fn text_advance_is_zero_empty_and_grows_with_length() {

@@ -245,7 +245,7 @@ pub fn empty_row(cols: usize) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::table::*;
 
     fn rope(s: &str) -> Rope {
         Rope::from_str(s)

@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
-use super::State;
+use crate::app::State;
 use crate::file;
 use crate::markdown;
 use crate::platform::error::{Error, Result};

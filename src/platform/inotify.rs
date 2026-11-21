@@ -177,7 +177,7 @@ fn parse_events<F: FnMut(Event)>(bytes: &[u8], f: &mut F) {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::platform::inotify::*;
     use std::fs;
     use std::path::PathBuf;
 

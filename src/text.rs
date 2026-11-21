@@ -1566,7 +1566,7 @@ fn class_run_end(rope: &Rope, from: usize, word: bool) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::text::*;
 
     #[test]
     fn insert_advances_cursor() {

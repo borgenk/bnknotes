@@ -223,7 +223,7 @@ fn canonical_parent(file: &Path) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::watch::*;
     use std::fs;
 
     fn tmp_dir(name: &str) -> PathBuf {

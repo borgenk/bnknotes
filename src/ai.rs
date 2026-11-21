@@ -821,7 +821,7 @@ impl Wake {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::ai::*;
 
     fn reassemble(spans: &[DiffSpan], keep: impl Fn(DiffKind) -> bool) -> String {
         spans

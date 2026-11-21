@@ -184,7 +184,7 @@ impl<'a> Reader<'a> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::platform::wire::*;
 
     #[test]
     fn a_small_body_rides_inline_and_reads_back_whole() {

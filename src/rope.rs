@@ -723,7 +723,7 @@ fn node_heap_bytes(node: &Inner) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::rope::*;
 
     #[test]
     fn empty_rope_is_one_empty_line() {

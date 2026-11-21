@@ -262,7 +262,7 @@ fn sync_parent_dir(path: &Path) {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::file::*;
     use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
 

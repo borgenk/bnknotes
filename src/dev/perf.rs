@@ -1264,7 +1264,7 @@ fn report_mem(label: &str, bytes: u64, note: &str) {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::dev::perf::*;
 
     #[test]
     fn parse_baseline_reads_pairs_and_skips_comments() {

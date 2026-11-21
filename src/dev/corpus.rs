@@ -265,7 +265,7 @@ fn markdown(target: usize) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::dev::corpus::*;
 
     #[test]
     fn every_named_corpus_generates_and_meets_its_target() {

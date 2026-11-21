@@ -251,7 +251,7 @@ pub fn reveal(scroll: i32, top: i32, height: i32, viewport: i32, content: i32, p
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::platform::scroll::*;
 
     #[test]
     fn clamp_bounds_into_valid_range() {

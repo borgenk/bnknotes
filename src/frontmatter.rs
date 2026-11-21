@@ -67,7 +67,7 @@ fn delimiter_at(rope: &Rope, start: usize, marker: u8) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::frontmatter::*;
 
     fn rope(s: &str) -> Rope {
         Rope::from_str(s)

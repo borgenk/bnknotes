@@ -11,7 +11,7 @@
 //!   into, sharing all the cursor and selection math. A heading with text hides
 //!   its marker once the cursor leaves; an empty heading's marker, and a list or
 //!   quote marker, persist (see [`block_marker_persists`]).
-//! - **Inline spans** ([`inline_spans`]): code spans, inline links, emphasis
+//! - **Inline spans** ([`inline_spans_append`]): code spans, inline links, emphasis
 //!   (`*`/`_`), and strikethrough (`~~`) style interior runs of a line, with their
 //!   delimiters hidden once the cursor leaves the line.
 //!
@@ -461,7 +461,7 @@ pub fn inline_spans(content: &str) -> Vec<Span> {
 
 /// Append `content`'s inline spans, content-relative and tiling `[0, len)`, to
 /// `out` without clearing it, so a caller can reuse a pooled buffer across lines.
-/// [`inline_spans`] is the owning wrapper.
+/// The owning wrapper, inline_spans, is for tests.
 pub fn inline_spans_append(content: &str, scratch: &mut InlineScratch, out: &mut Vec<Span>) {
     let bytes = content.as_bytes();
     let n = bytes.len();
@@ -908,7 +908,7 @@ pub struct Link {
 }
 
 /// The links in `content`, each with its text range and a cleaned destination, as
-/// byte ranges into `content`. The renderer reaches links through [`inline_spans`];
+/// byte ranges into `content`. The renderer reaches links through [`inline_spans_append`];
 /// this is the structured view the editor uses to follow the link the pointer clicks.
 /// A `[x](y)` inside a code span is skipped, matching the renderer.
 ///
@@ -1232,7 +1232,7 @@ pub fn table_head(header: &str, delim: &str) -> Option<Vec<Align>> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::markdown::*;
 
     /// The marker-length half of [`classify`], kept terse for the assertions.
     fn marker_len(line: &str) -> usize {

@@ -182,7 +182,7 @@ fn ctrl_or(ctrl: bool, with_ctrl: KeyAction, plain: KeyAction) -> KeyAction {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::keymap::*;
 
     #[test]
     fn special_keys_dispatch_without_a_keymap() {

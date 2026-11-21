@@ -272,7 +272,7 @@ fn write(path: &Path, text: &str) -> crate::platform::error::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::search::*;
 
     /// A vault of `notes` (relative path, contents) in a directory of this test's
     /// own, removed and rebuilt each run so a rerun cannot see the last one's files.

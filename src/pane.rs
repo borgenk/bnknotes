@@ -938,7 +938,7 @@ impl DragSelect {
 
 /// One content pane: an independent editor over its own buffer, carrying its own
 /// file, inline images, memoized layout, scroll, find bar, and the drag/selection
-/// transients a click-drag needs. Two of these live on [`State`].
+/// transients a click-drag needs. Two of these live on the app's State.
 /// How a document's file on disk has diverged from the buffer, once the editor
 /// notices a change made outside it that it cannot silently absorb. `None` while
 /// the buffer and the file agree (or the buffer was cleanly reloaded).
@@ -1059,7 +1059,7 @@ pub(crate) struct EditorPane {
     /// a hovered line's links reuses its buffers instead of reallocating per event.
     link_scratch: markdown::InlineScratch,
     /// The display scale and the device-pixel body font size this pane lays out at,
-    /// set by [`State`] and refreshed on a DPI change. At [`Scale::ONE`] the body is
+    /// set by the app's State and refreshed on a DPI change. At [`Scale::ONE`] the body is
     /// [`FONT_SIZE`] and every geometry constant is its authored value.
     scale: Scale,
     body_size: u32,
@@ -3241,7 +3241,7 @@ fn smart_home_target(line: &str, start: usize, end: usize, cursor: usize) -> usi
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::pane::*;
 
     #[test]
     fn reveal_follows_the_selection_through_a_drag() {

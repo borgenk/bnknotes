@@ -213,7 +213,7 @@ pub(crate) fn is_hidden(name: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::tree::*;
 
     /// A throwaway directory tree under the temp dir, removed on drop.
     struct Fixture(PathBuf);

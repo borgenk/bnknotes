@@ -67,7 +67,7 @@ impl Scale {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::scale::*;
 
     #[test]
     fn scale_one_is_the_identity() {

@@ -201,7 +201,7 @@ pub fn dev_minor(dev: u64) -> u32 {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::platform::dmabuf::*;
 
     /// Build one 16-byte format-table entry.
     fn entry(format: u32, modifier: u64) -> Vec<u8> {

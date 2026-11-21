@@ -392,7 +392,7 @@ struct State {
     hovered_vault: Option<usize>,
     /// A chip being dragged to a new place in the rail, `None` when none is.
     drag_vault: Option<VaultDrag>,
-    /// The chips' baked icons, keyed by [`Vault::icon_key`]: a crop of a vault
+    /// The chips' baked icons, keyed by each vault's IconKeys: a crop of a vault
     /// picture, resampled to the chip, tinted and rounded, ready for the renderer to
     /// blit like any other image. Baked by [`Self::sync_icons`].
     icons: ImageStore,

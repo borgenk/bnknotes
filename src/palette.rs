@@ -485,7 +485,7 @@ fn subsequence(hay: &str, needle: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::palette::*;
 
     /// A palette over `labels`, each row switching to the vault at its index, which
     /// is all the ranking and the geometry care about.

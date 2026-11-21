@@ -2,7 +2,7 @@ use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 use std::rc::Rc;
 use std::time::Instant;
 
-use super::State;
+use crate::app::State;
 use crate::platform::conn::Connection;
 use crate::platform::dmabuf;
 use crate::platform::error::{Error, Result};

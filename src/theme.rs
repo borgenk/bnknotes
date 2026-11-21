@@ -231,7 +231,7 @@ pub(crate) const RAIL_ACTIVE_W: i32 = 3;
 /// tick against the chip rather than a second block beside it.
 pub(crate) const RAIL_ACTIVE_SPAN: f32 = 0.55;
 /// A chip's initials, inked with whichever of the two contrasts better against its
-/// fill (see [`crate::paint::chip_ink`]), so a vault color of any tone stays
+/// fill (chip_ink in the paint module), so a vault color of any tone stays
 /// legible. Every color in [`VAULT_COLORS`] takes the dark one.
 pub(crate) const RAIL_INK_LIGHT: u32 = 0x00f5_f7fa;
 pub(crate) const RAIL_INK_DARK: u32 = 0x0016_1a1f;

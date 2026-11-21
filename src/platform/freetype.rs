@@ -4,8 +4,7 @@
 //! bitmap, handling hinting, scan conversion, and per-size metrics. This is the
 //! thin FFI layer over it: a small extern block, one struct owning the C-side
 //! handles, a Drop impl, and methods returning owned data. The font file is read
-//! into a Vec the Face borrows, rather than mmapped, and coverage comes back as
-//! a Vec<u8>.
+//! into a Vec the Face borrows, and coverage comes back as a byte vector.
 //!
 //! FreeType exposes glyph data as struct fields reached from the Face pointer
 //! (face->glyph->bitmap, face->size->metrics), not accessors. The repr(C)
@@ -624,8 +623,8 @@ impl Face {
 
     /// Rasterize a character at the current pixel size, copying the coverage
     /// out. A load failure or glyphless character yields an empty glyph. The
-    /// render path goes through [`Self::with_glyph`], which caches the result;
-    /// this is the uncached primitive behind it.
+    /// renderer caches the result per face and character; this is the uncached
+    /// primitive it calls.
     pub fn rasterize(&self, ch: char) -> Glyph {
         // SAFETY: face is valid; FT_Load_Char renders into the face's shared
         // glyph slot. No reference into that slot is held across this call.

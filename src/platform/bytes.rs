@@ -62,7 +62,7 @@ impl<'a> Cursor<'a> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::platform::bytes::*;
 
     #[test]
     fn count_byte_matches_a_naive_count() {

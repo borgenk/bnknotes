@@ -314,7 +314,7 @@ include!("grapheme_tables.rs");
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::platform::grapheme::*;
 
     /// Cluster boundaries as a list, for compact assertions.
     fn bounds(s: &str) -> Vec<usize> {

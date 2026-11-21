@@ -364,7 +364,7 @@ const YAML: LangSpec = LangSpec {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::syntax::*;
 
     fn toks(lang: Lang, line: &str) -> Vec<(String, CodeToken)> {
         let mut out = Vec::new();

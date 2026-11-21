@@ -561,7 +561,7 @@ impl Default for FontConfig {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::config::*;
 
     #[test]
     fn expand_tilde_joins_the_home_dir() {

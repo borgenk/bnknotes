@@ -466,7 +466,7 @@ impl Parser {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::regex::*;
 
     fn all(pattern: &str, text: &str) -> Vec<(usize, usize)> {
         Regex::compile(pattern)

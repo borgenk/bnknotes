@@ -540,7 +540,8 @@ fn backtick_marker_width(
 /// True when a marker run begins with a backtick: an inline code delimiter or a
 /// fence line (```rust and the like). Such markers recolor to
 /// [`crate::theme::CODE_MARKER_COLOR`] so the delimiters stay legible against the
-/// code panel's darker tint, while the other muted markers keep [`MARKER_COLOR`].
+/// code panel's darker tint, while the other muted markers keep
+/// [`crate::theme::MARKER_COLOR`].
 pub(crate) fn is_code_marker(rope: &Rope, run: &Run) -> bool {
     matches!(run.kind, markdown::SpanKind::Marker) && rope.byte(run.start) == Some(b'`')
 }
@@ -814,7 +815,7 @@ impl Layout {
         Self::build_with_images(&ctx, left, top)
     }
 
-    /// Like [`Self::build`], but resolves a standalone `![alt](path)` line to a
+    /// Like Self::build, but resolves a standalone `![alt](path)` line to a
     /// rendered picture via `images`, scaled to fit the content column (aspect
     /// preserved, never upscaled). The picture always shows once decoded; its
     /// editable `![alt](path)` source, when revealed, is laid out as a text line
@@ -3998,8 +3999,8 @@ fn cell_line_width(ctx: &LayoutCtx, size: u32, runs: &[Run], header: bool) -> i3
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use crate::fold::Folds;
+    use crate::layout::*;
     use crate::markdown::LineStyle;
     use crate::theme::MARGIN;
 

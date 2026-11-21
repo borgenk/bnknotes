@@ -173,7 +173,7 @@ impl MenuLayout {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::menu::*;
 
     /// A menu of `n` items at `at`, which is all the geometry cares about.
     fn menu(n: usize, at: (i32, i32)) -> Menu {

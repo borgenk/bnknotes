@@ -98,7 +98,7 @@ fn fnv1a(bytes: &[u8]) -> u32 {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::icon::*;
 
     #[test]
     fn the_middle_square_of_a_wide_picture() {

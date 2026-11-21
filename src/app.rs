@@ -1,22 +1,5 @@
 //! The editor's orchestration: it binds the compositor globals, builds the
 //! xdg-shell surface stack, and runs the event loop.
-//!
-//! On top of the earlier single-line field, this drives a small but real
-//! multi-line editor. A keyboard (via libxkbcommon) inserts text, newlines, and
-//! soft-tab indentation, and moves the cursor by grapheme cluster; Up/Down/
-//! Home/End and Page Up/Down navigate the visual lines a [`Layout`] pass
-//! computes, while Ctrl jumps by word (arrows) or to the document ends
-//! (Home/End) and deletes whole words (Backspace/Delete); a held Shift turns
-//! motion into a selection, which a pointer can also drag out (double- and
-//! triple-click select a word or line, Shift+click extends, and a drag past an
-//! edge auto-scrolls), with an I-beam shown over the text; the selection
-//! highlights behind the text and Backspace or typing replaces it. Ctrl shortcuts
-//! select-all,
-//! copy, cut, paste (over wl_data_device), and undo/redo; a held key repeats on a
-//! timer. Content taller than the window scrolls (mouse wheel, or automatically
-//! to keep the caret in view), and the window honors compositor resizes by
-//! reallocating its GPU buffers. Rendering double-buffers so the compositor never
-//! reads a frame we are still painting.
 
 mod clipboard;
 mod input;
@@ -1223,7 +1206,7 @@ impl State {
 
         let compositor = self
             .compositor
-            .ok_or_else(|| Error::msg("compositor has no wl_compositor"))?;
+            .ok_or_else(|| Error::msg("compositor lacks wl_compositor v4+"))?;
         let wm_base = self
             .wm_base
             .ok_or_else(|| Error::msg("compositor has no xdg_wm_base"))?;
@@ -2847,7 +2830,7 @@ impl State {
         let interface = r.string()?;
         let version = r.u32()?;
         match interface {
-            protocol::IFACE_COMPOSITOR => {
+            protocol::IFACE_COMPOSITOR if version >= protocol::VERSION_COMPOSITOR => {
                 let id = self.bind_capped(name, interface, version, protocol::VERSION_COMPOSITOR);
                 self.compositor = Some(id);
             }

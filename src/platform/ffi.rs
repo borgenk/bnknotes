@@ -22,7 +22,7 @@
 use core::ffi::{CStr, c_char, c_int, c_long, c_short, c_uint, c_ulong, c_void};
 use std::mem;
 use std::os::fd::{FromRawFd, OwnedFd, RawFd};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::platform::error::{Error, Result};
 
@@ -225,6 +225,7 @@ fn ok_or_errno(rc: c_int, what: &str) -> Result<()> {
 // a following read return at once (with the error or EOF), so the caller treats
 // them as "ready, go find out" rather than a reason to keep waiting.
 const POLLIN: c_short = 0x0001;
+const POLLOUT: c_short = 0x0004;
 const POLLERR: c_short = 0x0008;
 const POLLHUP: c_short = 0x0010;
 
@@ -648,6 +649,43 @@ pub fn dmabuf_export_sync_file(dmabuf: RawFd) -> Result<Option<OwnedFd>> {
     }
 }
 
+/// Wait until the fence in sync_file signals, or timeout passes; whether it did.
+pub fn wait_sync_file(sync_file: RawFd, timeout: Duration) -> bool {
+    wait_for_events(sync_file, POLLIN, timeout)
+}
+
+/// Wait until every fence on dmabuf (the compositor's reads and writes) signals,
+/// or timeout passes; whether they did. A dmabuf polls writable once it is safe
+/// to write, which reaches the fences dmabuf_export_sync_file would export, on a
+/// kernel that cannot export them.
+pub fn wait_dmabuf_writable(dmabuf: RawFd, timeout: Duration) -> bool {
+    wait_for_events(dmabuf, POLLOUT, timeout)
+}
+
+/// Poll fd for events until one fires or timeout passes. An interrupting signal
+/// restarts the poll with the time that is left, and the millisecond timeout is
+/// rounded up, so the wait never ends early.
+fn wait_for_events(fd: RawFd, events: c_short, timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let left = deadline.saturating_duration_since(Instant::now());
+        let ms = left.as_nanos().div_ceil(1_000_000).min(c_int::MAX as u128) as c_int;
+        let mut pfd = PollFd {
+            fd,
+            events,
+            revents: 0,
+        };
+        // SAFETY: one live PollFd; poll reads events and writes revents only.
+        let n = unsafe { poll(&mut pfd, 1, ms) };
+        if n > 0 {
+            return pfd.revents & events != 0;
+        }
+        if n == 0 || errno() != EINTR {
+            return false;
+        }
+    }
+}
+
 /// Attach `sync` (a sync-file fd) to `dmabuf` as a write fence, so every other
 /// user of the dmabuf (the compositor) waits for it before reading. `Ok(false)`
 /// means unsupported; the caller should fall back to a CPU wait before letting
@@ -733,6 +771,8 @@ const DRM_IOCTL_SYNCOBJ_CREATE: c_ulong = drm_iowr(0xBF, mem::size_of::<DrmSynco
 const DRM_IOCTL_SYNCOBJ_HANDLE_TO_FD: c_ulong = drm_iowr(0xC1, mem::size_of::<DrmSyncobjHandle>());
 const DRM_IOCTL_SYNCOBJ_FD_TO_HANDLE: c_ulong = drm_iowr(0xC2, mem::size_of::<DrmSyncobjHandle>());
 const DRM_IOCTL_SYNCOBJ_TRANSFER: c_ulong = drm_iowr(0xCC, mem::size_of::<DrmSyncobjTransfer>());
+/// A transfer flag: wait for the source point's fence to be attached.
+const DRM_SYNCOBJ_WAIT_FOR_SUBMIT: u32 = 1 << 1;
 
 /// Open the GPU's DRM render node (`/dev/dri/renderD<minor>`) read-write, for
 /// creating the sync objects that back explicit sync. Render nodes need no DRM
@@ -801,20 +841,23 @@ fn drm_syncobj_export_sync_file(drm: RawFd, handle: u32) -> Result<OwnedFd> {
     Ok(unsafe { OwnedFd::from_raw_fd(arg.fd) })
 }
 
-/// Copy the fence at (`src`, `src_point`) to (`dst`, `dst_point`).
+/// Copy the fence at (`src`, `src_point`) to (`dst`, `dst_point`). flags is 0,
+/// or DRM_SYNCOBJ_WAIT_FOR_SUBMIT to wait for a source point that has no fence
+/// yet instead of failing on it.
 fn drm_syncobj_transfer(
     drm: RawFd,
     src: u32,
     src_point: u64,
     dst: u32,
     dst_point: u64,
+    flags: u32,
 ) -> Result<()> {
     let arg = DrmSyncobjTransfer {
         src_handle: src,
         dst_handle: dst,
         src_point,
         dst_point,
-        flags: 0,
+        flags,
         pad: 0,
     };
     // SAFETY: arg is a live drm_syncobj_transfer; the kernel only reads it.
@@ -857,20 +900,39 @@ pub fn drm_syncobj_sync_file_to_point(
     scratch: u32,
 ) -> Result<()> {
     drm_syncobj_import_sync_file(drm, scratch, sync_file)?;
-    drm_syncobj_transfer(drm, scratch, 0, timeline, point)
+    drm_syncobj_transfer(drm, scratch, 0, timeline, point, 0)
+}
+
+/// Put an already-signaled fence at a timeline point, copied from the caller's
+/// binary syncobj signaled (created signaled, never re-armed). This is the
+/// acquire point of a frame the CPU already waited out.
+pub fn drm_syncobj_signal_point(
+    drm: RawFd,
+    timeline: u32,
+    point: u64,
+    signaled: u32,
+) -> Result<()> {
+    drm_syncobj_transfer(drm, signaled, 0, timeline, point, 0)
 }
 
 /// Export timeline `point` of `timeline` as a sync file, via the caller-owned
 /// binary `scratch` syncobj: transfer the point to scratch point 0, then export
 /// it. Used to turn the compositor's release point into a fence the next render
-/// into that buffer waits on.
+/// into that buffer waits on. With wait_for_submit, a point nobody has attached
+/// a fence to yet is waited for, up to the kernel's bound, instead of failing.
 pub fn drm_syncobj_point_to_sync_file(
     drm: RawFd,
     timeline: u32,
     point: u64,
     scratch: u32,
+    wait_for_submit: bool,
 ) -> Result<OwnedFd> {
-    drm_syncobj_transfer(drm, timeline, point, scratch, 0)?;
+    let flags = if wait_for_submit {
+        DRM_SYNCOBJ_WAIT_FOR_SUBMIT
+    } else {
+        0
+    };
+    drm_syncobj_transfer(drm, timeline, point, scratch, 0, flags)?;
     drm_syncobj_export_sync_file(drm, scratch)
 }
 
@@ -950,11 +1012,57 @@ fn parse_cmsgs(cbuf: &CmsgBuf, controllen: usize, out: &mut Vec<OwnedFd>) {
     }
 }
 
+/// Whether `fd`, a sync file, carries a signaled fence: its fd turns readable
+/// exactly then, so a zero-timeout poll reads the state without waiting.
+#[cfg(test)]
+pub(crate) fn fd_is_signaled(fd: RawFd) -> bool {
+    matches!(poll_readable(&[fd], Some(Duration::ZERO)), Ok(1))
+}
+
+/// The first usable DRM render node, or `None` on a machine without one, so a
+/// test that needs it skips rather than fails.
+#[cfg(test)]
+pub(crate) fn open_any_render_node() -> Option<OwnedFd> {
+    for entry in std::fs::read_dir("/dev/dri").ok()?.flatten() {
+        let minor = entry
+            .file_name()
+            .to_str()
+            .and_then(|n| n.strip_prefix("renderD"))
+            .and_then(|n| n.parse::<u32>().ok());
+        if let Some(minor) = minor
+            && let Ok(fd) = open_drm_render_node(minor)
+        {
+            return Some(fd);
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use core::ffi::c_short;
     use std::os::fd::AsRawFd;
+
+    use crate::platform::ffi::*;
+
+    #[test]
+    fn a_wait_holds_until_its_deadline_and_returns_once_the_fd_is_ready() {
+        let (read_end, write_end) = pipe().expect("pipe");
+        let timeout = Duration::from_millis(30);
+        let started = Instant::now();
+        assert!(
+            !wait_sync_file(read_end.as_raw_fd(), timeout),
+            "nothing to read yet"
+        );
+        assert!(started.elapsed() >= timeout, "the wait must not end early");
+
+        write_all(write_end.as_raw_fd(), b"x").expect("write");
+        let started = Instant::now();
+        assert!(wait_sync_file(read_end.as_raw_fd(), Duration::from_secs(5)));
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "a ready fd returns at once"
+        );
+    }
 
     #[test]
     fn cmsg_math_matches_one_fd() {
@@ -1006,54 +1114,6 @@ mod tests {
         assert_eq!(DRM_IOCTL_SYNCOBJ_TRANSFER, 0xC020_64CC);
     }
 
-    // Kernel readiness check for the round-trip test below. A sync file's fd
-    // becomes POLLIN-readable exactly when its fence has signaled, so a
-    // zero-timeout poll reads the fence state without waiting. Test-only, so the
-    // binding stays here rather than widening the module's production surface.
-    const POLLIN: c_short = 0x0001;
-
-    #[repr(C)]
-    struct PollFd {
-        fd: c_int,
-        events: c_short,
-        revents: c_short,
-    }
-
-    unsafe extern "C" {
-        fn poll(fds: *mut PollFd, nfds: c_ulong, timeout: c_int) -> c_int;
-    }
-
-    /// Whether `fd` (a sync file) currently carries a signaled fence.
-    fn fd_is_signaled(fd: RawFd) -> bool {
-        let mut pfd = PollFd {
-            fd,
-            events: POLLIN,
-            revents: 0,
-        };
-        // SAFETY: one live PollFd; poll reads events and writes revents only.
-        let n = unsafe { poll(&mut pfd, 1, 0) };
-        n > 0 && (pfd.revents & POLLIN) != 0
-    }
-
-    /// Open the first usable DRM render node, or `None` when the machine has
-    /// none (a GPU-less box), so the round-trip test skips rather than fails.
-    /// Drives the production `open_drm_render_node` on the way.
-    fn open_any_render_node() -> Option<OwnedFd> {
-        for entry in std::fs::read_dir("/dev/dri").ok()?.flatten() {
-            let minor = entry
-                .file_name()
-                .to_str()
-                .and_then(|n| n.strip_prefix("renderD"))
-                .and_then(|n| n.parse::<u32>().ok());
-            if let Some(minor) = minor
-                && let Ok(fd) = open_drm_render_node(minor)
-            {
-                return Some(fd);
-            }
-        }
-        None
-    }
-
     // A real round-trip against the kernel's DRM syncobj interface: push a
     // signaled fence into a timeline point and pull it back out, the exact
     // plumbing the present path uses to publish a frame's acquire fence and
@@ -1086,12 +1146,25 @@ mod tests {
         const POINT: u64 = 42;
         drm_syncobj_sync_file_to_point(fd, signaled.as_raw_fd(), timeline, POINT, scratch)
             .expect("publish fence to timeline point");
-        let round_tripped = drm_syncobj_point_to_sync_file(fd, timeline, POINT, scratch)
+        let round_tripped = drm_syncobj_point_to_sync_file(fd, timeline, POINT, scratch, false)
             .expect("read timeline point back as a sync file");
         assert!(
             fd_is_signaled(round_tripped.as_raw_fd()),
             "the fence must stay signaled across the timeline round-trip",
         );
+
+        // A point published from the signaled syncobj (a CPU-waited frame's
+        // acquire point) reads back signaled, and a second publish still works,
+        // so the source is not consumed.
+        for point in [POINT + 1, POINT + 2] {
+            drm_syncobj_signal_point(fd, timeline, point, src).expect("signal point");
+            let read = drm_syncobj_point_to_sync_file(fd, timeline, point, scratch, false)
+                .expect("read the signaled point back");
+            assert!(
+                fd_is_signaled(read.as_raw_fd()),
+                "a point published from the signaled syncobj must read back signaled",
+            );
+        }
         // Dropping `drm` closes the render node, freeing every syncobj on it.
     }
 }

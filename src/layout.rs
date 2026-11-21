@@ -2775,9 +2775,10 @@ impl LineIndex {
         // Copy out the ctx's `Send` fields so each worker rebuilds its ctx from
         // these rather than capturing `ctx` itself: `Fonts` is `!Sync` (FreeType
         // faces are not shareable), so `&LayoutCtx` is not `Send` and cannot cross
-        // the thread boundary. Each worker opens its own `fonts` and rebuilds a
-        // reveal-free ctx via `for_index`, so the base-geometry precondition holds
-        // by construction rather than by copying `active`/`image_ui` across.
+        // the thread boundary. Each worker opens its own fonts from the caller's
+        // selection and rebuilds a reveal-free ctx via `for_index`, so the
+        // base-geometry precondition holds by construction.
+        let selection = ctx.fonts.selection();
         let rope = ctx.rope;
         let wrap_width = ctx.wrap_width;
         let body_size = ctx.body_size;
@@ -2786,14 +2787,15 @@ impl LineIndex {
 
         // Measure every chunk from ground state. The main thread takes the first
         // chunk with the caller's fonts; each other chunk gets a worker that opens
-        // its own fonts (`None` if it cannot, which forces the fallback below).
+        // the same selection (`None` if it cannot, which forces the fallback below).
         let outs: Vec<Option<ChunkOut>> = std::thread::scope(|s| {
             let handles: Vec<_> = ranges
                 .iter()
                 .skip(1)
                 .map(|&(lo, hi)| {
                     s.spawn(move || {
-                        let fonts = Fonts::new(&markdown::all_sizes(body_size)).ok()?;
+                        let sizes = markdown::all_sizes(body_size);
+                        let fonts = Fonts::open(selection.clone(), &sizes).ok()?;
                         let worker_ctx = LayoutCtx::for_index(
                             &fonts, rope, wrap_width, body_size, images, scale,
                         );
@@ -5194,6 +5196,23 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn parallel_index_measures_with_the_callers_fonts() {
+        // Each worker opens its own fonts, and they must be the caller's: the
+        // editor's line spacing, not the default font's own line height.
+        let f = fonts_scaled(1.5);
+        let no_images = ImageStore::new(None);
+        let r = rope(&"A line of prose.\n".repeat(64));
+        let w = ORACLE_WIDTHS[0];
+        let seq = LineIndex::build(&f, &r, w, BODY, &no_images, Scale::ONE);
+        let ctx = LayoutCtx::for_index(&f, &r, w, BODY, &no_images, Scale::ONE);
+        let par = LineIndex::build_chunked(&ctx, 2);
+        assert_eq!(
+            par.tops, seq.tops,
+            "every chunk lays out at the same line height"
+        );
     }
 
     #[test]

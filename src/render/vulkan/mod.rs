@@ -255,11 +255,48 @@ impl Drop for Gpu {
     }
 }
 
-/// The device's single-plane, color-attachment-capable modifiers for
-/// B8G8R8A8_UNORM (the two-call pattern over the chained modifier list).
+/// The device's modifiers a presentable image can be laid out with.
 fn render_modifiers(
     get_format_props2: PfnGetPhysicalDeviceFormatProperties2,
     physical: VkPhysicalDevice,
+) -> Vec<VkDrmFormatModifierPropertiesEXT> {
+    usable_modifiers(
+        format_modifiers(get_format_props2, physical, VK_FORMAT_B8G8R8A8_UNORM),
+        &format_modifiers(get_format_props2, physical, VK_FORMAT_B8G8R8A8_SRGB),
+    )
+}
+
+/// The store-format modifiers a presentable image can be laid out with, given
+/// the device's modifiers for the sRGB view format. A modifier's features can
+/// differ between the two formats, and the image needs both: it is a color
+/// attachment in its own format, and the render pass draws and blends through
+/// the sRGB view.
+fn usable_modifiers(
+    mut store: Vec<VkDrmFormatModifierPropertiesEXT>,
+    view: &[VkDrmFormatModifierPropertiesEXT],
+) -> Vec<VkDrmFormatModifierPropertiesEXT> {
+    let store_needs = VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT;
+    let view_needs =
+        VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT | VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BLEND_BIT;
+    let has = |m: &VkDrmFormatModifierPropertiesEXT, needs: u32| {
+        m.drm_format_modifier_tiling_features & needs == needs
+    };
+    store.retain(|m| {
+        m.drm_format_modifier_plane_count == 1
+            && has(m, store_needs)
+            && view
+                .iter()
+                .any(|v| v.drm_format_modifier == m.drm_format_modifier && has(v, view_needs))
+    });
+    store
+}
+
+/// The device's modifiers for format and the features each supports (the
+/// two-call pattern over the chained modifier list).
+fn format_modifiers(
+    get_format_props2: PfnGetPhysicalDeviceFormatProperties2,
+    physical: VkPhysicalDevice,
+    format: u32,
 ) -> Vec<VkDrmFormatModifierPropertiesEXT> {
     let mut list = VkDrmFormatModifierPropertiesListEXT {
         s_type: VK_STRUCTURE_TYPE_DRM_FORMAT_MODIFIER_PROPERTIES_LIST_EXT,
@@ -277,7 +314,7 @@ fn render_modifiers(
         },
     };
     // SAFETY: physical is live; props chains one correctly-typed list struct.
-    unsafe { get_format_props2(physical, VK_FORMAT_B8G8R8A8_UNORM, &mut props) };
+    unsafe { get_format_props2(physical, format, &mut props) };
     let mut mods = vec![
         VkDrmFormatModifierPropertiesEXT {
             drm_format_modifier: 0,
@@ -288,15 +325,8 @@ fn render_modifiers(
     ];
     list.p_drm_format_modifier_properties = mods.as_mut_ptr();
     // SAFETY: the array now has room for the advertised count.
-    unsafe { get_format_props2(physical, VK_FORMAT_B8G8R8A8_UNORM, &mut props) };
+    unsafe { get_format_props2(physical, format, &mut props) };
     mods.truncate(list.drm_format_modifier_count as usize);
-    let needed = VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT
-        | VK_FORMAT_FEATURE_TRANSFER_SRC_BIT
-        | VK_FORMAT_FEATURE_TRANSFER_DST_BIT;
-    mods.retain(|m| {
-        m.drm_format_modifier_plane_count == 1
-            && m.drm_format_modifier_tiling_features & needed == needed
-    });
     mods
 }
 
@@ -586,7 +616,53 @@ fn create_logical_device(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::render::vulkan::*;
+
+    const VIEW: u32 =
+        VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT | VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BLEND_BIT;
+
+    fn modifier(id: u64, planes: u32, features: u32) -> VkDrmFormatModifierPropertiesEXT {
+        VkDrmFormatModifierPropertiesEXT {
+            drm_format_modifier: id,
+            drm_format_modifier_plane_count: planes,
+            drm_format_modifier_tiling_features: features,
+        }
+    }
+
+    fn usable(
+        store: Vec<VkDrmFormatModifierPropertiesEXT>,
+        view: &[VkDrmFormatModifierPropertiesEXT],
+    ) -> Vec<u64> {
+        usable_modifiers(store, view)
+            .iter()
+            .map(|m| m.drm_format_modifier)
+            .collect()
+    }
+
+    #[test]
+    fn a_modifier_needs_the_srgb_view_to_draw_and_blend() {
+        let store = (1..=4)
+            .map(|m| modifier(m, 1, VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT))
+            .collect();
+        let view = [
+            modifier(1, 1, VIEW),
+            modifier(2, 1, VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT),
+            modifier(3, 1, VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BLEND_BIT),
+        ];
+        // 2 cannot blend, 3 cannot be drawn into, and the view does not offer 4.
+        assert_eq!(usable(store, &view), [1]);
+    }
+
+    #[test]
+    fn a_modifier_needs_one_plane_it_can_draw_into() {
+        let store = vec![
+            modifier(1, 1, VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT),
+            modifier(2, 2, VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT),
+            modifier(3, 1, VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BLEND_BIT),
+        ];
+        let view: Vec<_> = (1..=3).map(|m| modifier(m, 1, VIEW)).collect();
+        assert_eq!(usable(store, &view), [1]);
+    }
 
     #[test]
     fn memory_type_picking_prefers_device_local() {

@@ -121,16 +121,13 @@ pub(super) const VK_SHARING_MODE_EXCLUSIVE: u32 = 0;
 /// its UNORM store format and an sRGB view for gamma-correct blending.
 pub(super) const VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT: u32 = 0x8;
 
-pub(super) const VK_IMAGE_USAGE_TRANSFER_SRC_BIT: u32 = 0x1;
 pub(super) const VK_IMAGE_USAGE_TRANSFER_DST_BIT: u32 = 0x2;
 pub(super) const VK_IMAGE_USAGE_SAMPLED_BIT: u32 = 0x4;
 pub(super) const VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT: u32 = 0x10;
-/// The format features a presentable image's modifier must support: rendering
-/// plus both transfer directions (the pixel-parity readback uses the source
-/// direction; clears use the destination).
+/// The format features a presentable image's modifier must support: drawing in
+/// the store format, and drawing and blending through the sRGB view.
 pub(super) const VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT: u32 = 0x80;
-pub(super) const VK_FORMAT_FEATURE_TRANSFER_SRC_BIT: u32 = 0x4000;
-pub(super) const VK_FORMAT_FEATURE_TRANSFER_DST_BIT: u32 = 0x8000;
+pub(super) const VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BLEND_BIT: u32 = 0x100;
 
 pub(super) const VK_IMAGE_LAYOUT_UNDEFINED: u32 = 0;
 /// The layout the image is handed to the compositor in: the only layout

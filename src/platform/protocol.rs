@@ -27,7 +27,6 @@ pub mod wl_compositor {
 
 pub mod wl_surface {
     pub const ATTACH: u16 = 1;
-    pub const DAMAGE: u16 = 2;
     /// Request a one-shot `wl_callback` that fires `done` when the compositor is
     /// ready for the next frame, pacing redraws to the refresh rate.
     pub const FRAME: u16 = 3;
@@ -37,6 +36,9 @@ pub mod wl_surface {
     /// surface. Used on the integer-scale fallback path; the fractional path uses
     /// a viewport instead.
     pub const SET_BUFFER_SCALE: u16 = 8;
+    /// Damage a rectangle in buffer pixels (version 4), so it needs no conversion
+    /// through the buffer scale or the viewport.
+    pub const DAMAGE_BUFFER: u16 = 9;
     /// The surface is now shown on this `wl_output`; its argument is the output's
     /// object id. Tracked (with `leave`) to pick the surface's integer scale as
     /// the max over the outputs it spans.
@@ -254,6 +256,7 @@ pub const IFACE_OUTPUT: &str = "wl_output";
 pub const IFACE_FRACTIONAL_SCALE_MANAGER: &str = "wp_fractional_scale_manager_v1";
 pub const IFACE_VIEWPORTER: &str = "wp_viewporter";
 
+/// The floor as well as the cap: wl_surface.damage_buffer needs version 4.
 pub const VERSION_COMPOSITOR: u32 = 4;
 pub const VERSION_WM_BASE: u32 = 1;
 pub const VERSION_SEAT: u32 = 5;

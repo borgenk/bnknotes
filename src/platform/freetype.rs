@@ -412,7 +412,7 @@ pub struct Face {
     /// The emoji face scales its color glyphs to this so an emoji sits on the
     /// same em square as the surrounding text.
     pixel_size: Cell<u32>,
-    /// The shared color emoji font, if one is installed; [`Fonts::new`] attaches
+    /// The shared color emoji font, if one is installed; [`Fonts::open`] attaches
     /// it to every face it opens. `None` on the emoji face itself and in
     /// face-only tests, in which case emoji clusters take the per-character
     /// path (tofu, exactly the pre-emoji behavior).
@@ -878,6 +878,45 @@ pub struct Fonts {
     /// The color emoji font, opened once and shared by every face, or `None`
     /// when no emoji font is installed (emoji then render as tofu, as before).
     emoji: Option<Rc<EmojiFont>>,
+    selection: FontSelection,
+}
+
+/// The font files a Fonts opens and the line spacing it lays out at, resolved
+/// once through fontconfig. Plain data, so a layout worker thread can open its
+/// own Fonts on exactly the editor's selection.
+#[derive(Clone, Debug)]
+pub struct FontSelection {
+    regular: FontFile,
+    /// A style's own file, or None when it resolved to the regular file and
+    /// draws in the regular face.
+    bold: Option<FontFile>,
+    italic: Option<FontFile>,
+    bold_italic: Option<FontFile>,
+    code: Option<FontFile>,
+    fallback: Vec<FontFile>,
+    line_height_scale: f32,
+}
+
+impl FontSelection {
+    /// Resolve config's prose, code and fallback families through fontconfig.
+    pub fn resolve(config: &FontConfig, line_height_scale: f32) -> Result<Self> {
+        let family = config.default_family()?;
+        let own_cut = |file: &FontFile| (*file != family.regular).then_some(file.clone());
+        let (bold, italic, bold_italic) = (
+            own_cut(&family.bold),
+            own_cut(&family.italic),
+            own_cut(&family.bold_italic),
+        );
+        Ok(Self {
+            code: config.code_regular(&family),
+            fallback: config.fallback_files(),
+            regular: family.regular,
+            bold,
+            italic,
+            bold_italic,
+            line_height_scale,
+        })
+    }
 }
 
 impl Fonts {
@@ -886,28 +925,33 @@ impl Fonts {
     /// [`Self::with_config`] using [`FontConfig::default`]; tests and the perf
     /// harness use it, while the editor threads its own config through
     /// [`Self::with_config`].
+    #[cfg(any(test, feature = "dev"))]
     pub fn new(sizes: &[u32]) -> Result<Self> {
         Self::with_config(&FontConfig::default(), sizes, 1.0)
     }
 
-    /// Open `config`'s prose family and code face at each of `sizes` (zeros and
-    /// duplicates skipped), loading every available style per size. Each size's
-    /// line box is grown to at least `line_height_scale` times the size (the CSS
-    /// line-height model), never below the font's own line height, so lines can
-    /// be spaced out without overlapping. At least one nonzero size is required;
-    /// the first opened becomes the fallback.
+    /// Resolve config through fontconfig and open it at each of sizes, as
+    /// Self::open does.
     pub fn with_config(config: &FontConfig, sizes: &[u32], line_height_scale: f32) -> Result<Self> {
-        let family = config.default_family()?;
-        let code = config.code_regular(&family);
-        let fallback_files = config.fallback_files();
-        // A style that resolved to the regular file has no cut of its own; leaving it
-        // unopened makes `face` draw it in the regular face.
-        let own_cut = |file: &FontFile| (*file != family.regular).then_some(file.clone());
-        let (bold, italic, bold_italic) = (
-            own_cut(&family.bold),
-            own_cut(&family.italic),
-            own_cut(&family.bold_italic),
-        );
+        Self::open(FontSelection::resolve(config, line_height_scale)?, sizes)
+    }
+
+    /// Open selection's prose family and code face at each of sizes (zeros and
+    /// duplicates skipped), loading every available style per size. Each size's
+    /// line box is grown to at least the selection's line-height scale times the
+    /// size (the CSS line-height model), never below the font's own line height,
+    /// so lines can be spaced out without overlapping. At least one nonzero size
+    /// is required; the first opened becomes the fallback.
+    pub fn open(selection: FontSelection, sizes: &[u32]) -> Result<Self> {
+        let FontSelection {
+            regular: regular_file,
+            bold,
+            italic,
+            bold_italic,
+            code,
+            fallback: fallback_files,
+            line_height_scale,
+        } = &selection;
         let emoji = EmojiFont::open().map(Rc::new);
         let mut sized: Vec<SizedFaces> = Vec::new();
         for &size in sizes {
@@ -923,7 +967,7 @@ impl Fonts {
             let variant = |file: &Option<FontFile>| {
                 open_variant(file.as_ref()?, size, emoji.as_ref(), &fallback)
             };
-            let regular = open_face(&family.regular, size, emoji.as_ref(), &fallback)?;
+            let regular = open_face(regular_file, size, emoji.as_ref(), &fallback)?;
             let mut metrics = regular.metrics();
             // Grow the line box to the requested multiple of the size, keeping
             // the font's own line height as the floor so lines never overlap.
@@ -933,23 +977,33 @@ impl Fonts {
             sized.push(SizedFaces {
                 size,
                 regular,
-                bold: variant(&bold),
-                italic: variant(&italic),
-                bold_italic: variant(&bold_italic),
-                code: variant(&code),
+                bold: variant(bold),
+                italic: variant(italic),
+                bold_italic: variant(bold_italic),
+                code: variant(code),
                 fallback,
                 metrics,
             });
         }
         if sized.is_empty() {
-            return Err(Error::msg("Fonts::new needs at least one nonzero size"));
+            return Err(Error::msg("opening fonts needs at least one nonzero size"));
         }
-        Ok(Self { sized, emoji })
+        Ok(Self {
+            sized,
+            emoji,
+            selection,
+        })
+    }
+
+    /// The selection these fonts were opened from, to open the same fonts on
+    /// another thread.
+    pub fn selection(&self) -> &FontSelection {
+        &self.selection
     }
 
     /// The entry for `size`, or the fallback (first opened) if `size` is unknown.
     fn entry(&self, size: u32) -> &SizedFaces {
-        // `sized` is never empty (Fonts::new errors otherwise), so the `[0]`
+        // `sized` is never empty (Fonts::open errors otherwise), so the `[0]`
         // fallback for an unknown size cannot panic.
         debug_assert!(!self.sized.is_empty());
         self.sized

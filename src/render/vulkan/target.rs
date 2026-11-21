@@ -1,5 +1,6 @@
 use core::ffi::c_void;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::time::Duration;
 
 use crate::platform::error::{Error, Result};
 use crate::render::gpu::{AtlasInfo, AtlasUpload, FrameData, ImageId};
@@ -8,6 +9,11 @@ use crate::render::vulkan::abi::*;
 use crate::render::vulkan::renderer::{
     HostBuffer, Texture, allocate_set, color_range, destroy_texture, write_image_set,
 };
+
+/// How long a frame waits on the CPU for the compositor to finish reading its
+/// buffer when that wait cannot ride the GPU. Past it the frame renders anyway:
+/// a frame that may tear beats a render error, which ends the editor.
+const ACQUIRE_WAIT: Duration = Duration::from_secs(1);
 
 // ---------------------------------------------------------------------------
 // Render targets.
@@ -266,8 +272,7 @@ impl Gpu {
             array_layers: 1,
             samples: VK_SAMPLE_COUNT_1_BIT,
             tiling: VK_IMAGE_TILING_DRM_FORMAT_MODIFIER,
-            // Rendered into by the pipeline; read back by the parity harness.
-            usage: VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
+            usage: VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT,
             sharing_mode: VK_SHARING_MODE_EXCLUSIVE,
             queue_family_index_count: 0,
             p_queue_family_indices: core::ptr::null(),
@@ -601,9 +606,9 @@ impl Gpu {
     /// (the compositor's release point for this buffer's previous frame, `None`
     /// on first use) instead of the dmabuf's implicit fences, and return the
     /// render-done sync file for the caller to publish as this frame's acquire
-    /// point. `Ok(None)` means the driver could not export a fence, so the frame
-    /// was CPU-waited to completion and the caller must set no points on the
-    /// commit (the buffer is already safe to read).
+    /// point. `Ok(None)` means no fence was exported, so the frame was CPU-waited
+    /// to completion and the caller publishes an already-signaled acquire point
+    /// (the buffer is already safe to read).
     pub fn render_list_explicit(
         &mut self,
         img: &mut GpuImage,
@@ -613,7 +618,8 @@ impl Gpu {
         release_wait: Option<OwnedFd>,
     ) -> Result<Option<OwnedFd>> {
         self.prepare_frame(img, frame, background, glyph_gamma)?;
-        let wait_acquire = self.import_acquire(img, release_wait)?;
+        // No release point means the buffer's first frame: nothing has read it yet.
+        let wait_acquire = release_wait.is_some_and(|sync| self.import_acquire(img, sync));
         self.submit_frame_explicit(img, wait_acquire)
     }
 
@@ -688,8 +694,8 @@ impl Gpu {
 
     /// Submit under explicit sync: after the submit, hand back the render-done
     /// sync file so the caller can publish it as this frame's acquire point. If
-    /// the driver cannot export one, CPU-wait to completion and return `None` so
-    /// the caller commits with no sync points.
+    /// none is exported, CPU-wait to completion and return `None`, for which the
+    /// caller publishes an already-signaled acquire point.
     fn submit_frame_explicit(
         &self,
         img: &mut GpuImage,
@@ -705,13 +711,11 @@ impl Gpu {
         }
     }
 
-    /// Import `sync` (a sync file) as a temporary payload of the acquire
-    /// semaphore so the submission waits on it; `None` arms no wait. Returns
-    /// whether a wait was armed. Consumes `sync` (Vulkan owns it on success).
-    fn import_acquire(&self, img: &GpuImage, sync: Option<OwnedFd>) -> Result<bool> {
-        let Some(sync) = sync else {
-            return Ok(false);
-        };
+    /// Import sync, a sync file, as a temporary payload of the acquire semaphore
+    /// so the submission waits on it, returning whether a wait was armed. When
+    /// the driver refuses the import, the CPU waits on sync here instead.
+    /// Consumes sync (Vulkan owns it on success).
+    fn import_acquire(&self, img: &GpuImage, sync: OwnedFd) -> bool {
         let raw = sync.as_raw_fd();
         let info = VkImportSemaphoreFdInfoKHR {
             s_type: VK_STRUCTURE_TYPE_IMPORT_SEMAPHORE_FD_INFO_KHR,
@@ -726,19 +730,26 @@ impl Gpu {
         if r == VK_SUCCESS {
             // Ownership moved to Vulkan; do not let OwnedFd close it.
             core::mem::forget(sync);
-            Ok(true)
+            true
         } else {
-            // Failed import: we keep ownership (sync drops); skip the wait.
-            Ok(false)
+            // Failed import: we keep ownership (sync drops) and wait here.
+            crate::platform::ffi::wait_sync_file(raw, ACQUIRE_WAIT);
+            false
         }
     }
 
     /// The implicit-sync bridge's acquire: the dmabuf's current read/write
-    /// fences become the acquire wait.
+    /// fences become the acquire wait, or a CPU wait on a kernel that cannot
+    /// export them.
     fn import_read_fences(&self, img: &GpuImage) -> Result<bool> {
-        self.import_acquire(
-            img,
-            crate::platform::ffi::dmabuf_export_sync_file(img.fd())?,
+        Ok(
+            match crate::platform::ffi::dmabuf_export_sync_file(img.fd())? {
+                Some(sync) => self.import_acquire(img, sync),
+                None => {
+                    crate::platform::ffi::wait_dmabuf_writable(img.fd(), ACQUIRE_WAIT);
+                    false
+                }
+            },
         )
     }
 
@@ -818,9 +829,12 @@ impl Gpu {
                 image: img.image,
                 subresource_range: range,
             };
+            // The acquire semaphore is waited at COLOR_ATTACHMENT_OUTPUT. Starting
+            // the barrier at that stage chains it to the wait, so the transition
+            // runs only after the compositor's reads are done.
             (f.cmd_pipeline_barrier)(
                 img.cmd,
-                VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
                 VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
                 0,
                 0,
@@ -962,8 +976,8 @@ impl Gpu {
         )
     }
 
-    /// Record one texture upload (or a bare initialization barrier when the
-    /// upload carries no bytes, the dummy texture's case).
+    /// Record one texture upload, or the bare initialization barrier a texture
+    /// created this frame gets (an upload that carries no bytes).
     fn record_upload(&self, img: &GpuImage, up: &PendingUpload) {
         let f = &self.fns;
         let range = color_range();
@@ -1098,8 +1112,8 @@ impl Gpu {
 
         // Atlas textures follow the CPU mirrors' generations, then take any
         // dirty-region upload for the frame.
-        self.sync_atlas(AtlasSlot::Glyph, &frame.glyph_atlas)?;
-        self.sync_atlas(AtlasSlot::Emoji, &frame.emoji_atlas)?;
+        self.sync_atlas(AtlasSlot::Glyph, &frame.glyph_atlas, &mut uploads)?;
+        self.sync_atlas(AtlasSlot::Emoji, &frame.emoji_atlas, &mut uploads)?;
         self.stage_atlas_upload(
             AtlasSlot::Glyph,
             &frame.glyph_upload,
@@ -1144,7 +1158,7 @@ impl Gpu {
             uploads.push(PendingUpload {
                 image: tex.image,
                 was_initialized: false,
-                staging_offset: staging.len(),
+                staging_offset: align_staging(&mut staging),
                 x: 0,
                 y: 0,
                 w,
@@ -1171,8 +1185,15 @@ impl Gpu {
     /// slot's in-flight frame, so the queue is drained before the old texture is
     /// destroyed, and the shared atlas descriptor set is repointed after the new
     /// one exists. Shared by the glyph and emoji slots so that ordering lives in
-    /// one place.
-    fn sync_atlas(&mut self, slot: AtlasSlot, info: &AtlasInfo) -> Result<()> {
+    /// one place. The new texture's bare initialization barrier is queued on
+    /// uploads, so it is in the layout its descriptor names before any draw
+    /// samples it, whether or not anything is uploaded into it.
+    fn sync_atlas(
+        &mut self,
+        slot: AtlasSlot,
+        info: &AtlasInfo,
+        uploads: &mut Vec<PendingUpload>,
+    ) -> Result<()> {
         let tex = match slot {
             AtlasSlot::Glyph => &mut self.renderer.glyph_tex,
             AtlasSlot::Emoji => &mut self.renderer.emoji_tex,
@@ -1184,7 +1205,17 @@ impl Gpu {
             self.wait_idle();
             destroy_texture(&self.fns, self.device.raw, old);
         }
-        let tex = self.create_texture(slot.format(), info.width, info.height)?;
+        let mut tex = self.create_texture(slot.format(), info.width, info.height)?;
+        uploads.push(PendingUpload {
+            image: tex.image,
+            was_initialized: false,
+            staging_offset: 0,
+            x: 0,
+            y: 0,
+            w: 0,
+            h: 0,
+        });
+        tex.initialized = true;
         match slot {
             AtlasSlot::Glyph => self.renderer.glyph_tex = Some((tex, info.generation)),
             AtlasSlot::Emoji => self.renderer.emoji_tex = Some((tex, info.generation)),
@@ -1213,7 +1244,7 @@ impl Gpu {
             uploads.push(PendingUpload {
                 image: tex.image,
                 was_initialized: tex.initialized,
-                staging_offset: staging.len(),
+                staging_offset: align_staging(staging),
                 x: up.x,
                 y: up.y,
                 w: up.w,
@@ -1562,4 +1593,42 @@ struct PendingUpload {
     y: u32,
     w: u32,
     h: u32,
+}
+
+/// Every upload's bytes start on a multiple of this. A buffer-to-image copy must
+/// start on a whole texel of the image's format: the emoji atlas and images have
+/// four-byte texels, and the glyph atlas's one-byte texels can leave the staging
+/// at any length before them.
+const STAGING_ALIGN: usize = 4;
+
+/// Pad staging to the next whole-texel offset and return it, which is where the
+/// next upload's bytes go.
+fn align_staging(staging: &mut Vec<u8>) -> usize {
+    let offset = staging.len().next_multiple_of(STAGING_ALIGN);
+    staging.resize(offset, 0);
+    offset
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::render::vulkan::target::align_staging;
+
+    /// The glyph atlas stages first, so a 9x17 glyph leaves 153 bytes ahead of
+    /// the emoji upload, whose four-byte texels must then start at 156.
+    #[test]
+    fn an_upload_after_an_odd_length_one_starts_on_a_whole_texel() {
+        let mut staging = Vec::new();
+        assert_eq!(align_staging(&mut staging), 0);
+        staging.extend_from_slice(&[0x11; 9 * 17]);
+
+        let emoji_at = align_staging(&mut staging);
+        staging.extend_from_slice(&[0x22; 4 * 3 * 2]);
+
+        assert_eq!(emoji_at, 156);
+        assert!(
+            staging[..153].iter().all(|&b| b == 0x11),
+            "the glyph bytes stay put"
+        );
+        assert!(staging[emoji_at..].iter().all(|&b| b == 0x22));
+    }
 }

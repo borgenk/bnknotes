@@ -1,0 +1,65 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_call:
+  schedule:
+    - cron: "0 6 * * 1"
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  rust:
+    name: Rust
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install system libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libfreetype-dev \
+            libharfbuzz-dev \
+            libfontconfig1-dev \
+            libxkbcommon-dev \
+            fonts-roboto-unhinted \
+            fonts-jetbrains-mono \
+            fonts-noto-core \
+            fonts-noto-color-emoji
+
+      - name: Confirm the runner has the fonts the defaults resolve
+        run: |
+          set -eu
+          status=0
+          for family in "Roboto" "JetBrains Mono" "Noto Sans Symbols" "Noto Sans Symbols2"; do
+            match=$(fc-match -f '%{family[0]}' "$family")
+            if [ "$match" != "$family" ]; then
+              echo "::error::$family is not installed (fontconfig picked $match)"
+              status=1
+            else
+              printf '%-20s -> %s\n' "$family" "$(fc-match -f '%{file}' "$family")"
+            fi
+          done
+          exit $status
+
+      - name: Install Rust toolchain
+        run: rustup toolchain install
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+
+      - name: Test the installer and the ABI floor
+        run: make test-install test-abi
+
+      - name: Gate
+        run: make test

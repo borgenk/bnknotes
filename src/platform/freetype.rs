@@ -19,75 +19,126 @@ use core::ffi::{c_char, c_int, c_long, c_short, c_uint, c_ulong, c_ushort, c_voi
 use core::ptr::{self, NonNull};
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
+use std::path::Path;
 use std::rc::Rc;
 
 use crate::platform::emoji::{ColorGlyph, EmojiFont, wants_emoji};
 use crate::platform::error::{Error, Result};
+use crate::platform::fontconfig::{self, FontFile};
 
-/// A font family and the four style files the editor draws emphasis with. A
-/// missing bold, italic, or bold-italic variant falls back to the regular face
-/// at render time, so a family that ships only some weights still renders (just
-/// without the slant or weight). Paths are owned so a config, the built-in
-/// default now and a loaded file later, can supply them.
+/// A font family resolved to one face per style.
+///
+/// Missing cuts and cuts substituted from another family use the regular face. Each
+/// [`FontFile`] retains collection and variable instance indices selected by fontconfig.
 #[derive(Clone, Debug)]
 pub struct FontFamily {
-    pub regular: String,
-    pub bold: String,
-    pub italic: String,
-    pub bold_italic: String,
+    pub regular: FontFile,
+    pub bold: FontFile,
+    pub italic: FontFile,
+    pub bold_italic: FontFile,
+    matched_families: Vec<String>,
 }
 
 impl FontFamily {
-    /// A family from its four style paths.
-    pub fn new(regular: &str, bold: &str, italic: &str, bold_italic: &str) -> Self {
-        Self {
-            regular: regular.into(),
-            bold: bold.into(),
-            italic: italic.into(),
-            bold_italic: bold_italic.into(),
-        }
+    /// Resolve a real or generic family name, querying each style independently.
+    ///
+    /// Missing cuts use the regular face. An uninstalled named family returns `None`.
+    pub fn resolve(name: &str) -> Option<Self> {
+        let regular = fontconfig::match_family(name, FontStyle::Regular)?;
+        let mut family = Self {
+            bold: regular.file.clone(),
+            italic: regular.file.clone(),
+            bold_italic: regular.file.clone(),
+            regular: regular.file,
+            matched_families: regular.families,
+        };
+        family.bold = family
+            .resolve_style(name, FontStyle::Bold)
+            .unwrap_or_else(|| family.regular.clone());
+        family.italic = family
+            .resolve_style(name, FontStyle::Italic)
+            .unwrap_or_else(|| family.regular.clone());
+        family.bold_italic = family
+            .resolve_style(name, FontStyle::BoldItalic)
+            .unwrap_or_else(|| family.regular.clone());
+        Some(family)
+    }
+
+    /// Resolve a style only when fontconfig keeps it in this family.
+    fn resolve_style(&self, name: &str, style: FontStyle) -> Option<FontFile> {
+        let matched = fontconfig::match_family(name, style)?;
+        style_file_in_family(matched, &self.matched_families)
     }
 }
 
-/// Which fonts the editor opens: an ordered list of prose family candidates, an
-/// ordered list of code face candidates, and an ordered fallback chain for
-/// scalars the chosen family cannot draw. The first prose family whose regular
-/// file exists is used; the first installed code face distinct from that regular
-/// renders code, else code shares the prose face; the fallback chain is consulted
-/// glyph by glyph (see [`Fonts::glyph_face`]) for a character the prose or code
-/// face lacks. The concrete selection is the app's to supply: its `Default` impl
-/// lives with the app config, keeping this portable layer free of the app's own
-/// font paths. A loader can later replace it.
+/// Keep a style match only when it shares a family name with the regular face.
+fn style_file_in_family(
+    matched: fontconfig::FamilyMatch,
+    selected_families: &[String],
+) -> Option<FontFile> {
+    matched
+        .families
+        .iter()
+        .any(|family| {
+            selected_families
+                .iter()
+                .any(|selected| selected.eq_ignore_ascii_case(family))
+        })
+        .then_some(matched.file)
+}
+
+/// Which fonts the editor opens, as family names fontconfig resolves on this machine:
+/// an ordered list of prose family candidates, an ordered list of code family
+/// candidates, and an ordered fallback chain for scalars the chosen family cannot draw.
+/// The first installed prose family is used; the first installed code family whose
+/// regular file differs from the prose one renders code, else code shares the prose
+/// face; the fallback chain is consulted glyph by glyph (see [`Fonts::glyph_face`]) for
+/// a character the prose or code face lacks. A list ending in a generic alias
+/// (`sans-serif`, `monospace`) resolves on any machine with a font at all. The concrete
+/// selection is the app's to supply: its `Default` impl lives with the app config,
+/// keeping this portable layer free of the app's own fonts.
 #[derive(Clone, Debug)]
 pub struct FontConfig {
-    pub families: Vec<FontFamily>,
+    pub families: Vec<String>,
     pub code: Vec<String>,
-    /// Regular-weight faces consulted, in order, for a scalar the prose or code
-    /// face has no glyph for: a symbols/icon font (Nerd Font and Powerline glyphs
-    /// live in the private-use area, which text families do not carry) or a
-    /// wider-coverage Unicode fallback. Only installed files open; an empty list
-    /// means no fallback (a missing glyph renders as the `.notdef` tofu box, the
-    /// pre-fallback behavior).
+    /// Families consulted, in order, at regular weight for a scalar the prose or code
+    /// face has no glyph for: a symbols/icon font (Nerd Font and Powerline glyphs live
+    /// in the private-use area, which text families do not carry) or a wider-coverage
+    /// Unicode fallback. Only installed families open; an empty list means no fallback
+    /// (a missing glyph renders as the `.notdef` tofu box).
     pub fallback: Vec<String>,
 }
 
 impl FontConfig {
-    /// The first prose family whose regular face is installed on this machine.
-    fn default_family(&self) -> Result<&FontFamily> {
+    /// The first prose family installed on this machine.
+    fn default_family(&self) -> Result<FontFamily> {
         self.families
             .iter()
-            .find(|f| std::path::Path::new(&f.regular).exists())
-            .ok_or_else(|| Error::msg("no usable font family found in the candidate list"))
+            .find_map(|name| FontFamily::resolve(name))
+            .ok_or_else(|| {
+                Error::msg(format!(
+                    "no usable font family: fontconfig resolves none of {:?}",
+                    self.families
+                ))
+            })
     }
 
-    /// The first installed code face whose path differs from the prose family's
-    /// regular face, or `None` if none is available. A `None` leaves code sharing
-    /// the prose face: still readable, just without the visual distinction.
-    fn code_regular_path(&self, prose: &FontFamily) -> Option<&str> {
+    /// The first installed code family whose regular file differs from the prose
+    /// family's, or `None` if none is. A `None` leaves code sharing the prose face:
+    /// still readable, just without the visual distinction.
+    fn code_regular(&self, prose: &FontFamily) -> Option<FontFile> {
         self.code
             .iter()
-            .map(String::as_str)
-            .find(|&p| p != prose.regular.as_str() && std::path::Path::new(p).exists())
+            .filter_map(|name| fontconfig::font_for_family(name, FontStyle::Regular))
+            .find(|file| *file != prose.regular)
+    }
+
+    /// The installed fallback families' regular files, in order.
+    fn fallback_files(&self) -> Vec<FontFile> {
+        self.fallback
+            .iter()
+            .filter_map(|name| fontconfig::font_for_family(name, FontStyle::Regular))
+            .collect()
     }
 }
 
@@ -419,14 +470,21 @@ impl Face {
     #[cfg(test)]
     pub fn open_default(pixel_size: u32) -> Result<Self> {
         let config = FontConfig::default();
-        let face = Self::from_path(&config.default_family()?.regular)?;
+        let face = Self::from_file(&config.default_family()?.regular)?;
         face.set_pixel_size(pixel_size)?;
         Ok(face)
     }
 
-    /// Build a face from a font file on disk.
-    pub fn from_path(path: &str) -> Result<Self> {
-        let data = std::fs::read(path).map_err(|e| Error::msg(format!("read font {path}: {e}")))?;
+    /// Open the path and face index selected by fontconfig.
+    pub fn from_file(file: &FontFile) -> Result<Self> {
+        Self::from_path_index(&file.path, file.index)
+    }
+
+    /// Build face `index` of a font file on disk. The index is 0 for an ordinary font
+    /// and selects a face in a collection, or a named instance of a variable font.
+    pub fn from_path_index(path: &Path, index: i32) -> Result<Self> {
+        let data = std::fs::read(path)
+            .map_err(|e| Error::msg(format!("read font {}: {e}", path.display())))?;
 
         let mut library: FtLibrary = ptr::null_mut();
         // SAFETY: alibrary points at a live local; FT writes the handle through
@@ -445,7 +503,7 @@ impl Face {
                 library.as_ptr(),
                 data.as_ptr(),
                 data.len() as c_long,
-                0,
+                c_long::from(index),
                 &mut face,
             )
         };
@@ -454,7 +512,10 @@ impl Face {
             None => {
                 // SAFETY: library came from FT_Init_FreeType and is freed once.
                 unsafe { FT_Done_FreeType(library.as_ptr()) };
-                return Err(Error::msg(format!("FT_New_Memory_Face failed for {path}")));
+                return Err(Error::msg(format!(
+                    "FT_New_Memory_Face failed for {} (face {index})",
+                    path.display()
+                )));
             }
         };
 
@@ -844,7 +905,16 @@ impl Fonts {
     /// the first opened becomes the fallback.
     pub fn with_config(config: &FontConfig, sizes: &[u32], line_height_scale: f32) -> Result<Self> {
         let family = config.default_family()?;
-        let code_path = config.code_regular_path(family);
+        let code = config.code_regular(&family);
+        let fallback_files = config.fallback_files();
+        // A style that resolved to the regular file has no cut of its own; leaving it
+        // unopened makes `face` draw it in the regular face.
+        let own_cut = |file: &FontFile| (*file != family.regular).then_some(file.clone());
+        let (bold, italic, bold_italic) = (
+            own_cut(&family.bold),
+            own_cut(&family.italic),
+            own_cut(&family.bold_italic),
+        );
         let emoji = EmojiFont::open().map(Rc::new);
         let mut sized: Vec<SizedFaces> = Vec::new();
         for &size in sizes {
@@ -853,11 +923,13 @@ impl Fonts {
             }
             // The chain opens first: every face at this size carries it, so each can
             // resolve a scalar it lacks on its own.
-            let fallback: Vec<Rc<Face>> = config
-                .fallback
+            let fallback: Vec<Rc<Face>> = fallback_files
                 .iter()
-                .filter_map(|p| open_variant(p, size, None, &[]).map(Rc::new))
+                .filter_map(|file| open_variant(file, size, None, &[]).map(Rc::new))
                 .collect();
+            let variant = |file: &Option<FontFile>| {
+                open_variant(file.as_ref()?, size, emoji.as_ref(), &fallback)
+            };
             let regular = open_face(&family.regular, size, emoji.as_ref(), &fallback)?;
             let mut metrics = regular.metrics();
             // Grow the line box to the requested multiple of the size, keeping
@@ -868,10 +940,10 @@ impl Fonts {
             sized.push(SizedFaces {
                 size,
                 regular,
-                bold: open_variant(&family.bold, size, emoji.as_ref(), &fallback),
-                italic: open_variant(&family.italic, size, emoji.as_ref(), &fallback),
-                bold_italic: open_variant(&family.bold_italic, size, emoji.as_ref(), &fallback),
-                code: code_path.and_then(|p| open_variant(p, size, emoji.as_ref(), &fallback)),
+                bold: variant(&bold),
+                italic: variant(&italic),
+                bold_italic: variant(&bold_italic),
+                code: variant(&code),
                 fallback,
                 metrics,
             });
@@ -961,35 +1033,32 @@ impl Fonts {
     }
 }
 
-/// Open `path` at `size` with the shared `emoji` font attached: the three-step
+/// Open `file` at `size` with the shared `emoji` font attached: the three-step
 /// face open (read the file, fix the pixel size, share the emoji font) that
 /// both the required regular face and the optional variants go through.
 fn open_face(
-    path: &str,
+    file: &FontFile,
     size: u32,
     emoji: Option<&Rc<EmojiFont>>,
     fallback: &[Rc<Face>],
 ) -> Result<Face> {
-    let mut face = Face::from_path(path)?;
+    let mut face = Face::from_file(file)?;
     face.set_pixel_size(size)?;
     face.emoji = emoji.cloned();
     face.fallback = fallback.to_vec();
     Ok(face)
 }
 
-/// Open a style variant at `size`, or `None` if the file is absent or fails to
-/// load, leaving the caller to fall back to the regular face. Keeps a family
-/// that ships only some weights from being a hard error.
+/// Open a style variant at `size`, or `None` if the file fails to load, leaving the
+/// caller to fall back to the regular face. Keeps a broken variant file from being a
+/// hard error.
 fn open_variant(
-    path: &str,
+    file: &FontFile,
     size: u32,
     emoji: Option<&Rc<EmojiFont>>,
     fallback: &[Rc<Face>],
 ) -> Option<Face> {
-    if !std::path::Path::new(path).exists() {
-        return None;
-    }
-    open_face(path, size, emoji, fallback).ok()
+    open_face(file, size, emoji, fallback).ok()
 }
 
 /// Copy a FreeType bitmap into a tightly packed top-down coverage buffer of
@@ -1198,6 +1267,139 @@ mod tests {
     fn fonts_reject_an_empty_size_set() {
         assert!(Fonts::new(&[]).is_err());
         assert!(Fonts::new(&[0]).is_err());
+    }
+
+    /// A config whose prose candidates are `names`, keeping the default code and
+    /// fallback lists.
+    fn config_of(names: &[&str]) -> FontConfig {
+        FontConfig {
+            families: names.iter().map(|n| (*n).to_string()).collect(),
+            ..FontConfig::default()
+        }
+    }
+
+    #[test]
+    fn a_candidate_nobody_has_installed_falls_through_to_the_next() {
+        if fontconfig::font_for_family("monospace", FontStyle::Regular).is_none() {
+            eprintln!("no usable fontconfig in this environment; skipping");
+            return;
+        }
+        let family = config_of(&["NoSuchFamilyAtAll", "monospace"])
+            .default_family()
+            .expect("the alias answers where the named family could not");
+        assert!(family.regular.path.exists());
+        Face::from_file(&family.regular).expect("the face fontconfig named opens");
+    }
+
+    #[test]
+    fn the_first_installed_candidate_wins() {
+        let (Some(sans), Some(mono)) = (
+            fontconfig::font_for_family("sans-serif", FontStyle::Regular),
+            fontconfig::font_for_family("monospace", FontStyle::Regular),
+        ) else {
+            return;
+        };
+        if sans == mono {
+            return;
+        }
+        let first = config_of(&["sans-serif", "monospace"])
+            .default_family()
+            .expect("resolves")
+            .regular;
+        assert_eq!(first, sans, "the leading candidate is the one used");
+        let second = config_of(&["monospace", "sans-serif"])
+            .default_family()
+            .expect("resolves")
+            .regular;
+        assert_eq!(second, mono, "and order is the only thing that decides it");
+    }
+
+    #[test]
+    fn a_config_naming_nothing_installed_is_an_error_not_a_panic() {
+        let err = config_of(&["NoSuchFamilyAtAll", "NorThisOne"])
+            .default_family()
+            .expect_err("nothing resolves");
+        assert!(
+            format!("{err}").contains("NoSuchFamilyAtAll"),
+            "the error names what was asked for: {err}"
+        );
+    }
+
+    #[test]
+    fn fonts_build_from_the_generic_alias_alone() {
+        if fontconfig::font_for_family("monospace", FontStyle::Regular).is_none() {
+            return;
+        }
+        let fonts = Fonts::with_config(&config_of(&["NoSuchFamilyAtAll", "monospace"]), &[16], 1.0)
+            .expect("fonts open");
+        assert!(
+            fonts.face(16, FontStyle::Regular).metrics().line_height > 0,
+            "a face opened from the alias has real metrics"
+        );
+    }
+
+    #[test]
+    fn a_style_substituted_from_another_family_is_refused() {
+        let selected = vec!["Body Face".to_string(), "Localized Body Face".to_string()];
+        let expected = FontFile {
+            path: "/same-family.ttf".into(),
+            index: 0,
+        };
+        let same_family = fontconfig::FamilyMatch {
+            file: expected.clone(),
+            families: vec!["localized body face".to_string()],
+        };
+        assert_eq!(style_file_in_family(same_family, &selected), Some(expected));
+
+        let foreign = fontconfig::FamilyMatch {
+            file: FontFile {
+                path: "/foreign-family.ttf".into(),
+                index: 0,
+            },
+            families: vec!["Foreign Face".to_string()],
+        };
+        assert_eq!(style_file_in_family(foreign, &selected), None);
+    }
+
+    #[test]
+    fn a_resolved_family_carries_a_cut_for_every_style() {
+        let Some(family) = FontFamily::resolve("monospace") else {
+            return;
+        };
+        for file in [
+            &family.regular,
+            &family.bold,
+            &family.italic,
+            &family.bold_italic,
+        ] {
+            assert!(file.path.exists(), "{} is missing", file.path.display());
+        }
+    }
+
+    #[test]
+    fn each_style_draws_from_its_own_cut_or_the_regular_face() {
+        // A style that resolved to the regular file has no cut of its own and draws in
+        // the regular face; one with its own file must draw from it, or bold text would
+        // quietly render at the regular weight.
+        let config = FontConfig::default();
+        let Ok(family) = config.default_family() else {
+            return;
+        };
+        let fonts = Fonts::with_config(&config, &[16], 1.0).expect("fonts open");
+        let regular = fonts.face(16, FontStyle::Regular);
+        for (style, file) in [
+            (FontStyle::Bold, &family.bold),
+            (FontStyle::Italic, &family.italic),
+            (FontStyle::BoldItalic, &family.bold_italic),
+        ] {
+            let drawn_regular = std::ptr::eq(fonts.face(16, style), regular);
+            assert_eq!(
+                drawn_regular,
+                *file == family.regular,
+                "{style:?} resolved to {} but drawn_regular is {drawn_regular}",
+                file.path.display()
+            );
+        }
     }
 
     #[test]

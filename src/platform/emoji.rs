@@ -114,7 +114,7 @@ impl EmojiFont {
         let path = EMOJI_FONTS
             .iter()
             .find(|p| std::path::Path::new(p).exists())?;
-        let face = Face::from_path(path).ok()?;
+        let face = Face::from_path_index(std::path::Path::new(path), 0).ok()?;
         let strike = face.select_first_strike()?;
         // SAFETY: the face handle is valid and has a size selected; the shaper
         // takes its own FreeType reference, so drop order does not matter.

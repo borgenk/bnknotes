@@ -22,7 +22,7 @@
 //! comments, the ordering, and any field this version does not know all survive.
 //!
 //! This module also owns the [`Default`] for the portable [`FontConfig`] type:
-//! the concrete font paths are this app's choice, so they live here rather than
+//! the concrete font families are this app's choice, so they live here rather than
 //! in the portable `platform/freetype.rs`, which stays free of app-specific fonts.
 
 use std::ffi::OsStr;
@@ -30,7 +30,7 @@ use std::path::{Path, PathBuf};
 
 use crate::icon::VaultIcon;
 use crate::platform::error::{Error, Result};
-use crate::platform::freetype::{FontConfig, FontFamily};
+use crate::platform::freetype::FontConfig;
 use crate::theme::VAULT_COLORS;
 
 const FILENAME: &str = "config";
@@ -516,73 +516,45 @@ impl Default for Config {
 
 impl Default for FontConfig {
     fn default() -> Self {
+        let names = |list: &[&str]| list.iter().map(|name| (*name).to_string()).collect();
         Self {
-            families: vec![
-                // Roboto first, the preferred text face; the first family installed wins.
-                FontFamily::new(
-                    "/usr/share/fonts/TTF/Roboto-Regular.ttf",
-                    "/usr/share/fonts/TTF/Roboto-Bold.ttf",
-                    "/usr/share/fonts/TTF/Roboto-Italic.ttf",
-                    "/usr/share/fonts/TTF/Roboto-BoldItalic.ttf",
-                ),
-                FontFamily::new(
-                    "/usr/share/fonts/noto/NotoSans-Regular.ttf",
-                    "/usr/share/fonts/noto/NotoSans-Bold.ttf",
-                    "/usr/share/fonts/noto/NotoSans-Italic.ttf",
-                    "/usr/share/fonts/noto/NotoSans-BoldItalic.ttf",
-                ),
-                FontFamily::new(
-                    "/usr/share/fonts/TTF/Hack-Regular.ttf",
-                    "/usr/share/fonts/TTF/Hack-Bold.ttf",
-                    "/usr/share/fonts/TTF/Hack-Italic.ttf",
-                    "/usr/share/fonts/TTF/Hack-BoldItalic.ttf",
-                ),
-                FontFamily::new(
-                    "/usr/share/fonts/noto/NotoSansMono-Regular.ttf",
-                    "/usr/share/fonts/noto/NotoSansMono-Bold.ttf",
-                    // Noto Sans Mono ships no italic; these paths simply will not
-                    // exist, and the lookup falls back to the regular face.
-                    "/usr/share/fonts/noto/NotoSansMono-Italic.ttf",
-                    "/usr/share/fonts/noto/NotoSansMono-BoldItalic.ttf",
-                ),
-                FontFamily::new(
-                    "/usr/share/fonts/Adwaita/AdwaitaMono-Regular.ttf",
-                    "/usr/share/fonts/Adwaita/AdwaitaMono-Bold.ttf",
-                    "/usr/share/fonts/Adwaita/AdwaitaMono-Italic.ttf",
-                    "/usr/share/fonts/Adwaita/AdwaitaMono-BoldItalic.ttf",
-                ),
-                FontFamily::new(
-                    "/usr/share/fonts/TTF/DejaVuSansMono.ttf",
-                    "/usr/share/fonts/TTF/DejaVuSansMono-Bold.ttf",
-                    // DejaVu calls its slanted styles Oblique rather than Italic.
-                    "/usr/share/fonts/TTF/DejaVuSansMono-Oblique.ttf",
-                    "/usr/share/fonts/TTF/DejaVuSansMono-BoldOblique.ttf",
-                ),
-            ],
+            // Roboto first, the preferred text face; the first family installed wins,
+            // and the generic alias at the end resolves on any machine with a font.
+            families: names(&[
+                "Roboto",
+                "Noto Sans",
+                "Hack",
+                "Noto Sans Mono",
+                "Adwaita Mono",
+                "DejaVu Sans Mono",
+                "sans-serif",
+            ]),
             // Code fonts: a monospace deliberately distinct from the prose family,
             // so code blocks and inline code read in their own typeface. Code
-            // never renders bold or italic, so only the regular face is listed.
-            code: vec![
-                // JetBrains Mono first, the preferred code face. Noto Sans Mono next as a
-                // near-universal fallback when JetBrains Mono is not installed.
-                "/usr/share/fonts/TTF/JetBrainsMono-Regular.ttf".into(),
-                "/usr/share/fonts/noto/NotoSansMono-Regular.ttf".into(),
-                "/usr/share/fonts/Adwaita/AdwaitaMono-Regular.ttf".into(),
-                "/usr/share/fonts/liberation/LiberationMono-Regular.ttf".into(),
-                "/usr/share/fonts/TTF/DejaVuSansMono.ttf".into(),
-                "/usr/share/fonts/gnu-free/FreeMono.otf".into(),
-            ],
+            // never renders bold or italic, so only the regular face is used.
+            // JetBrains Mono first, the preferred code face.
+            code: names(&[
+                "JetBrains Mono",
+                "Noto Sans Mono",
+                "Adwaita Mono",
+                "Liberation Mono",
+                "DejaVu Sans Mono",
+                "FreeMono",
+                "monospace",
+            ]),
             // Fallback chain for scalars the prose and code faces lack: arrows,
             // maths and technical signs, and the many symbol blocks a text font
             // omits. The Symbols faces cover most of them; Noto Sans Mono rounds out
-            // the odd Latin-adjacent glyph. A glyph absent from all of these still
-            // renders its .notdef box, the pre-fallback behavior. Consulted per
-            // missing glyph only, so the common all-Latin path never touches it.
-            fallback: vec![
-                "/usr/share/fonts/noto/NotoSansSymbols-Regular.ttf".into(),
-                "/usr/share/fonts/noto/NotoSansSymbols2-Regular.ttf".into(),
-                "/usr/share/fonts/noto/NotoSansMono-Regular.ttf".into(),
-            ],
+            // the odd Latin-adjacent glyph. A glyph absent from all of these renders
+            // its .notdef box. Consulted per missing glyph only, so the common
+            // all-Latin path never touches it. Older Noto releases (Debian, Ubuntu)
+            // name the second Symbols face without the space.
+            fallback: names(&[
+                "Noto Sans Symbols",
+                "Noto Sans Symbols 2",
+                "Noto Sans Symbols2",
+                "Noto Sans Mono",
+            ]),
         }
     }
 }

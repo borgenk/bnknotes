@@ -537,9 +537,11 @@ fn line_lcs(a: &[&str], b: &[&str]) -> Vec<LineOp> {
 pub struct Job {
     child: Child,
     stdout_rx: Receiver<Result<String>>,
-    stderr_path: PathBuf,
+    /// The job's reserved stderr file, taken when the job deletes it (see
+    /// [`Self::remove_scratch`]).
+    stderr_path: Option<PathBuf>,
     /// The file a Codex-style provider writes its answer to, read in place of stdout;
-    /// `None` for a provider whose answer is stdout.
+    /// `None` for a provider whose answer is stdout, and once the job has deleted it.
     answer_path: Option<PathBuf>,
 }
 
@@ -554,32 +556,35 @@ impl Job {
     /// one byte is written to `wake` (a pipe the event loop polls), after which the app
     /// calls [`Self::take_outcome`]. Errors only when the process cannot be started.
     pub fn spawn(provider: Provider, instruction: &str, input: &str, wake: RawFd) -> Result<Job> {
+        let scratch = Scratch::reserve()?;
         // A file-answer provider needs its output path chosen up front, so it can go
         // both into the command's args and into the job that reads it back.
         let answer_path = match provider.output() {
             OutputMode::Stdout => None,
-            OutputMode::LastMessageFile => Some(scratch_path("answer")),
+            OutputMode::LastMessageFile => Some(scratch.answer_path()),
         };
         let cmd = provider.command(instruction, answer_path.as_deref());
-        Job::spawn_command(cmd, provider.program(), input, wake, answer_path)
+        Job::spawn_command(cmd, provider.program(), input, wake, scratch, answer_path)
     }
 
     /// The core of [`Self::spawn`], taking the built command so a test can drive the
     /// worker-thread and wake plumbing with a plain local program rather than the
-    /// provider. `answer_path`, when set, is the file the answer is read from instead
-    /// of stdout.
+    /// provider. `scratch` is the job's reserved stderr file; `answer_path`, when set,
+    /// is the file the answer is read from instead of stdout.
     fn spawn_command(
         mut cmd: Command,
         program: &str,
         input: &str,
         wake: RawFd,
+        scratch: Scratch,
         answer_path: Option<PathBuf>,
     ) -> Result<Job> {
         // stderr goes to a scratch file rather than a second pipe: reading two pipes
         // from the one worker could deadlock, and the file is read only on failure.
-        let stderr_path = scratch_path("stderr");
-        let stderr_file = std::fs::File::create(&stderr_path)
-            .map_err(|e| Error::msg(format!("cannot open a scratch file: {e}")))?;
+        let Scratch {
+            stderr_path,
+            stderr: stderr_file,
+        } = scratch;
         // The answer file starts absent, so a file left behind by a killed job (or by
         // an earlier process that held this pid) can never be read back as this job's
         // answer when the child exits without writing one.
@@ -587,12 +592,19 @@ impl Job {
             let _ = std::fs::remove_file(path);
         }
 
-        let mut child = cmd
+        let spawned = cmd
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::from(stderr_file))
-            .spawn()
-            .map_err(|e| Error::msg(format!("cannot run {program}: {e}")))?;
+            .spawn();
+        let mut child = match spawned {
+            Ok(child) => child,
+            Err(e) => {
+                // No job will own the reserved file, so it goes now.
+                let _ = std::fs::remove_file(&stderr_path);
+                return Err(Error::msg(format!("cannot run {program}: {e}")));
+            }
+        };
 
         let mut stdin = child
             .stdin
@@ -630,7 +642,7 @@ impl Job {
         Ok(Job {
             child,
             stdout_rx,
-            stderr_path,
+            stderr_path: Some(stderr_path),
             answer_path,
         })
     }
@@ -645,10 +657,7 @@ impl Job {
                 // The worker vanished without sending (it panicked): reap and report.
                 let _ = self.child.kill();
                 let _ = self.child.wait();
-                let _ = std::fs::remove_file(&self.stderr_path);
-                if let Some(path) = &self.answer_path {
-                    let _ = std::fs::remove_file(path);
-                }
+                self.remove_scratch();
                 Some(Outcome::Failed("the tool ended unexpectedly".into()))
             }
         }
@@ -659,27 +668,25 @@ impl Job {
     /// returns at once.
     fn finish(&mut self, stdout: Result<String>) -> Outcome {
         let status = self.child.wait();
-        let stderr = std::fs::read_to_string(&self.stderr_path).unwrap_or_default();
-        let _ = std::fs::remove_file(&self.stderr_path);
-
+        let stderr = self
+            .stderr_path
+            .as_ref()
+            .and_then(|path| std::fs::read_to_string(path).ok())
+            .unwrap_or_default();
         // The answer is stdout, or, for a Codex-style provider, the file it wrote (its
         // own stdout being session chatter the worker read only to learn it exited).
-        let text = match &self.answer_path {
-            None => match stdout {
-                Ok(text) => text,
-                Err(e) => return Outcome::Failed(e.to_string()),
-            },
-            Some(path) => {
-                let read = stdout.and_then(|_| {
-                    std::fs::read_to_string(path)
-                        .map_err(|e| Error::msg(format!("reading the answer failed: {e}")))
-                });
-                let _ = std::fs::remove_file(path);
-                match read {
-                    Ok(text) => text,
-                    Err(e) => return Outcome::Failed(e.to_string()),
-                }
-            }
+        let answer = self.answer_path.as_ref().map(|path| {
+            std::fs::read_to_string(path)
+                .map_err(|e| Error::msg(format!("reading the answer failed: {e}")))
+        });
+        self.remove_scratch();
+        let text = match answer {
+            None => stdout,
+            Some(read) => stdout.and(read),
+        };
+        let text = match text {
+            Ok(text) => text,
+            Err(e) => return Outcome::Failed(e.to_string()),
         };
         match status {
             Ok(st) if st.success() => {
@@ -694,6 +701,19 @@ impl Job {
             Err(e) => Outcome::Failed(format!("the tool could not be reaped: {e}")),
         }
     }
+
+    /// Delete the scratch files the job still holds. Each path is taken as it goes, so
+    /// a job that already cleaned up cannot delete a file a newer job reserved under
+    /// the freed name. The answer file goes first: the stderr file is the reservation,
+    /// so the name frees only once nothing of this job's is left under it.
+    fn remove_scratch(&mut self) {
+        for path in [self.answer_path.take(), self.stderr_path.take()]
+            .into_iter()
+            .flatten()
+        {
+            let _ = std::fs::remove_file(path);
+        }
+    }
 }
 
 impl Drop for Job {
@@ -703,23 +723,61 @@ impl Drop for Job {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
-        let _ = std::fs::remove_file(&self.stderr_path);
-        if let Some(path) = &self.answer_path {
-            let _ = std::fs::remove_file(path);
-        }
+        self.remove_scratch();
     }
 }
 
-/// A scratch file for one job: `$XDG_RUNTIME_DIR` when the session has one (a
-/// per-user directory nobody else can reach, which a Wayland client always has),
-/// else the shared temp directory. The name carries the pid so two editors keep
-/// their own, and [`Job::spawn_command`] clears the path before the child runs.
-fn scratch_path(suffix: &str) -> PathBuf {
-    let dir = std::env::var_os("XDG_RUNTIME_DIR")
-        .filter(|d| !d.is_empty())
-        .map(PathBuf::from)
-        .unwrap_or_else(std::env::temp_dir);
-    dir.join(format!("bnknotes-ai-{}.{suffix}", std::process::id()))
+/// One job's scratch files, `bnknotes-ai-<pid>-<n>.<suffix>`, in `$XDG_RUNTIME_DIR`
+/// when the session has one (a per-user directory nobody else can reach, which a
+/// Wayland client always has), else the shared temp directory. Creating the stderr
+/// file exclusively reserves `n` while the job holds it, so jobs alive at once in one
+/// process never share a file; the pid keeps two editors apart.
+struct Scratch {
+    stderr_path: PathBuf,
+    stderr: std::fs::File,
+}
+
+impl Scratch {
+    /// Names tried before giving up. Far more than one editor runs at once, so running
+    /// out means the directory is full of leftovers.
+    const SLOTS: u32 = 1024;
+
+    fn reserve() -> Result<Self> {
+        let dir = std::env::var_os("XDG_RUNTIME_DIR")
+            .filter(|d| !d.is_empty())
+            .map(PathBuf::from)
+            .unwrap_or_else(std::env::temp_dir);
+        Self::reserve_in(&dir)
+    }
+
+    fn reserve_in(dir: &Path) -> Result<Self> {
+        let pid = std::process::id();
+        for n in 0..Self::SLOTS {
+            let stderr_path = dir.join(format!("bnknotes-ai-{pid}-{n}.stderr"));
+            let created = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&stderr_path);
+            match created {
+                Ok(stderr) => {
+                    return Ok(Self {
+                        stderr_path,
+                        stderr,
+                    });
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(e) => return Err(Error::msg(format!("cannot open a scratch file: {e}"))),
+            }
+        }
+        Err(Error::msg(
+            "cannot open a scratch file: every name is taken",
+        ))
+    }
+
+    /// Job::spawn_command clears it before the child runs.
+    fn answer_path(&self) -> PathBuf {
+        self.stderr_path.with_extension("answer")
+    }
 }
 
 /// A failure message: the given summary, plus the last non-empty stderr line when
@@ -1024,6 +1082,7 @@ mod tests {
             "cat",
             "round trip\n",
             wake.write_fd(),
+            Scratch::reserve().expect("a scratch file"),
             None,
         )
         .expect("spawn cat");
@@ -1051,8 +1110,15 @@ mod tests {
             &path.to_string_lossy(),
         ]);
         let wake = Wake::new().expect("wake pipe");
-        let mut job = Job::spawn_command(cmd, "sh", "file answer\n", wake.write_fd(), Some(path))
-            .expect("spawn sh");
+        let mut job = Job::spawn_command(
+            cmd,
+            "sh",
+            "file answer\n",
+            wake.write_fd(),
+            Scratch::reserve().expect("a scratch file"),
+            Some(path),
+        )
+        .expect("spawn sh");
         match await_outcome(&mut job, &wake) {
             Outcome::Revised(text) => assert_eq!(text, "file answer"),
             Outcome::Failed(msg) => panic!("sh failed: {msg}"),
@@ -1071,8 +1137,15 @@ mod tests {
         let mut cmd = Command::new("sh");
         cmd.args(["-c", "cat > /dev/null; echo session chatter"]);
         let wake = Wake::new().expect("wake pipe");
-        let mut job = Job::spawn_command(cmd, "sh", "input\n", wake.write_fd(), Some(path.clone()))
-            .expect("spawn sh");
+        let mut job = Job::spawn_command(
+            cmd,
+            "sh",
+            "input\n",
+            wake.write_fd(),
+            Scratch::reserve().expect("a scratch file"),
+            Some(path.clone()),
+        )
+        .expect("spawn sh");
         match await_outcome(&mut job, &wake) {
             Outcome::Revised(text) => panic!("read a stale answer: {text}"),
             Outcome::Failed(_) => {}
@@ -1089,12 +1162,24 @@ mod tests {
         // file nor the answer file the tool had already written.
         let answer =
             std::env::temp_dir().join(format!("bnknotes-ai-drop-{}.answer", std::process::id()));
-        let mut cmd = Command::new("sh");
-        cmd.args(["-c", "sleep 30"]);
+        // sleep itself, not sh -c: a shell that forks it (dash does) leaves sleep holding
+        // stdout after the kill, and the worker would wait out the whole sleep.
+        let mut cmd = Command::new("sleep");
+        cmd.arg("30");
         let wake = Wake::new().expect("wake pipe");
-        let job = Job::spawn_command(cmd, "sh", "", wake.write_fd(), Some(answer.clone()))
-            .expect("spawn sh");
-        let stderr = job.stderr_path.clone();
+        let job = Job::spawn_command(
+            cmd,
+            "sleep",
+            "",
+            wake.write_fd(),
+            Scratch::reserve().expect("a scratch file"),
+            Some(answer.clone()),
+        )
+        .expect("spawn sleep");
+        let stderr = job
+            .stderr_path
+            .clone()
+            .expect("a live job holds its stderr file");
         // Stand in for the tool having written its answer before the cancel.
         std::fs::write(&answer, b"half an answer").expect("write the answer file");
         assert!(stderr.exists(), "the job opens its stderr file at spawn");
@@ -1112,5 +1197,113 @@ mod tests {
                 .expect("poll the wake pipe");
         assert_ne!(ready, 0, "the worker wakes the loop as the job ends");
         wake.drain();
+    }
+
+    /// A directory of the test's own, so a test that plants or deletes scratch files
+    /// cannot touch the files of a job another test is running.
+    fn private_dir(test: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("bnknotes-{test}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("create the test directory");
+        dir
+    }
+
+    /// A `sleep 30` job on its own wake pipe, for the tests that cancel one; sleep run
+    /// directly for the reason `a_dropped_job_removes_its_scratch_files` gives.
+    fn sleeping_job(wake: &Wake, dir: &Path) -> Job {
+        let mut cmd = std::process::Command::new("sleep");
+        cmd.arg("30");
+        Job::spawn_command(
+            cmd,
+            "sleep",
+            "",
+            wake.write_fd(),
+            Scratch::reserve_in(dir).expect("a scratch file"),
+            None,
+        )
+        .expect("spawn sleep")
+    }
+
+    /// Wait for a canceled job's worker to write its wake byte, while the pipe is still
+    /// open, for the reason `a_dropped_job_removes_its_scratch_files` gives.
+    fn await_wake(wake: &Wake) {
+        let ready = crate::platform::ffi::poll_readable(
+            &[wake.read_fd()],
+            Some(std::time::Duration::from_secs(5)),
+        )
+        .expect("poll the wake pipe");
+        assert_ne!(ready, 0, "the worker wakes the loop as the job ends");
+        wake.drain();
+    }
+
+    #[test]
+    fn overlapping_jobs_keep_their_own_scratch_files() {
+        // Two jobs alive at once in one process, as the test harness runs them in
+        // parallel: each gets its own files, and one's cleanup leaves the other's alone.
+        let (old_wake, new_wake) = (
+            Wake::new().expect("wake pipe"),
+            Wake::new().expect("wake pipe"),
+        );
+        let dir = private_dir("ai-overlap");
+        let old = sleeping_job(&old_wake, &dir);
+        let new = sleeping_job(&new_wake, &dir);
+        let new_stderr = new
+            .stderr_path
+            .clone()
+            .expect("a live job holds its stderr file");
+        assert_ne!(
+            old.stderr_path, new.stderr_path,
+            "two live jobs share a scratch file"
+        );
+
+        drop(old);
+        assert!(
+            new_stderr.exists(),
+            "the old job's cleanup removed the new job's stderr"
+        );
+        drop(new);
+        assert!(
+            !new_stderr.exists(),
+            "a dropped job removes its stderr file"
+        );
+        await_wake(&old_wake);
+        await_wake(&new_wake);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_finished_job_dropped_late_leaves_its_freed_name_alone() {
+        use std::process::Command;
+
+        // A job deletes its files when it reports and frees its name. Dropping it after
+        // that must not delete them again: a newer job may hold the name by then.
+        let wake = Wake::new().expect("wake pipe");
+        let dir = private_dir("ai-late-drop");
+        let mut done = Job::spawn_command(
+            Command::new("cat"),
+            "cat",
+            "done\n",
+            wake.write_fd(),
+            Scratch::reserve_in(&dir).expect("a scratch file"),
+            None,
+        )
+        .expect("spawn cat");
+        let freed = done
+            .stderr_path
+            .clone()
+            .expect("a live job holds its stderr file");
+        assert!(matches!(
+            await_outcome(&mut done, &wake),
+            Outcome::Revised(_)
+        ));
+        assert!(!freed.exists(), "a finished job removes its stderr file");
+
+        // Stand in for a newer job that reserved the freed name.
+        std::fs::write(&freed, b"a newer job's stderr").expect("write the newer file");
+        drop(done);
+        assert!(
+            freed.exists(),
+            "dropping the finished job deleted a newer job's file"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

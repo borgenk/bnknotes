@@ -18,6 +18,8 @@ use core::ffi::{c_char, c_int, c_long, c_short, c_uint, c_ulong, c_ushort, c_voi
 use core::ptr::{self, NonNull};
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
+use std::ffi::CString;
+use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 use std::rc::Rc;
 
@@ -231,10 +233,9 @@ pub(crate) const FT_PIXEL_MODE_BGRA: u8 = 7;
 unsafe extern "C" {
     fn FT_Init_FreeType(alibrary: *mut FtLibrary) -> FtError;
     fn FT_Done_FreeType(library: FtLibrary) -> FtError;
-    fn FT_New_Memory_Face(
+    fn FT_New_Face(
         library: FtLibrary,
-        file_base: *const u8,
-        file_size: c_long,
+        filepathname: *const c_char,
         face_index: c_long,
         aface: *mut FtFace,
     ) -> FtError;
@@ -424,15 +425,12 @@ pub struct Metrics {
     pub line_height: i32,
 }
 
-/// Owns the FreeType library, the face, and the font-file bytes the face
-/// borrows. FT_New_Memory_Face keeps a pointer into the bytes for the face's
-/// life; the Vec's heap buffer has a stable address across moves of this
-/// struct, so holding both together is sound as long as the bytes are never
-/// mutated or reallocated (they are not).
+/// Owns the FreeType library and the face. FreeType maps the font file itself and
+/// holds the mapping for the face's life, so every face of one file, at every
+/// size and in every thread, shares the same pages.
 pub struct Face {
     library: NonNull<c_void>,
     face: NonNull<FtFaceRec>,
-    _data: Vec<u8>,
     /// Pen advances cached by character. Layout measures every character to wrap
     /// and size runs but the GPU atlas rasterizes only the ones on screen, and the
     /// advance is constant for a fixed-size face, so caching it turns a
@@ -483,8 +481,8 @@ impl Face {
     /// Build face `index` of a font file on disk. The index is 0 for an ordinary font
     /// and selects a face in a collection, or a named instance of a variable font.
     pub fn from_path_index(path: &Path, index: i32) -> Result<Self> {
-        let data = std::fs::read(path)
-            .map_err(|e| Error::msg(format!("read font {}: {e}", path.display())))?;
+        let c_path = CString::new(path.as_os_str().as_bytes())
+            .map_err(|_| Error::msg(format!("font path {} holds a NUL", path.display())))?;
 
         let mut library: FtLibrary = ptr::null_mut();
         // SAFETY: alibrary points at a live local; FT writes the handle through
@@ -495,14 +493,12 @@ impl Face {
             .ok_or_else(|| Error::msg("FT_Init_FreeType failed"))?;
 
         let mut face: FtFace = ptr::null_mut();
-        // SAFETY: library is valid; data outlives the face (it is moved into the
-        // returned struct and dropped only after FT_Done_Face); aface is a live
-        // local. FreeType keeps a pointer into data.
+        // SAFETY: library is valid, c_path is a NUL-terminated string that outlives
+        // the call, and aface is a live local.
         let err = unsafe {
-            FT_New_Memory_Face(
+            FT_New_Face(
                 library.as_ptr(),
-                data.as_ptr(),
-                data.len() as c_long,
+                c_path.as_ptr(),
                 c_long::from(index),
                 &mut face,
             )
@@ -513,7 +509,7 @@ impl Face {
                 // SAFETY: library came from FT_Init_FreeType and is freed once.
                 unsafe { FT_Done_FreeType(library.as_ptr()) };
                 return Err(Error::msg(format!(
-                    "FT_New_Memory_Face failed for {} (face {index})",
+                    "FT_New_Face failed for {} (face {index}, error {err})",
                     path.display()
                 )));
             }
@@ -522,7 +518,6 @@ impl Face {
         Ok(Self {
             library,
             face,
-            _data: data,
             advances: RefCell::new(HashMap::new()),
             pixel_size: Cell::new(0),
             emoji: None,
@@ -751,9 +746,8 @@ impl Face {
 
 impl Drop for Face {
     fn drop(&mut self) {
-        // The face must be freed before the library it came from; the data Vec
-        // is freed afterwards by its own Drop. SAFETY: each handle came from its
-        // matching FreeType new call and is freed exactly once.
+        // The face must be freed before the library it came from. SAFETY: each
+        // handle came from its matching FreeType new call and is freed exactly once.
         unsafe {
             FT_Done_Face(self.face.as_ptr());
             FT_Done_FreeType(self.library.as_ptr());

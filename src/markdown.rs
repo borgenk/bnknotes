@@ -723,6 +723,51 @@ fn find_byte(bytes: &[u8], from: usize, target: u8, flags: &[u16]) -> Option<usi
     (from..bytes.len()).find(|&i| bytes[i] == target && flags[i] & F_IN_CODE == 0)
 }
 
+/// The index of the `)` that closes a link destination starting at from, the way
+/// CommonMark reads one: a `<...>` destination ends at its `>`, and a bare one may
+/// hold balanced parentheses (`wiki/Cure_(album)`) and backslash-escaped ones. A
+/// quoted title after whitespace may hold any parenthesis. None when the
+/// parentheses never balance, which leaves the text literal.
+fn dest_close(bytes: &[u8], from: usize, flags: &[u16]) -> Option<usize> {
+    let mut i = from;
+    while matches!(bytes.get(i), Some(b' ' | b'\t')) {
+        i += 1;
+    }
+    if bytes.get(i) == Some(&b'<') {
+        let gt = find_byte(bytes, i + 1, b'>', flags)?;
+        return find_byte(bytes, gt + 1, b')', flags);
+    }
+    let mut depth = 0usize;
+    let mut title = None;
+    while let Some(&b) = bytes.get(i) {
+        if flags[i] & F_IN_CODE != 0 {
+            i += 1;
+            continue;
+        }
+        if let Some(quote) = title {
+            if b == quote {
+                title = None;
+            }
+            i += 1;
+            continue;
+        }
+        match b {
+            b'\\' => i += 1,
+            b'"' | b'\''
+                if depth == 0 && matches!(bytes.get(i.wrapping_sub(1)), Some(b' ' | b'\t')) =>
+            {
+                title = Some(b);
+            }
+            b'(' => depth += 1,
+            b')' if depth == 0 => return Some(i),
+            b')' => depth -= 1,
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
+
 /// The byte index just past the run of backticks starting at `start` (which must
 /// be a backtick).
 fn backtick_run_end(bytes: &[u8], start: usize) -> usize {
@@ -800,8 +845,9 @@ struct LinkSpan {
 /// Locate the inline links in `bytes`, skipping any markup inside a code span
 /// (flagged in `in_code`). A link is `[text](dest)` with non-empty text and
 /// destination; an image `![..](..)` is skipped (its `!` guards it) and reference
-/// links `[text][id]` are ignored (no `(` follows the `]`). The first `]`/`)`
-/// outside code close the text/dest, so nested brackets are not handled.
+/// links `[text][id]` are ignored (no `(` follows the `]`). The first `]` outside
+/// code closes the text, so nested brackets in it are not handled; the destination
+/// ends where dest_close says.
 fn link_spans_into(bytes: &[u8], flags: &[u16], out: &mut Vec<LinkSpan>) {
     let n = bytes.len();
     let mut i = 0;
@@ -820,7 +866,7 @@ fn link_spans_into(bytes: &[u8], flags: &[u16], out: &mut Vec<LinkSpan>) {
             i = rb + 1;
             continue;
         }
-        let Some(rp) = find_byte(bytes, rb + 2, b')', flags) else {
+        let Some(rp) = dest_close(bytes, rb + 2, flags) else {
             i = rb + 2;
             continue;
         };
@@ -1907,6 +1953,28 @@ mod tests {
             vec![("a", "http://x")]
         );
         assert_eq!(link_list("[a](<b c>)"), vec![("a", "b c")]);
+    }
+
+    #[test]
+    fn a_destination_holds_balanced_parentheses() {
+        // CommonMark lets a bare destination nest parentheses, as Wikipedia titles do.
+        assert_eq!(
+            link_list("[Cure](https://en.wikipedia.org/wiki/Cure_(album)) rocks"),
+            vec![("Cure", "https://en.wikipedia.org/wiki/Cure_(album)")]
+        );
+        assert_eq!(link_list("[a](b(c(d)e)f)"), vec![("a", "b(c(d)e)f")]);
+        // An escaped parenthesis does not count, a quoted title may hold one, and a
+        // <...> destination ends at its >.
+        assert_eq!(link_list(r"[a](b\)c)"), vec![("a", r"b\)c")]);
+        assert_eq!(
+            link_list(r#"[a](http://x "see (note)")"#),
+            vec![("a", "http://x")]
+        );
+        assert_eq!(link_list("[a](<b)c>)"), vec![("a", "b)c")]);
+        // Parentheses after the link are prose.
+        assert_eq!(link_list("[a](b) (aside)"), vec![("a", "b")]);
+        // A destination left unbalanced is not a link.
+        assert!(link_list("[a](b(c)").is_empty());
     }
 
     #[test]

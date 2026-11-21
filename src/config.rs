@@ -231,7 +231,7 @@ fn load_from(path: &Path) -> Config {
 fn read_config(path: &Path) -> Result<Option<String>> {
     match std::fs::metadata(path) {
         Ok(meta) if meta.len() > CONFIG_MAX_BYTES => {
-            return Err(Error::msg("config file is too large to be a config"))
+            return Err(Error::msg("config file is too large to be a config"));
         }
         Ok(_) => {}
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),

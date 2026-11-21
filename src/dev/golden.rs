@@ -20,7 +20,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use crate::layout::{Gutter, Layout, TableRow, VisualLine, NO_REVEAL};
+use crate::layout::{Gutter, Layout, NO_REVEAL, TableRow, VisualLine};
 use crate::markdown::{self, Align, CodeToken, Emphasis, SpanKind};
 use crate::platform::freetype::Fonts;
 use crate::rope::Rope;
@@ -196,7 +196,7 @@ fn first_diff(want: &str, got: &str) -> Option<(usize, String, String)> {
                     n,
                     a.unwrap_or("<end of golden>").to_string(),
                     b.unwrap_or("<end of output>").to_string(),
-                ))
+                ));
             }
         }
     }

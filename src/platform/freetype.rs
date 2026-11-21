@@ -21,7 +21,7 @@ use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::rc::Rc;
 
-use crate::platform::emoji::{wants_emoji, ColorGlyph, EmojiFont};
+use crate::platform::emoji::{ColorGlyph, EmojiFont, wants_emoji};
 use crate::platform::error::{Error, Result};
 
 /// A font family and the four style files the editor draws emphasis with. A
@@ -176,7 +176,7 @@ pub(crate) const FT_PIXEL_MODE_BGRA: u8 = 7;
 
 #[link(name = "freetype")]
 #[allow(non_snake_case)]
-extern "C" {
+unsafe extern "C" {
     fn FT_Init_FreeType(alibrary: *mut FtLibrary) -> FtError;
     fn FT_Done_FreeType(library: FtLibrary) -> FtError;
     fn FT_New_Memory_Face(
@@ -638,10 +638,10 @@ impl Face {
     /// measuring twin of [`Self::with_cluster_glyph`]; the two must route the
     /// same way or the caret drifts from the pixels.
     pub fn cluster_advance(&self, cluster: &str) -> f32 {
-        if let Some((emoji, px)) = self.emoji_cluster(cluster) {
-            if let Some(advance) = emoji.advance(cluster, px) {
-                return advance;
-            }
+        if let Some((emoji, px)) = self.emoji_cluster(cluster)
+            && let Some(advance) = emoji.advance(cluster, px)
+        {
+            return advance;
         }
         cluster.chars().map(|c| self.advance(c)).sum()
     }

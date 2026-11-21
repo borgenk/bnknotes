@@ -8,7 +8,7 @@ use crate::find::FindState;
 use crate::fold::{self, FoldMap, Folds};
 use crate::frontmatter;
 use crate::layout::{
-    Adjust, ImageUi, Layout, LayoutCtx, LineIndex, RevealAdjust, VisualLine, NO_REVEAL,
+    Adjust, ImageUi, Layout, LayoutCtx, LineIndex, NO_REVEAL, RevealAdjust, VisualLine,
 };
 use crate::markdown;
 use crate::platform::error::{Error, Result};
@@ -531,14 +531,14 @@ fn load(path: &Path) -> Result<(String, FileFormat)> {
     // Reject an oversized file up front (by its stat size) rather than reading it
     // all into memory. A missing file is not an error here, so a stat failure
     // falls through to the read, which maps NotFound to an empty buffer.
-    if let Ok(meta) = std::fs::metadata(path) {
-        if meta.len() > MAX_FILE_BYTES {
-            return Err(Error::msg(format!(
-                "file is {} bytes; refusing to open files larger than {} MiB",
-                meta.len(),
-                MAX_FILE_BYTES / (1024 * 1024)
-            )));
-        }
+    if let Ok(meta) = std::fs::metadata(path)
+        && meta.len() > MAX_FILE_BYTES
+    {
+        return Err(Error::msg(format!(
+            "file is {} bytes; refusing to open files larger than {} MiB",
+            meta.len(),
+            MAX_FILE_BYTES / (1024 * 1024)
+        )));
     }
     match std::fs::read(path) {
         Ok(bytes) => file::decode(&bytes),
@@ -2940,10 +2940,10 @@ impl PaneGroup {
     /// Flip tab `i`'s pinned state. A diff review is transient and never re-homed,
     /// so it is never pinned; the toggle ignores one (and any out-of-range index).
     pub(crate) fn toggle_pin(&mut self, i: usize) {
-        if let Some(tab) = self.tabs.get_mut(i) {
-            if tab.as_doc().is_some() {
-                tab.pinned = !tab.pinned;
-            }
+        if let Some(tab) = self.tabs.get_mut(i)
+            && tab.as_doc().is_some()
+        {
+            tab.pinned = !tab.pinned;
         }
     }
 

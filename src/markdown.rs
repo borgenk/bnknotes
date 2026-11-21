@@ -676,16 +676,15 @@ fn match_delims_into(
 ) {
     open_stack.clear();
     for (idx, delim) in delims.iter().enumerate() {
-        if delim.can_close {
-            if let Some(pos) = open_stack
+        if delim.can_close
+            && let Some(pos) = open_stack
                 .iter()
                 .rposition(|&oi| delims[oi].ch == delim.ch && delims[oi].len == delim.len)
-            {
-                pairs.push((open_stack[pos], idx));
-                // Drop the opener and any unmatched openers nested inside it.
-                open_stack.truncate(pos);
-                continue;
-            }
+        {
+            pairs.push((open_stack[pos], idx));
+            // Drop the opener and any unmatched openers nested inside it.
+            open_stack.truncate(pos);
+            continue;
         }
         if delim.can_open {
             open_stack.push(idx);

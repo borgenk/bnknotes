@@ -269,20 +269,12 @@ impl Rope {
 
 /// The `i`-th byte of `s` counted from the front (`forward`) or the back.
 fn nth(s: &[u8], i: usize, forward: bool) -> u8 {
-    if forward {
-        s[i]
-    } else {
-        s[s.len() - 1 - i]
-    }
+    if forward { s[i] } else { s[s.len() - 1 - i] }
 }
 
 /// `s` with its first `n` bytes dropped (`forward`) or its last `n`.
 fn trimmed(s: &[u8], n: usize, forward: bool) -> &[u8] {
-    if forward {
-        &s[n..]
-    } else {
-        &s[..s.len() - n]
-    }
+    if forward { &s[n..] } else { &s[..s.len() - n] }
 }
 
 /// A borrowed, read-only view into a byte range of a [`Rope`]. It holds no copy
@@ -562,13 +554,13 @@ fn concat(l: Arc<Inner>, r: Arc<Inner>) -> Arc<Inner> {
     if r.bytes == 0 {
         return l;
     }
-    if let (Kind::Leaf(a), Kind::Leaf(b)) = (&l.kind, &r.kind) {
-        if a.len() + b.len() <= MAX_LEAF {
-            let mut s = String::with_capacity(a.len() + b.len());
-            s.push_str(a);
-            s.push_str(b);
-            return leaf(s);
-        }
+    if let (Kind::Leaf(a), Kind::Leaf(b)) = (&l.kind, &r.kind)
+        && a.len() + b.len() <= MAX_LEAF
+    {
+        let mut s = String::with_capacity(a.len() + b.len());
+        s.push_str(a);
+        s.push_str(b);
+        return leaf(s);
     }
     branch(l, r)
 }

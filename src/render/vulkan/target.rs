@@ -3,11 +3,11 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 
 use crate::platform::error::{Error, Result};
 use crate::render::gpu::{AtlasInfo, AtlasUpload, FrameData, ImageId};
+use crate::render::vulkan::Gpu;
 use crate::render::vulkan::abi::*;
 use crate::render::vulkan::renderer::{
-    allocate_set, color_range, destroy_texture, write_image_set, HostBuffer, Texture,
+    HostBuffer, Texture, allocate_set, color_range, destroy_texture, write_image_set,
 };
-use crate::render::vulkan::Gpu;
 
 // ---------------------------------------------------------------------------
 // Render targets.

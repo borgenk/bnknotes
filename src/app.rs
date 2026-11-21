@@ -27,23 +27,23 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
-use self::clipboard::{is_text_mime, ClipboardState, CLIPBOARD_MIMES, IMAGE_MIMES};
+use self::clipboard::{CLIPBOARD_MIMES, ClipboardState, IMAGE_MIMES, is_text_mime};
 use self::input::KeyRepeat;
 use self::present::GpuPresentation;
 use crate::ai::{self, Preview};
-use crate::config::{self, vault_name, CaretConfig, Config, IconKeys, Vault, VaultKind};
+use crate::config::{self, CaretConfig, Config, IconKeys, Vault, VaultKind, vault_name};
 use crate::icon;
 use crate::menu::{Menu, MenuAction, MenuItem};
 use crate::paint::{
-    build_display_list_into, build_find_paint, conflict_banner_layout, diff_columns, font_sizes,
-    measure_tree, push_ai_preview, push_conflict_banner, push_diff_view, push_image_view,
-    push_menu, push_palette, push_rail, push_splitter, push_top_bar, push_tree, top_bar_height,
-    tree_metrics, BarCtx, CaretPaint, PaintParams, RailDragView, RailView, TabStrip,
+    BarCtx, CaretPaint, PaintParams, RailDragView, RailView, TabStrip, build_display_list_into,
+    build_find_paint, conflict_banner_layout, diff_columns, font_sizes, measure_tree,
+    push_ai_preview, push_conflict_banner, push_diff_view, push_image_view, push_menu,
+    push_palette, push_rail, push_splitter, push_top_bar, push_tree, top_bar_height, tree_metrics,
 };
 use crate::palette::{Palette, PaletteAction, PaletteRow, Rows};
 use crate::pane::{
-    restore_group, CaretAnim, CaretBlink, CaretFrame, Columns, Focus, Hit, PaneGroup, PaneLayout,
-    Saved, TreePane,
+    CaretAnim, CaretBlink, CaretFrame, Columns, Focus, Hit, PaneGroup, PaneLayout, Saved, TreePane,
+    restore_group,
 };
 use crate::platform::conn::{Connection, Fill};
 use crate::platform::error::{Error, Result};
@@ -1148,13 +1148,12 @@ impl State {
     /// current scale and effective body size to both panes so their cached layouts
     /// invalidate and re-measure at the new size.
     fn apply_font_size(&mut self, size: u32) {
-        if size != self.body_size {
-            if let Ok(fonts) =
+        if size != self.body_size
+            && let Ok(fonts) =
                 Fonts::with_config(&self.font_config, &font_sizes(size), self.line_height_scale)
-            {
-                self.fonts = fonts;
-                self.body_size = size;
-            }
+        {
+            self.fonts = fonts;
+            self.body_size = size;
         }
         let (scale, body) = (self.scale(), self.body_size);
         for ed in &mut self.editors {
@@ -1294,10 +1293,10 @@ impl State {
         // belongs with. `--gpu-probe` reports the same thing without a window, so a
         // quiet startup costs nothing. The backend is mandatory (bring_up exits above
         // if it is missing), so it is present.
-        if self.stats {
-            if let Some(gpu) = &self.presentation.backend {
-                eprintln!("bnknotes: renderer: gpu ({})", gpu.name());
-            }
+        if self.stats
+            && let Some(gpu) = &self.presentation.backend
+        {
+            eprintln!("bnknotes: renderer: gpu ({})", gpu.name());
         }
         self.run_until(|s| s.closed)?;
         // The last word on the way out: whatever the idle window was still holding
@@ -2442,16 +2441,16 @@ impl State {
         }
         // A picture opened over the window covers all of it, chrome included: it is
         // the one thing being looked at, so everything else gets out of the way.
-        if let Some(view) = &self.image_view {
-            if let Some(size) = self.editors[view.pane].images.dimensions(&view.raw) {
-                push_image_view(
-                    &mut list,
-                    (self.width as i32, self.height as i32),
-                    size,
-                    &view.raw,
-                    scale,
-                );
-            }
+        if let Some(view) = &self.image_view
+            && let Some(size) = self.editors[view.pane].images.dimensions(&view.raw)
+        {
+            push_image_view(
+                &mut list,
+                (self.width as i32, self.height as i32),
+                size,
+                &view.raw,
+                scale,
+            );
         }
         // The context menu floats over everything, so it is pushed after everything.
         if let Some(menu) = &self.menu {
@@ -3119,21 +3118,25 @@ mod tests {
         let (old, new) = demo_diff_texts();
         let rows = crate::ai::line_diff(&old, &new);
         // An unchanged line carried through on both sides.
-        assert!(rows
-            .iter()
-            .any(|r| !r.changed && r.old.is_some() && r.new.is_some()));
+        assert!(
+            rows.iter()
+                .any(|r| !r.changed && r.old.is_some() && r.new.is_some())
+        );
         // A changed pair (both sides present, tinted).
-        assert!(rows
-            .iter()
-            .any(|r| r.changed && r.old.is_some() && r.new.is_some()));
+        assert!(
+            rows.iter()
+                .any(|r| r.changed && r.old.is_some() && r.new.is_some())
+        );
         // A wholly removed line (present on the left, hatched on the right).
-        assert!(rows
-            .iter()
-            .any(|r| r.changed && r.old.is_some() && r.new.is_none()));
+        assert!(
+            rows.iter()
+                .any(|r| r.changed && r.old.is_some() && r.new.is_none())
+        );
         // A wholly added line (present on the right, hatched on the left).
-        assert!(rows
-            .iter()
-            .any(|r| r.changed && r.old.is_none() && r.new.is_some()));
+        assert!(
+            rows.iter()
+                .any(|r| r.changed && r.old.is_none() && r.new.is_some())
+        );
         // Reading each side back reproduces it, so the demo is a real diff, not a mock.
         let a: Vec<&str> = old.split('\n').collect();
         let b: Vec<&str> = new.split('\n').collect();

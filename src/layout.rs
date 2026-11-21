@@ -952,15 +952,14 @@ impl Layout {
     /// structural pipes (where a type would corrupt the row).
     pub fn line_bounds(&self, offset: usize) -> (usize, usize) {
         let line = self.line_for(offset);
-        if let Some(t) = &line.table {
-            if let Some(cell) = t
+        if let Some(t) = &line.table
+            && let Some(cell) = t
                 .cells
                 .iter()
                 .find(|c| offset <= c.end)
                 .or_else(|| t.cells.last())
-            {
-                return (cell.start, cell.end);
-            }
+        {
+            return (cell.start, cell.end);
         }
         (line.start, line.end)
     }
@@ -1626,11 +1625,7 @@ impl Layout {
         // A line with no visible glyphs (an empty line, or a picture row whose
         // source is collapsed) instead lands at its start, so arrowing onto a
         // picture reveals its source on the next build.
-        if drew_text {
-            line.end
-        } else {
-            line.start
-        }
+        if drew_text { line.end } else { line.start }
     }
 
     /// Pen advance in pixels from the left margin to absolute byte `offset`,
@@ -2289,44 +2284,44 @@ fn lay_line(
                 wrap_extra: 0,
             };
         }
-        if let Some(link) = markdown::standalone_image(&line) {
-            if let Some((iw, ih)) = ctx.images.dimensions(&line[link.path.0..link.path.1]) {
-                carry.list_depth = None;
-                let column = if ctx.wrap_width > 0 {
-                    ctx.wrap_width
-                } else {
-                    iw as i32
+        if let Some(link) = markdown::standalone_image(&line)
+            && let Some((iw, ih)) = ctx.images.dimensions(&line[link.path.0..link.path.1])
+        {
+            carry.list_depth = None;
+            let column = if ctx.wrap_width > 0 {
+                ctx.wrap_width
+            } else {
+                iw as i32
+            };
+            let (width, height) = fit_image(iw, ih, column);
+            let image = ImageBox {
+                path_start: ls + link.path.0,
+                path_end: ls + link.path.1,
+                width,
+                height,
+                pad_y: ctx.scale.px(IMAGE_PAD_Y),
+                selected: ctx.image_ui.selected == Some(ls),
+            };
+            if (on_line && !ctx.image_ui.dragging) || ctx.image_ui.raw == Some(ls) {
+                // Source revealed: emit it (fall through), then the widget. A live
+                // drag holds it collapsed so the geometry under the pointer is
+                // stable, matching the index's `reveal_adjust`.
+                pending_image = Some(image);
+            } else {
+                // Picture only: one widget line, no source text.
+                out.push(VisualLine::image_widget(
+                    ls,
+                    le,
+                    y + ctx.fonts.metrics(ctx.body_size).ascent,
+                    has_newline,
+                    ctx.body_size,
+                    image,
+                ));
+                y += image.box_height();
+                return Laid {
+                    height: y - box_top,
+                    wrap_extra: 0,
                 };
-                let (width, height) = fit_image(iw, ih, column);
-                let image = ImageBox {
-                    path_start: ls + link.path.0,
-                    path_end: ls + link.path.1,
-                    width,
-                    height,
-                    pad_y: ctx.scale.px(IMAGE_PAD_Y),
-                    selected: ctx.image_ui.selected == Some(ls),
-                };
-                if (on_line && !ctx.image_ui.dragging) || ctx.image_ui.raw == Some(ls) {
-                    // Source revealed: emit it (fall through), then the widget. A live
-                    // drag holds it collapsed so the geometry under the pointer is
-                    // stable, matching the index's `reveal_adjust`.
-                    pending_image = Some(image);
-                } else {
-                    // Picture only: one widget line, no source text.
-                    out.push(VisualLine::image_widget(
-                        ls,
-                        le,
-                        y + ctx.fonts.metrics(ctx.body_size).ascent,
-                        has_newline,
-                        ctx.body_size,
-                        image,
-                    ));
-                    y += image.box_height();
-                    return Laid {
-                        height: y - box_top,
-                        wrap_extra: 0,
-                    };
-                }
             }
         }
     }
@@ -3601,10 +3596,11 @@ impl TableMemo {
     /// the editing model, so caret navigation and rendering agree on a table's
     /// bounds); the alignments are resolved here for layout.
     fn locate(&mut self, rope: &Rope, i: usize) -> Option<(TableSpan, TableRole)> {
-        if let Some(held) = &self.block {
-            if i >= held.span.header && i < held.span.end {
-                return Some((held.span, held.span.role(i)));
-            }
+        if let Some(held) = &self.block
+            && i >= held.span.header
+            && i < held.span.end
+        {
+            return Some((held.span, held.span.role(i)));
         }
         let block = crate::table::block_at(rope, i)?;
         let text = |k: usize| {
@@ -6938,10 +6934,11 @@ mod tests {
             "both ``` fences collapse when the cursor is outside the block"
         );
         // The code line between always shows, fence or no fence.
-        assert!(away
-            .run_slice(&away.lines()[1])
-            .iter()
-            .all(|run| run.visible));
+        assert!(
+            away.run_slice(&away.lines()[1])
+                .iter()
+                .all(|run| run.visible)
+        );
         // Cursor on the opening fence line reveals only that fence (per-line, like
         // a heading): the closing fence on another line stays hidden.
         let on = Layout::build(&f, &r, LEFT, TOP, 1_000_000, BODY, (0, 0));
@@ -7799,9 +7796,10 @@ mod tests {
             .expect("add-column zone");
         assert_eq!(add_col.kind, TableButtonKind::AddColumn);
         // Inside a cell: no button.
-        assert!(l
-            .table_button_at(&f, &r, (left + 5) as f32, (box_top + 4) as f32)
-            .is_none());
+        assert!(
+            l.table_button_at(&f, &r, (left + 5) as f32, (box_top + 4) as f32)
+                .is_none()
+        );
     }
 
     #[test]

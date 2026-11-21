@@ -17,7 +17,7 @@ use std::collections::HashMap;
 use std::os::fd::RawFd;
 use std::path::{Path, PathBuf};
 
-use crate::platform::inotify::{Inotify, Wd, IN_IGNORED};
+use crate::platform::inotify::{IN_IGNORED, Inotify, Wd};
 
 /// One directory watch plus a count of how many open files live in it, so the
 /// watch is removed only when the last file in that directory closes.
@@ -186,10 +186,10 @@ impl FileWatcher {
             return;
         };
         dw.files -= 1;
-        if dw.files == 0 {
-            if let (Some(inotify), Some(dw)) = (self.inotify.as_ref(), self.dirs.remove(&dir)) {
-                inotify.rm(dw.wd);
-            }
+        if dw.files == 0
+            && let (Some(inotify), Some(dw)) = (self.inotify.as_ref(), self.dirs.remove(&dir))
+        {
+            inotify.rm(dw.wd);
         }
     }
 

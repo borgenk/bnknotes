@@ -543,11 +543,11 @@ impl Batcher<'_> {
     /// the bound image texture would change.
     fn extend_batch(&mut self, image: Option<ImageId>, count: u32) {
         let start = self.vertices.len() as u32 - count;
-        if let Some(last) = self.batches.last_mut() {
-            if last.image == image {
-                last.count += count;
-                return;
-            }
+        if let Some(last) = self.batches.last_mut()
+            && last.image == image
+        {
+            last.count += count;
+            return;
         }
         self.batches.push(Batch {
             start,

@@ -144,15 +144,15 @@ impl Regex {
         let mut threads = Threads::new(self.prog.len());
         let mut i = 0;
         while i <= text.len() {
-            if let Some(end) = self.match_at(text, i, &mut threads) {
-                if end > i {
-                    out.push((i, end));
-                    if out.len() >= limit {
-                        break;
-                    }
-                    i = end;
-                    continue;
+            if let Some(end) = self.match_at(text, i, &mut threads)
+                && end > i
+            {
+                out.push((i, end));
+                if out.len() >= limit {
+                    break;
                 }
+                i = end;
+                continue;
             }
             match text[i..].chars().next() {
                 Some(c) => i += c.len_utf8(),
@@ -186,17 +186,17 @@ impl Regex {
             threads.next.clear();
             threads.next_seen.fill(false);
             for &pc in &threads.current {
-                if let Inst::Class(class) = &self.prog[pc] {
-                    if class.matches(c) {
-                        self.add_thread(
-                            &mut threads.next,
-                            &mut threads.next_seen,
-                            pc + 1,
-                            text,
-                            next_pos,
-                            &mut best,
-                        );
-                    }
+                if let Inst::Class(class) = &self.prog[pc]
+                    && class.matches(c)
+                {
+                    self.add_thread(
+                        &mut threads.next,
+                        &mut threads.next_seen,
+                        pc + 1,
+                        text,
+                        next_pos,
+                        &mut best,
+                    );
                 }
             }
             std::mem::swap(&mut threads.current, &mut threads.next);

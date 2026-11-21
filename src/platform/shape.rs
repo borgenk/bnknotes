@@ -78,7 +78,7 @@ struct HbGlyphPosition {
 }
 
 #[link(name = "harfbuzz")]
-extern "C" {
+unsafe extern "C" {
     fn hb_ft_font_create_referenced(ft_face: *mut c_void) -> *mut c_void;
     fn hb_font_destroy(font: *mut c_void);
     fn hb_buffer_create() -> *mut c_void;
@@ -119,7 +119,8 @@ impl Shaper {
     /// `ft_face` must be a valid `FT_Face` with a size selected. HarfBuzz takes
     /// its own reference, so the face may be freed before or after the shaper.
     pub unsafe fn from_ft_face(ft_face: *mut c_void) -> Option<Self> {
-        let font = hb_ft_font_create_referenced(ft_face);
+        // SAFETY: the caller guarantees ft_face is a valid sized FT_Face.
+        let font = unsafe { hb_ft_font_create_referenced(ft_face) };
         Some(Self {
             font: NonNull::new(font)?,
         })

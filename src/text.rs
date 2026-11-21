@@ -735,13 +735,13 @@ impl TextBuffer {
         if self.take_selection() {
             return true;
         }
-        if let Some(cell) = table::cell_at(&self.text, self.cursor) {
-            if self.cursor <= cell.start {
-                return match table::prev_cell_end(&self.text, cell) {
-                    Some(target) => self.set_cursor_changed(target, false),
-                    None => false,
-                };
-            }
+        if let Some(cell) = table::cell_at(&self.text, self.cursor)
+            && self.cursor <= cell.start
+        {
+            return match table::prev_cell_end(&self.text, cell) {
+                Some(target) => self.set_cursor_changed(target, false),
+                None => false,
+            };
         }
         match self.prev_grapheme() {
             Some(prev) => self.delete_to(prev, Coalesce::Delete),
@@ -1124,12 +1124,10 @@ impl TextBuffer {
     /// cursor moved.
     fn move_cluster(&mut self, back: bool, extend: bool) -> bool {
         self.group = Coalesce::None;
-        if !extend {
-            if let Some((start, end)) = self.selection() {
-                self.cursor = if back { start } else { end };
-                self.anchor = None;
-                return true;
-            }
+        if !extend && let Some((start, end)) = self.selection() {
+            self.cursor = if back { start } else { end };
+            self.anchor = None;
+            return true;
         }
         // Inside a table, a step off a cell's edge jumps to the adjacent cell (over
         // the hidden pipes and padding), or leaves the table at its outer edge.
@@ -1451,11 +1449,7 @@ fn prev_word_rope(rope: &Rope, pos: usize) -> usize {
             start = abs;
         }
     }
-    if in_word {
-        start
-    } else {
-        0
-    }
+    if in_word { start } else { 0 }
 }
 
 /// The byte range of the word (or run of separators) at `offset`, for
@@ -2950,7 +2944,7 @@ mod tests {
         let mut b = TextBuffer::new();
         b.insert_str("- a\n  - b\n    - c"); // a > b > c, each one deeper
         b.set_cursor(8, false); // on the middle item "  - b"
-                                // Outdenting b carries its child c along, so c stays nested under b.
+        // Outdenting b carries its child c along, so c stays nested under b.
         b.nest_list_item(true);
         assert_eq!(b.text(), "- a\n- b\n  - c");
         // Indenting b again carries c back down: the subtree moves as a unit.

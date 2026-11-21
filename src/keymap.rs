@@ -18,7 +18,7 @@
 //!
 //! Anything else is text, and goes through the compose machine as a [`KeyAction::Char`].
 
-use crate::platform::xkb::{keycode, Xkb};
+use crate::platform::xkb::{Xkb, keycode};
 
 /// What a key press should do to the editor. The cursor-motion variants (Left, Right,
 /// Up, Down, Home, End, the word/document variants, and the page moves) are the ones a
@@ -177,11 +177,7 @@ fn ctrl_action_for_sym(sym: u32, shift: bool) -> KeyAction {
 /// keys that jump further with Ctrl (word/document motion, word delete) share this
 /// shape.
 fn ctrl_or(ctrl: bool, with_ctrl: KeyAction, plain: KeyAction) -> KeyAction {
-    if ctrl {
-        with_ctrl
-    } else {
-        plain
-    }
+    if ctrl { with_ctrl } else { plain }
 }
 
 #[cfg(test)]

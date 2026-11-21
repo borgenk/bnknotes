@@ -66,7 +66,7 @@ const XKB_COMPOSE_CANCELLED: c_int = 3;
 
 #[link(name = "xkbcommon")]
 #[allow(non_snake_case)]
-extern "C" {
+unsafe extern "C" {
     fn xkb_context_new(flags: u32) -> *mut c_void;
     fn xkb_context_unref(ctx: *mut c_void);
     fn xkb_keymap_new_from_string(

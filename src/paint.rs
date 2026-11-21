@@ -4,8 +4,8 @@ use crate::ai::{self, DiffKind, Preview};
 use crate::config::{Vault, VaultKind};
 use crate::find::{self, FindState};
 use crate::layout::{
-    aligned_x, cell_line_top, face_key, image_button_rect, is_code_marker, row_max_lines, CellLine,
-    Gutter, Layout, TableRow, TABLE_BORDER, TABLE_CELL_PAD_Y,
+    CellLine, Gutter, Layout, TABLE_BORDER, TABLE_CELL_PAD_Y, TableRow, aligned_x, cell_line_top,
+    face_key, image_button_rect, is_code_marker, row_max_lines,
 };
 use crate::markdown;
 use crate::menu::{Menu, MenuLayout};
@@ -39,12 +39,13 @@ use crate::theme::{
     RAIL_INK_DARK, RAIL_INK_LIGHT, RAIL_PAD, RAIL_RADIUS, RAIL_TEMP_RING, RULE_COLOR,
     RULE_THICKNESS, SCROLL_INK, SCROLL_INSET, SCROLL_MIN_THUMB, SCROLL_NEAR, SCROLL_THIN,
     SCROLL_THUMB_COVER, SCROLL_THUMB_HOVER_COVER, SCROLL_TROUGH_COVER, SCROLL_WIDE,
-    SELECTION_COLOR, SPLITTER_COLOR, TABLE_BORDER_COLOR, TABLE_HEADER_BG, TAB_ACTIVE_BG,
-    TAB_ACTIVE_TEXT, TAB_BUTTON_HOVER_BG, TAB_BUTTON_RADIUS, TAB_CLOSE_GAP, TAB_CLOSE_W,
-    TAB_DIRTY_COLOR, TAB_HOVER_BG, TAB_INACTIVE_TEXT, TAB_MAX_W, TAB_MIN_W, TAB_NEW_W, TAB_PAD_X,
-    TAB_PINNED_W, TAB_VPAD, TICK_HEIGHT, TICK_WIDTH, TOP_BAR_BG, TREE_BG, TREE_FOOTER_GAP,
-    TREE_FOOTER_VPAD, TREE_HOVER_BG, TREE_INDENT, TREE_MARKER_COLOR, TREE_MARKER_W, TREE_PAD,
-    TREE_ROW_INSET_Y, TREE_ROW_PAD, TREE_ROW_RADIUS, TREE_TEXT_COLOR, VAULT_PAD_X,
+    SELECTION_COLOR, SPLITTER_COLOR, TAB_ACTIVE_BG, TAB_ACTIVE_TEXT, TAB_BUTTON_HOVER_BG,
+    TAB_BUTTON_RADIUS, TAB_CLOSE_GAP, TAB_CLOSE_W, TAB_DIRTY_COLOR, TAB_HOVER_BG,
+    TAB_INACTIVE_TEXT, TAB_MAX_W, TAB_MIN_W, TAB_NEW_W, TAB_PAD_X, TAB_PINNED_W, TAB_VPAD,
+    TABLE_BORDER_COLOR, TABLE_HEADER_BG, TICK_HEIGHT, TICK_WIDTH, TOP_BAR_BG, TREE_BG,
+    TREE_FOOTER_GAP, TREE_FOOTER_VPAD, TREE_HOVER_BG, TREE_INDENT, TREE_MARKER_COLOR,
+    TREE_MARKER_W, TREE_PAD, TREE_ROW_INSET_Y, TREE_ROW_PAD, TREE_ROW_RADIUS, TREE_TEXT_COLOR,
+    VAULT_PAD_X,
 };
 
 /// The per-frame inputs [`build_display_list`] needs beyond the layout itself:
@@ -2207,34 +2208,34 @@ fn push_tab_strip(list: &mut DisplayList, ctx: &BarCtx, strip: &TabStrip) {
     }
     // The floating dragged tab, drawn last so it rides over its neighbors and the
     // + button. It follows the pointer, clamped to stay within the visible lane.
-    if let Some(d) = &strip.drag {
-        if let (Some(tab), Some(view)) = (tabs.get(d.tab), strip.tabs.get(d.tab)) {
-            let max_left = (clip[1] - tab.rect.w).max(strip.rect.x);
-            let left = d.left.clamp(strip.rect.x, max_left);
-            let dx = left - tab.rect.x;
-            let floated = TabHit {
-                rect: Rect {
-                    x: tab.rect.x + dx,
-                    ..tab.rect
-                },
-                close: Rect {
-                    x: tab.close.x + dx,
-                    ..tab.close
-                },
-            };
-            // The float rides above the run, clipped to the whole strip so it is not
-            // cut at the + lane it may overlap.
-            push_tab_body(
-                list,
-                ctx,
-                &floated,
-                view,
-                true,
-                false,
-                false,
-                [strip.rect.x, strip.rect.x + strip.rect.w],
-            );
-        }
+    if let Some(d) = &strip.drag
+        && let (Some(tab), Some(view)) = (tabs.get(d.tab), strip.tabs.get(d.tab))
+    {
+        let max_left = (clip[1] - tab.rect.w).max(strip.rect.x);
+        let left = d.left.clamp(strip.rect.x, max_left);
+        let dx = left - tab.rect.x;
+        let floated = TabHit {
+            rect: Rect {
+                x: tab.rect.x + dx,
+                ..tab.rect
+            },
+            close: Rect {
+                x: tab.close.x + dx,
+                ..tab.close
+            },
+        };
+        // The float rides above the run, clipped to the whole strip so it is not
+        // cut at the + lane it may overlap.
+        push_tab_body(
+            list,
+            ctx,
+            &floated,
+            view,
+            true,
+            false,
+            false,
+            [strip.rect.x, strip.rect.x + strip.rect.w],
+        );
     }
 }
 
@@ -2680,19 +2681,18 @@ impl<'a> Painter<'a> {
             // folded one always shows, since it is the only sign that content is
             // hidden there. The chevron sits left of the text column, so it never
             // shifts a glyph.
-            if let Some(folded) = line.fold {
-                if folded || self.fold_hover == Some(line.start) {
-                    if let Some(rect) = self.layout.fold_rect(fonts, line, self.body_size) {
-                        self.list.push(DrawCmd::Chevron {
-                            rect: Rect {
-                                y: rect.y - scroll_y,
-                                ..rect
-                            },
-                            color: MARKER_COLOR,
-                            down: !folded,
-                        });
-                    }
-                }
+            if let Some(folded) = line.fold
+                && (folded || self.fold_hover == Some(line.start))
+                && let Some(rect) = self.layout.fold_rect(fonts, line, self.body_size)
+            {
+                self.list.push(DrawCmd::Chevron {
+                    rect: Rect {
+                        y: rect.y - scroll_y,
+                        ..rect
+                    },
+                    color: MARKER_COLOR,
+                    down: !folded,
+                });
             }
             // A blockquote draws a bar down its gutter, on every wrapped line.
             if matches!(line.gutter, Gutter::QuoteBar { .. }) {
@@ -3138,11 +3138,7 @@ fn visible_byte_range(fonts: &Fonts, layout: &Layout, scroll_y: i32, view: Rect)
         range.0 = range.0.min(line.start);
         range.1 = range.1.max(line.end);
     }
-    if range.0 > range.1 {
-        (0, 0)
-    } else {
-        range
-    }
+    if range.0 > range.1 { (0, 0) } else { range }
 }
 
 /// Append the find bar: a rounded panel floating at the top-right of the pane with
@@ -3693,19 +3689,23 @@ mod tests {
 
         // The removed word is washed red on the left; the added word is washed green on
         // the right. Neither is struck through.
-        assert!(list
-            .iter()
-            .any(|c| matches!(c, DrawCmd::Fill { color, .. } if *color == AI_DELETE_BG)));
-        assert!(list
-            .iter()
-            .any(|c| matches!(c, DrawCmd::Fill { color, .. } if *color == AI_INSERT_BG)));
+        assert!(
+            list.iter()
+                .any(|c| matches!(c, DrawCmd::Fill { color, .. } if *color == AI_DELETE_BG))
+        );
+        assert!(
+            list.iter()
+                .any(|c| matches!(c, DrawCmd::Fill { color, .. } if *color == AI_INSERT_BG))
+        );
         // Both sides draw their text.
-        assert!(list
-            .iter()
-            .any(|c| matches!(c, DrawCmd::Text { text, .. } if text.contains("teh"))));
-        assert!(list
-            .iter()
-            .any(|c| matches!(c, DrawCmd::Text { text, .. } if text.contains("the cat"))));
+        assert!(
+            list.iter()
+                .any(|c| matches!(c, DrawCmd::Text { text, .. } if text.contains("teh")))
+        );
+        assert!(
+            list.iter()
+                .any(|c| matches!(c, DrawCmd::Text { text, .. } if text.contains("the cat")))
+        );
         // A line-number gutter numbers the first line on each side; this line changed, so
         // its number takes the accent color (red on the left, green on the right).
         assert!(list.iter().any(|c| matches!(
@@ -3717,9 +3717,10 @@ mod tests {
             DrawCmd::Text { text, color, .. } if text == "1" && *color == DIFF_INSERT_ACCENT
         )));
         // The two columns are parted by a divider.
-        assert!(list
-            .iter()
-            .any(|c| matches!(c, DrawCmd::Fill { color, .. } if *color == DIFF_DIVIDER)));
+        assert!(
+            list.iter()
+                .any(|c| matches!(c, DrawCmd::Fill { color, .. } if *color == DIFF_DIVIDER))
+        );
     }
 
     #[test]
@@ -3765,20 +3766,24 @@ mod tests {
 
         // The empty left half of the added line has a hatched text area and a solid
         // gutter of the same tone.
-        assert!(list
-            .iter()
-            .any(|c| matches!(c, DrawCmd::Hatch { color, .. } if *color == DIFF_HATCH)));
-        assert!(list
-            .iter()
-            .any(|c| matches!(c, DrawCmd::Fill { color, .. } if *color == DIFF_HATCH)));
+        assert!(
+            list.iter()
+                .any(|c| matches!(c, DrawCmd::Hatch { color, .. } if *color == DIFF_HATCH))
+        );
+        assert!(
+            list.iter()
+                .any(|c| matches!(c, DrawCmd::Fill { color, .. } if *color == DIFF_HATCH))
+        );
         // The added line carries a faint full-line wash (extending into its gutter) and
         // its line number is drawn in the green accent.
-        assert!(list
-            .iter()
-            .any(|c| matches!(c, DrawCmd::Fill { color, .. } if *color == DIFF_LINE_INSERT_BG)));
-        assert!(list
-            .iter()
-            .any(|c| matches!(c, DrawCmd::Text { color, .. } if *color == DIFF_INSERT_ACCENT)));
+        assert!(
+            list.iter()
+                .any(|c| matches!(c, DrawCmd::Fill { color, .. } if *color == DIFF_LINE_INSERT_BG))
+        );
+        assert!(
+            list.iter()
+                .any(|c| matches!(c, DrawCmd::Text { color, .. } if *color == DIFF_INSERT_ACCENT))
+        );
         // The right side numbers three lines, the left only two: the gutter numbers are
         // the real line numbers, aligned across the change.
         let numbers: Vec<&str> = list
@@ -3799,9 +3804,10 @@ mod tests {
             DrawCmd::Text { text, color, .. } if text == "1" && *color == DIFF_GUTTER_TEXT
         )));
         // A subtle hairline parts each gutter from its text.
-        assert!(list
-            .iter()
-            .any(|c| matches!(c, DrawCmd::Fill { color, .. } if *color == DIFF_GUTTER_BORDER)));
+        assert!(
+            list.iter()
+                .any(|c| matches!(c, DrawCmd::Fill { color, .. } if *color == DIFF_GUTTER_BORDER))
+        );
         // Nothing is drawn above the pane top: the aligned bands are placed in the pane's
         // window space, not at the window origin.
         let min_text_y = list
@@ -4029,7 +4035,7 @@ mod tests {
     /// The tick strip's per-match tops, matching what the app derives from its line
     /// index: each match's line baseline.
     fn tick_tops(layout: &Layout, matches: &[(usize, usize)]) -> Vec<i32> {
-        let tops = matches
+        matches
             .iter()
             .map(|&(start, _)| {
                 let idx = layout
@@ -4038,8 +4044,7 @@ mod tests {
                     .saturating_sub(1);
                 layout.lines().get(idx).map_or(0, |l| l.baseline)
             })
-            .collect();
-        tops
+            .collect()
     }
     use crate::rope::Rope;
 
@@ -4597,10 +4602,12 @@ mod tests {
         assert_eq!(unscrolled[3].rect.x, strip.x + 3 * w);
         // Scrolling shifts every tab left by the offset, keeping the slots aligned.
         let scrolled = tab_rects(strip, &tabs, Scale::ONE, 50);
-        assert!(unscrolled
-            .iter()
-            .zip(&scrolled)
-            .all(|(a, b)| b.rect.x == a.rect.x - 50));
+        assert!(
+            unscrolled
+                .iter()
+                .zip(&scrolled)
+                .all(|(a, b)| b.rect.x == a.rect.x - 50)
+        );
     }
 
     #[test]

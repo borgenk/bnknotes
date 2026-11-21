@@ -125,17 +125,17 @@ pub fn lex_into(lang: Lang, line: &str, out: &mut Vec<markdown::Span>) {
         }
         // A block comment runs to its close, or to the line end if it does not
         // close here (line-local: the next line starts fresh).
-        if let Some((open, close)) = spec.block_comment {
-            if starts_at(b, i, open.as_bytes()) {
-                flush(out, plain, i);
-                let end = find_from(b, i + open.len(), close.as_bytes())
-                    .map(|p| p + close.len())
-                    .unwrap_or(n);
-                push(out, i, end, CodeToken::Comment);
-                i = end;
-                plain = i;
-                continue;
-            }
+        if let Some((open, close)) = spec.block_comment
+            && starts_at(b, i, open.as_bytes())
+        {
+            flush(out, plain, i);
+            let end = find_from(b, i + open.len(), close.as_bytes())
+                .map(|p| p + close.len())
+                .unwrap_or(n);
+            push(out, i, end, CodeToken::Comment);
+            i = end;
+            plain = i;
+            continue;
         }
         let c = b[i];
         // A string literal to its closing quote (or the line end if unterminated).
@@ -404,9 +404,10 @@ mod tests {
         let t = toks(Lang::Rust, "let s = \"hi\"; // note");
         assert!(t.contains(&("let".into(), CodeToken::Keyword)));
         assert!(t.contains(&("\"hi\"".into(), CodeToken::Str)));
-        assert!(t
-            .iter()
-            .any(|(txt, k)| txt == "// note" && *k == CodeToken::Comment));
+        assert!(
+            t.iter()
+                .any(|(txt, k)| txt == "// note" && *k == CodeToken::Comment)
+        );
         let n = toks(Lang::Rust, "x = 0x1F");
         assert!(n.contains(&("0x1F".into(), CodeToken::Number)));
     }
@@ -424,9 +425,10 @@ mod tests {
     #[test]
     fn a_digit_inside_an_identifier_is_not_a_number() {
         let t = toks(Lang::Rust, "let var1 = x2");
-        assert!(!t
-            .iter()
-            .any(|(txt, k)| txt == "1" && *k == CodeToken::Number));
+        assert!(
+            !t.iter()
+                .any(|(txt, k)| txt == "1" && *k == CodeToken::Number)
+        );
         assert!(!t.iter().any(|(_, k)| *k == CodeToken::Number));
     }
 

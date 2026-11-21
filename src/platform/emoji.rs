@@ -11,7 +11,7 @@ use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 
 use crate::platform::freetype::{
-    CacheStats, FT_Load_Glyph, Face, FtBitmap, FT_LOAD_COLOR, FT_LOAD_RENDER, FT_PIXEL_MODE_BGRA,
+    CacheStats, FT_LOAD_COLOR, FT_LOAD_RENDER, FT_Load_Glyph, FT_PIXEL_MODE_BGRA, Face, FtBitmap,
 };
 use crate::platform::grapheme;
 use crate::platform::pixel::{premultiplied_over, resample_argb, straight_from_premultiplied};

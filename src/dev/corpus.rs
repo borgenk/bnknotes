@@ -42,7 +42,7 @@ pub fn generate(name: &str, target_bytes: usize) -> Option<String> {
     CORPORA
         .iter()
         .find(|(n, _)| *n == name)
-        .map(|(_, gen)| gen(target_bytes))
+        .map(|(_, build)| build(target_bytes))
 }
 
 /// A minimal SplitMix64: enough spread to shape realistic text, fully

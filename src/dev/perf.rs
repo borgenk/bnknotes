@@ -35,7 +35,7 @@ use crate::find::FindState;
 use crate::fold::FoldMap;
 use crate::layout::{ImageUi, Layout, LayoutCtx, LineIndex};
 use crate::markdown;
-use crate::paint::{build_display_list, CaretPaint, PaintParams};
+use crate::paint::{CaretPaint, PaintParams, build_display_list};
 use crate::platform::error::{Error, Result};
 use crate::platform::freetype::Fonts;
 use crate::platform::geom::Rect;

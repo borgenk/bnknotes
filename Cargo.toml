@@ -1,43 +1,30 @@
-# panic = "immediate-abort" on the release profile is still unstable, so the
-# manifest has to opt in. That is what pins this project to nightly.
+# panic = "immediate-abort" on the release profile is still unstable, which is
+# what pins this project to nightly.
 cargo-features = ["panic-immediate-abort"]
 
 [package]
 name = "bnknotes"
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
 
-# Almost zero dependencies. The editor is a native Wayland client (the wire
-# protocol is spoken directly over a UnixStream) and glyph rasterization FFIs
-# into the system FreeType.
-#
-# The one exception is image decoding (src/render/image.rs). Decoders parse
-# hostile, attacker-controlled bytes, exactly the place where an in-tree decoder
-# (or binding C libpng/libjpeg) would trade away the memory safety we want, so we
-# lean on pure-Rust, no-C decoders behind a single isolated module: zune, for PNG
-# and JPEG. Its default-features are off to compile only the decode path.
+# Image decoding is the only dependency: decoders parse untrusted bytes, so they
+# are pure Rust, and src/render/image.rs is the one module that uses them.
 [dependencies]
 zune-core = { version = "0.5", default-features = false, features = ["std"] }
 zune-png = { version = "0.5", default-features = false, features = ["std"] }
 zune-jpeg = { version = "0.5", default-features = false, features = ["std"] }
 
 [features]
-# Install the counting global allocator (src/dev/alloc.rs) so the perf harness can
-# report allocations per operation. Off by default: a global allocator taxes
-# every allocation, so the shipping editor never carries it. `make perf` and
-# `make perf-lab` enable it.
+# The counting global allocator in src/dev/alloc.rs, for the perf harness. A global
+# allocator taxes every allocation, so only the measuring build carries one.
 perf-alloc = []
 
-# A release panic aborts where it happens and prints nothing: no message, no location,
-# no backtrace. That leaves out the unwinding tables, the panic formatter and std's
-# backtrace symbolizer, about a twelfth of the binary. The editor can afford it because
-# no panics outside tests is a prime directive, so a release panic is a bug either way,
-# and nothing in the tree calls catch_unwind, sets a panic hook, or uses should_panic.
-# The strategy sits on this profile, so debug builds and the test harness keep unwinding
-# panics with their messages.
+# immediate-abort leaves out the unwinding tables, the panic formatter and std's
+# backtrace symbolizer, so a release panic prints nothing and nothing may rely on
+# unwinding (catch_unwind, a panic hook). Debug builds and the test harness keep
+# unwinding panics.
 #
-# For a profile with symbols, build with --config profile.release.strip=false
-# --config profile.release.debug=1. A readable panic needs a debug build.
+# For symbols: --config profile.release.strip=false --config profile.release.debug=1
 [profile.release]
 opt-level = 3
 lto = true

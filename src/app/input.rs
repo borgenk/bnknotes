@@ -6,7 +6,7 @@ use super::{State, TabDrag, TabHover, VaultDrag};
 use crate::find;
 use crate::keymap::{self, KeyAction};
 use crate::menu::{Menu, MenuLayout};
-use crate::paint::{conflict_banner_layout, BannerButton};
+use crate::paint::{BannerButton, conflict_banner_layout};
 use crate::palette::{Palette, PaletteLayout, Rows, Submit};
 use crate::pane::{CaretAnim, Columns, DiskConflict, EditorPane, Focus, Hit, ImagePress, SPLITTER};
 use crate::platform::error::{Error, Result};
@@ -866,11 +866,11 @@ impl State {
                         // A tab reorder just ended: persist the new order and let the
                         // lifted tab settle back into its slot. A press that never
                         // grew into a drag was a plain click, already handled.
-                        if let Some(drag) = self.drag_tab.take() {
-                            if drag.moved {
-                                self.save_session();
-                                self.dirty = true;
-                            }
+                        if let Some(drag) = self.drag_tab.take()
+                            && drag.moved
+                        {
+                            self.save_session();
+                            self.dirty = true;
                         }
                         // A chip is let go of here rather than at press: this is where
                         // a rail reorder is remembered, and where a chip that never
@@ -963,30 +963,33 @@ impl State {
             return self.top_bar_hit(&cols, px, py);
         }
         for (s, rect) in cols.splitters.iter().enumerate() {
-            if let Some(r) = rect {
-                if x >= r.x && x < r.x + r.w {
-                    return Hit::Splitter(s);
-                }
+            if let Some(r) = rect
+                && x >= r.x
+                && x < r.x + r.w
+            {
+                return Hit::Splitter(s);
             }
         }
-        if let Some(r) = cols.tree {
-            if x >= r.x && x < r.x + r.w {
-                let col = self.tree_column(r);
-                if py as i32 >= col.footer.y {
-                    return if col.button.contains(px, py) {
-                        Hit::TreeFilter
-                    } else {
-                        Hit::TreeFooter
-                    };
-                }
-                return Hit::Tree(col.rows);
+        if let Some(r) = cols.tree
+            && x >= r.x
+            && x < r.x + r.w
+        {
+            let col = self.tree_column(r);
+            if py as i32 >= col.footer.y {
+                return if col.button.contains(px, py) {
+                    Hit::TreeFilter
+                } else {
+                    Hit::TreeFooter
+                };
             }
+            return Hit::Tree(col.rows);
         }
         for (i, rect) in cols.editors.iter().enumerate() {
-            if let Some(r) = rect {
-                if x >= r.x && x < r.x + r.w {
-                    return Hit::Editor(i, *r);
-                }
+            if let Some(r) = rect
+                && x >= r.x
+                && x < r.x + r.w
+            {
+                return Hit::Editor(i, *r);
             }
         }
         Hit::None
@@ -1861,10 +1864,10 @@ impl State {
     /// as everything else: nothing typed is lost by being closed, and the idle window
     /// is not a race against Ctrl+W.
     fn close_tab(&mut self, g: usize, i: usize) {
-        if let Some(doc) = self.editors[g].docs_mut().nth(i) {
-            if let Err(e) = doc.save() {
-                eprintln!("bnknotes: could not save the closing tab: {e}");
-            }
+        if let Some(doc) = self.editors[g].docs_mut().nth(i)
+            && let Err(e) = doc.save()
+        {
+            eprintln!("bnknotes: could not save the closing tab: {e}");
         }
         self.editors[g].close(i);
         self.hovered_tab = None;
@@ -1968,14 +1971,14 @@ impl State {
         self.editors[i].raw_image = None;
         // A plain click on a rendered task checkbox toggles it without moving the
         // caret. Shift-click falls through so it can extend a selection.
-        if !shift {
-            if let Some(ls) = self.editors[i].checkbox_under_pointer(&self.fonts, rect, px, py) {
-                if self.editors[i].text.toggle_task(ls) {
-                    self.dirty = true;
-                }
-                self.bump_caret();
-                return;
+        if !shift
+            && let Some(ls) = self.editors[i].checkbox_under_pointer(&self.fonts, rect, px, py)
+        {
+            if self.editors[i].text.toggle_task(ls) {
+                self.dirty = true;
             }
+            self.bump_caret();
+            return;
         }
         // Click chaining for double/triple-click.
         let (click_count, chained) = self.editors[i].clicks.register(px, py, Instant::now());
@@ -1987,13 +1990,13 @@ impl State {
             return;
         }
         // A plain, un-chained click on a rendered link follows it.
-        if !chained && !shift {
-            if let Some(dest) = self.editors[i].link_under_pointer(&self.fonts, rect, px, py) {
-                if crate::platform::browser::open_url(&dest).is_ok() {
-                    self.editors[i].end_drag();
-                    return;
-                }
-            }
+        if !chained
+            && !shift
+            && let Some(dest) = self.editors[i].link_under_pointer(&self.fonts, rect, px, py)
+            && crate::platform::browser::open_url(&dest).is_ok()
+        {
+            self.editors[i].end_drag();
+            return;
         }
         match click_count {
             1 => {

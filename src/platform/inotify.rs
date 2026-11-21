@@ -11,7 +11,7 @@
 //! poll as the compositor socket and drains it with [`Inotify::for_each_event`]
 //! only when it signals readable.
 
-use std::ffi::{c_char, c_int, c_void, CString};
+use std::ffi::{CString, c_char, c_int, c_void};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
@@ -51,7 +51,7 @@ pub const DIR_MASK: u32 = IN_CLOSE_WRITE
 const IN_NONBLOCK: c_int = 0o4000;
 const IN_CLOEXEC: c_int = 0o2000000;
 
-extern "C" {
+unsafe extern "C" {
     fn inotify_init1(flags: c_int) -> c_int;
     fn inotify_add_watch(fd: c_int, pathname: *const c_char, mask: u32) -> c_int;
     fn inotify_rm_watch(fd: c_int, wd: c_int) -> c_int;

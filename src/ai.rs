@@ -317,11 +317,11 @@ fn whole_replace(old: &str, new: &str) -> Vec<DiffSpan> {
 /// Append `text` to the last span when it shares `kind`, else start a new run, so
 /// the diff coalesces adjacent tokens of one kind into a single span.
 fn push_token(spans: &mut Vec<DiffSpan>, kind: DiffKind, text: &str) {
-    if let Some(last) = spans.last_mut() {
-        if last.kind == kind {
-            last.text.push_str(text);
-            return;
-        }
+    if let Some(last) = spans.last_mut()
+        && last.kind == kind
+    {
+        last.text.push_str(text);
+        return;
     }
     spans.push(DiffSpan {
         kind,
@@ -807,15 +807,21 @@ mod tests {
     fn a_single_word_fix_touches_only_that_word() {
         let spans = word_diff("teh cat sat", "the cat sat");
         // The shared "cat sat" stays Equal; only the first word is delete + insert.
-        assert!(spans
-            .iter()
-            .any(|s| s.kind == DiffKind::Delete && s.text == "teh"));
-        assert!(spans
-            .iter()
-            .any(|s| s.kind == DiffKind::Insert && s.text == "the"));
-        assert!(spans
-            .iter()
-            .any(|s| s.kind == DiffKind::Equal && s.text.contains("cat sat")));
+        assert!(
+            spans
+                .iter()
+                .any(|s| s.kind == DiffKind::Delete && s.text == "teh")
+        );
+        assert!(
+            spans
+                .iter()
+                .any(|s| s.kind == DiffKind::Insert && s.text == "the")
+        );
+        assert!(
+            spans
+                .iter()
+                .any(|s| s.kind == DiffKind::Equal && s.text.contains("cat sat"))
+        );
     }
 
     #[test]

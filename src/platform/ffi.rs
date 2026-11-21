@@ -19,7 +19,7 @@
 //! Struct layouts (`msghdr`, `iovec`, `cmsghdr`) mirror the Linux x86_64/arm64
 //! ABI; this targets Linux/Wayland and nothing else.
 
-use core::ffi::{c_char, c_int, c_long, c_short, c_uint, c_ulong, c_void, CStr};
+use core::ffi::{CStr, c_char, c_int, c_long, c_short, c_uint, c_ulong, c_void};
 use std::mem;
 use std::os::fd::{FromRawFd, OwnedFd, RawFd};
 use std::time::Duration;
@@ -116,7 +116,7 @@ struct CmsgHdr {
 // FFI declarations.
 // ---------------------------------------------------------------------------
 
-extern "C" {
+unsafe extern "C" {
     fn mmap(
         addr: *mut c_void,
         len: usize,
@@ -1019,7 +1019,7 @@ mod tests {
         revents: c_short,
     }
 
-    extern "C" {
+    unsafe extern "C" {
         fn poll(fds: *mut PollFd, nfds: c_ulong, timeout: c_int) -> c_int;
     }
 
@@ -1045,10 +1045,10 @@ mod tests {
                 .to_str()
                 .and_then(|n| n.strip_prefix("renderD"))
                 .and_then(|n| n.parse::<u32>().ok());
-            if let Some(minor) = minor {
-                if let Ok(fd) = open_drm_render_node(minor) {
-                    return Some(fd);
-                }
+            if let Some(minor) = minor
+                && let Ok(fd) = open_drm_render_node(minor)
+            {
+                return Some(fd);
             }
         }
         None

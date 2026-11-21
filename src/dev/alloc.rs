@@ -56,8 +56,10 @@ pub struct Counting;
 
 #[cfg(feature = "perf-alloc")]
 unsafe impl std::alloc::GlobalAlloc for Counting {
+    // SAFETY: every method passes its caller's arguments to the system allocator
+    // unchanged, so the caller's `GlobalAlloc` contract carries over.
     unsafe fn alloc(&self, layout: std::alloc::Layout) -> *mut u8 {
-        let ptr = std::alloc::System.alloc(layout);
+        let ptr = unsafe { std::alloc::System.alloc(layout) };
         if !ptr.is_null() {
             ALLOCS.fetch_add(1, Relaxed);
         }
@@ -65,11 +67,11 @@ unsafe impl std::alloc::GlobalAlloc for Counting {
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: std::alloc::Layout) {
-        std::alloc::System.dealloc(ptr, layout);
+        unsafe { std::alloc::System.dealloc(ptr, layout) };
     }
 
     unsafe fn alloc_zeroed(&self, layout: std::alloc::Layout) -> *mut u8 {
-        let ptr = std::alloc::System.alloc_zeroed(layout);
+        let ptr = unsafe { std::alloc::System.alloc_zeroed(layout) };
         if !ptr.is_null() {
             ALLOCS.fetch_add(1, Relaxed);
         }
@@ -77,7 +79,7 @@ unsafe impl std::alloc::GlobalAlloc for Counting {
     }
 
     unsafe fn realloc(&self, ptr: *mut u8, layout: std::alloc::Layout, new_size: usize) -> *mut u8 {
-        let new_ptr = std::alloc::System.realloc(ptr, layout, new_size);
+        let new_ptr = unsafe { std::alloc::System.realloc(ptr, layout, new_size) };
         if !new_ptr.is_null() {
             // A realloc that grows is a fresh allocation's worth of work; count it
             // so growing a Vec in a loop shows the churn it really is.

@@ -472,9 +472,11 @@ mod tests {
         // here may split a character or mis-place an offset.
         let root = vault("fold", &[("a.md", "Ærlig\n")]);
         assert_eq!(search(&root, "Ærlig", &none(), Narrow::Vault).hits.len(), 1);
-        assert!(search(&root, "aerlig", &none(), Narrow::Vault)
-            .hits
-            .is_empty());
+        assert!(
+            search(&root, "aerlig", &none(), Narrow::Vault)
+                .hits
+                .is_empty()
+        );
     }
 
     #[test]
@@ -552,9 +554,11 @@ mod tests {
         // What is in the buffer is found; what is only in the file is not.
         let r = search(&root, "typed", &open, Narrow::Vault);
         assert_eq!(rows(&r, &root), ["a.md:1 typed but not saved"]);
-        assert!(search(&root, "on disk", &open, Narrow::Vault)
-            .hits
-            .is_empty());
+        assert!(
+            search(&root, "on disk", &open, Narrow::Vault)
+                .hits
+                .is_empty()
+        );
     }
 
     #[test]
@@ -664,8 +668,10 @@ mod tests {
     fn a_vault_that_does_not_exist_answers_nothing_rather_than_failing() {
         let root = std::env::temp_dir().join("bnknotes-search-nonexistent-xyz");
         let _ = std::fs::remove_dir_all(&root);
-        assert!(search(&root, "target", &none(), Narrow::Vault)
-            .hits
-            .is_empty());
+        assert!(
+            search(&root, "target", &none(), Narrow::Vault)
+                .hits
+                .is_empty()
+        );
     }
 }

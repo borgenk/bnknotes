@@ -48,7 +48,7 @@ impl CpuSet {
     }
 }
 
-extern "C" {
+unsafe extern "C" {
     fn getrusage(who: c_int, usage: *mut Rusage) -> c_int;
     fn sysconf(name: c_int) -> c_long;
     fn sched_setaffinity(pid: c_int, cpusetsize: usize, mask: *const CpuSet) -> c_int;
@@ -154,9 +154,5 @@ pub fn current_rss_bytes() -> u64 {
 fn page_size() -> u64 {
     // SAFETY: sysconf with a valid name has no memory effects.
     let p = unsafe { sysconf(SC_PAGESIZE) };
-    if p > 0 {
-        p as u64
-    } else {
-        4096
-    }
+    if p > 0 { p as u64 } else { 4096 }
 }

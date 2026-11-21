@@ -87,7 +87,7 @@ mod tests {
         assert_eq!(Scale::from_120(180).px(100), 150); // 1.5x
         assert_eq!(Scale::from_120(150).px(100), 125); // 1.25x
         assert_eq!(Scale::from_120(150).px(101), 126); // 126.25 -> 126 (nearest)
-                                                       // No overflow at the extremes (i64 math, then narrowed).
+        // No overflow at the extremes (i64 math, then narrowed).
         assert_eq!(Scale::from_120(240).px(16384), 32768);
     }
 
@@ -97,7 +97,7 @@ mod tests {
         assert_eq!(Scale::from_120(240).font_px(14), 28); // 2.0x -> 28
         assert_eq!(Scale::from_120(180).font_px(14), 21); // 1.5x -> 21
         assert_eq!(Scale::from_120(150).font_px(14), 18); // 1.25x -> 17.5 -> 18
-                                                          // Same physical size two ways: 14px at 2x equals 28px at 1x.
+        // Same physical size two ways: 14px at 2x equals 28px at 1x.
         assert_eq!(
             Scale::from_120(240).font_px(14),
             Scale::from_120(120).font_px(28)

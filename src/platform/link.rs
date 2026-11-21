@@ -30,12 +30,17 @@
 //!   legal inside a URL yet is also how prose punctuates, so it may not *end* one.
 //!   `last_safe` gets this for free: soft characters never advance it, so a run of
 //!   them at the end is simply never reached. `example.com/a.b` keeps its dot;
-//!   `see example.com/a.` gives it back to the sentence.
+//!   `see example.com/a.` gives it back to the sentence. Punctuation from other
+//!   scripts is soft the same way (`。`, `、`, `…`, `·`, and quotation marks such as
+//!   `“”` and `«»`), so `ジョン・レノン` keeps its dot and `example.jp/a。` drops its
+//!   stop.
 //! - **Balanced brackets.** A closing bracket belongs to the URL only when the URL
 //!   opened it, which is why `last_safe` advances only at nesting depth zero: while
 //!   a bracket is open the link cannot end, and an unmatched closer ends it at once.
 //!   `en.wikipedia.org/wiki/Cure_(album)` keeps its parentheses; `(see example.com/a)`
-//!   gives its `)` back to the prose.
+//!   gives its `)` back to the prose. Every bracket pair Unicode defines balances the
+//!   same way, so `wiki/北京（消歧义）` and `wiki/【推しの子】` stay whole and
+//!   `「example.jp/a」` gives its `」` back.
 //!
 //! We detect exactly the schemes [`browser::OPENABLE_SCHEMES`] lists, by scanning for
 //! that same constant. A link the app decorates and then refuses to follow is a worse
@@ -45,6 +50,7 @@
 //!
 //! [uts58]: https://www.unicode.org/reports/tr58/
 
+use std::cmp::Ordering;
 use std::ops::Range;
 
 use crate::platform::browser;
@@ -62,10 +68,13 @@ pub fn urls(text: &str) -> impl Iterator<Item = Range<usize>> + '_ {
     std::iter::from_fn(move || {
         while at < text.len() {
             match scheme_at(text, at).and_then(|len| extent(text, at, len)) {
-                Some(range) => {
+                // Only a target the browser module would open is a link, so nothing is
+                // drawn as one that does nothing when clicked.
+                Some(range) if browser::can_open(&text[range.clone()]) => {
                     at = range.end;
                     return Some(range);
                 }
+                Some(range) => at = range.end,
                 // Not a link here (or a scheme with no host, or mid-character): the
                 // next byte is the next candidate.
                 None => at += 1,
@@ -172,18 +181,140 @@ fn classify(c: char) -> Class {
         '-' | '_' | '~' | '/' | '#' | '@' | '$' | '&' | '*' | '+' | '=' | '%' => Class::Url,
         // Every other ASCII character (`"`, `<`, `>`, `\`, `^`, backtick, `{`, `|`,
         // `}`) is illegal in a URL, so it ends one. This is what makes the common ways
-        // of quoting a link — `<http://x>`, `"http://x"` — come out clean with no
+        // of quoting a link (`<http://x>`, `"http://x"`) come out clean with no
         // special case for them.
         c if c.is_ascii() => Class::Hard,
-        // Non-ASCII: an IRI may carry it (an accented Wikipedia title), and it is
-        // never prose punctuation we would have to guess about.
-        _ => Class::Url,
+        // Non-ASCII brackets balance like the ASCII ones above, and the rest of the
+        // punctuation is split the way the ASCII is.
+        c => bracket(c).unwrap_or(match punctuation(c) {
+            Some(Punct::Unpaired) => Class::Hard,
+            Some(Punct::Prose) => Class::Soft,
+            // Anything else an IRI may carry: an accented title, an en dash.
+            None => Class::Url,
+        }),
     }
 }
 
+/// What a non-ASCII punctuation mark that is not a bracket pair does to a URL, by
+/// its General_Category.
+#[derive(Clone, Copy)]
+enum Punct {
+    /// Ps or Pe that pairs with nothing, which ends a URL.
+    Unpaired,
+    /// Pi, Pf, Po: quotation marks and sentence punctuation, which may not end a URL.
+    Prose,
+}
+
+/// The class of a non-ASCII bracket that has a pair: Open, or Close carrying the
+/// opening bracket it closes.
+fn bracket(c: char) -> Option<Class> {
+    let u = u32::from(c);
+    if OPENING_BRACKETS.binary_search(&u).is_ok() {
+        return Some(Class::Open);
+    }
+    let at = CLOSING_BRACKETS
+        .binary_search_by_key(&u, |&(close, _)| close)
+        .ok()?;
+    let opener = CLOSING_BRACKETS
+        .get(at)
+        .and_then(|&(_, open)| char::from_u32(open))?;
+    Some(Class::Close(opener))
+}
+
+/// The Punct of c, or None when it is not non-ASCII punctuation.
+fn punctuation(c: char) -> Option<Punct> {
+    let u = u32::from(c);
+    let at = PUNCTUATION
+        .binary_search_by(|&(lo, hi, _)| range_order(lo, hi, u))
+        .ok()?;
+    PUNCTUATION.get(at).map(|&(_, _, punct)| punct)
+}
+
+/// Where the inclusive range lo..=hi sits relative to u, for a binary search over a
+/// sorted table of ranges.
+fn range_order(lo: u32, hi: u32, u: u32) -> Ordering {
+    if u < lo {
+        Ordering::Greater
+    } else if u > hi {
+        Ordering::Less
+    } else {
+        Ordering::Equal
+    }
+}
+
+include!("link_tables.rs");
+
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::platform::link::*;
+
+    #[test]
+    fn closing_punctuation_from_any_script_is_left_to_the_prose() {
+        for (text, url) in [
+            ("see https://example.com/a” next", "https://example.com/a"),
+            ("«https://example.fr/a» ok", "https://example.fr/a"),
+            ("「https://example.jp/a」を参照", "https://example.jp/a"),
+            ("（https://example.jp/a）", "https://example.jp/a"),
+            ("詳細: https://example.jp/a。", "https://example.jp/a"),
+            ("https://example.com/a…", "https://example.com/a"),
+            ("انظر https://example.com/a؟", "https://example.com/a"),
+            ("देखें https://example.in/a।", "https://example.in/a"),
+        ] {
+            assert_eq!(all(text), [url], "{text}");
+        }
+    }
+
+    #[test]
+    fn punctuation_from_another_script_inside_a_url_is_kept() {
+        for url in [
+            "https://ja.wikipedia.org/wiki/ジョン・レノン",
+            "https://ca.wikipedia.org/wiki/Paral·lel",
+            "https://en.wikipedia.org/wiki/Spanish–American_War",
+            "https://ja.wikipedia.org/wiki/【推しの子】",
+            "https://zh.wikipedia.org/wiki/北京（消歧义）",
+            "https://example.jp/a（注）",
+        ] {
+            assert_eq!(all(&format!("{url} ok")), [url]);
+        }
+    }
+
+    #[test]
+    fn every_non_ascii_punctuation_mark_is_classified_by_its_category() {
+        // The committed table against the vendored data, so a Unicode bump without
+        // make tables cannot leave it stale.
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/ucd/DerivedGeneralCategory.txt"
+        );
+        let text = std::fs::read_to_string(path).unwrap();
+        let mut checked = 0;
+        for line in text.lines() {
+            let data = line.split('#').next().unwrap().trim();
+            let Some((range, category)) = data.split_once(';') else {
+                continue;
+            };
+            let hex = |s: &str| u32::from_str_radix(s.trim(), 16).unwrap();
+            let (lo, hi) = match range.split_once("..") {
+                Some((lo, hi)) => (hex(lo), hex(hi)),
+                None => (hex(range), hex(range)),
+            };
+            for c in (lo..=hi)
+                .filter_map(char::from_u32)
+                .filter(|c| !c.is_ascii())
+            {
+                let class = classify(c);
+                match category.trim() {
+                    // A bracket with a pair balances; one without ends the URL.
+                    "Ps" => assert!(matches!(class, Class::Open | Class::Hard), "{c:?}"),
+                    "Pe" => assert!(matches!(class, Class::Close(_) | Class::Hard), "{c:?}"),
+                    "Pi" | "Pf" | "Po" => assert!(matches!(class, Class::Soft), "{c:?}"),
+                    _ => continue,
+                }
+                checked += 1;
+            }
+        }
+        assert!(checked > 500, "only {checked} marks checked");
+    }
 
     /// Every URL in `text`, as [`urls`] yields them.
     fn all(text: &str) -> Vec<&str> {

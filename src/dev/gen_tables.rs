@@ -1,10 +1,13 @@
-//! `--gen-tables`: regenerate the Unicode property tables that `grapheme.rs`
-//! binary-searches, from the UCD data files vendored in `ucd/`.
+//! `--gen-tables`: regenerate the Unicode property tables that `grapheme.rs` and
+//! `link.rs` binary-search, from the UCD data files vendored in `ucd/`.
 //!
 //! ```text
 //!   ucd/GraphemeBreakProperty.txt   ─┐
 //!   ucd/emoji-data.txt              ─┼─▶ src/platform/grapheme_tables.rs
 //!   ucd/DerivedCoreProperties.txt   ─┘   (GCB, EXTENDED_PICTOGRAPHIC, INCB)
+//!   ucd/DerivedGeneralCategory.txt  ─┬─▶ src/platform/link_tables.rs
+//!   ucd/BidiBrackets.txt            ─┘   (PUNCTUATION, OPENING_BRACKETS,
+//!                                         CLOSING_BRACKETS)
 //! ```
 //!
 //! The inputs are vendored and version-pinned, so a regeneration is a pure,
@@ -20,6 +23,7 @@ use crate::platform::error::{Error, Result};
 use std::fmt::Write as _;
 
 const GRAPHEME_TABLES: &str = "src/platform/grapheme_tables.rs";
+const LINK_TABLES: &str = "src/platform/link_tables.rs";
 
 pub fn run(_args: &[String]) -> Result<()> {
     // Every vendored file is one Unicode version; read it off the one whose header
@@ -27,8 +31,79 @@ pub fn run(_args: &[String]) -> Result<()> {
     let version = read_version(&ucd("GraphemeBreakProperty.txt"))?;
     std::fs::write(GRAPHEME_TABLES, gen_grapheme(&version)?)
         .map_err(|e| Error::msg(format!("write {GRAPHEME_TABLES}: {e}")))?;
-    println!("wrote {GRAPHEME_TABLES} from Unicode {version}");
+    std::fs::write(LINK_TABLES, gen_link(&version)?)
+        .map_err(|e| Error::msg(format!("write {LINK_TABLES}: {e}")))?;
+    println!("wrote {GRAPHEME_TABLES} and {LINK_TABLES} from Unicode {version}");
     Ok(())
+}
+
+/// The tables link.rs reads, all non-ASCII (ASCII is classified by hand there).
+/// The bracket pairs (Bidi_Paired_Bracket_Type) balance inside a URL the way ASCII
+/// parentheses do. PUNCTUATION is the rest by General_Category: an opening or
+/// closing mark that pairs with nothing (Ps, Pe) ends a URL, and quotation marks and
+/// other punctuation (Pi, Pf, Po) may not end one.
+fn gen_link(version: &str) -> Result<String> {
+    let dgc = read(&ucd("DerivedGeneralCategory.txt"))?;
+    let mut punctuation = Vec::new();
+    for (lo, hi, f) in dgc.lines().filter_map(ucd_fields) {
+        let tag = match f.first().copied() {
+            Some("Ps" | "Pe") => "Punct::Unpaired",
+            Some("Pi" | "Pf" | "Po") => "Punct::Prose",
+            _ => continue,
+        };
+        let lo = lo.max(0x80);
+        if lo <= hi {
+            punctuation.push((lo, hi, tag));
+        }
+    }
+    let brackets = read(&ucd("BidiBrackets.txt"))?;
+    let mut opening = Vec::new();
+    let mut closing = Vec::new();
+    for (bracket, _, f) in brackets.lines().filter_map(ucd_fields) {
+        let Some(pair) = f.first().and_then(|h| hex(h)) else {
+            continue;
+        };
+        if bracket < 0x80 {
+            continue;
+        }
+        match f.get(1).copied() {
+            Some("o") => opening.push(bracket),
+            Some("c") => closing.push((bracket, pair)),
+            _ => {}
+        }
+    }
+    opening.sort_unstable();
+    closing.sort_unstable();
+
+    let mut out = String::new();
+    header(
+        &mut out,
+        version,
+        &["ucd/DerivedGeneralCategory.txt", "ucd/BidiBrackets.txt"],
+    );
+    let _ = writeln!(
+        out,
+        "/// Every non-ASCII punctuation range, tagged with what it does to a bare URL."
+    );
+    emit_tagged(&mut out, "PUNCTUATION", "Punct", &merge_tagged(punctuation));
+    let _ = writeln!(out);
+    let _ = writeln!(out, "/// Every non-ASCII opening bracket that has a pair.");
+    let _ = writeln!(out, "static OPENING_BRACKETS: &[u32] = &[");
+    for bracket in &opening {
+        let _ = writeln!(out, "    0x{bracket:04X},");
+    }
+    let _ = writeln!(out, "];");
+    let _ = writeln!(out);
+    let _ = writeln!(
+        out,
+        "/// Every non-ASCII closing bracket, with the opening bracket it closes."
+    );
+    let _ = writeln!(out, "static CLOSING_BRACKETS: &[(u32, u32)] = &[");
+    for (close, open) in &closing {
+        let _ = writeln!(out, "    (0x{close:04X}, 0x{open:04X}),");
+    }
+    let _ = writeln!(out, "];");
+    Ok(out)
 }
 
 /// The path of a vendored UCD file.

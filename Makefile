@@ -117,7 +117,7 @@ perf-lab:
 deps:
 	sudo pacman -S --needed --asexplicit $(UCD_PKG)
 
-# Regenerate the committed Unicode property tables (src/platform/grapheme_tables.rs)
+# Regenerate the committed Unicode property tables (src/platform/grapheme_tables.rs and link_tables.rs)
 # from the vendored ucd/ data. Deterministic and offline; only needed when ucd/ is
 # refreshed for a new Unicode version (`make deps`, then copy /usr/share/unicode/ into
 # ucd/). The output is guarded by the conformance test over ucd/GraphemeBreakTest.txt.

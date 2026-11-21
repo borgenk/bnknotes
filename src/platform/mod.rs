@@ -10,7 +10,8 @@
 //!   and ARGB pixel math (`pixel`).
 //! - **Foundation**: the syscall FFI surface (`ffi`), the minimal error type
 //!   (`error`), branchless byte scanning (`bytes`), scroll math (`scroll`), and
-//!   finding a URL in text (`link`) so it can be opened in the browser (`browser`).
+//!   finding a URL in text (`link`) so it can be opened in the browser (`browser`)
+//!   once its host is read the one way a browser would not rewrite (`host`).
 //!
 //! This layer is self-contained enough to lift out whole. It is a clean leaf: a
 //! module here may depend only on other `platform` modules and `std`, never on
@@ -28,6 +29,7 @@ pub(crate) mod fontconfig;
 pub(crate) mod freetype;
 pub(crate) mod geom;
 pub(crate) mod grapheme;
+pub(crate) mod host;
 pub(crate) mod inotify;
 pub(crate) mod link;
 pub(crate) mod pixel;

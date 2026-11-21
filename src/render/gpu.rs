@@ -16,6 +16,7 @@
 
 use std::collections::HashMap;
 
+use crate::platform::emoji::wants_emoji;
 use crate::platform::freetype::{CodeInk, Face, FaceKey, Fonts};
 use crate::platform::geom::Rect;
 use crate::platform::grapheme;
@@ -681,12 +682,19 @@ impl Batcher<'_> {
     /// cached, so a steady-state frame neither re-shapes nor touches the `Face`
     /// (beyond reporting the atlas hit for the frame stats). Non-emoji clusters
     /// are not tallied, matching the pre-atlas emoji-cache accounting.
+    ///
+    /// A cluster that would not be emoji even where the text face lacks its glyph
+    /// (a letter, an accented letter, a box-drawing character) returns None before
+    /// the lookup, so plain text never enters the map.
     fn packed_cluster(
         &mut self,
         face: &Face,
         face_key: FaceKey,
         cluster: &str,
     ) -> Option<PackedGlyph> {
+        if !wants_emoji(cluster, |_| false) {
+            return None;
+        }
         if let Some(&packed) = self
             .cache
             .cluster_slots
@@ -1337,6 +1345,47 @@ mod tests {
         assert!(f.vertices.is_empty());
         assert!(f.batches.is_empty());
         assert!(f.image_uploads.is_empty());
+    }
+
+    /// Text the emoji font never draws stays out of the cluster map, so a note of
+    /// distinct letters cannot grow it without bound.
+    #[test]
+    fn plain_text_leaves_the_cluster_cache_alone() {
+        let fonts = Fonts::new(&[16]).expect("default font");
+        let images = ImageStore::new(None);
+        let mut cache = GlyphCache::new();
+        let text: String = ('α'..='ω')
+            .chain("café naïve Ærøskøbing ├──".chars())
+            .collect();
+        let list = vec![DrawCmd::Text {
+            bounds: Rect {
+                x: 0,
+                y: 0,
+                w: 2000,
+                h: 20,
+            },
+            x: 0,
+            baseline: 16,
+            face: FaceKey::Prose {
+                size: 16,
+                style: crate::platform::freetype::FontStyle::Regular,
+            },
+            color: 0x00ff_ffff,
+            text: format!("{text} 😀"),
+            clip_x: None,
+        }];
+        let f = built(&fonts, &[&images], &list, &mut cache, &|_| false, 1.0);
+        let clusters: usize = cache.cluster_slots.values().map(HashMap::len).sum();
+        assert!(
+            clusters <= 1,
+            "only the emoji is recorded, not {clusters} clusters"
+        );
+        if crate::platform::emoji::EmojiFont::open().is_some() {
+            assert!(
+                f.vertices.iter().any(|v| v.mode == MODE_EMOJI),
+                "the emoji still draws in color"
+            );
+        }
     }
 
     #[test]

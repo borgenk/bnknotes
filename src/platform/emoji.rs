@@ -5,10 +5,11 @@
 //! (cluster, size). Sits above the FFI layer in `freetype.rs` (whose faces and
 //! glyph-slot mirror it reads) and the pure pixel math in `pixel.rs`.
 
-use core::ffi::{c_uint, c_void};
+use core::ffi::c_uint;
 use core::ptr::NonNull;
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
+use std::rc::Rc;
 
 use crate::platform::freetype::{
     CacheStats, FT_LOAD_COLOR, FT_LOAD_RENDER, FT_Load_Glyph, FT_PIXEL_MODE_BGRA, Face, FtBitmap,
@@ -86,12 +87,9 @@ type ClusterCache<T> = RefCell<HashMap<u32, HashMap<Box<str>, Option<T>>>>;
 /// font, or a cluster the font cannot form all yield `None`, and the caller
 /// falls back to per-character rendering.
 pub struct EmojiFont {
-    /// Declared before `face` deliberately: fields drop in declaration order,
-    /// and the shaper's HarfBuzz font holds a reference to the FreeType face
-    /// that it releases with `FT_Done_Face` on destroy. The face's own `Drop`
-    /// tears down its whole FreeType library, so HarfBuzz must let go first.
+    /// Shared with shaper, which keeps it alive for as long as HarfBuzz uses it.
+    face: Rc<Face>,
     shaper: Shaper,
-    face: Face,
     /// The strike's nominal pixel size; glyph bitmaps and shaped positions are
     /// scaled by `target / strike` to land on the text's em square.
     strike: f32,
@@ -114,11 +112,9 @@ impl EmojiFont {
         let path = EMOJI_FONTS
             .iter()
             .find(|p| std::path::Path::new(p).exists())?;
-        let face = Face::from_path_index(std::path::Path::new(path), 0).ok()?;
+        let face = Rc::new(Face::from_path_index(std::path::Path::new(path), 0).ok()?);
         let strike = face.select_first_strike()?;
-        // SAFETY: the face handle is valid and has a size selected; the shaper
-        // takes its own FreeType reference, so drop order does not matter.
-        let shaper = unsafe { Shaper::from_ft_face(face.ft_face_ptr() as *mut c_void) }?;
+        let shaper = Shaper::new(Rc::clone(&face))?;
         Some(Self {
             face,
             shaper,
@@ -421,6 +417,16 @@ mod tests {
 
     fn emoji() -> EmojiFont {
         EmojiFont::open().expect("a color emoji font should be installed")
+    }
+
+    /// The shaper keeps the face it shapes with, so the font's other owner can go
+    /// first: dropping the face before the shaper used to free the FreeType library
+    /// HarfBuzz was still reading.
+    #[test]
+    fn a_shaper_outlives_the_other_owners_of_its_face() {
+        let EmojiFont { face, shaper, .. } = emoji();
+        drop(face);
+        assert!(!shaper.shape("😀").is_empty(), "the shaper still shapes");
     }
 
     #[test]

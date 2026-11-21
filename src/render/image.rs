@@ -540,12 +540,12 @@ impl ImageStore {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::render::image::*;
 
     // Real, tiny fixtures generated offline (no external sources): a 2x2 RGBA PNG
-    // and a 16x16 solid-red JPEG. See src/render/testdata.
-    const TINY_PNG: &[u8] = include_bytes!("testdata/tiny.png");
-    const TINY_JPEG: &[u8] = include_bytes!("testdata/tiny.jpg");
+    // and a 16x16 solid-red JPEG.
+    const TINY_PNG: &[u8] = include_bytes!("../../testdata/images/tiny.png");
+    const TINY_JPEG: &[u8] = include_bytes!("../../testdata/images/tiny.jpg");
 
     /// A `w` by `h` image whose pixels are `f(x, y)`, opaque unless `f` says
     /// otherwise.

@@ -1173,7 +1173,7 @@ mod tests {
     #[test]
     fn image_splits_its_own_batch_and_uploads_once() {
         let fonts = Fonts::new(&[16]).expect("default font");
-        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/render/testdata");
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("testdata/images");
         let mut images = ImageStore::new(Some(dir));
         images.ensure("tiny.png");
         let mut cache = GlyphCache::new();

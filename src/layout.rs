@@ -786,6 +786,7 @@ impl Layout {
     /// range reaches the line. Wrapping always uses the *source* text, so reveal
     /// state never changes line breaks or baselines, only the horizontal
     /// rendering of the heading's first segment.
+    #[cfg(any(test, feature = "dev"))]
     pub fn build(
         fonts: &Fonts,
         rope: &Rope,
@@ -935,6 +936,7 @@ impl Layout {
 
     /// Total height of the laid-out text block in pixels, for sizing the
     /// scrollable content.
+    #[cfg(any(test, feature = "dev"))]
     pub fn text_height(&self) -> i32 {
         self.text_height
     }
@@ -2940,6 +2942,7 @@ impl LineIndex {
 
     /// The heap bytes the index holds: the per-line records and their prefix sums.
     /// For the memory report.
+    #[cfg(any(test, feature = "dev"))]
     pub fn heap_bytes(&self) -> usize {
         self.recs.capacity() * std::mem::size_of::<LineRec>()
             + (self.tops.capacity() + self.wrap_tops.capacity()) * std::mem::size_of::<i32>()

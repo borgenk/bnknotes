@@ -183,6 +183,7 @@ impl Rope {
     /// The heap bytes this rope holds: every leaf's `String` capacity plus each
     /// node's `Arc` allocation (two atomic counters and the `Inner`). Walks the
     /// tree, so it is for the memory report, not a hot path.
+    #[cfg(any(test, feature = "dev"))]
     pub fn heap_bytes(&self) -> usize {
         node_heap_bytes(&self.root)
     }
@@ -710,6 +711,7 @@ fn bytecount_nl(s: &str) -> usize {
 /// Heap bytes of `node` and its subtree: each node is an `Arc` allocation (two
 /// atomic counters plus the `Inner`, which inlines a leaf `String`'s 24-byte
 /// header or the two child pointers), and a leaf adds its `String` capacity.
+#[cfg(any(test, feature = "dev"))]
 fn node_heap_bytes(node: &Inner) -> usize {
     let mut total = 2 * std::mem::size_of::<usize>() + std::mem::size_of::<Inner>();
     match &node.kind {

@@ -518,6 +518,7 @@ impl ImageStore {
 
     /// A store pre-populated with already-decoded images, bypassing the filesystem:
     /// used by tests and the performance harness.
+    #[cfg(any(test, feature = "dev"))]
     pub(crate) fn from_decoded(items: Vec<(String, Image)>) -> Self {
         let mut store = Self::new(None);
         for (key, image) in items {

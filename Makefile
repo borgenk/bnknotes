@@ -121,8 +121,8 @@ deps:
 # from the vendored ucd/ data. Deterministic and offline; only needed when ucd/ is
 # refreshed for a new Unicode version (`make deps`, then copy /usr/share/unicode/ into
 # ucd/). The output is guarded by the conformance test over ucd/GraphemeBreakTest.txt.
-tables: build-prod
-	$(BUILD_PATH)/$(APP_NAME) --gen-tables
+tables:
+	cargo run --release --features dev -- --gen-tables
 
 # Clean build artifacts
 clean:

@@ -155,6 +155,9 @@ struct Slot {
     h: u32,
 }
 
+/// One face's ASCII placements, indexed by the character's byte.
+type AsciiSlots = [Option<PackedGlyph>; 128];
+
 /// A glyph's atlas placement plus its pen metrics, cached beside the slot so a
 /// steady-state frame emits the quad without re-rasterizing the glyph. `slot` is
 /// `None` for an inkless glyph (a space, or an emoji that shaped to no ink) or
@@ -336,6 +339,12 @@ impl Atlas {
 pub struct GlyphCache {
     pub glyphs: Atlas,
     pub emoji: Atlas,
+    /// ASCII placements, one table per raster key. A text run finds its table
+    /// once and indexes it per character, where scalar_slots, which holds every
+    /// other character, hashes each lookup. The tables are few (one per face and
+    /// size in use) and fixed in size, so they need no cap.
+    ascii_slots: Vec<AsciiSlots>,
+    ascii_tables: HashMap<FaceKey, usize>,
     scalar_slots: HashMap<(FaceKey, char), PackedGlyph>,
     /// Nested so lookups borrow the cluster as `&str` (no per-frame `String`).
     /// A `None` value records a cluster that is not color emoji, so a
@@ -379,6 +388,8 @@ impl GlyphCache {
         Self {
             glyphs: Atlas::new(1),
             emoji: Atlas::new(4),
+            ascii_slots: Vec::new(),
+            ascii_tables: HashMap::new(),
             scalar_slots: HashMap::new(),
             cluster_slots: HashMap::new(),
             cluster_records: 0,
@@ -407,12 +418,36 @@ impl GlyphCache {
         id
     }
 
-    /// Record a scalar's placement. At the record cap the glyph atlas is wiped
-    /// instead, which restarts the build with an empty map; when this build has
-    /// wiped it already, the placement goes unrecorded and a later frame retries.
-    fn record_scalar(&mut self, key: (FaceKey, char), packed: PackedGlyph) {
-        if self.scalar_slots.len() < MAX_SLOT_RECORDS {
-            self.scalar_slots.insert(key, packed);
+    /// The index of key's ASCII table, adding an empty one on first use.
+    fn ascii_table(&mut self, key: FaceKey) -> usize {
+        if let Some(&table) = self.ascii_tables.get(&key) {
+            return table;
+        }
+        let table = self.ascii_slots.len();
+        self.ascii_slots.push([None; 128]);
+        self.ascii_tables.insert(key, table);
+        table
+    }
+
+    /// A scalar's recorded placement: an ASCII character's from the run's table,
+    /// any other from the map.
+    fn scalar_slot(&self, ascii: usize, key: FaceKey, ch: char) -> Option<PackedGlyph> {
+        match self.ascii_slots.get(ascii).and_then(|t| t.get(ch as usize)) {
+            Some(slot) => *slot,
+            None => self.scalar_slots.get(&(key, ch)).copied(),
+        }
+    }
+
+    /// Record a scalar's placement. At the map's record cap the glyph atlas is
+    /// wiped instead, which restarts the build with an empty map; when this build
+    /// has wiped it already, the placement goes unrecorded and a later frame
+    /// retries.
+    fn record_scalar(&mut self, ascii: usize, key: FaceKey, ch: char, packed: PackedGlyph) {
+        let table = self.ascii_slots.get_mut(ascii);
+        if let Some(slot) = table.and_then(|t| t.get_mut(ch as usize)) {
+            *slot = Some(packed);
+        } else if self.scalar_slots.len() < MAX_SLOT_RECORDS {
+            self.scalar_slots.insert((key, ch), packed);
         } else {
             self.glyphs.reclaim();
         }
@@ -436,6 +471,8 @@ impl GlyphCache {
     /// and what the build packed into it before restarting, which nothing refers to.
     fn reset_for(&mut self, glyphs_gen: u32, emoji_gen: u32) {
         if self.glyphs.generation != glyphs_gen {
+            self.ascii_slots.clear();
+            self.ascii_tables.clear();
             self.scalar_slots.clear();
             self.glyphs.clear();
         }
@@ -496,6 +533,19 @@ pub fn build_frame(
         cache.emoji.take_uploads(&mut out.emoji_uploads);
         return;
     }
+}
+
+/// What every glyph of one text run is drawn with.
+struct Run<'f> {
+    face: &'f Face,
+    /// The raster key, shared by both code inks.
+    key: FaceKey,
+    /// The key's ASCII table in the glyph cache.
+    ascii: usize,
+    baseline: i32,
+    color: u32,
+    gamma: f32,
+    clip_x: Option<[i32; 2]>,
 }
 
 struct Batcher<'a> {
@@ -694,16 +744,25 @@ impl Batcher<'_> {
         };
         // The ink class picked the gamma; the raster is the same either way, so the
         // glyph cache sees one key per face and size.
-        let face_key = face_key.raster();
+        let key = face_key.raster();
+        let run = Run {
+            face,
+            key,
+            ascii: self.cache.ascii_table(key),
+            baseline,
+            color,
+            gamma,
+            clip_x,
+        };
         let mut pen = x as f32;
         if text.is_ascii() {
             for ch in text.chars() {
-                pen = self.scalar(face, face_key, ch, pen, baseline, color, gamma, clip_x);
+                pen = self.scalar(&run, ch, pen);
             }
             return;
         }
         for (_, cluster) in grapheme::graphemes(text) {
-            match self.packed_cluster(face, face_key, cluster) {
+            match self.packed_cluster(face, key, cluster) {
                 Some(packed) => {
                     // Emoji carry their own color and ignore the mask gamma.
                     self.emit_glyph(&packed, pen, baseline, MODE_EMOJI, 0, 0.0, clip_x);
@@ -711,7 +770,7 @@ impl Batcher<'_> {
                 }
                 None => {
                     for ch in cluster.chars() {
-                        pen = self.scalar(face, face_key, ch, pen, baseline, color, gamma, clip_x);
+                        pen = self.scalar(&run, ch, pen);
                     }
                 }
             }
@@ -722,28 +781,25 @@ impl Batcher<'_> {
     /// returning the advanced pen. Its placement is cached beside the atlas
     /// slot, so a steady-state frame emits the quad without re-rasterizing the
     /// glyph.
-    #[allow(clippy::too_many_arguments)]
-    fn scalar(
-        &mut self,
-        face: &Face,
-        face_key: FaceKey,
-        ch: char,
-        pen: f32,
-        baseline: i32,
-        color: u32,
-        gamma: f32,
-        clip_x: Option<[i32; 2]>,
-    ) -> f32 {
-        let packed = self.packed_scalar(face, face_key, ch);
-        self.emit_glyph(&packed, pen, baseline, MODE_GLYPH, color, gamma, clip_x);
+    fn scalar(&mut self, run: &Run, ch: char, pen: f32) -> f32 {
+        let packed = self.packed_scalar(run, ch);
+        self.emit_glyph(
+            &packed,
+            pen,
+            run.baseline,
+            MODE_GLYPH,
+            run.color,
+            run.gamma,
+            run.clip_x,
+        );
         pen + packed.advance
     }
 
     /// The cached placement for a scalar glyph. On the first sight of this
     /// (face, character) the glyph is rasterized once and its coverage written
     /// straight into the atlas; later frames read the cached placement.
-    fn packed_scalar(&mut self, face: &Face, face_key: FaceKey, ch: char) -> PackedGlyph {
-        if let Some(&packed) = self.cache.scalar_slots.get(&(face_key, ch)) {
+    fn packed_scalar(&mut self, run: &Run, ch: char) -> PackedGlyph {
+        if let Some(packed) = self.cache.scalar_slot(run.ascii, run.key, ch) {
             self.cache.stats.hits += 1;
             return packed;
         }
@@ -753,7 +809,7 @@ impl Batcher<'_> {
         // instead of a tofu box. The advance comes from the same face, since
         // `Face::advance` resolves the scalar the way `glyph_face` does, so the pen
         // moves by the width of the glyph that was actually inked.
-        let g = self.fonts.glyph_face(face_key, ch).rasterize(ch);
+        let g = self.fonts.glyph_face(run.key, ch).rasterize(ch);
         let placed =
             self.cache
                 .glyphs
@@ -765,10 +821,10 @@ impl Batcher<'_> {
             slot: placed.unwrap_or_default(),
             left: g.left,
             top: g.top,
-            advance: face.advance(ch),
+            advance: run.face.advance(ch),
         };
         if fitted {
-            self.cache.record_scalar((face_key, ch), packed);
+            self.cache.record_scalar(run.ascii, run.key, ch, packed);
         }
         packed
     }
@@ -1099,7 +1155,7 @@ mod tests {
         built(
             &fonts,
             &[&images],
-            &[prose_text("a😀")],
+            &[prose_text("é😀")],
             &mut cache,
             &|_| false,
             1.0,
@@ -1112,7 +1168,7 @@ mod tests {
         assert_eq!(cache.emoji.generation, emoji + 1);
         // Without an emoji font the smiley draws per character, so it is a
         // scalar record too.
-        let drawn = ['a', '😀'];
+        let drawn = ['é', '😀'];
         assert!(
             !cache.scalar_slots.is_empty()
                 && cache.scalar_slots.keys().all(|(_, ch)| drawn.contains(ch)),

@@ -230,6 +230,17 @@ fn punctuation(c: char) -> Option<Punct> {
     PUNCTUATION.get(at).map(|&(_, _, punct)| punct)
 }
 
+/// Whether c draws nothing: it has the Default_Ignorable_Code_Point property or is
+/// a format character (category Cf). That covers zero-width spaces and joiners,
+/// bidi controls, the soft hyphen, variation selectors and tag characters.
+pub fn is_hidden(c: char) -> bool {
+    let u = u32::from(c);
+    !c.is_ascii()
+        && HIDDEN
+            .binary_search_by(|&(lo, hi)| range_order(lo, hi, u))
+            .is_ok()
+}
+
 /// Where the inclusive range lo..=hi sits relative to u, for a binary search over a
 /// sorted table of ranges.
 fn range_order(lo: u32, hi: u32, u: u32) -> Ordering {
@@ -247,6 +258,24 @@ include!("link_tables.rs");
 #[cfg(test)]
 mod tests {
     use crate::platform::link::*;
+
+    #[test]
+    fn characters_that_draw_nothing_are_hidden() {
+        for c in [
+            '\u{200B}',
+            '\u{200D}',
+            '\u{00AD}',
+            '\u{202E}',
+            '\u{FEFF}',
+            '\u{E0041}',
+            '\u{FE0F}',
+        ] {
+            assert!(is_hidden(c), "{c:?}");
+        }
+        for c in ['a', ' ', 'é', 'ジ', '–'] {
+            assert!(!is_hidden(c), "{c:?}");
+        }
+    }
 
     #[test]
     fn closing_punctuation_from_any_script_is_left_to_the_prose() {
@@ -308,6 +337,7 @@ mod tests {
                     "Ps" => assert!(matches!(class, Class::Open | Class::Hard), "{c:?}"),
                     "Pe" => assert!(matches!(class, Class::Close(_) | Class::Hard), "{c:?}"),
                     "Pi" | "Pf" | "Po" => assert!(matches!(class, Class::Soft), "{c:?}"),
+                    "Cf" => assert!(is_hidden(c), "{c:?}"),
                     _ => continue,
                 }
                 checked += 1;

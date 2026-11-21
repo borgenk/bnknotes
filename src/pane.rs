@@ -2104,7 +2104,10 @@ impl EditorPane {
             .into_iter()
             .find(|l| layout.span_hit(fonts, rope, row, (ls + l.text.0, ls + l.text.1), px, y))?;
         let dest = content[link.dest.0..link.dest.1].to_string();
-        crate::platform::browser::can_open(&dest).then_some(dest)
+        let text = &content[link.text.0..link.text.1];
+        (crate::platform::browser::can_open(&dest)
+            && crate::platform::browser::text_agrees(text, &dest))
+        .then_some(dest)
     }
 
     /// The logical-line start of the rendered task checkbox under a window
@@ -4251,6 +4254,23 @@ ran the numbers
         );
         // Ordinary prose is not a link, so a click there just places the caret.
         assert_eq!(link_over("see https://example.com/a now", "now"), None);
+    }
+
+    #[test]
+    fn a_link_whose_text_shows_another_host_does_not_follow() {
+        // The reader sees paypal.com; the click would go to evil.example.
+        let doc = "pay at [https://paypal.com/login](https://evil.example/) now";
+        assert_eq!(link_over(doc, "paypal"), None);
+        // Text that names the target's own host still follows, and so does a bare
+        // URL whose path quotes another URL.
+        let doc = "see [https://example.com/a](https://example.com/b) now";
+        assert_eq!(
+            link_over(doc, "example"),
+            Some("https://example.com/b".into())
+        );
+        let url = "https://web.archive.org/web/2020/https://example.com/";
+        let doc = format!("see {url} now");
+        assert_eq!(link_over(&doc, "archive"), Some(url.into()));
     }
 
     #[test]

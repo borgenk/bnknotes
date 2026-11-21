@@ -11,8 +11,8 @@ files.
 | --- | --- | --- |
 | `GraphemeBreakProperty.txt` | `src/platform/grapheme_tables.rs` | Grapheme_Cluster_Break |
 | `emoji-data.txt` | `src/platform/grapheme_tables.rs` | Extended_Pictographic (rule GB11) |
-| `DerivedCoreProperties.txt` | `src/platform/grapheme_tables.rs` | Indic_Conjunct_Break (rule GB9c) |
-| `DerivedGeneralCategory.txt` | `src/platform/link_tables.rs` | General_Category (punctuation) |
+| `DerivedCoreProperties.txt` | `src/platform/grapheme_tables.rs`, `src/platform/link_tables.rs` | Indic_Conjunct_Break (rule GB9c), Default_Ignorable_Code_Point |
+| `DerivedGeneralCategory.txt` | `src/platform/link_tables.rs` | General_Category (punctuation and Cf) |
 | `BidiBrackets.txt` | `src/platform/link_tables.rs` | Bidi_Paired_Bracket, Bidi_Paired_Bracket_Type |
 | `GraphemeBreakTest.txt` | `grapheme.rs` test | the official UAX #29 conformance suite |
 

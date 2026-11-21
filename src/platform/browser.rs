@@ -12,6 +12,7 @@ use std::process::{Command, Stdio};
 
 use crate::platform::error::{Error, Result};
 use crate::platform::host::{self, Host};
+use crate::platform::link;
 
 /// The schemes we are willing to open, and so also exactly the schemes
 /// [`crate::platform::link`] detects: a link the app decorates and then refuses to
@@ -103,6 +104,99 @@ pub fn judge(url: &str) -> core::result::Result<(), Refusal> {
         return Err(Refusal::MailField);
     }
     Ok(())
+}
+
+/// Whether a link's visible text agrees with its target: every URL the text shows
+/// must begin with the target's host. The text is read the way a reader takes it:
+/// past characters that draw nothing and a code span's backticks, in any case, with
+/// a URL anywhere in it (an openable scheme, or www. at the start of a word), so
+/// markup and quotes around it change nothing. A leading www. on either side is the
+/// same site. A host shown with a non-ASCII letter never matches, since a target's
+/// host is ASCII. Text that shows no URL agrees with any target.
+pub fn text_agrees(text: &str, url: &str) -> bool {
+    let target = match host::read(url) {
+        Host::Name(name) => name.to_ascii_lowercase(),
+        Host::Absent | Host::Refused => String::new(),
+    };
+    let (shown, breaks) = shown_text(text);
+    shown_hosts(&shown, &breaks).all(|host| same_site(host, &target))
+}
+
+/// The text as a reader sees it, ASCII-lowercased: characters that draw nothing and
+/// backticks dropped. The offsets returned are where something was dropped, which a
+/// reader sees as a break between words.
+fn shown_text(text: &str) -> (String, Vec<usize>) {
+    let mut shown = String::with_capacity(text.len());
+    let mut breaks = Vec::new();
+    for c in text.chars() {
+        if c == '`' || link::is_hidden(c) {
+            if breaks.last() != Some(&shown.len()) {
+                breaks.push(shown.len());
+            }
+        } else {
+            shown.push(c.to_ascii_lowercase());
+        }
+    }
+    (shown, breaks)
+}
+
+/// What starts a URL in shown text.
+const URL_STARTS: [&str; 4] = ["https://", "http://", "file://", "www."];
+
+/// The host each URL in shown text begins with: the bracketed address or the run of
+/// letters, digits, dots, hyphens and underscores after its scheme (trailing dots
+/// left to the sentence), or from a www. that starts a word. The rest of the URL, up
+/// to the next whitespace, is its path, so a URL quoted in another one's path or
+/// query names no host of its own.
+fn shown_hosts<'a>(shown: &'a str, breaks: &'a [usize]) -> impl Iterator<Item = &'a str> {
+    let mut at = 0;
+    std::iter::from_fn(move || {
+        while let Some(rest) = shown.get(at..).filter(|rest| !rest.is_empty()) {
+            let start = URL_STARTS.iter().find(|start| {
+                rest.starts_with(**start) && (**start != "www." || starts_word(shown, breaks, at))
+            });
+            let Some(start) = start else {
+                at += rest.chars().next().map_or(1, char::len_utf8);
+                continue;
+            };
+            let from = if *start == "www." {
+                at
+            } else {
+                at + start.len()
+            };
+            let url = &shown[from..];
+            let host = match url.strip_prefix('[') {
+                Some(v6) => v6.find(']').map_or(url, |end| &url[..end + 2]),
+                None => {
+                    let end = url
+                        .find(|c: char| !(c.is_alphanumeric() || matches!(c, '.' | '-' | '_')))
+                        .unwrap_or(url.len());
+                    url[..end].trim_end_matches('.')
+                }
+            };
+            at = url
+                .find(char::is_whitespace)
+                .map_or(shown.len(), |space| from + space);
+            return Some(host);
+        }
+        None
+    })
+}
+
+/// Whether offset at in shown text starts a word: nothing before it, something that
+/// is not a letter or digit, or a dropped character.
+fn starts_word(shown: &str, breaks: &[usize], at: usize) -> bool {
+    breaks.binary_search(&at).is_ok()
+        || shown[..at]
+            .chars()
+            .next_back()
+            .is_none_or(|before| !before.is_alphanumeric())
+}
+
+/// Whether two lowercased hosts are the same site, a leading www. aside.
+fn same_site(shown: &str, target: &str) -> bool {
+    let bare = |host: &'_ str| host.strip_prefix("www.").unwrap_or(host).to_string();
+    bare(shown) == bare(target)
 }
 
 /// What a file: target reaches on disk, judged at the click: the path resolved
@@ -374,6 +468,63 @@ mod tests {
         ] {
             assert_eq!(judge(url), Err(refusal), "{url:?}");
             assert!(!can_open(url), "{url:?} must not be offered to the pointer");
+        }
+    }
+
+    #[test]
+    fn link_text_that_shows_another_host_disagrees() {
+        for (text, url) in [
+            ("https://paypal.com/login", "https://evil.example/"),
+            ("HTTPS://PAYPAL.COM", "https://evil.example/"),
+            ("**https://paypal.com**", "https://evil.example/"),
+            ("“https://paypal.com”", "https://evil.example/"),
+            (
+                "see https://paypal.com for details",
+                "https://evil.example/",
+            ),
+            ("ht\u{200B}tps://paypal.com", "https://evil.example/"),
+            ("https://pаypal.com", "https://xn--pypal-4ve.com/"),
+            ("https://paypal.com.evil.example", "https://evil.example/"),
+            ("www.paypal.com", "https://evil.example/"),
+            ("https://example.com", "mailto:someone@example.com"),
+            ("[`https:`//paypal.com", "https://evil.example/"),
+            ("https:/`/`paypal.com", "https://evil.example/"),
+            ("Login\u{3164}www.paypal.com", "https://evil.example/"),
+            (
+                "https://example.com and https://paypal.com",
+                "https://example.com/",
+            ),
+        ] {
+            assert!(!text_agrees(text, url), "{text:?} -> {url}");
+        }
+    }
+
+    #[test]
+    fn link_text_that_shows_no_other_host_agrees() {
+        for (text, url) in [
+            ("the docs", "https://evil.example/"),
+            ("https://example.com/a", "https://example.com/b"),
+            ("**https://Example.com**", "https://example.com/"),
+            ("see https://example.com.", "https://example.com/"),
+            ("www.example.com", "https://www.example.com/x"),
+            ("awww.example.com", "https://evil.example/"),
+            ("file:///home/user/a.md", "file:///home/user/b.md"),
+            ("https://example.com", "https://example.com"),
+            ("www.example.com", "https://example.com/"),
+            ("https://example.com", "https://www.example.com/"),
+            ("http://localhost:3000/", "http://localhost:3000/"),
+        ] {
+            assert!(text_agrees(text, url), "{text:?} -> {url}");
+        }
+        // A bare URL is its own text, whatever its path quotes.
+        for url in [
+            "https://web.archive.org/web/2020/https://example.com/",
+            "https://www.google.com/search?q=www.example.com",
+            "file:///srv/www.example.com/index.html",
+            "http://[::1]:5173/",
+            "https://example.com/a?next=https://example.com/b",
+        ] {
+            assert!(text_agrees(url, url), "{url}");
         }
     }
 

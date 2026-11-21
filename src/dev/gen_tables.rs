@@ -6,8 +6,8 @@
 //!   ucd/emoji-data.txt              ─┼─▶ src/platform/grapheme_tables.rs
 //!   ucd/DerivedCoreProperties.txt   ─┘   (GCB, EXTENDED_PICTOGRAPHIC, INCB)
 //!   ucd/DerivedGeneralCategory.txt  ─┬─▶ src/platform/link_tables.rs
-//!   ucd/BidiBrackets.txt            ─┘   (PUNCTUATION, OPENING_BRACKETS,
-//!                                         CLOSING_BRACKETS)
+//!   ucd/BidiBrackets.txt            ─┤   (PUNCTUATION, OPENING_BRACKETS,
+//!   ucd/DerivedCoreProperties.txt   ─┘    CLOSING_BRACKETS, HIDDEN)
 //! ```
 //!
 //! The inputs are vendored and version-pinned, so a regeneration is a pure,
@@ -41,14 +41,20 @@ pub fn run(_args: &[String]) -> Result<()> {
 /// The bracket pairs (Bidi_Paired_Bracket_Type) balance inside a URL the way ASCII
 /// parentheses do. PUNCTUATION is the rest by General_Category: an opening or
 /// closing mark that pairs with nothing (Ps, Pe) ends a URL, and quotation marks and
-/// other punctuation (Pi, Pf, Po) may not end one.
+/// other punctuation (Pi, Pf, Po) may not end one. HIDDEN is every character that
+/// draws nothing, Default_Ignorable_Code_Point together with category Cf.
 fn gen_link(version: &str) -> Result<String> {
     let dgc = read(&ucd("DerivedGeneralCategory.txt"))?;
     let mut punctuation = Vec::new();
+    let mut hidden = Vec::new();
     for (lo, hi, f) in dgc.lines().filter_map(ucd_fields) {
         let tag = match f.first().copied() {
             Some("Ps" | "Pe") => "Punct::Unpaired",
             Some("Pi" | "Pf" | "Po") => "Punct::Prose",
+            Some("Cf") => {
+                hidden.push((lo, hi));
+                continue;
+            }
             _ => continue,
         };
         let lo = lo.max(0x80);
@@ -74,12 +80,22 @@ fn gen_link(version: &str) -> Result<String> {
     }
     opening.sort_unstable();
     closing.sort_unstable();
+    let dcp = read(&ucd("DerivedCoreProperties.txt"))?;
+    for (lo, hi, f) in dcp.lines().filter_map(ucd_fields) {
+        if f.first() == Some(&"Default_Ignorable_Code_Point") {
+            hidden.push((lo, hi));
+        }
+    }
 
     let mut out = String::new();
     header(
         &mut out,
         version,
-        &["ucd/DerivedGeneralCategory.txt", "ucd/BidiBrackets.txt"],
+        &[
+            "ucd/DerivedGeneralCategory.txt",
+            "ucd/BidiBrackets.txt",
+            "ucd/DerivedCoreProperties.txt",
+        ],
     );
     let _ = writeln!(
         out,
@@ -103,6 +119,12 @@ fn gen_link(version: &str) -> Result<String> {
         let _ = writeln!(out, "    (0x{close:04X}, 0x{open:04X}),");
     }
     let _ = writeln!(out, "];");
+    let _ = writeln!(out);
+    let _ = writeln!(
+        out,
+        "/// Every Default_Ignorable_Code_Point or Cf range: the characters that draw nothing."
+    );
+    emit_ranges(&mut out, "HIDDEN", &merge(hidden));
     Ok(out)
 }
 

@@ -75,6 +75,14 @@ impl Message {
     }
 }
 
+/// The longest message libwayland delivers: its connection buffer holds 4096 bytes
+/// and a message is read whole.
+pub const MAX_MESSAGE: usize = 4096;
+
+/// The longest string a request holds as its only argument: MAX_MESSAGE less the
+/// header, the length word and the NUL.
+pub const MAX_STR_ARG: usize = MAX_MESSAGE - 8 - 4 - 1;
+
 /// Append an encoded request to `buf`.
 pub fn encode(buf: &mut Vec<u8>, object: u32, opcode: u16, args: &[Arg]) {
     let start = buf.len();
@@ -84,12 +92,11 @@ pub fn encode(buf: &mut Vec<u8>, object: u32, opcode: u16, args: &[Arg]) {
         encode_arg(buf, arg);
     }
     let size = (buf.len() - start) as u32;
-    // The size lives in the header's high 16 bits, so a request must be < 64 KiB.
-    // We never build one anywhere near that; assert the invariant rather than let
-    // `size << 16` silently truncate the length into the opcode bits.
+    // Callers bound what they send, since a longer request cannot be delivered and
+    // past 64 KiB its size no longer fits the header.
     debug_assert!(
-        size <= 0xffff,
-        "wayland request too large to encode: {size} bytes"
+        size as usize <= MAX_MESSAGE,
+        "wayland request too large to send: {size} bytes"
     );
     let word = (size << 16) | u32::from(opcode);
     buf[start + 4..start + 8].copy_from_slice(&word.to_ne_bytes());

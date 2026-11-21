@@ -6,7 +6,7 @@ mod input;
 mod present;
 
 use std::collections::BTreeSet;
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::rc::Rc;
@@ -42,7 +42,7 @@ use crate::platform::protocol::{
     wp_fractional_scale_v1, wp_viewporter, xdg_surface, xdg_toplevel, xdg_wm_base,
 };
 use crate::platform::scroll::{self, Scrollbar};
-use crate::platform::wire::{Arg, Message, Reader};
+use crate::platform::wire::{self, Arg, Message, Reader};
 use crate::platform::xkb::Xkb;
 use crate::render::display::{DisplayList, DrawCmd};
 use crate::render::image::{Image, ImageStore, Limits};
@@ -3044,29 +3044,22 @@ impl State {
         }
     }
 
-    /// Write the toplevel title into the scratch buffer: the focused editor's file
-    /// name (or just the app name for an unnamed buffer), with a leading dot when it
-    /// has unsaved changes. Formatting into a buffer the state keeps means the
-    /// per-keystroke refresh below compares without allocating.
+    /// Write the focused editor's title into the scratch buffer. Formatting into a
+    /// buffer the state keeps means the per-keystroke refresh below compares without
+    /// allocating.
     fn write_window_title(&mut self) {
-        use std::fmt::Write as _;
         let pane = &self.editors[self.active_editor()];
-        let mut title = std::mem::take(&mut self.title_scratch);
-        title.clear();
-        if pane.has_tabs() {
-            if pane.text.is_modified() {
-                title.push_str("• ");
-            }
-            match pane.path.as_ref().and_then(|p| p.file_name()) {
-                Some(name) => {
-                    let _ = write!(title, "{} - bnknotes", name.to_string_lossy());
-                }
-                None => title.push_str("bnknotes"),
-            }
-        } else {
-            title.push_str("bnknotes");
-        }
-        self.title_scratch = title;
+        let tabs = pane.has_tabs();
+        let name = pane
+            .path
+            .as_ref()
+            .and_then(|p| p.file_name())
+            .filter(|_| tabs);
+        write_title(
+            &mut self.title_scratch,
+            tabs && pane.text.is_modified(),
+            name,
+        );
     }
 
     /// Send the toplevel title only if it changed, so the modified indicator and
@@ -3166,11 +3159,63 @@ impl State {
     }
 }
 
+/// The toplevel title: the file's name, or the app name for an unnamed buffer, with
+/// a leading dot while there are unsaved changes. A name too long for one set_title
+/// request is cut at a character boundary.
+fn write_title(out: &mut String, modified: bool, name: Option<&OsStr>) {
+    use std::fmt::Write as _;
+    out.clear();
+    if modified {
+        out.push_str("• ");
+    }
+    match name {
+        Some(name) => {
+            let _ = write!(out, "{} - bnknotes", name.to_string_lossy());
+        }
+        None => out.push_str("bnknotes"),
+    }
+    out.truncate(out.floor_char_boundary(wire::MAX_STR_ARG));
+}
+
 #[cfg(test)]
 mod tests {
     use crate::app::*;
     use crate::platform::protocol::wl_keyboard;
     use crate::theme::VAULT_COLORS;
+
+    #[test]
+    fn the_title_names_the_file_and_marks_unsaved_changes() {
+        let mut title = String::new();
+        write_title(&mut title, false, Some(OsStr::new("notes.md")));
+        assert_eq!(title, "notes.md - bnknotes");
+        write_title(&mut title, true, Some(OsStr::new("notes.md")));
+        assert_eq!(title, "• notes.md - bnknotes");
+        write_title(&mut title, true, None);
+        assert_eq!(title, "• bnknotes");
+        write_title(&mut title, false, None);
+        assert_eq!(title, "bnknotes");
+    }
+
+    #[test]
+    fn a_title_too_long_for_one_request_is_cut_at_a_character() {
+        let mut title = String::new();
+        // Two-byte letters, so the byte limit falls inside one.
+        let name = "é".repeat(3000);
+        write_title(&mut title, true, Some(OsStr::new(&name)));
+        assert!(title.starts_with("• éé"));
+        let mut request = Vec::new();
+        wire::encode(
+            &mut request,
+            3,
+            xdg_toplevel::SET_TITLE,
+            &[Arg::Str(&title)],
+        );
+        assert!(
+            request.len() <= wire::MAX_MESSAGE,
+            "a {}-byte request",
+            request.len()
+        );
+    }
 
     #[test]
     fn a_retired_object_keeps_its_fd_event_until_the_compositor_deletes_it() {

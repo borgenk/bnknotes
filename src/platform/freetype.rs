@@ -417,7 +417,7 @@ impl Glyph {
 /// above and below the baseline); `line_height` is the baseline-to-baseline
 /// distance and may exceed ascent + descent, the surplus being leading that
 /// falls below the line (so text is top-aligned in a taller line box).
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Default, Debug)]
 pub struct Metrics {
     pub ascent: i32,
     pub descent: i32,
@@ -653,7 +653,7 @@ impl Face {
     /// advance when the cluster routes to color emoji, else the sum of the
     /// per-character advances (identical to measuring the characters one by
     /// one, so ASCII fast paths and this stay in exact agreement). This is the
-    /// measuring twin of [`Self::with_cluster_glyph`]; the two must route the
+    /// measuring twin of [`Self::rasterize_cluster`]; the two must route the
     /// same way or the caret drifts from the pixels.
     pub fn cluster_advance(&self, cluster: &str) -> f32 {
         if let Some((emoji, px)) = self.emoji_cluster(cluster)
@@ -664,18 +664,14 @@ impl Face {
         cluster.chars().map(|c| self.advance(c)).sum()
     }
 
-    /// Run `f` over the color glyph for an emoji cluster, or return `None` when
-    /// the cluster renders through the ordinary per-character path (not an
-    /// emoji, no emoji font installed, or the emoji font cannot form it).
-    /// `None` tells the caller to draw the cluster's characters instead, which
-    /// matches what [`Self::cluster_advance`] measured for that case.
-    pub fn with_cluster_glyph<R>(
-        &self,
-        cluster: &str,
-        f: impl FnOnce(&ColorGlyph) -> R,
-    ) -> Option<R> {
+    /// The color glyph for an emoji cluster, or None when the cluster renders
+    /// through the ordinary per-character path (not an emoji, no emoji font
+    /// installed, or the emoji font cannot form it). None tells the caller to draw
+    /// the cluster's characters instead, which matches what
+    /// [`Self::cluster_advance`] measured for that case.
+    pub fn rasterize_cluster(&self, cluster: &str) -> Option<ColorGlyph> {
         let (emoji, px) = self.emoji_cluster(cluster)?;
-        emoji.with_glyph(cluster, px, f)
+        emoji.rasterize(cluster, px)
     }
 
     /// The emoji font and target pixel size for `cluster`, or `None` when the
@@ -723,47 +719,28 @@ impl Face {
         (ppem > 0).then(|| f32::from(ppem))
     }
 
-    /// Ascent and descent at the current pixel size, in pixels. Descent is
-    /// negative, matching FreeType.
-    pub fn line_metrics(&self) -> (f32, f32) {
-        // SAFETY: face is valid; face->size is non-null once a size is set,
-        // which open_default always does. The metrics are copied out.
-        let size = unsafe { (*self.face.as_ptr()).size };
-        let Some(size) = NonNull::new(size) else {
-            return (0.0, 0.0);
-        };
-        let metrics = unsafe { &size.as_ref().metrics };
-        (
-            metrics.ascender as f32 / 64.0,
-            metrics.descender as f32 / 64.0,
-        )
-    }
-
-    /// The recommended baseline-to-baseline distance at the current pixel size,
-    /// in pixels: FreeType's line height, which includes any line gap the font
-    /// asks for. Zero if no size is set.
-    pub fn line_height(&self) -> f32 {
-        // SAFETY: face is valid; face->size is non-null once a size is set.
-        let size = unsafe { (*self.face.as_ptr()).size };
-        let Some(size) = NonNull::new(size) else {
-            return 0.0;
-        };
-        unsafe { size.as_ref().metrics.height as f32 / 64.0 }
-    }
-
     /// Render-ready [`Metrics`] at the current pixel size: ascent and descent
-    /// rounded up to whole pixels, and the baseline-to-baseline line height,
-    /// held to at least the ink height so stacked lines never overlap.
+    /// rounded up to whole pixels, and FreeType's baseline-to-baseline height
+    /// (which includes any line gap the font asks for), held to at least the ink
+    /// height so stacked lines never overlap. All zero before a size is set.
     ///
     /// FreeType rounds the ascender up and the descender down independently of
     /// the height it reports, so a font can hand back a baseline-to-baseline
     /// height a pixel below the rounded ascent + descent (Noto Sans does at some
     /// sizes). Taking the max keeps the line box honest for any font.
     pub fn metrics(&self) -> Metrics {
-        let (ascent, descent) = self.line_metrics();
-        let ascent = ascent.ceil() as i32;
-        let descent = (-descent).ceil() as i32;
-        let line_height = (self.line_height().ceil() as i32).max(ascent + descent);
+        // SAFETY: face is valid; face->size is non-null once a size is set.
+        let size = unsafe { (*self.face.as_ptr()).size };
+        let Some(size) = NonNull::new(size) else {
+            return Metrics::default();
+        };
+        // SAFETY: size is the face's live size record; its metrics are copied out.
+        let m = unsafe { &size.as_ref().metrics };
+        // 26.6 fixed point, rounded up to whole pixels.
+        let px = |v: c_long| (v as f32 / 64.0).ceil() as i32;
+        let ascent = px(m.ascender);
+        let descent = px(-m.descender);
+        let line_height = px(m.height).max(ascent + descent);
         Metrics {
             ascent,
             descent,
@@ -1261,14 +1238,6 @@ mod tests {
     }
 
     #[test]
-    fn line_metrics_have_expected_signs() {
-        let face = open();
-        let (ascent, descent) = face.line_metrics();
-        assert!(ascent > 0.0);
-        assert!(descent < 0.0);
-    }
-
-    #[test]
     fn render_metrics_never_overlap_lines() {
         // FreeType can report a baseline-to-baseline height a pixel under the
         // rounded ink height (it rounds ascender up and descender down apart from
@@ -1507,12 +1476,12 @@ mod tests {
         let advance = face.cluster_advance("😀");
         assert!(advance > 0.0);
         assert_eq!(
-            face.with_cluster_glyph("😀", |g| g.advance),
+            face.rasterize_cluster("😀").map(|g| g.advance),
             Some(advance),
             "draw and measure route identically"
         );
         assert!(
-            face.with_cluster_glyph("a", |_| ()).is_none(),
+            face.rasterize_cluster("a").is_none(),
             "ASCII never routes to the emoji path"
         );
         assert_eq!(

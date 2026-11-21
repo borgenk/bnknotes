@@ -7,7 +7,7 @@ use crate::render::gpu::{AtlasInfo, AtlasUpload, FrameData, ImageId};
 use crate::render::vulkan::Gpu;
 use crate::render::vulkan::abi::*;
 use crate::render::vulkan::renderer::{
-    HostBuffer, Texture, allocate_set, color_range, destroy_texture, write_image_set,
+    HostBuffer, Renderer, Texture, allocate_set, color_range, destroy_texture, write_image_set,
 };
 
 /// How long a frame waits on the CPU for the compositor to finish reading its
@@ -33,6 +33,14 @@ impl AtlasSlot {
         match self {
             AtlasSlot::Glyph => VK_FORMAT_R8_UNORM,
             AtlasSlot::Emoji => VK_FORMAT_B8G8R8A8_UNORM,
+        }
+    }
+
+    /// The renderer's texture for this atlas, with the atlas generation it holds.
+    fn texture(self, renderer: &mut Renderer) -> &mut Option<(Texture, u32)> {
+        match self {
+            AtlasSlot::Glyph => &mut renderer.glyph_tex,
+            AtlasSlot::Emoji => &mut renderer.emoji_tex,
         }
     }
 }
@@ -1194,14 +1202,11 @@ impl Gpu {
         info: &AtlasInfo,
         uploads: &mut Vec<PendingUpload>,
     ) -> Result<()> {
-        let tex = match slot {
-            AtlasSlot::Glyph => &mut self.renderer.glyph_tex,
-            AtlasSlot::Emoji => &mut self.renderer.emoji_tex,
-        };
-        if tex.as_ref().is_some_and(|(_, g)| *g == info.generation) {
+        let current = slot.texture(&mut self.renderer);
+        if current.as_ref().is_some_and(|(_, g)| *g == info.generation) {
             return Ok(());
         }
-        if let Some((old, _)) = tex.take() {
+        if let Some((old, _)) = current.take() {
             self.wait_idle();
             destroy_texture(&self.fns, self.device.raw, old);
         }
@@ -1216,10 +1221,7 @@ impl Gpu {
             h: 0,
         });
         tex.initialized = true;
-        match slot {
-            AtlasSlot::Glyph => self.renderer.glyph_tex = Some((tex, info.generation)),
-            AtlasSlot::Emoji => self.renderer.emoji_tex = Some((tex, info.generation)),
-        }
+        *slot.texture(&mut self.renderer) = Some((tex, info.generation));
         self.update_atlas_set()
     }
 
@@ -1236,11 +1238,7 @@ impl Gpu {
         let Some(up) = upload else {
             return;
         };
-        let tex = match slot {
-            AtlasSlot::Glyph => self.renderer.glyph_tex.as_mut(),
-            AtlasSlot::Emoji => self.renderer.emoji_tex.as_mut(),
-        };
-        if let Some((tex, _)) = tex {
+        if let Some((tex, _)) = slot.texture(&mut self.renderer) {
             uploads.push(PendingUpload {
                 image: tex.image,
                 was_initialized: tex.initialized,

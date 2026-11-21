@@ -135,23 +135,9 @@ impl EmojiFont {
         advance
     }
 
-    /// Run `f` over the color glyph for `cluster` at `target` pixels, rasterizing
-    /// it (shape, decode strikes, composite, resample) on the spot. `None` means
-    /// the font cannot form this cluster, matching what [`Self::advance`]
-    /// reported, since both derive from the same shaping. The GPU batcher caches
-    /// the atlas placement, so it calls this only on the first sight of a cluster.
-    pub(crate) fn with_glyph<R>(
-        &self,
-        cluster: &str,
-        target: u32,
-        f: impl FnOnce(&ColorGlyph) -> R,
-    ) -> Option<R> {
-        Some(f(&self.raster(cluster, target)?))
-    }
-
     /// Shape `cluster` and keep the result only when the font can really form
     /// it: at least one glyph and no `.notdef`. The single success predicate
-    /// behind both [`Self::advance`] and [`Self::with_glyph`], which is what
+    /// behind both [`Self::advance`] and [`Self::rasterize`], which is what
     /// keeps measuring and drawing in agreement.
     fn shaped(&self, cluster: &str) -> Option<Vec<crate::platform::shape::ShapedGlyph>> {
         let glyphs = self.shaper.shape(cluster);
@@ -169,13 +155,16 @@ impl EmojiFont {
     /// Rasterize `cluster` at `target` pixels: decode each shaped glyph's color
     /// strike, composite them along the pen into one strike-sized image, then
     /// resample once to the target size. Emoji clusters almost always shape to
-    /// a single glyph, so the composite loop usually runs once.
+    /// a single glyph, so the composite loop usually runs once. None means the
+    /// font cannot form the cluster, as [`Self::advance`] reported, since both
+    /// come from the same shaping. The GPU batcher keeps the atlas placement, so
+    /// this runs once per cluster.
     ///
     /// The pipeline stays *premultiplied* (as FreeType decodes it) through
     /// compositing and resampling, and un-premultiplies only the final
     /// display-size pixels. Filtering straight alpha would mix the black of
     /// transparent texels into edge colors and fringe the glyph outline dark.
-    fn raster(&self, cluster: &str, target: u32) -> Option<ColorGlyph> {
+    pub(crate) fn rasterize(&self, cluster: &str, target: u32) -> Option<ColorGlyph> {
         let shaped = self.shaped(cluster)?;
         let scale = self.scale(target);
         let (placed, pen) = self.place_strikes(&shaped);
@@ -429,12 +418,9 @@ mod tests {
         let font = emoji();
         let advance = font.advance("😀", 32).expect("the smiley should shape");
         assert!(advance > 0.0);
-        let (width, rows, has_ink, glyph_advance) = font
-            .with_glyph("😀", 32, |g| {
-                let ink = g.argb.iter().any(|&p| p >> 24 != 0);
-                (g.width, g.rows, ink, g.advance)
-            })
-            .expect("the smiley should raster");
+        let g = font.rasterize("😀", 32).expect("the smiley should raster");
+        let (width, rows, glyph_advance) = (g.width, g.rows, g.advance);
+        let has_ink = g.argb.iter().any(|&p| p >> 24 != 0);
         assert!(width > 0 && rows > 0, "the smiley has pixels");
         assert!(has_ink, "the smiley has visible ink");
         assert!(
@@ -469,6 +455,6 @@ mod tests {
         // has no glyphs for it and must say so rather than render garbage.
         // (Routing filters this out anyway; the font still answers safely.)
         assert!(font.advance("e\u{301}", 32).is_none());
-        assert!(font.with_glyph("e\u{301}", 32, |_| ()).is_none());
+        assert!(font.rasterize("e\u{301}", 32).is_none());
     }
 }

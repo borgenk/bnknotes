@@ -733,7 +733,7 @@ impl Batcher<'_> {
             return packed;
         }
         let atlas = &mut self.cache.emoji;
-        let packed = face.with_cluster_glyph(cluster, |g| PackedGlyph {
+        let packed = face.rasterize_cluster(cluster).map(|g| PackedGlyph {
             slot: pack_argb(atlas, g.width as u32, g.rows as u32, &g.argb),
             left: g.left,
             top: g.top,

@@ -4,13 +4,15 @@
 //! shallower level, so folding one hides its body and everything nested under it
 //! and stops at its first sibling. The heading line itself always stays visible.
 //!
-//!     # Guide          owns lines 1..6, down to EOF
-//!     intro            <- hidden by folding # Guide
-//!     ## Setup         owns lines 3..5, stopped by ## Usage
-//!     install          <- hidden by folding # Guide or ## Setup
-//!     ### Notes
-//!     detail           <- hidden by any of the three
-//!     ## Usage         a sibling of ## Setup, so it ends that section
+//! ```text
+//! # Guide          owns lines 1..6, down to EOF
+//! intro            <- hidden by folding # Guide
+//! ## Setup         owns lines 3..5, stopped by ## Usage
+//! install          <- hidden by folding # Guide or ## Setup
+//! ### Notes
+//! detail           <- hidden by any of the three
+//! ## Usage         a sibling of ## Setup, so it ends that section
+//! ```
 //!
 //! Two types split the state from what it implies. [`Folds`] is the durable set,
 //! the heading line numbers a document has folded; it rides the editor pane and is

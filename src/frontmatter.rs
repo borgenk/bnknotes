@@ -1,10 +1,12 @@
 //! The YAML frontmatter block a note may open with: where it ends, so the rest of
 //! the editor can treat it as metadata rather than markdown.
 //!
-//!     ---                        <- line 0, the opener
-//!     title: Work log
-//!     tags: [Notebooks/Work]
-//!     ---                        <- the closer; the block is lines 0..4
+//! ```text
+//! ---                        <- line 0, the opener
+//! title: Work log
+//! tags: [Notebooks/Work]
+//! ---                        <- the closer; the block is lines 0..4
+//! ```
 //!
 //! Frontmatter is not markdown and has no CommonMark rule. What marks it is
 //! position: only a `---` on the document's very first line opens one, which is why

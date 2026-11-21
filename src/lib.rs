@@ -1,5 +1,8 @@
-//! bnknotes: a minimal, GPU-rendered markdown notes editor and a native
-//! Wayland client (no winit, no smithay, almost no crates).
+//! bnknotes: a GPU-rendered markdown notes editor and a native Wayland client.
+//!
+//! Every module is private, so the compiler reports code nothing reaches as dead.
+
+use std::process::ExitCode;
 
 mod ai;
 mod app;
@@ -31,7 +34,7 @@ mod theme;
 mod tree;
 mod watch;
 
-fn main() {
+pub fn main() -> ExitCode {
     // `--perf` runs the offline regression gate, `--perf-lab` the corpus-driven
     // performance lab, `--gpu-probe` reports what the compositor offers the GPU
     // presentation path, and `--gen-tables` regenerates the Unicode property
@@ -53,8 +56,11 @@ fn main() {
     } else {
         app::run()
     };
-    if let Err(e) = result {
-        eprintln!("bnknotes: {e}");
-        std::process::exit(1);
+    match result {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("bnknotes: {e}");
+            ExitCode::FAILURE
+        }
     }
 }

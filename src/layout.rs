@@ -82,7 +82,7 @@ use crate::scale::Scale;
 const NEWLINE_PAD: i32 = 8;
 
 /// Horizontal padding inside a fenced code block's panel: the code text (and the
-/// ``` fences) is inset this many pixels from the panel's left edge, and wrapping
+/// fence lines) is inset this many pixels from the panel's left edge, and wrapping
 /// keeps the same gap on the right, so the tinted background frames the code
 /// rather than butting against it.
 const CODE_PAD_X: i32 = 10;

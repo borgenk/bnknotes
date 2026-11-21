@@ -8,6 +8,10 @@ version = "0.1.0"
 edition = "2024"
 license = "MIT"
 
+[[bin]]
+name = "bnknotes"
+path = "src/bin/bnknotes.rs"
+
 # Image decoding is the only dependency: decoders parse untrusted bytes, so they
 # are pure Rust, and src/render/image.rs is the one module that uses them.
 [dependencies]

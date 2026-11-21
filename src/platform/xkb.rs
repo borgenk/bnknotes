@@ -132,15 +132,12 @@ impl Xkb {
         })
     }
 
-    /// Build a Compose state from the user's locale (`$LC_ALL`, `$LC_CTYPE`, or
-    /// `$LANG`, defaulting to `C`). Returns `None` if no compose table is found,
-    /// which is not an error: input simply has no dead-key support then. The
-    /// table is released once the state holds its own reference.
+    /// Build a Compose state from the user's locale (compose_locale). Returns
+    /// `None` if no compose table is found, which is not an error: input simply
+    /// has no dead-key support then. The table is released once the state holds
+    /// its own reference.
     fn new_compose(ctx: NonNull<c_void>) -> Option<NonNull<c_void>> {
-        let locale = std::env::var("LC_ALL")
-            .or_else(|_| std::env::var("LC_CTYPE"))
-            .or_else(|_| std::env::var("LANG"))
-            .unwrap_or_else(|_| "C".to_string());
+        let locale = compose_locale(|name| std::env::var(name).ok());
         let locale = std::ffi::CString::new(locale)
             .or_else(|_| std::ffi::CString::new("C"))
             .ok()?;
@@ -202,6 +199,19 @@ impl Xkb {
         // SAFETY: state is valid (NonNull, owned).
         unsafe {
             xkb_state_update_mask(state.as_ptr(), depressed, latched, locked, 0, 0, group);
+        }
+    }
+
+    /// Drop every modifier and any half-typed compose sequence, which is what
+    /// wl_keyboard.leave asks for: once the surface is unfocused, the release of a
+    /// held key goes to another client, so a Ctrl or Shift kept here would stay
+    /// down until restart. The compositor sends the current modifiers again after
+    /// the next enter.
+    pub fn reset_held_state(&self) {
+        self.update_modifiers(0, 0, 0, 0);
+        if let Some(compose) = self.compose {
+            // SAFETY: compose is valid (NonNull, owned).
+            unsafe { xkb_compose_state_reset(compose.as_ptr()) };
         }
     }
 
@@ -369,9 +379,69 @@ impl Drop for Xkb {
     }
 }
 
+/// The locale whose compose table to load: the first of LC_ALL, LC_CTYPE and
+/// LANG that is set and not empty, else C. POSIX reads an empty one as unset.
+/// var reads one environment variable.
+fn compose_locale(var: impl Fn(&str) -> Option<String>) -> String {
+    ["LC_ALL", "LC_CTYPE", "LANG"]
+        .into_iter()
+        .filter_map(var)
+        .find(|value| !value.is_empty())
+        .unwrap_or_else(|| "C".to_string())
+}
+
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::platform::xkb::*;
+
+    /// Ctrl held while switching windows must not still read as held on return,
+    /// where it would turn the next plain shortcut or click into a Ctrl one.
+    #[test]
+    fn losing_focus_clears_a_held_modifier() {
+        let mut xkb = Xkb::new().expect("xkb context");
+        xkb.load_keymap(MINIMAL_KEYMAP.as_bytes(), XKB_KEYMAP_FORMAT_TEXT_V1)
+            .expect("the minimal keymap compiles");
+        // Control is real modifier index 2 in every keymap, so its mask is 1 << 2,
+        // the bits a compositor sends in wl_keyboard.modifiers.
+        xkb.update_modifiers(1 << 2, 0, 0, 0);
+        assert!(xkb.ctrl_active(), "the depressed mask makes Ctrl active");
+
+        xkb.reset_held_state();
+        assert!(!xkb.ctrl_active(), "leaving the surface drops it");
+
+        xkb.update_modifiers(1 << 2, 0, 0, 0);
+        assert!(xkb.ctrl_active(), "the next modifiers event restores it");
+    }
+
+    /// An empty LC_ALL named no locale, found no compose table, and turned dead
+    /// keys off.
+    #[test]
+    fn an_empty_locale_variable_reads_as_unset() {
+        fn env<'a>(vars: &'a [(&str, &str)]) -> impl Fn(&str) -> Option<String> + 'a {
+            move |name| {
+                vars.iter()
+                    .find(|(var, _)| *var == name)
+                    .map(|(_, value)| value.to_string())
+            }
+        }
+        let set = [
+            ("LC_ALL", "fr_FR.UTF-8"),
+            ("LC_CTYPE", "de_DE.UTF-8"),
+            ("LANG", "en_US.UTF-8"),
+        ];
+        assert_eq!(compose_locale(env(&set)), "fr_FR.UTF-8");
+        assert_eq!(compose_locale(env(&[])), "C");
+        let empty_all = [
+            ("LC_ALL", ""),
+            ("LC_CTYPE", "de_DE.UTF-8"),
+            ("LANG", "en_US.UTF-8"),
+        ];
+        assert_eq!(compose_locale(env(&empty_all)), "de_DE.UTF-8");
+        let only_lang = [("LC_ALL", ""), ("LC_CTYPE", ""), ("LANG", "en_US.UTF-8")];
+        assert_eq!(compose_locale(env(&only_lang)), "en_US.UTF-8");
+        let all_empty = [("LC_ALL", ""), ("LC_CTYPE", ""), ("LANG", "")];
+        assert_eq!(compose_locale(env(&all_empty)), "C");
+    }
 
     #[test]
     fn queries_are_inert_without_a_keymap() {

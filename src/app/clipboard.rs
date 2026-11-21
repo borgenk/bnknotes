@@ -1,5 +1,8 @@
-use std::os::fd::AsRawFd;
+use std::os::fd::{AsRawFd, OwnedFd};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Duration;
 
 use super::State;
 use crate::file;
@@ -27,13 +30,30 @@ pub(super) const IMAGE_MIMES: &[&str] = &["image/png", "image/jpeg"];
 /// image, the same vault) that a file would.
 const MAX_PASTE_BYTES: usize = 64 * 1024 * 1024;
 
+/// How long a paste waits for the clipboard owner to send more, and for the whole
+/// payload. The read runs on the event loop, so an owner that accepts and never
+/// writes would otherwise freeze the editor.
+const PASTE_IDLE: Duration = Duration::from_secs(3);
+const PASTE_TOTAL: Duration = Duration::from_secs(30);
+
+/// How long quitting waits for transfers of our selection still in flight.
+const SERVE_DRAIN: Duration = Duration::from_secs(2);
+
+/// Transfers of our selection allowed in flight at once. Each is a thread blocked
+/// on a target's pipe, so a target that never reads holds one until it closes.
+const MAX_SERVES: usize = 8;
+
 /// Clipboard state. When we own the selection, `source` is our live
 /// `wl_data_source`; `data` is the bytes it serves and `mimes` the types it
 /// advertises (text for a text selection, `image/png`/`image/jpeg` for a copied
 /// image). Incoming offers are tracked so a paste can request the right MIME type.
 pub(super) struct ClipboardState {
     pub(super) source: u32,
-    pub(super) data: Vec<u8>,
+    /// Our selection's bytes, shared with the threads serving it, so a transfer
+    /// keeps the selection it started with.
+    pub(super) data: Arc<[u8]>,
+    /// The transfers of our selection now in flight.
+    serving: Arc<AtomicUsize>,
     pub(super) mimes: Vec<&'static str>,
     pub(super) incoming_offer: u32,
     pub(super) incoming_text_mime: Option<String>,
@@ -48,7 +68,8 @@ impl ClipboardState {
     pub(super) fn new() -> Self {
         Self {
             source: 0,
-            data: Vec::new(),
+            data: Arc::default(),
+            serving: Arc::default(),
             mimes: Vec::new(),
             incoming_offer: 0,
             incoming_text_mime: None,
@@ -100,22 +121,12 @@ impl State {
                     .conn
                     .take_fd()
                     .ok_or_else(|| Error::msg("data_source.send arrived without its fd"))?;
-                // A target that closes its read end early makes this write fail
-                // (EPIPE). Serving the clipboard must not bring the editor down, so
-                // report and swallow the I/O error rather than propagate it out of
-                // the event loop (the protocol-parse errors above stay fatal).
-                if let Err(e) = ffi::write_all(fd.as_raw_fd(), &self.clipboard.data) {
-                    eprintln!("bnknotes: clipboard serve failed: {e}");
-                }
+                self.serve_selection(fd);
             }
             wl_data_source::EV_CANCELLED => {
                 // Another selection replaced ours; tear the source down.
-                if self.clipboard.source != 0 {
-                    self.conn
-                        .request(self.clipboard.source, wl_data_source::DESTROY, &[]);
-                }
-                self.clipboard.source = 0;
-                self.clipboard.data.clear();
+                self.destroy_source();
+                self.clipboard.data = Arc::default();
                 self.clipboard.mimes.clear();
             }
             _ => {}
@@ -178,10 +189,7 @@ impl State {
         let (Some(manager), true) = (self.data_device_manager, self.data_device != 0) else {
             return;
         };
-        if self.clipboard.source != 0 {
-            self.conn
-                .request(self.clipboard.source, wl_data_source::DESTROY, &[]);
-        }
+        self.destroy_source();
         let source = self.alloc_id();
         self.conn.request(
             manager,
@@ -198,7 +206,7 @@ impl State {
             &[Arg::Object(source), Arg::Uint(self.last_serial)],
         );
         self.clipboard.source = source;
-        self.clipboard.data = data;
+        self.clipboard.data = data.into();
         self.clipboard.mimes = mimes;
     }
 
@@ -269,7 +277,7 @@ impl State {
     pub(super) fn clipboard_image(&mut self) -> Result<Option<Vec<u8>>> {
         if self.clipboard.source != 0 {
             if self.clipboard.mimes.iter().any(|m| IMAGE_MIMES.contains(m)) {
-                return Ok(Some(self.clipboard.data.clone()));
+                return Ok(Some(self.clipboard.data.to_vec()));
             }
             return Ok(None);
         }
@@ -290,6 +298,8 @@ impl State {
         Ok(Some(ffi::read_to_end(
             read_end.as_raw_fd(),
             MAX_PASTE_BYTES,
+            PASTE_IDLE,
+            PASTE_TOTAL,
         )?))
     }
 
@@ -373,8 +383,47 @@ impl State {
             write_end.as_raw_fd(),
         )?;
         drop(write_end);
-        let bytes = ffi::read_to_end(read_end.as_raw_fd(), MAX_PASTE_BYTES)?;
-        Ok(String::from_utf8(bytes).ok())
+        let bytes = ffi::read_to_end(
+            read_end.as_raw_fd(),
+            MAX_PASTE_BYTES,
+            PASTE_IDLE,
+            PASTE_TOTAL,
+        )?;
+        // Text that is not UTF-8 pastes lossily, as our own selection does.
+        Ok(Some(String::from_utf8(bytes).unwrap_or_else(|e| {
+            String::from_utf8_lossy(e.as_bytes()).into_owned()
+        })))
+    }
+
+    /// Destroy our data source, if there is one. A send already on its way for it
+    /// still carries an fd, so the source stays known as retired until the
+    /// compositor confirms the deletion.
+    fn destroy_source(&mut self) {
+        let source = std::mem::take(&mut self.clipboard.source);
+        if source != 0 {
+            self.conn.request(source, wl_data_source::DESTROY, &[]);
+            self.retired.retire(source, wl_data_source::EV_SEND);
+        }
+    }
+
+    /// Give transfers of our selection still in flight a bounded time to finish,
+    /// since exiting would cut them short and hand the target a truncated
+    /// selection.
+    pub(super) fn finish_serving(&self) {
+        let deadline = std::time::Instant::now() + SERVE_DRAIN;
+        while self.clipboard.serving.load(Ordering::Acquire) > 0
+            && std::time::Instant::now() < deadline
+        {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    fn serve_selection(&mut self, fd: OwnedFd) {
+        serve(
+            Arc::clone(&self.clipboard.data),
+            fd,
+            &self.clipboard.serving,
+        );
     }
 
     pub(super) fn insert_clipboard(&mut self, text: &str) {
@@ -444,9 +493,90 @@ fn free_attachment_name(dir: &Path, stamp: &str, ext: &str) -> Option<(String, P
 /// one second takes the first counter; a hundred of them is not a person pasting.
 const MAX_ATTACHMENT_TRIES: u32 = 100;
 
+/// Write data to a target's pipe on a worker thread, so a target that reads
+/// slowly, or not at all, cannot stall the event loop. Past MAX_SERVES transfers in
+/// flight a request is refused by closing its pipe, which the target reads as an
+/// empty selection.
+fn serve(data: Arc<[u8]>, fd: OwnedFd, serving: &Arc<AtomicUsize>) {
+    let Some(slot) = ServeSlot::take(serving) else {
+        eprintln!("bnknotes: clipboard serve refused: {MAX_SERVES} already in flight");
+        return;
+    };
+    let spawned = std::thread::Builder::new()
+        .name("clipboard-serve".into())
+        .spawn(move || {
+            // A target that closes its read end early makes the write fail
+            // (EPIPE), which is reported and otherwise harmless. The pipe closes
+            // when fd drops, which is the target's end of data.
+            if let Err(e) = ffi::write_all(fd.as_raw_fd(), &data) {
+                eprintln!("bnknotes: clipboard serve failed: {e}");
+            }
+            drop(slot);
+        });
+    if let Err(e) = spawned {
+        eprintln!("bnknotes: clipboard serve failed: {e}");
+    }
+}
+
+/// One transfer's place in the in-flight count, given back when it drops: when the
+/// transfer ends, or with the thread's closure if the thread never starts.
+struct ServeSlot(Arc<AtomicUsize>);
+
+impl ServeSlot {
+    fn take(serving: &Arc<AtomicUsize>) -> Option<Self> {
+        serving
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+                (n < MAX_SERVES).then_some(n + 1)
+            })
+            .ok()
+            .map(|_| Self(Arc::clone(serving)))
+    }
+}
+
+impl Drop for ServeSlot {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::app::clipboard::*;
+
+    /// A copied image runs to megabytes, past a pipe's 64 KiB buffer, and the
+    /// target may not read for a while. Serving must not wait for it, and the
+    /// target must still get every byte and then the end of data.
+    #[test]
+    fn serving_a_large_selection_returns_at_once_and_delivers_it_whole() {
+        let data: Arc<[u8]> = (0..1 << 20).map(|i| i as u8).collect();
+        let (read_end, write_end) = ffi::pipe().expect("pipe");
+        let serving = Arc::default();
+        let started = std::time::Instant::now();
+        serve(Arc::clone(&data), write_end, &serving);
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "serving does not block"
+        );
+
+        let (idle, total) = (Duration::from_secs(10), Duration::from_secs(30));
+        let got = ffi::read_to_end(read_end.as_raw_fd(), 2 << 20, idle, total)
+            .expect("the whole selection, then end of data");
+        assert_eq!(&got[..], &data[..]);
+    }
+
+    #[test]
+    fn transfers_past_the_cap_are_refused_until_one_ends() {
+        let serving = Arc::default();
+        let slots: Vec<_> = (0..MAX_SERVES)
+            .map(|_| ServeSlot::take(&serving).expect("a free slot"))
+            .collect();
+        assert!(ServeSlot::take(&serving).is_none(), "the cap holds");
+        drop(slots);
+        assert!(
+            ServeSlot::take(&serving).is_some(),
+            "an ended transfer frees its slot"
+        );
+    }
 
     #[test]
     fn plain_text_is_told_from_the_markup_beside_an_image() {

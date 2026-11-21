@@ -327,6 +327,40 @@ impl TabHover {
     }
 }
 
+/// Protocol objects the editor released or destroyed whose events may still be in
+/// flight, each with the opcode of its event that carries an fd. Such an event's fd
+/// must be taken off the connection's fd queue, or every later fd-carrying event
+/// receives the one before it. An entry leaves on wl_display.delete_id, and the
+/// list is capped so a compositor that never confirms a deletion cannot grow it.
+#[derive(Default)]
+struct RetiredObjects {
+    entries: Vec<(u32, u16)>,
+}
+
+impl RetiredObjects {
+    const MAX: usize = 64;
+
+    fn retire(&mut self, id: u32, fd_event: u16) {
+        if self.entries.len() == Self::MAX {
+            self.entries.remove(0);
+        }
+        self.entries.push((id, fd_event));
+    }
+
+    /// The compositor confirmed id is gone; it may now name a new object.
+    fn deleted(&mut self, id: u32) {
+        self.entries.retain(|&(retired, _)| retired != id);
+    }
+
+    /// The fd-carrying opcode of id, when id is retired.
+    fn fd_event_of(&self, id: u32) -> Option<u16> {
+        self.entries
+            .iter()
+            .find(|&&(retired, _)| retired == id)
+            .map(|&(_, fd_event)| fd_event)
+    }
+}
+
 struct State {
     conn: Connection,
     /// The font opened at every size the styles need (body and heading sizes),
@@ -453,6 +487,11 @@ struct State {
     compositor: Option<u32>,
     wm_base: Option<u32>,
     seat: Option<u32>,
+    /// The version seat is bound at, which decides whether its keyboard and
+    /// pointer can be released.
+    seat_version: u32,
+    /// Objects released or destroyed whose events may still be in flight.
+    retired: RetiredObjects,
     surface: u32,
     xdg_surface: u32,
     toplevel: u32,
@@ -975,6 +1014,8 @@ impl State {
             compositor: None,
             wm_base: None,
             seat: None,
+            seat_version: 0,
+            retired: RetiredObjects::default(),
             surface: 0,
             xdg_surface: 0,
             toplevel: 0,
@@ -1311,6 +1352,7 @@ impl State {
         // Remember the layout for next launch: column sizes, tree root and open
         // folders, and each pane's file with its caret and scroll.
         self.save_session();
+        self.finish_serving();
         Ok(())
     }
 
@@ -2636,6 +2678,7 @@ impl State {
                     // (>= 0xff000000) must never be handed back out as a fresh
                     // object; the server allocates those itself.
                     if id < SERVER_ID_BASE {
+                        self.retired.deleted(id);
                         self.free_ids.push(id);
                     }
                 }
@@ -2757,14 +2800,26 @@ impl State {
         }
 
         if Some(msg.object) == self.seat && msg.opcode == wl_seat::EV_CAPABILITIES {
+            // A capability can go and come back: a keyboard unplugged, a KVM switch,
+            // a Bluetooth device asleep. The compositor makes the old object inert
+            // when it goes, so it is released then, and a fresh one is created when
+            // it returns.
             let caps = r.u32()?;
-            if caps & wl_seat::CAP_KEYBOARD != 0 && self.keyboard == 0 {
+            let has_keyboard = caps & wl_seat::CAP_KEYBOARD != 0;
+            let has_pointer = caps & wl_seat::CAP_POINTER != 0;
+            if !has_keyboard && self.keyboard != 0 {
+                self.release_keyboard();
+            }
+            if !has_pointer && self.pointer != 0 {
+                self.release_pointer();
+            }
+            if has_keyboard && self.keyboard == 0 {
                 let keyboard = self.alloc_id();
                 self.conn
                     .request(msg.object, wl_seat::GET_KEYBOARD, &[Arg::NewId(keyboard)]);
                 self.keyboard = keyboard;
             }
-            if caps & wl_seat::CAP_POINTER != 0 && self.pointer == 0 {
+            if has_pointer && self.pointer == 0 {
                 let pointer = self.alloc_id();
                 self.conn
                     .request(msg.object, wl_seat::GET_POINTER, &[Arg::NewId(pointer)]);
@@ -2774,11 +2829,18 @@ impl State {
             return Ok(());
         }
 
-        if msg.object == self.keyboard {
+        if let Some(fd_event) = self.retired.fd_event_of(msg.object) {
+            if msg.opcode == fd_event {
+                drop(self.conn.take_fd());
+            }
+            return Ok(());
+        }
+
+        if self.keyboard != 0 && msg.object == self.keyboard {
             return self.on_keyboard(msg.opcode, &mut r);
         }
 
-        if msg.object == self.pointer {
+        if self.pointer != 0 && msg.object == self.pointer {
             return self.on_pointer(msg.opcode, &mut r);
         }
 
@@ -2838,9 +2900,13 @@ impl State {
                 let id = self.bind_capped(name, interface, version, protocol::VERSION_WM_BASE);
                 self.wm_base = Some(id);
             }
-            protocol::IFACE_SEAT => {
+            // The first seat only. The keyboard and pointer belong to the seat that
+            // created them, so a second seat whose capabilities lack a keyboard must
+            // not release the first seat's.
+            protocol::IFACE_SEAT if self.seat.is_none() => {
                 let id = self.bind_capped(name, interface, version, protocol::VERSION_SEAT);
                 self.seat = Some(id);
+                self.seat_version = version.min(protocol::VERSION_SEAT);
             }
             protocol::IFACE_DATA_DEVICE_MANAGER => {
                 let id = self.bind_capped(
@@ -3109,8 +3175,38 @@ impl State {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::app::*;
+    use crate::platform::protocol::wl_keyboard;
     use crate::theme::VAULT_COLORS;
+
+    #[test]
+    fn a_retired_object_keeps_its_fd_event_until_the_compositor_deletes_it() {
+        let mut retired = RetiredObjects::default();
+        retired.retire(40, wl_keyboard::EV_KEYMAP);
+        assert_eq!(retired.fd_event_of(40), Some(wl_keyboard::EV_KEYMAP));
+        assert_eq!(
+            retired.fd_event_of(41),
+            None,
+            "a live object is not retired"
+        );
+        retired.deleted(40);
+        assert_eq!(
+            retired.fd_event_of(40),
+            None,
+            "the id may now name a new object"
+        );
+    }
+
+    #[test]
+    fn retired_objects_stay_bounded() {
+        let mut retired = RetiredObjects::default();
+        for id in 0..RetiredObjects::MAX as u32 + 1 {
+            retired.retire(id, 0);
+        }
+        assert_eq!(retired.entries.len(), RetiredObjects::MAX);
+        assert_eq!(retired.fd_event_of(0), None, "the oldest goes first");
+        assert!(retired.fd_event_of(RetiredObjects::MAX as u32).is_some());
+    }
 
     // `Focus` is not `Debug`, so compare with `==` inside `assert!`.
 

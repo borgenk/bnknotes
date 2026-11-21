@@ -14,7 +14,7 @@ use crate::platform::ffi;
 use crate::platform::freetype::{Fonts, Metrics};
 use crate::platform::geom::Rect;
 use crate::platform::protocol::{
-    wl_keyboard, wl_pointer, wp_cursor_shape_device_v1, wp_cursor_shape_manager_v1,
+    wl_keyboard, wl_pointer, wl_seat, wp_cursor_shape_device_v1, wp_cursor_shape_manager_v1,
 };
 use crate::platform::scroll::{self, Scrollbar};
 use crate::platform::wire::{Arg, Reader};
@@ -258,21 +258,77 @@ impl State {
                 self.bump_caret();
                 self.dirty = true;
             }
-            wl_keyboard::EV_LEAVE => {
-                self.stop_repeat();
-                // Lost keyboard focus: hide the caret, stop blinking, and let the
-                // loop go idle (no 500ms blink wake-ups while unfocused).
-                self.focused = false;
-                self.caret.hide();
-                self.dirty = true;
-                // Turning to another window is the user done with this one for now,
-                // so it does not wait out the idle window: what they typed is on
-                // disk by the time they are reading it somewhere else.
-                self.save_all();
-            }
+            wl_keyboard::EV_LEAVE => self.keyboard_left(),
             _ => {}
         }
         Ok(())
+    }
+
+    /// Keyboard focus is gone, by leave or because the keyboard itself went away.
+    fn keyboard_left(&mut self) {
+        self.stop_repeat();
+        self.xkb.reset_held_state();
+        // Lost keyboard focus: hide the caret, stop blinking, and let the loop go
+        // idle (no 500ms blink wake-ups while unfocused).
+        self.focused = false;
+        self.caret.hide();
+        self.dirty = true;
+        // Turning to another window is the user done with this one for now, so it
+        // does not wait out the idle window: what they typed is on disk by the time
+        // they are reading it somewhere else.
+        self.save_all();
+    }
+
+    /// The pointer is gone from the surface, by leave or because the pointer
+    /// itself went away, so drop the mouse hover highlights; otherwise the
+    /// last-hovered tree row, filter toggle, tab, or scrollbar stays lit with no
+    /// pointer on it.
+    fn pointer_left(&mut self) {
+        let lit =
+            self.tree.hovered.is_some() || self.tree.filter_hovered || self.hovered_tab.is_some();
+        self.tree.hovered = None;
+        self.tree.filter_hovered = false;
+        self.hovered_tab = None;
+        let mut bars = false;
+        for region in [Focus::Tree, Focus::Editor(0), Focus::Editor(1)] {
+            bars |= self.scrollbar_mut(region).set_near(false);
+        }
+        if lit || bars {
+            self.dirty = true;
+        }
+    }
+
+    /// The seat lost its keyboard: release the inert object and forget it,
+    /// keeping it retired until the compositor confirms the deletion (a seat below
+    /// version 3 cannot release it, so there it stays retired).
+    pub(super) fn release_keyboard(&mut self) {
+        let keyboard = std::mem::take(&mut self.keyboard);
+        if self.seat_version >= wl_seat::VERSION_RELEASE {
+            self.conn.request(keyboard, wl_keyboard::RELEASE, &[]);
+        }
+        self.retired.retire(keyboard, wl_keyboard::EV_KEYMAP);
+        self.keyboard_left();
+    }
+
+    /// The seat lost its pointer: destroy its cursor-shape device, then release
+    /// the inert object and forget it. Pointer events carry no fds, so nothing in
+    /// flight for it needs taking off the fd queue.
+    pub(super) fn release_pointer(&mut self) {
+        if self.cursor_shape_device != 0 {
+            self.conn.request(
+                self.cursor_shape_device,
+                wp_cursor_shape_device_v1::DESTROY,
+                &[],
+            );
+            self.cursor_shape_device = 0;
+        }
+        let pointer = std::mem::take(&mut self.pointer);
+        if self.seat_version >= wl_seat::VERSION_RELEASE {
+            self.conn.request(pointer, wl_pointer::RELEASE, &[]);
+        }
+        // A new device starts with no shape set, so the next one is requested.
+        self.cursor_shape = 0;
+        self.pointer_left();
     }
 
     /// Move keyboard focus to editor pane `i`, remembering it as the last active
@@ -778,24 +834,7 @@ impl State {
                 self.cursor_shape = 0;
                 self.update_cursor_shape();
             }
-            wl_pointer::EV_LEAVE => {
-                // The pointer left the surface, so drop the mouse hover highlights;
-                // otherwise the last-hovered tree row, filter toggle, tab, or scrollbar
-                // stays lit with no pointer on it.
-                let lit = self.tree.hovered.is_some()
-                    || self.tree.filter_hovered
-                    || self.hovered_tab.is_some();
-                self.tree.hovered = None;
-                self.tree.filter_hovered = false;
-                self.hovered_tab = None;
-                let mut bars = false;
-                for region in [Focus::Tree, Focus::Editor(0), Focus::Editor(1)] {
-                    bars |= self.scrollbar_mut(region).set_near(false);
-                }
-                if lit || bars {
-                    self.dirty = true;
-                }
-            }
+            wl_pointer::EV_LEAVE => self.pointer_left(),
             wl_pointer::EV_MOTION => {
                 let _time = r.u32()?;
                 let scale = self.scale();

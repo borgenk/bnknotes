@@ -585,13 +585,26 @@ pub fn write_all(fd: RawFd, bytes: &[u8]) -> Result<()> {
 }
 
 /// Read `fd` to end-of-file, returning all bytes, or an error once they would pass
-/// `cap`. Used to pull a paste payload out of the pipe the compositor writes into:
-/// the payload is another app's, of a size it chooses, so the cap is the caller's
-/// statement of what it is willing to hold.
-pub fn read_to_end(fd: RawFd, cap: usize) -> Result<Vec<u8>> {
+/// `cap`, the sender goes `idle` without sending, or the whole read passes `total`.
+/// Used to pull a paste payload out of the pipe the compositor writes into: the
+/// payload is another app's, of a size and at a pace it chooses, and the read runs
+/// on the event loop, so both are bounded. The idle limit restarts after every
+/// read, so a slow sender that keeps sending (an image encoded as it goes) is not
+/// cut off.
+pub fn read_to_end(fd: RawFd, cap: usize, idle: Duration, total: Duration) -> Result<Vec<u8>> {
+    let end = Instant::now() + total;
     let mut out = Vec::new();
     let mut buf = [0u8; 4096];
     loop {
+        let now = Instant::now();
+        let wait = idle.min(end.saturating_duration_since(now));
+        if !wait_for_events(fd, POLLIN, wait) {
+            return Err(Error::msg(if Instant::now() >= end {
+                format!("the sender took longer than {total:?}")
+            } else {
+                format!("the sender sent nothing for {idle:?}")
+            }));
+        }
         // SAFETY: buf is a live writable array of buf.len() bytes.
         let n = unsafe { read(fd, buf.as_mut_ptr() as *mut c_void, buf.len()) };
         if n < 0 {
@@ -662,9 +675,11 @@ pub fn wait_dmabuf_writable(dmabuf: RawFd, timeout: Duration) -> bool {
     wait_for_events(dmabuf, POLLOUT, timeout)
 }
 
-/// Poll fd for events until one fires or timeout passes. An interrupting signal
-/// restarts the poll with the time that is left, and the millisecond timeout is
-/// rounded up, so the wait never ends early.
+/// Poll fd for events until one fires or timeout passes. A hang-up or an error
+/// counts as ready too, so the caller's next read or check sees it (a pipe whose
+/// writer closed reports only a hang-up). An interrupting signal restarts the poll
+/// with the time that is left, and the millisecond timeout is rounded up, so the
+/// wait never ends early.
 fn wait_for_events(fd: RawFd, events: c_short, timeout: Duration) -> bool {
     let deadline = Instant::now() + timeout;
     loop {
@@ -678,7 +693,7 @@ fn wait_for_events(fd: RawFd, events: c_short, timeout: Duration) -> bool {
         // SAFETY: one live PollFd; poll reads events and writes revents only.
         let n = unsafe { poll(&mut pfd, 1, ms) };
         if n > 0 {
-            return pfd.revents & events != 0;
+            return pfd.revents & (events | POLLERR | POLLHUP) != 0;
         }
         if n == 0 || errno() != EINTR {
             return false;
@@ -1062,6 +1077,52 @@ mod tests {
             started.elapsed() < Duration::from_secs(1),
             "a ready fd returns at once"
         );
+    }
+
+    #[test]
+    fn a_paste_read_gives_up_on_a_sender_that_never_writes() {
+        // The write end stays open and silent, as a clipboard owner that accepted
+        // the receive and then hung would leave it.
+        let (read_end, _write_end) = pipe().expect("pipe");
+        let idle = Duration::from_millis(30);
+        let started = Instant::now();
+        assert!(read_to_end(read_end.as_raw_fd(), 1024, idle, Duration::from_secs(10)).is_err());
+        let waited = started.elapsed();
+        assert!(waited >= idle, "the read waits out its idle limit");
+        assert!(waited < Duration::from_secs(2), "and no longer");
+    }
+
+    #[test]
+    fn a_paste_read_keeps_a_slow_sender_that_keeps_sending() {
+        // Each chunk comes after a pause shorter than the idle limit, and the whole
+        // send takes longer than one idle limit, so only a limit that restarts after
+        // each read lets it through.
+        let (read_end, write_end) = pipe().expect("pipe");
+        let sender = std::thread::spawn(move || {
+            for _ in 0..4 {
+                std::thread::sleep(Duration::from_millis(40));
+                write_all(write_end.as_raw_fd(), b"chunk").expect("write");
+            }
+        });
+        let idle = Duration::from_millis(100);
+        let got = read_to_end(read_end.as_raw_fd(), 1024, idle, Duration::from_secs(10));
+        sender.join().expect("the sender finishes");
+        assert_eq!(got.expect("the whole send"), b"chunkchunkchunkchunk");
+    }
+
+    #[test]
+    fn a_paste_read_returns_what_was_sent_and_refuses_past_its_cap() {
+        let (read_end, write_end) = pipe().expect("pipe");
+        write_all(write_end.as_raw_fd(), b"pasted").expect("write");
+        drop(write_end);
+        let (idle, total) = (Duration::from_secs(5), Duration::from_secs(10));
+        let bytes = read_to_end(read_end.as_raw_fd(), 1024, idle, total);
+        assert_eq!(bytes.expect("read to the end"), b"pasted");
+
+        let (read_end, write_end) = pipe().expect("pipe");
+        write_all(write_end.as_raw_fd(), &[0; 64]).expect("write");
+        drop(write_end);
+        assert!(read_to_end(read_end.as_raw_fd(), 63, idle, total).is_err());
     }
 
     #[test]

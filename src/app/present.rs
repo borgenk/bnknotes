@@ -1,6 +1,6 @@
 use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 use std::rc::Rc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crate::app::State;
 use crate::platform::conn::Connection;
@@ -18,6 +18,12 @@ use crate::render::glyph_cache::{self, GlyphCache};
 use crate::render::gpu;
 use crate::render::vulkan;
 use crate::theme::BACKGROUND;
+
+/// How soon a frame waiting for a free buffer under explicit sync looks again. The
+/// wait doubles with each miss up to SLOT_RETRY_MAX, so a compositor that holds
+/// both buffers for long costs few wakeups.
+const SLOT_RETRY: Duration = Duration::from_millis(1);
+const SLOT_RETRY_MAX: Duration = Duration::from_millis(32);
 
 /// Client-owned explicit-sync state (linux-drm-syncobj-v1), negotiated over a
 /// live GPU backend when the compositor advertises the manager. DRM syncobj
@@ -75,9 +81,9 @@ impl ExplicitSync {
 
     /// The sync file to wait on before rendering into buffer idx: the
     /// compositor's release of that buffer's previous frame, or None the first
-    /// time the slot is used (nothing has read it yet). wl_buffer.release can
-    /// arrive before the compositor attaches the release fence, so a point with
-    /// no fence yet is waited for rather than treated as an error.
+    /// time the slot is used (nothing has read it yet). free_slot picks a buffer
+    /// only once its point holds a fence, so the wait for one, up to the kernel's
+    /// bound, is a safety net rather than the usual path.
     fn release_fence(&self, idx: usize) -> Result<Option<OwnedFd>> {
         let slot = self
             .release
@@ -149,6 +155,27 @@ impl ExplicitSync {
         Ok(())
     }
 
+    /// The buffer to render the next frame into, or None while both are still the
+    /// compositor's. Under explicit sync wl_buffer.release is undefined, so a
+    /// buffer is free once it was never committed or the compositor has put a
+    /// fence on its release point, which the render waits on. The buffer committed
+    /// longest ago is tried first, so the one on screen is the last choice.
+    fn free_slot(&self) -> Result<Option<usize>> {
+        let [a, b] = &self.release;
+        let mut order = [(a.point, 0, a.syncobj), (b.point, 1, b.syncobj)];
+        order.sort_unstable();
+        for (point, idx, syncobj) in order {
+            let free = match point {
+                None => true,
+                Some(p) => ffi::drm_syncobj_point_available(self.drm.as_raw_fd(), syncobj, p)?,
+            };
+            if free {
+                return Ok(Some(idx));
+            }
+        }
+        Ok(None)
+    }
+
     /// Forget every buffer's published release point (the buffers they named are
     /// gone, e.g. after a resize), so the next use of each slot waits on nothing.
     fn forget_buffers(&mut self) {
@@ -185,7 +212,14 @@ pub(super) struct GpuPresentation {
     pub(super) syncobj_manager: Option<u32>,
     pub(super) explicit_sync: Option<ExplicitSync>,
     pub(super) buffers: [u32; 2],
+    /// Buffers the compositor holds, until its wl_buffer.release. Read only
+    /// without explicit sync, where that event is defined.
     pub(super) busy: [bool; 2],
+    /// When to look for a free buffer again, set while a frame waits for one
+    /// under explicit sync: no event says when a release point gets its fence.
+    pub(super) slot_retry_at: Option<Instant>,
+    /// The wait before the next look, growing while no buffer frees.
+    slot_retry: Duration,
     pub(super) buffer_size: (u32, u32),
     pub(super) present_list: Rc<DisplayList>,
     /// The regions the frame being presented changed.
@@ -212,6 +246,8 @@ impl GpuPresentation {
             explicit_sync: None,
             buffers: [0, 0],
             busy: [false, false],
+            slot_retry_at: None,
+            slot_retry: SLOT_RETRY,
             buffer_size: (0, 0),
             present_list: Rc::default(),
             damage: display::Damage::default(),
@@ -481,8 +517,9 @@ impl State {
     }
 
     /// Build the current frame and present it on the GPU. Returns false if both
-    /// buffers are still held by the compositor, leaving `dirty` set so the next
-    /// buffer release retries.
+    /// buffers are still held by the compositor, leaving dirty set so the frame is
+    /// tried again: at the next wl_buffer.release, or under explicit sync at
+    /// slot_retry_at.
     ///
     /// The display list is built and diffed against `present_list` (what is on
     /// screen): an identical frame early-outs (the common idle case), otherwise
@@ -500,7 +537,22 @@ impl State {
         if self.presentation.buffer_size != (self.width, self.height) {
             self.create_buffers()?;
         }
-        let Some(idx) = (0..2).find(|&i| !self.presentation.busy[i]) else {
+        let free = match self.presentation.explicit_sync.as_ref() {
+            Some(es) => es.free_slot()?,
+            None => (0..2).find(|&i| !self.presentation.busy[i]),
+        };
+        self.presentation.slot_retry_at = match free {
+            None if self.presentation.explicit_sync.is_some() => {
+                let wait = self.presentation.slot_retry;
+                self.presentation.slot_retry = (wait * 2).min(SLOT_RETRY_MAX);
+                Some(Instant::now() + wait)
+            }
+            _ => {
+                self.presentation.slot_retry = SLOT_RETRY;
+                None
+            }
+        };
+        let Some(idx) = free else {
             return Ok(false);
         };
         let started = self.stats.then(Instant::now);
@@ -935,6 +987,43 @@ mod tests {
         assert!(
             released(&es, 0),
             "buffer 0 reads as released once its own point signals"
+        );
+    }
+
+    #[test]
+    fn a_buffer_is_free_once_its_release_point_holds_a_fence() {
+        let Some(drm) = ffi::open_any_render_node() else {
+            eprintln!("bnknotes: no DRM render node; skipping the free-buffer test");
+            return;
+        };
+        let mut es = ExplicitSync::new(drm).expect("create the syncobjs");
+        es.release[0].timeline = 10;
+        es.release[1].timeline = 11;
+        // What the compositor does once it is done with a commit's buffer.
+        let release = |es: &ExplicitSync, (point, timeline): (u64, u32)| {
+            let syncobj = es.release_syncobj_of(timeline).expect("a known timeline");
+            ffi::drm_syncobj_signal_point(es.drm.as_raw_fd(), syncobj, point, es.signaled)
+                .expect("signal the release point");
+        };
+        let free = |es: &ExplicitSync| es.free_slot().expect("query the release points");
+
+        assert_eq!(free(&es), Some(0), "unused buffers are free");
+        let first = es.claim(None, 0).expect("frame into buffer 0");
+        assert_eq!(free(&es), Some(1), "a committed buffer is the compositor's");
+        let second = es.claim(None, 1).expect("frame into buffer 1");
+        assert_eq!(free(&es), None, "no release event frees either");
+
+        release(&es, first);
+        assert_eq!(free(&es), Some(0), "its release point now holds a fence");
+        release(&es, second);
+        assert_eq!(free(&es), Some(0), "the buffer committed longest ago first");
+        let third = es.claim(None, 0).expect("frame into buffer 0 again");
+        assert_eq!(free(&es), Some(1), "the other one, still released");
+        release(&es, third);
+        assert_eq!(
+            free(&es),
+            Some(1),
+            "both released, and buffer 1 went to the screen first"
         );
     }
 

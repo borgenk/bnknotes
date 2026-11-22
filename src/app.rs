@@ -3224,6 +3224,12 @@ impl State {
         // is itself a save, but a window left dirty some other way (the pointer
         // dragging text into it, a find-replace as focus goes) must still land.
         let autosave = self.autosave_at.map(until);
+        // A frame waiting for a free buffer under explicit sync looks again soon,
+        // as long as it still wants drawing.
+        let slot = (self.dirty && self.frame_callback == 0)
+            .then_some(self.presentation.slot_retry_at)
+            .flatten()
+            .map(until);
         [
             self.repeat_timeout(),
             autoscroll,
@@ -3231,6 +3237,7 @@ impl State {
             caret_anim,
             scrollbar,
             autosave,
+            slot,
         ]
         .into_iter()
         .flatten()

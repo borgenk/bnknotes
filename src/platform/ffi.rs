@@ -62,6 +62,8 @@ const RTLD_NOW: c_int = 2;
 /// without sync-file support); the sync bridge then degrades to CPU waits.
 const ENOTTY: c_int = 25;
 const EINVAL: c_int = 22;
+/// A wait whose timeout passed first.
+const ETIME: c_int = 62;
 
 /// `struct dma_buf_export_sync_file` / `struct dma_buf_import_sync_file`:
 /// identical layout, flags plus a sync-file fd (out for export, in for import).
@@ -788,8 +790,28 @@ const DRM_IOCTL_SYNCOBJ_CREATE: c_ulong = drm_iowr(0xBF, mem::size_of::<DrmSynco
 const DRM_IOCTL_SYNCOBJ_HANDLE_TO_FD: c_ulong = drm_iowr(0xC1, mem::size_of::<DrmSyncobjHandle>());
 const DRM_IOCTL_SYNCOBJ_FD_TO_HANDLE: c_ulong = drm_iowr(0xC2, mem::size_of::<DrmSyncobjHandle>());
 const DRM_IOCTL_SYNCOBJ_TRANSFER: c_ulong = drm_iowr(0xCC, mem::size_of::<DrmSyncobjTransfer>());
-/// A transfer flag: wait for the source point's fence to be attached.
+/// A transfer or wait flag: wait for the point's fence to be attached.
 const DRM_SYNCOBJ_WAIT_FOR_SUBMIT: u32 = 1 << 1;
+/// A wait flag: a point is done once it has a fence, signaled or not.
+const DRM_SYNCOBJ_WAIT_AVAILABLE: u32 = 1 << 2;
+
+/// `struct drm_syncobj_timeline_wait`: wait on points of several timelines. The
+/// handles and points are user pointers to arrays of count_handles entries, and
+/// the timeout is absolute CLOCK_MONOTONIC.
+#[repr(C)]
+struct DrmSyncobjTimelineWait {
+    handles: u64,
+    points: u64,
+    timeout_nsec: i64,
+    count_handles: u32,
+    flags: u32,
+    first_signaled: u32,
+    pad: u32,
+    deadline_nsec: u64,
+}
+
+const DRM_IOCTL_SYNCOBJ_TIMELINE_WAIT: c_ulong =
+    drm_iowr(0xCA, mem::size_of::<DrmSyncobjTimelineWait>());
 
 /// Open the GPU's DRM render node (`/dev/dri/renderD<minor>`) read-write, for
 /// creating the sync objects that back explicit sync. Render nodes need no DRM
@@ -930,6 +952,39 @@ pub fn drm_syncobj_signal_point(
     signaled: u32,
 ) -> Result<()> {
     drm_syncobj_transfer(drm, signaled, 0, timeline, point, 0)
+}
+
+/// Whether timeline point of timeline holds a fence yet, signaled or not. It does
+/// not wait: a timeout of 0 has already passed, so the kernel answers at once.
+pub fn drm_syncobj_point_available(drm: RawFd, timeline: u32, point: u64) -> Result<bool> {
+    let mut arg = DrmSyncobjTimelineWait {
+        handles: &timeline as *const u32 as u64,
+        points: &point as *const u64 as u64,
+        timeout_nsec: 0,
+        count_handles: 1,
+        // Without WAIT_FOR_SUBMIT a point with no fence is an error, not "not yet".
+        flags: DRM_SYNCOBJ_WAIT_FOR_SUBMIT | DRM_SYNCOBJ_WAIT_AVAILABLE,
+        first_signaled: 0,
+        pad: 0,
+        deadline_nsec: 0,
+    };
+    loop {
+        // SAFETY: arg is a live drm_syncobj_timeline_wait whose handle and point
+        // pointers name one live u32 and one live u64 for the whole call.
+        let rc = unsafe { ioctl(drm, DRM_IOCTL_SYNCOBJ_TIMELINE_WAIT, &mut arg) };
+        if rc == 0 {
+            return Ok(true);
+        }
+        match errno() {
+            EINTR => continue,
+            ETIME => return Ok(false),
+            e => {
+                return Err(Error::msg(format!(
+                    "DRM_IOCTL_SYNCOBJ_TIMELINE_WAIT failed: errno {e}"
+                )));
+            }
+        }
+    }
 }
 
 /// Export timeline `point` of `timeline` as a sync file, via the caller-owned
@@ -1186,6 +1241,8 @@ mod tests {
         assert_eq!(mem::size_of::<DrmSyncobjCreate>(), 8);
         assert_eq!(mem::size_of::<DrmSyncobjHandle>(), 24);
         assert_eq!(mem::size_of::<DrmSyncobjTransfer>(), 32);
+        assert_eq!(mem::size_of::<DrmSyncobjTimelineWait>(), 48);
+        assert_eq!(DRM_IOCTL_SYNCOBJ_TIMELINE_WAIT, 0xC030_64CA);
         assert_eq!(DRM_IOCTL_SYNCOBJ_CREATE, 0xC008_64BF);
         assert_eq!(DRM_IOCTL_SYNCOBJ_HANDLE_TO_FD, 0xC018_64C1);
         assert_eq!(DRM_IOCTL_SYNCOBJ_FD_TO_HANDLE, 0xC018_64C2);

@@ -304,8 +304,8 @@ impl State {
         }
     }
 
-    /// The seat's global went away: let go of everything made from it, so a seat
-    /// announced later is bound from scratch. A seat below version 5 cannot be
+    /// The bound seat's global went away: let go of everything made from it, so
+    /// another seat can be bound from scratch. A seat below version 5 cannot be
     /// released and stays an inert object.
     pub(super) fn drop_seat(&mut self) {
         if self.keyboard != 0 {
@@ -320,7 +320,6 @@ impl State {
         {
             self.conn.request(seat, wl_seat::RELEASE, &[]);
         }
-        self.seat_global = None;
         self.seat_version = 0;
     }
 

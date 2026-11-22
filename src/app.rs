@@ -305,6 +305,60 @@ struct VaultDrag {
     moved: bool,
 }
 
+/// The wl_seat globals the compositor announced, and which one is bound. One is
+/// bound at a time: the keyboard and pointer belong to the seat that created them,
+/// so a second seat whose capabilities lack a keyboard must not release the
+/// first seat's. The others wait, in case the bound one goes away.
+#[derive(Default)]
+struct SeatGlobals {
+    bound: Option<u32>,
+    /// Seats announced while one was bound, oldest first, as (name, version).
+    spare: Vec<(u32, u32)>,
+}
+
+/// Most seats kept waiting; a desktop announces one.
+const MAX_SPARE_SEATS: usize = 8;
+
+/// What a removed global means for the bound seat.
+#[derive(Debug, PartialEq, Eq)]
+enum SeatRemoval {
+    /// Not the bound seat.
+    Other,
+    /// The bound seat, with no other to take its place.
+    Lost,
+    /// The bound seat, and the spare to bind in its place.
+    Replaced { name: u32, version: u32 },
+}
+
+impl SeatGlobals {
+    /// A seat was announced; true when it is to be bound now, because none is.
+    fn announced(&mut self, name: u32, version: u32) -> bool {
+        if self.bound.is_none() {
+            self.bound = Some(name);
+            return true;
+        }
+        if self.spare.len() < MAX_SPARE_SEATS {
+            self.spare.push((name, version));
+        }
+        false
+    }
+
+    /// A global went away.
+    fn removed(&mut self, name: u32) -> SeatRemoval {
+        self.spare.retain(|&(spare, _)| spare != name);
+        if self.bound != Some(name) {
+            return SeatRemoval::Other;
+        }
+        self.bound = None;
+        if self.spare.is_empty() {
+            return SeatRemoval::Lost;
+        }
+        let (name, version) = self.spare.remove(0);
+        self.bound = Some(name);
+        SeatRemoval::Replaced { name, version }
+    }
+}
+
 /// The drags the left button can carry, each None while it is not. They all end
 /// together, when the button comes up or the pointer goes away with it held.
 #[derive(Default)]
@@ -536,8 +590,7 @@ struct State {
     /// The version seat is bound at, which decides whether its keyboard and
     /// pointer can be released.
     seat_version: u32,
-    /// The bound seat's global name, to notice the seat going away.
-    seat_global: Option<u32>,
+    seat_globals: SeatGlobals,
     /// Objects released or destroyed whose events may still be in flight.
     retired: RetiredObjects,
     surface: u32,
@@ -1062,7 +1115,7 @@ impl State {
             wm_base: None,
             seat: None,
             seat_version: 0,
-            seat_global: None,
+            seat_globals: SeatGlobals::default(),
             retired: RetiredObjects::default(),
             surface: 0,
             xdg_surface: 0,
@@ -2723,8 +2776,13 @@ impl State {
             return self.on_global(&mut r);
         }
         if msg.object == self.registry && msg.opcode == wl_registry::EV_GLOBAL_REMOVE {
-            if Some(r.u32()?) == self.seat_global {
-                self.drop_seat();
+            match self.seat_globals.removed(r.u32()?) {
+                SeatRemoval::Other => {}
+                SeatRemoval::Lost => self.drop_seat(),
+                SeatRemoval::Replaced { name, version } => {
+                    self.drop_seat();
+                    self.bind_seat(name, version);
+                }
             }
             return Ok(());
         }
@@ -2938,16 +2996,10 @@ impl State {
                 let id = self.bind_capped(name, interface, version, protocol::VERSION_WM_BASE);
                 self.wm_base = Some(id);
             }
-            // One seat at a time. The keyboard and pointer belong to the seat that
-            // created them, so a second seat whose capabilities lack a keyboard must
-            // not release the first seat's. Once the bound seat goes away, the next
-            // one announced takes its place.
-            protocol::IFACE_SEAT if self.seat.is_none() => {
-                let id = self.bind_capped(name, interface, version, protocol::VERSION_SEAT);
-                self.seat = Some(id);
-                self.seat_version = version.min(protocol::VERSION_SEAT);
-                self.seat_global = Some(name);
-                self.bind_data_device();
+            protocol::IFACE_SEAT => {
+                if self.seat_globals.announced(name, version) {
+                    self.bind_seat(name, version);
+                }
             }
             protocol::IFACE_DATA_DEVICE_MANAGER => {
                 let id = self.bind_capped(
@@ -3190,6 +3242,14 @@ impl State {
     /// version we support. Allocates the object id, sends the registry bind, and
     /// returns the id for the caller to store. The shared body of every
     /// [`on_global`](Self::on_global) arm.
+    /// Bind seat global name, and the data device that drives the clipboard from it.
+    fn bind_seat(&mut self, name: u32, version: u32) {
+        let id = self.bind_capped(name, protocol::IFACE_SEAT, version, protocol::VERSION_SEAT);
+        self.seat = Some(id);
+        self.seat_version = version.min(protocol::VERSION_SEAT);
+        self.bind_data_device();
+    }
+
     fn bind_capped(&mut self, name: u32, interface: &str, version: u32, max: u32) -> u32 {
         let id = self.alloc_id();
         self.conn.request(
@@ -3264,6 +3324,39 @@ mod tests {
             "a {}-byte request",
             request.len()
         );
+    }
+
+    #[test]
+    fn the_first_seat_is_bound_and_a_spare_replaces_it_when_it_goes() {
+        let mut seats = SeatGlobals::default();
+        assert!(seats.announced(10, 7), "the first seat is bound");
+        assert!(!seats.announced(11, 5), "a second one waits");
+        assert!(!seats.announced(12, 9));
+        assert_eq!(seats.removed(30), SeatRemoval::Other, "another global");
+        assert_eq!(
+            seats.removed(10),
+            SeatRemoval::Replaced {
+                name: 11,
+                version: 5
+            },
+            "the oldest spare takes the lost seat's place"
+        );
+        assert_eq!(
+            seats.removed(12),
+            SeatRemoval::Other,
+            "a spare that went away"
+        );
+        assert_eq!(seats.removed(11), SeatRemoval::Lost, "nothing left to bind");
+        assert!(seats.announced(13, 7), "a seat announced later is bound");
+    }
+
+    #[test]
+    fn the_spare_seats_stay_bounded() {
+        let mut seats = SeatGlobals::default();
+        for name in 0..100 {
+            seats.announced(name, 7);
+        }
+        assert_eq!(seats.spare.len(), MAX_SPARE_SEATS);
     }
 
     fn chip(moved: bool) -> VaultDrag {

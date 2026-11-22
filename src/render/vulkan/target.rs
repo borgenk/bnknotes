@@ -79,8 +79,9 @@ pub struct GpuImage {
     stride: u32,
     offset: u32,
     modifier: u64,
-    /// False until the first submission: the first frame enters from
-    /// UNDEFINED, later frames re-acquire from the foreign queue family.
+    /// False until the image's first submission, and again after a resize: the
+    /// first frame enters from UNDEFINED, later frames re-acquire from the
+    /// foreign queue family.
     used: bool,
 }
 
@@ -104,8 +105,9 @@ impl GpuImage {
     }
 }
 
-/// Partially constructed image state, so an error mid-`create_image` destroys
-/// exactly what exists so far (handle 0 = never created).
+/// Image handles to destroy together (handle 0 = none): what an error midway
+/// through create_image or create_target has made so far, or what
+/// destroy_image and resize_image tear down.
 struct PendingImage<'a> {
     gpu: &'a Gpu,
     image: VkImage,
@@ -120,12 +122,40 @@ struct PendingImage<'a> {
     staging: HostBuffer,
 }
 
+impl<'a> PendingImage<'a> {
+    fn empty(gpu: &'a Gpu) -> Self {
+        Self {
+            gpu,
+            image: 0,
+            memory: 0,
+            fence: 0,
+            acquire: 0,
+            release: 0,
+            cmd: core::ptr::null_mut(),
+            view: 0,
+            framebuffer: 0,
+            vertices: HostBuffer::default(),
+            staging: HostBuffer::default(),
+        }
+    }
+}
+
+/// What create_target reports beside the handles it puts in a PendingImage: the
+/// exported dmabuf and the layout the wl_buffer must describe.
+struct Target {
+    fd: OwnedFd,
+    stride: u32,
+    offset: u32,
+    modifier: u64,
+}
+
 impl Drop for PendingImage<'_> {
     fn drop(&mut self) {
         let d = self.gpu.device.raw;
         let f = &self.gpu.fns;
-        // SAFETY: every non-zero handle below was created on this device and
-        // is destroyed exactly once; nothing was ever submitted with them.
+        // SAFETY: every non-zero handle below was created on this device and is
+        // destroyed exactly once; no submission that used them is still in
+        // flight (they were never submitted, or the caller waited).
         unsafe {
             if self.framebuffer != 0 {
                 (f.destroy_framebuffer)(d, self.framebuffer, core::ptr::null());
@@ -222,6 +252,107 @@ impl Gpu {
     /// export its memory as a dmabuf. Returns the image with the geometry the
     /// wl_buffer needs (chosen modifier, plane stride and offset).
     pub fn create_image(&self, width: u32, height: u32, modifiers: &[u64]) -> Result<GpuImage> {
+        let d = self.device.raw;
+        let f = &self.fns;
+        let mut pending = PendingImage::empty(self);
+
+        let target = self.create_target(&mut pending, width, height, modifiers)?;
+
+        // The submission state, which a resize keeps. The fence starts signaled
+        // so the first frame's wait passes.
+        let fence_info = VkFenceCreateInfo {
+            s_type: VK_STRUCTURE_TYPE_FENCE_CREATE_INFO,
+            p_next: core::ptr::null(),
+            flags: 0x1, // VK_FENCE_CREATE_SIGNALED_BIT
+        };
+        // SAFETY: fence_info outlives the call.
+        check(
+            unsafe { (f.create_fence)(d, &fence_info, core::ptr::null(), &mut pending.fence) },
+            "vkCreateFence",
+        )?;
+        let plain_sem = VkSemaphoreCreateInfo {
+            s_type: VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO,
+            p_next: core::ptr::null(),
+            flags: 0,
+        };
+        // SAFETY: plain_sem outlives the call.
+        check(
+            unsafe { (f.create_semaphore)(d, &plain_sem, core::ptr::null(), &mut pending.acquire) },
+            "vkCreateSemaphore (acquire)",
+        )?;
+        let export_sem = VkExportSemaphoreCreateInfo {
+            s_type: VK_STRUCTURE_TYPE_EXPORT_SEMAPHORE_CREATE_INFO,
+            p_next: core::ptr::null(),
+            handle_types: VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_SYNC_FD_BIT,
+        };
+        let export_sem_info = VkSemaphoreCreateInfo {
+            s_type: VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO,
+            p_next: (&export_sem as *const VkExportSemaphoreCreateInfo).cast(),
+            flags: 0,
+        };
+        // SAFETY: export_sem_info and its chain outlive the call.
+        check(
+            unsafe {
+                (f.create_semaphore)(d, &export_sem_info, core::ptr::null(), &mut pending.release)
+            },
+            "vkCreateSemaphore (release)",
+        )?;
+
+        let cmd_info = VkCommandBufferAllocateInfo {
+            s_type: VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
+            p_next: core::ptr::null(),
+            command_pool: self.pool,
+            level: VK_COMMAND_BUFFER_LEVEL_PRIMARY,
+            command_buffer_count: 1,
+        };
+        // SAFETY: the pool is live; one handle is written.
+        check(
+            unsafe { (f.allocate_command_buffers)(d, &cmd_info, &mut pending.cmd) },
+            "vkAllocateCommandBuffers",
+        )?;
+
+        // Host-visible per-slot buffers; both grow on demand once a frame
+        // needs more (the fence has been waited by then, so recreation is safe).
+        pending.vertices = self.create_host_buffer(64 * 1024, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT)?;
+        pending.staging = self.create_host_buffer(
+            256 * 1024,
+            VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+        )?;
+
+        // Success: move everything out of the guard.
+        let img = GpuImage {
+            image: pending.image,
+            memory: pending.memory,
+            fd: target.fd,
+            cmd: pending.cmd,
+            fence: pending.fence,
+            acquire: pending.acquire,
+            release: pending.release,
+            view: pending.view,
+            framebuffer: pending.framebuffer,
+            vertices: std::mem::take(&mut pending.vertices),
+            staging: std::mem::take(&mut pending.staging),
+            width,
+            height,
+            stride: target.stride,
+            offset: target.offset,
+            modifier: target.modifier,
+            used: false,
+        };
+        core::mem::forget(pending);
+        Ok(img)
+    }
+
+    /// Create the size-dependent half of a render target into pending: the
+    /// image, laid out by one of modifiers, its exported memory, and the sRGB
+    /// view and framebuffer the render pass draws through.
+    fn create_target(
+        &self,
+        pending: &mut PendingImage,
+        width: u32,
+        height: u32,
+        modifiers: &[u64],
+    ) -> Result<Target> {
         if width == 0 || height == 0 {
             return Err(Error::msg("gpu image with a zero dimension"));
         }
@@ -230,20 +361,6 @@ impl Gpu {
         }
         let d = self.device.raw;
         let f = &self.fns;
-        let mut pending = PendingImage {
-            gpu: self,
-            image: 0,
-            memory: 0,
-            fence: 0,
-            acquire: 0,
-            release: 0,
-            cmd: core::ptr::null_mut(),
-            view: 0,
-            framebuffer: 0,
-            vertices: HostBuffer::default(),
-            staging: HostBuffer::default(),
-        };
-
         // The image: renderable, clearable, exportable, laid out by one of the
         // allowed modifiers (driver's choice, queried back below). It stores
         // UNORM bytes for the compositor but is mutable so the render pass can
@@ -381,59 +498,6 @@ impl Gpu {
         // SAFETY: the driver just handed us ownership of this fd.
         let fd = unsafe { OwnedFd::from_raw_fd(raw_fd) };
 
-        // Per-image submission state. The fence starts signaled so the first
-        // frame's wait passes.
-        let fence_info = VkFenceCreateInfo {
-            s_type: VK_STRUCTURE_TYPE_FENCE_CREATE_INFO,
-            p_next: core::ptr::null(),
-            flags: 0x1, // VK_FENCE_CREATE_SIGNALED_BIT
-        };
-        // SAFETY: fence_info outlives the call.
-        check(
-            unsafe { (f.create_fence)(d, &fence_info, core::ptr::null(), &mut pending.fence) },
-            "vkCreateFence",
-        )?;
-        let plain_sem = VkSemaphoreCreateInfo {
-            s_type: VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO,
-            p_next: core::ptr::null(),
-            flags: 0,
-        };
-        // SAFETY: plain_sem outlives the call.
-        check(
-            unsafe { (f.create_semaphore)(d, &plain_sem, core::ptr::null(), &mut pending.acquire) },
-            "vkCreateSemaphore (acquire)",
-        )?;
-        let export_sem = VkExportSemaphoreCreateInfo {
-            s_type: VK_STRUCTURE_TYPE_EXPORT_SEMAPHORE_CREATE_INFO,
-            p_next: core::ptr::null(),
-            handle_types: VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_SYNC_FD_BIT,
-        };
-        let export_sem_info = VkSemaphoreCreateInfo {
-            s_type: VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO,
-            p_next: (&export_sem as *const VkExportSemaphoreCreateInfo).cast(),
-            flags: 0,
-        };
-        // SAFETY: export_sem_info and its chain outlive the call.
-        check(
-            unsafe {
-                (f.create_semaphore)(d, &export_sem_info, core::ptr::null(), &mut pending.release)
-            },
-            "vkCreateSemaphore (release)",
-        )?;
-
-        let cmd_info = VkCommandBufferAllocateInfo {
-            s_type: VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
-            p_next: core::ptr::null(),
-            command_pool: self.pool,
-            level: VK_COMMAND_BUFFER_LEVEL_PRIMARY,
-            command_buffer_count: 1,
-        };
-        // SAFETY: the pool is live; one handle is written.
-        check(
-            unsafe { (f.allocate_command_buffers)(d, &cmd_info, &mut pending.cmd) },
-            "vkAllocateCommandBuffers",
-        )?;
-
         // The render-pass plumbing: an sRGB view of the image and its
         // framebuffer, so fixed-function blending runs in linear space.
         pending.view = self.create_view(pending.image, VK_FORMAT_B8G8R8A8_SRGB)?;
@@ -455,37 +519,42 @@ impl Gpu {
             },
             "vkCreateFramebuffer",
         )?;
-
-        // Host-visible per-slot buffers; both grow on demand once a frame
-        // needs more (the fence has been waited by then, so recreation is safe).
-        pending.vertices = self.create_host_buffer(64 * 1024, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT)?;
-        pending.staging = self.create_host_buffer(
-            256 * 1024,
-            VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
-        )?;
-
-        // Success: move everything out of the guard.
-        let img = GpuImage {
-            image: pending.image,
-            memory: pending.memory,
+        Ok(Target {
             fd,
-            cmd: pending.cmd,
-            fence: pending.fence,
-            acquire: pending.acquire,
-            release: pending.release,
-            view: pending.view,
-            framebuffer: pending.framebuffer,
-            vertices: std::mem::take(&mut pending.vertices),
-            staging: std::mem::take(&mut pending.staging),
-            width,
-            height,
             stride,
             offset,
             modifier: chosen.drm_format_modifier,
-            used: false,
-        };
-        core::mem::forget(pending);
-        Ok(img)
+        })
+    }
+
+    /// Rebuild img at a new size. Only what depends on the size is replaced: the
+    /// image, its memory and dmabuf, the view and the framebuffer. The fence,
+    /// semaphores and command buffer carry over, and so do the host buffers at
+    /// the size they have grown to. The caller ensures nothing is in flight, as
+    /// for destroy_image. On an error img keeps its old target.
+    pub fn resize_image(
+        &self,
+        img: &mut GpuImage,
+        width: u32,
+        height: u32,
+        modifiers: &[u64],
+    ) -> Result<()> {
+        let mut old = PendingImage::empty(self);
+        let target = self.create_target(&mut old, width, height, modifiers)?;
+        // old now holds the new handles; swapping hands them to img and leaves
+        // img's previous ones in old, which destroys them when it drops.
+        std::mem::swap(&mut img.image, &mut old.image);
+        std::mem::swap(&mut img.memory, &mut old.memory);
+        std::mem::swap(&mut img.view, &mut old.view);
+        std::mem::swap(&mut img.framebuffer, &mut old.framebuffer);
+        img.fd = target.fd;
+        img.width = width;
+        img.height = height;
+        img.stride = target.stride;
+        img.offset = target.offset;
+        img.modifier = target.modifier;
+        img.used = false;
+        Ok(())
     }
 
     /// Tear an image down. The caller ensures no submission is in flight
@@ -1589,7 +1658,86 @@ fn align_staging(staging: &mut Vec<u8>) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use crate::render::vulkan::target::align_staging;
+    use std::os::unix::fs::MetadataExt;
+
+    use crate::render::gpu::{Batch, FrameData, Vertex};
+    use crate::render::vulkan::target::*;
+
+    /// A Gpu on the first render node that brings one up, or None without one.
+    fn any_gpu() -> Option<Gpu> {
+        let nodes = std::fs::read_dir("/dev/dri").ok()?;
+        nodes
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().starts_with("renderD"))
+            .find_map(|e| Gpu::new(e.metadata().ok()?.rdev()).ok())
+    }
+
+    /// A frame of n vertices drawn as one batch.
+    fn frame_of(n: u32) -> FrameData {
+        let v = Vertex {
+            pos: [0.0; 2],
+            uv: [0.0; 2],
+            color: [0.0; 4],
+            extra: [0.0; 4],
+            mode: 0,
+        };
+        FrameData {
+            vertices: vec![v; n as usize],
+            batches: vec![Batch {
+                start: 0,
+                count: n,
+                image: None,
+            }],
+            ..FrameData::default()
+        }
+    }
+
+    #[test]
+    fn a_resized_image_keeps_its_submission_state_and_still_renders() {
+        let Some(mut gpu) = any_gpu() else {
+            eprintln!("bnknotes: no GPU; skipping the image resize test");
+            return;
+        };
+        let all: Vec<u64> = gpu
+            .modifiers
+            .iter()
+            .map(|m| m.drm_format_modifier)
+            .collect();
+        let modifiers = gpu.image_modifiers(&all);
+        let mut img = gpu.create_image(64, 48, &modifiers).expect("an image");
+        // More vertices than the vertex buffer starts with, so it grows.
+        let frame = frame_of(6000);
+        gpu.render_list(&mut img, &frame, [0.0; 4], 1.0)
+            .expect("render");
+        let grown = img.vertices.capacity;
+        assert!(grown >= std::mem::size_of_val(frame.vertices.as_slice()));
+        let state = (img.cmd, img.fence, img.acquire, img.release);
+        let target = (img.image, img.view, img.framebuffer, img.fd());
+
+        gpu.wait_idle();
+        gpu.resize_image(&mut img, 200, 100, &modifiers)
+            .expect("resize");
+        assert_eq!((img.width, img.height), (200, 100));
+        // Every size-dependent handle is new, and the wl_buffer layout describes
+        // the new image: a row of 200 four-byte pixels fits its stride.
+        assert_ne!(img.image, target.0);
+        assert_ne!(img.view, target.1);
+        assert_ne!(img.framebuffer, target.2);
+        assert_ne!(img.fd(), target.3);
+        assert!(img.stride() >= 200 * 4, "stride {}", img.stride());
+        assert!(modifiers.contains(&img.modifier()));
+        assert!(!img.used, "a new image enters from UNDEFINED");
+        assert_eq!((img.cmd, img.fence, img.acquire, img.release), state);
+        assert_eq!(
+            img.vertices.capacity, grown,
+            "the grown buffer carries over"
+        );
+
+        gpu.render_list(&mut img, &frame, [0.0; 4], 1.0)
+            .expect("render at the new size");
+        gpu.wait_idle();
+        gpu.destroy_image(img);
+    }
 
     /// The glyph atlas stages first, so a 9x17 glyph leaves 153 bytes ahead of
     /// the emoji upload, whose four-byte texels must then start at 156.

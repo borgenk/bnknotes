@@ -323,9 +323,10 @@ impl State {
 
     /// Allocate the two presentable buffers at the current size: one exported
     /// GPU image per swap slot, each wrapped in a wl_buffer via
-    /// `zwp_linux_buffer_params_v1` (`create_immed` is sound because every
-    /// parameter comes from the compositor's own feedback). A failure (a resize
-    /// on a dying device) propagates and ends the process; there is no software
+    /// zwp_linux_buffer_params_v1 (create_immed is sound because every parameter
+    /// comes from the compositor's own feedback). On a resize the images are
+    /// rebuilt in place and keep their submission state. A failure (a resize on
+    /// a dying device) propagates and ends the process; there is no software
     /// path to fall back to.
     pub(super) fn create_buffers(&mut self) -> Result<()> {
         let dmabuf_global = self
@@ -333,34 +334,49 @@ impl State {
             .dmabuf
             .ok_or_else(|| Error::msg("gpu buffers without zwp_linux_dmabuf_v1"))?;
         let (w, h) = (self.width, self.height);
-        let mut images = Vec::with_capacity(2);
+        self.destroy_buffers();
         {
             let Some(gpu) = self.presentation.backend.as_ref() else {
                 return Err(Error::msg("gpu buffers without a gpu backend"));
             };
-            for _ in 0..2 {
-                images.push(gpu.create_image(w, h, &self.presentation.modifiers)?);
+            let modifiers = &self.presentation.modifiers;
+            let images = &mut self.presentation.images;
+            if images.is_empty() {
+                for _ in 0..2 {
+                    images.push(gpu.create_image(w, h, modifiers)?);
+                }
+            } else {
+                // Nothing may be in flight while the images are rebuilt; resize
+                // is rare enough that a full drain is the simple correct answer.
+                gpu.wait_idle();
+                for img in images.iter_mut() {
+                    gpu.resize_image(img, w, h, modifiers)?;
+                }
             }
         }
-        for (i, img) in images.iter().enumerate() {
+        for i in 0..self.presentation.images.len() {
+            let Some(img) = self.presentation.images.get(i) else {
+                break;
+            };
+            let (fd, offset, stride, modifier) =
+                (img.fd(), img.offset(), img.stride(), img.modifier());
             let params = self.alloc_id();
             self.conn.request(
                 dmabuf_global,
                 zwp_linux_dmabuf_v1::CREATE_PARAMS,
                 &[Arg::NewId(params)],
             );
-            let modifier = img.modifier();
             self.conn.request_with_fd(
                 params,
                 zwp_linux_buffer_params_v1::ADD,
                 &[
                     Arg::Uint(0), // plane index
-                    Arg::Uint(img.offset()),
-                    Arg::Uint(img.stride()),
+                    Arg::Uint(offset),
+                    Arg::Uint(stride),
                     Arg::Uint((modifier >> 32) as u32),
                     Arg::Uint(modifier as u32),
                 ],
-                img.fd(),
+                fd,
             )?;
             let buffer = self.alloc_id();
             self.conn.request(
@@ -378,35 +394,26 @@ impl State {
                 .request(params, zwp_linux_buffer_params_v1::DESTROY, &[]);
             self.presentation.buffers[i] = buffer;
         }
-        self.presentation.images = images;
         self.presentation.buffer_size = (self.width, self.height);
         self.presentation.busy = [false, false];
-        // Fresh images never carried a release point, so a resize must forget
-        // the old buffers' points; their next use starts with no wait.
+        // New images never carried a release point, so a resize must forget the
+        // old buffers' points; their next use starts with no wait.
         if let Some(es) = self.presentation.explicit_sync.as_mut() {
             es.forget_buffers();
         }
-        // Fresh images hold no known frame, so forget what was on screen: the
+        // New images hold no known frame, so forget what was on screen: the
         // screen diff gates whether the next frame presents at all.
         self.presentation.present_list = Rc::default();
         Ok(())
     }
 
-    /// Destroy the current buffers and their backing GPU images. The server
-    /// recycles the wl_buffer ids via `delete_id` into our free list.
-    pub(super) fn destroy_buffers(&mut self) {
+    /// Destroy the current wl_buffers; the GPU images stay for create_buffers to
+    /// resize. The server recycles the ids via delete_id into the free list.
+    fn destroy_buffers(&mut self) {
         let buffers = self.presentation.buffers;
         for b in buffers {
             if b != 0 {
                 self.conn.request(b, wl_buffer::DESTROY, &[]);
-            }
-        }
-        if let Some(gpu) = &self.presentation.backend {
-            // Nothing may be in flight while images are destroyed; resize is
-            // rare enough that a full drain is the simple correct answer.
-            gpu.wait_idle();
-            for img in self.presentation.images.drain(..) {
-                gpu.destroy_image(img);
             }
         }
         self.presentation.buffers = [0, 0];
@@ -490,7 +497,6 @@ impl State {
         // collapses an interactive resize's dmabuf churn to one reallocation per
         // painted frame (frame-callback paced), instead of one per configure.
         if self.presentation.buffer_size != (self.width, self.height) {
-            self.destroy_buffers();
             self.create_buffers()?;
         }
         let Some(idx) = (0..2).find(|&i| !self.presentation.busy[i]) else {

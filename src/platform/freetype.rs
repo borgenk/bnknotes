@@ -459,6 +459,82 @@ pub struct Face {
     /// draws a scalar from a `&Face` alone, which is what lets measuring and drawing
     /// route through one decision (see [`Self::advance`]).
     fallback: Vec<Rc<Face>>,
+    /// The fonts fontconfig finds for a scalar neither this face nor its chain
+    /// has, shared by every face its Fonts opens. None on a fallback face, as for
+    /// the chain.
+    system: Option<Rc<SystemFallback>>,
+}
+
+/// The face that draws a character: the face asked, one of its chain, or one
+/// fontconfig found for it.
+pub enum GlyphFace<'a> {
+    Held(&'a Face),
+    Found(Rc<Face>),
+}
+
+impl std::ops::Deref for GlyphFace<'_> {
+    type Target = Face;
+
+    fn deref(&self) -> &Face {
+        match self {
+            GlyphFace::Held(face) => face,
+            GlyphFace::Found(face) => face,
+        }
+    }
+}
+
+/// Faces opened from a SystemFallback's fonts, by position and pixel size, or None
+/// for one that would not open.
+type SystemFaces = HashMap<(usize, u32), Option<Rc<Face>>>;
+
+/// Most characters SystemFallback remembers a font for; it forgets them all at
+/// this many, since each answer can be found again.
+const MAX_SYSTEM_CHARS: usize = 1 << 16;
+
+/// The fonts fontconfig finds for characters no configured face has, in its
+/// fallback order for the prose family. The choice for a character depends only on
+/// that order, so measuring and drawing pick the same face, and so does every
+/// thread's own Fonts.
+pub(crate) struct SystemFallback {
+    fonts: fontconfig::FallbackFonts,
+    /// By character, the position in fonts of the one that draws it, or None.
+    by_char: RefCell<HashMap<char, Option<usize>>>,
+    faces: RefCell<SystemFaces>,
+}
+
+impl SystemFallback {
+    fn new(fonts: fontconfig::FallbackFonts) -> Self {
+        Self {
+            fonts,
+            by_char: RefCell::new(HashMap::new()),
+            faces: RefCell::new(HashMap::new()),
+        }
+    }
+
+    /// The face that draws ch at size, or None when no installed font does.
+    fn face_for(&self, ch: char, size: u32) -> Option<Rc<Face>> {
+        let found = self.by_char.borrow().get(&ch).copied();
+        let at = match found {
+            Some(at) => at,
+            None => {
+                let at = self.fonts.covering(ch);
+                let mut by_char = self.by_char.borrow_mut();
+                if by_char.len() >= MAX_SYSTEM_CHARS {
+                    by_char.clear();
+                }
+                by_char.insert(ch, at);
+                at
+            }
+        }?;
+        if let Some(face) = self.faces.borrow().get(&(at, size)) {
+            return face.clone();
+        }
+        let face = (self.fonts.file(at))
+            .and_then(|file| open_variant(&file, size, None, &[], None))
+            .map(Rc::new);
+        self.faces.borrow_mut().insert((at, size), face.clone());
+        face
+    }
 }
 
 impl Face {
@@ -522,6 +598,7 @@ impl Face {
             pixel_size: Cell::new(0),
             emoji: None,
             fallback: Vec::new(),
+            system: None,
         })
     }
 
@@ -601,22 +678,28 @@ impl Face {
     }
 
     /// The face that draws `ch`: this one when its character map covers the scalar,
-    /// else the first face in the fallback chain that does, else this one again (so a
-    /// scalar absent everywhere draws its own `.notdef` box). The single routing
-    /// decision the measure and draw paths share, the way [`Self::emoji_cluster`] is
-    /// for color clusters.
+    /// else the first face in the fallback chain that does, else the font fontconfig
+    /// finds for it, else this one again (so a scalar absent everywhere draws its own
+    /// `.notdef` box). The single routing decision the measure and draw paths share,
+    /// the way [`Self::emoji_cluster`] is for color clusters.
     ///
     /// The keyed face's own map is consulted first and answers every ASCII and Latin
     /// glyph without touching the chain, so the common case pays one
-    /// [`FT_Get_Char_Index`] and only a genuine miss walks the (short) chain.
-    pub fn glyph_face(&self, ch: char) -> &Face {
+    /// [`FT_Get_Char_Index`] and only a genuine miss walks further.
+    pub fn glyph_face(&self, ch: char) -> GlyphFace<'_> {
         if self.has_scalar(ch) {
-            return self;
+            return GlyphFace::Held(self);
         }
-        self.fallback
-            .iter()
-            .find(|f| f.has_scalar(ch))
-            .map_or(self, |f| f.as_ref())
+        if let Some(face) = self.fallback.iter().find(|f| f.has_scalar(ch)) {
+            return GlyphFace::Held(face);
+        }
+        let found = (self.system.as_ref())
+            .and_then(|system| system.face_for(ch, self.pixel_size.get()))
+            .filter(|face| face.has_scalar(ch));
+        match found {
+            Some(face) => GlyphFace::Found(face),
+            None => GlyphFace::Held(self),
+        }
     }
 
     /// Load `ch`'s pen advance, from whichever face draws it. The uncached primitive
@@ -788,6 +871,8 @@ pub struct Fonts {
 /// own Fonts on exactly the editor's selection.
 #[derive(Clone, Debug)]
 pub struct FontSelection {
+    /// The prose family's name, which fontconfig's fallback order is sorted by.
+    family: String,
     regular: FontFile,
     /// A style's own file, or None when it resolved to the regular file and
     /// draws in the regular face.
@@ -812,6 +897,9 @@ impl FontSelection {
         Ok(Self {
             code: config.code_regular(&family),
             fallback: config.fallback_files(),
+            family: (family.matched_families.first())
+                .map_or("sans-serif", String::as_str)
+                .to_string(),
             regular: family.regular,
             bold,
             italic,
@@ -846,6 +934,7 @@ impl Fonts {
     /// is required; the first opened becomes the fallback.
     pub fn open(selection: FontSelection, sizes: &[u32]) -> Result<Self> {
         let FontSelection {
+            family,
             regular: regular_file,
             bold,
             italic,
@@ -855,6 +944,8 @@ impl Fonts {
             line_height_scale,
         } = &selection;
         let emoji = EmojiFont::open().map(Rc::new);
+        let system = fontconfig::FallbackFonts::for_family(family)
+            .map(|fonts| Rc::new(SystemFallback::new(fonts)));
         let mut sized: Vec<SizedFaces> = Vec::new();
         for &size in sizes {
             if size == 0 || sized.iter().any(|s| s.size == size) {
@@ -865,12 +956,24 @@ impl Fonts {
             // font, since it never routes a color cluster.
             let fallback: Vec<Rc<Face>> = fallback_files
                 .iter()
-                .filter_map(|file| open_variant(file, size, None, &[]).map(Rc::new))
+                .filter_map(|file| open_variant(file, size, None, &[], None).map(Rc::new))
                 .collect();
             let variant = |file: &Option<FontFile>| {
-                open_variant(file.as_ref()?, size, emoji.as_ref(), &fallback)
+                open_variant(
+                    file.as_ref()?,
+                    size,
+                    emoji.as_ref(),
+                    &fallback,
+                    system.as_ref(),
+                )
             };
-            let regular = open_face(regular_file, size, emoji.as_ref(), &fallback)?;
+            let regular = open_face(
+                regular_file,
+                size,
+                emoji.as_ref(),
+                &fallback,
+                system.as_ref(),
+            )?;
             let mut metrics = regular.metrics();
             // Grow the line box to the requested multiple of the size, keeping
             // the font's own line height as the floor so lines never overlap.
@@ -953,7 +1056,7 @@ impl Fonts {
     /// `(key, ch)`, so this runs once per new glyph, never per frame. With an empty
     /// [`FontConfig::fallback`] the chain is empty and this always returns the keyed
     /// face.
-    pub fn glyph_face(&self, key: FaceKey, ch: char) -> &Face {
+    pub fn glyph_face(&self, key: FaceKey, ch: char) -> GlyphFace<'_> {
         self.face_for(key).glyph_face(ch)
     }
 
@@ -971,11 +1074,13 @@ fn open_face(
     size: u32,
     emoji: Option<&Rc<EmojiFont>>,
     fallback: &[Rc<Face>],
+    system: Option<&Rc<SystemFallback>>,
 ) -> Result<Face> {
     let mut face = Face::from_file(file)?;
     face.set_pixel_size(size)?;
     face.emoji = emoji.cloned();
     face.fallback = fallback.to_vec();
+    face.system = system.cloned();
     Ok(face)
 }
 
@@ -987,8 +1092,9 @@ fn open_variant(
     size: u32,
     emoji: Option<&Rc<EmojiFont>>,
     fallback: &[Rc<Face>],
+    system: Option<&Rc<SystemFallback>>,
 ) -> Option<Face> {
-    open_face(file, size, emoji, fallback).ok()
+    open_face(file, size, emoji, fallback, system).ok()
 }
 
 /// Copy a FreeType bitmap into a tightly packed top-down coverage buffer of
@@ -1504,7 +1610,7 @@ mod tests {
         // the common path never walks the fallback chain.
         let primary = fonts.face_for(key);
         assert!(primary.has_scalar('A'));
-        assert!(std::ptr::eq(fonts.glyph_face(key, 'A'), primary));
+        assert!(std::ptr::eq(&*fonts.glyph_face(key, 'A'), primary));
 
         // Resolving the icon never panics whether or not a fallback is present.
         // When the primary lacks it but a fallback covers it, the resolved face
@@ -1558,7 +1664,7 @@ mod tests {
         };
         let primary = fonts.face_for(key);
         let drawn = fonts.glyph_face(key, ARROW);
-        if std::ptr::eq(primary, drawn) {
+        if std::ptr::eq(primary, &*drawn) {
             return; // No symbols fallback on this machine: nothing to check.
         }
         assert_eq!(
@@ -1578,8 +1684,47 @@ mod tests {
             style: FontStyle::Regular,
         };
         let primary = fonts.face_for(key);
-        assert!(std::ptr::eq(fonts.glyph_face(key, 'a'), primary));
+        assert!(std::ptr::eq(&*fonts.glyph_face(key, 'a'), primary));
         assert_eq!(primary.advance('a'), primary.load_advance('a'));
+    }
+
+    #[test]
+    fn a_character_no_configured_face_has_draws_from_a_font_fontconfig_finds() {
+        let fonts = Fonts::new(&[16]).expect("a default font");
+        let key = FaceKey::Prose {
+            size: 16,
+            style: FontStyle::Regular,
+        };
+        let primary = fonts.face_for(key);
+        let Some(system) = fontconfig::FallbackFonts::for_family(&fonts.selection().family) else {
+            eprintln!("bnknotes: fontconfig cannot sort; skipping the system fallback test");
+            return;
+        };
+        let configured =
+            |ch: char| primary.has_scalar(ch) || primary.fallback.iter().any(|f| f.has_scalar(ch));
+        let Some(ch) = fontconfig::TEST_SCRIPTS
+            .chars()
+            .find(|&ch| !configured(ch) && system.covering(ch).is_some())
+        else {
+            eprintln!("bnknotes: no test script lacks a configured font; skipping");
+            return;
+        };
+
+        let drawn = fonts.glyph_face(key, ch);
+        assert!(
+            drawn.has_scalar(ch),
+            "U+{:04X} draws a real glyph, not the .notdef box",
+            ch as u32
+        );
+        assert!(!std::ptr::eq(&*drawn, primary));
+        assert_eq!(
+            primary.advance(ch),
+            drawn.load_advance(ch),
+            "measured as drawn"
+        );
+        // A second Fonts, as a layout worker opens, routes it the same way.
+        let other = Fonts::new(&[16]).expect("a default font");
+        assert_eq!(other.face_for(key).advance(ch), primary.advance(ch));
     }
 
     #[test]
@@ -1597,7 +1742,7 @@ mod tests {
         if fonts.glyph_face(key, UNMAPPED).has_scalar(UNMAPPED) {
             return;
         }
-        assert!(std::ptr::eq(fonts.glyph_face(key, UNMAPPED), primary));
+        assert!(std::ptr::eq(&*fonts.glyph_face(key, UNMAPPED), primary));
         assert_eq!(primary.advance(UNMAPPED), primary.load_advance(UNMAPPED));
     }
 
@@ -1613,7 +1758,7 @@ mod tests {
             style: FontStyle::Regular,
         };
         let face = fonts.face_for(key);
-        if std::ptr::eq(fonts.glyph_face(key, ARROW), face) {
+        if std::ptr::eq(&*fonts.glyph_face(key, ARROW), face) {
             return; // No symbols fallback on this machine.
         }
         let with = crate::platform::shape::text_advance(face, "a→b");

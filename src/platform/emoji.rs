@@ -11,8 +11,9 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
 
+use crate::platform::fontconfig::{self, FontFile};
 use crate::platform::freetype::{
-    FT_LOAD_COLOR, FT_LOAD_RENDER, FT_Load_Glyph, FT_PIXEL_MODE_BGRA, Face, FtBitmap,
+    FT_LOAD_COLOR, FT_LOAD_RENDER, FT_Load_Glyph, FT_PIXEL_MODE_BGRA, Face, FontStyle, FtBitmap,
 };
 use crate::platform::grapheme;
 use crate::platform::pixel::{premultiplied_over, resample_argb, straight_from_premultiplied};
@@ -62,13 +63,11 @@ pub struct ColorGlyph {
     pub argb: Vec<u32>,
 }
 
-/// The usual install paths of the Noto color emoji font, tried in order. With none
-/// of them present, the editor draws no emoji.
-const EMOJI_FONTS: &[&str] = &[
-    "/usr/share/fonts/noto/NotoColorEmoji.ttf",
-    "/usr/share/fonts/google-noto/NotoColorEmoji.ttf",
-    "/usr/share/fonts/truetype/noto/NotoColorEmoji.ttf",
-];
+/// The families asked of fontconfig for the color emoji font, in order: its emoji
+/// alias, then the font that alias usually names, for a fontconfig without the
+/// alias. With neither resolving to a font with bitmap strikes, the editor draws
+/// no emoji.
+const EMOJI_FAMILIES: [&str; 2] = ["emoji", "Noto Color Emoji"];
 
 /// A cache of cluster results, keyed by target pixel size then by cluster bytes.
 /// Splitting on the size (a cheap `u32` key) lets the inner lookup borrow the
@@ -100,14 +99,18 @@ pub struct EmojiFont {
 }
 
 impl EmojiFont {
-    /// Open the first installed emoji font, or `None` when there is none, the
-    /// font has no bitmap strikes (an outline-only build), or the shaper cannot
-    /// bind to it.
+    /// Open the color emoji font fontconfig names, or `None` when there is none,
+    /// it has no bitmap strikes (an outline-only build), or the shaper cannot bind
+    /// to it.
     pub fn open() -> Option<Self> {
-        let path = EMOJI_FONTS
+        EMOJI_FAMILIES
             .iter()
-            .find(|p| std::path::Path::new(p).exists())?;
-        let face = Rc::new(Face::from_path_index(std::path::Path::new(path), 0).ok()?);
+            .filter_map(|family| fontconfig::font_for_family(family, FontStyle::Regular))
+            .find_map(|file| Self::from_file(&file))
+    }
+
+    fn from_file(file: &FontFile) -> Option<Self> {
+        let face = Rc::new(Face::from_file(file).ok()?);
         let strike = face.select_first_strike()?;
         let shaper = Shaper::new(Rc::clone(&face))?;
         Some(Self {

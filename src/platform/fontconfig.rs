@@ -6,7 +6,7 @@
 use std::ffi::{CStr, CString, OsString};
 use std::os::unix::ffi::OsStringExt;
 use std::path::PathBuf;
-use std::ptr;
+use std::ptr::{self, NonNull};
 
 use core::ffi::{c_char, c_int, c_uchar};
 
@@ -16,6 +16,20 @@ use crate::platform::freetype::FontStyle;
 #[repr(C)]
 struct FcPattern {
     _opaque: [u8; 0],
+}
+
+/// An opaque fontconfig character set: the code points a font has glyphs for.
+#[repr(C)]
+struct FcCharSet {
+    _opaque: [u8; 0],
+}
+
+/// `FcFontSet`, a public struct: an array of patterns.
+#[repr(C)]
+struct FcFontSet {
+    nfont: c_int,
+    sfont: c_int,
+    fonts: *mut *mut FcPattern,
 }
 
 /// An opaque fontconfig configuration. Every call passes null, meaning "the current one",
@@ -31,6 +45,9 @@ const FC_INDEX: &[u8] = b"index\0";
 const FC_FAMILY: &[u8] = b"family\0";
 const FC_WEIGHT: &[u8] = b"weight\0";
 const FC_SLANT: &[u8] = b"slant\0";
+const FC_CHARSET: &[u8] = b"charset\0";
+const FC_OUTLINE: &[u8] = b"outline\0";
+const FC_COLOR: &[u8] = b"color\0";
 
 // Fontconfig's weight and slant values from fontconfig.h.
 const FC_WEIGHT_REGULAR: c_int = 80;
@@ -76,6 +93,27 @@ unsafe extern "C" {
         pattern: *mut FcPattern,
         result: *mut c_int,
     ) -> *mut FcPattern;
+    fn FcFontSort(
+        config: *mut FcConfig,
+        pattern: *mut FcPattern,
+        trim: c_int,
+        csp: *mut *mut FcCharSet,
+        result: *mut c_int,
+    ) -> *mut FcFontSet;
+    fn FcFontSetDestroy(set: *mut FcFontSet);
+    fn FcPatternGetCharSet(
+        pattern: *const FcPattern,
+        object: *const c_char,
+        index: c_int,
+        value: *mut *mut FcCharSet,
+    ) -> c_int;
+    fn FcPatternGetBool(
+        pattern: *const FcPattern,
+        object: *const c_char,
+        index: c_int,
+        value: *mut c_int,
+    ) -> c_int;
+    fn FcCharSetHasChar(charset: *const FcCharSet, ucs4: u32) -> c_int;
 }
 
 /// A resolved font path and its FreeType face index.
@@ -240,6 +278,103 @@ fn alias_targets<'a>(
     targets
 }
 
+/// fontconfig's fallback order for a family: the installed fonts that each add
+/// coverage, best match first, as other text renderers find a font for a character
+/// their chosen family lacks. The answer for a character depends only on the
+/// fontconfig configuration, never on what was asked before.
+pub struct FallbackFonts {
+    set: NonNull<FcFontSet>,
+}
+
+impl FallbackFonts {
+    /// The sorted list for family at regular weight, or None when fontconfig cannot
+    /// load its configuration or sort.
+    pub fn for_family(family: &str) -> Option<Self> {
+        // SAFETY: FcInit takes no arguments and is idempotent.
+        if unsafe { FcInit() } != FC_TRUE {
+            return None;
+        }
+        let (weight, slant) = weight_and_slant(FontStyle::Regular);
+        let (query, _) = configured_family_query(family, weight, slant)?;
+        let mut result: c_int = 0;
+        // SAFETY: query is live; FcDefaultSubstitute completes it before the sort. A
+        // null config is the current one, a null charset pointer asks for no union,
+        // and the returned set is owned here and freed on drop.
+        let set = unsafe {
+            FcDefaultSubstitute(query.0);
+            FcFontSort(
+                ptr::null_mut(),
+                query.0,
+                FC_TRUE,
+                ptr::null_mut(),
+                &mut result,
+            )
+        };
+        let set = NonNull::new(set)?;
+        let fonts = Self { set };
+        (result == FC_RESULT_MATCH).then_some(fonts)
+    }
+
+    /// The position of the first font in the list that draws ch with outline
+    /// glyphs, or None when no installed font does. A color font is left out: its
+    /// glyphs are bitmaps or color layers, which the emoji path draws.
+    pub fn covering(&self, ch: char) -> Option<usize> {
+        self.patterns().iter().position(|&pattern| {
+            pattern_bool(pattern, FC_OUTLINE) == Some(true)
+                && pattern_bool(pattern, FC_COLOR) != Some(true)
+                && pattern_has_char(pattern, ch)
+        })
+    }
+
+    /// The file of the font at position i.
+    pub fn file(&self, i: usize) -> Option<FontFile> {
+        let pattern = *self.patterns().get(i)?;
+        Some(FontFile {
+            path: pattern_path(pattern, FC_FILE)?,
+            index: pattern_integer(pattern, FC_INDEX).unwrap_or(0),
+        })
+    }
+
+    fn patterns(&self) -> &[*mut FcPattern] {
+        // SAFETY: the set came from FcFontSort and lives until drop; fonts points at
+        // nfont pattern pointers the set owns.
+        unsafe {
+            let set = self.set.as_ref();
+            match usize::try_from(set.nfont) {
+                Ok(n) if !set.fonts.is_null() => std::slice::from_raw_parts(set.fonts, n),
+                _ => &[],
+            }
+        }
+    }
+}
+
+impl Drop for FallbackFonts {
+    fn drop(&mut self) {
+        // SAFETY: the set came from FcFontSort and is freed exactly once.
+        unsafe { FcFontSetDestroy(self.set.as_ptr()) };
+    }
+}
+
+/// Whether a pattern's charset has ch.
+fn pattern_has_char(pattern: *const FcPattern, ch: char) -> bool {
+    let mut charset: *mut FcCharSet = ptr::null_mut();
+    // SAFETY: pattern is live and object a NUL-terminated literal; fontconfig writes
+    // a pointer borrowed from the pattern, read before the pattern can go.
+    unsafe {
+        FcPatternGetCharSet(pattern, FC_CHARSET.as_ptr().cast(), 0, &mut charset) == FC_RESULT_MATCH
+            && !charset.is_null()
+            && FcCharSetHasChar(charset, ch as u32) == FC_TRUE
+    }
+}
+
+/// A boolean property of a pattern, or None when it does not carry one.
+fn pattern_bool(pattern: *const FcPattern, object: &[u8]) -> Option<bool> {
+    let mut value: c_int = 0;
+    // SAFETY: as pattern_integer; fontconfig writes the FcBool through the pointer.
+    let result = unsafe { FcPatternGetBool(pattern, object.as_ptr().cast(), 0, &mut value) };
+    (result == FC_RESULT_MATCH).then_some(value == FC_TRUE)
+}
+
 /// Map a font style to fontconfig's weight and slant scales.
 fn weight_and_slant(style: FontStyle) -> (c_int, c_int) {
     match style {
@@ -323,9 +458,58 @@ impl Drop for Pattern {
 /// a null pointer in the calls above.
 const _: Option<&FcConfig> = None;
 
+/// A letter from each of several scripts a Latin text family lacks: Devanagari,
+/// Arabic, Hebrew, Thai, Ethiopic, Georgian, Han and Hangul.
+#[cfg(test)]
+pub(crate) const TEST_SCRIPTS: &str = "कبאกሀა一가";
+
 #[cfg(test)]
 mod tests {
     use crate::platform::fontconfig::*;
+    use crate::platform::freetype::Face;
+
+    #[test]
+    fn fontconfig_font_set_mirror_matches_the_c_layout() {
+        pin_c_layout!(FcFontSet, size 16; nfont @ 0, sfont @ 4, fonts @ 8);
+    }
+
+    #[test]
+    fn the_fallback_order_finds_a_font_for_a_script_the_family_lacks() {
+        let Some(fonts) = FallbackFonts::for_family("sans-serif") else {
+            eprintln!("bnknotes: fontconfig cannot sort; skipping the fallback order test");
+            return;
+        };
+        assert!(fonts.covering('a').is_some());
+        assert_eq!(fonts.covering('\u{0378}'), None, "an unassigned code point");
+        let Some((ch, at)) = TEST_SCRIPTS
+            .chars()
+            .find_map(|ch| fonts.covering(ch).map(|at| (ch, at)))
+        else {
+            eprintln!("bnknotes: no font for any test script; skipping the fallback order test");
+            return;
+        };
+        let file = fonts.file(at).expect("the font's file");
+        assert!(file.path.exists(), "{}", file.path.display());
+        let again = FallbackFonts::for_family("sans-serif").expect("sorts again");
+        assert_eq!(
+            again.covering(ch).and_then(|at| again.file(at)),
+            Some(file),
+            "the answer depends on the configuration alone"
+        );
+    }
+
+    #[test]
+    fn a_color_font_is_never_the_fallback_for_text() {
+        let Some(fonts) = FallbackFonts::for_family("sans-serif") else {
+            return;
+        };
+        // Usually only the emoji font has this smiley, as color bitmaps no text
+        // glyph can be drawn from.
+        if let Some(at) = fonts.covering('\u{1F600}') {
+            let face = Face::from_file(&fonts.file(at).expect("a file")).expect("opens");
+            assert!(face.select_first_strike().is_none(), "an outline font");
+        }
+    }
 
     /// Whether fontconfig loads its configuration here; a test needing it skips when
     /// it does not.

@@ -14,6 +14,7 @@ use crate::platform::protocol::{
 };
 use crate::platform::wire::{Arg, Reader};
 use crate::render::display::{self, DisplayList};
+use crate::render::glyph_cache::{self, GlyphCache};
 use crate::render::gpu;
 use crate::render::vulkan;
 use crate::theme::BACKGROUND;
@@ -177,7 +178,7 @@ pub(super) struct GpuPresentation {
     pub(super) backend: Option<vulkan::Gpu>,
     pub(super) images: Vec<vulkan::GpuImage>,
     pub(super) modifiers: Vec<u64>,
-    pub(super) glyphs: gpu::GlyphCache,
+    pub(super) glyphs: GlyphCache,
     /// The frame the batcher fills, kept across frames so its vertex and batch
     /// buffers are refilled rather than reallocated every present.
     pub(super) frame: gpu::FrameData,
@@ -205,7 +206,7 @@ impl GpuPresentation {
             backend: None,
             images: Vec::new(),
             modifiers: Vec::new(),
-            glyphs: gpu::GlyphCache::new(),
+            glyphs: GlyphCache::new(),
             frame: gpu::FrameData::default(),
             syncobj_manager: None,
             explicit_sync: None,
@@ -558,7 +559,7 @@ impl State {
             let Some(img) = self.presentation.images.get_mut(idx) else {
                 return Err(Error::msg("gpu frame without gpu buffers"));
             };
-            let known = |id: gpu::ImageId| gpu.has_image(id);
+            let known = |id: glyph_cache::ImageId| gpu.has_image(id);
             // Built into the frame buffer the presentation keeps, so the vertices and
             // batches reuse last frame's capacity rather than regrowing from zero.
             let frame = &mut self.presentation.frame;

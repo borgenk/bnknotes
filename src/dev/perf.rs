@@ -306,7 +306,7 @@ fn measure() -> Result<Vec<Sample>> {
     // (glyph lookups against warm atlases, quad emission, batch splitting).
     // This runs even without a GPU, so the harness can hold it; the GPU-side
     // frame time is only observable via BNKNOTES_STATS on a live run.
-    let mut glyph_cache = crate::render::gpu::GlyphCache::new();
+    let mut glyph_cache = crate::render::glyph_cache::GlyphCache::new();
     // One frame buffer across the runs, as the app keeps one across presents, so the
     // steady state this measures is the pooled one.
     let mut gpu_frame = crate::render::gpu::FrameData::default();
@@ -682,7 +682,7 @@ pub fn run_lab(args: &[String]) -> Result<()> {
         // Warm the caches the real editor warms before it reaches steady state.
         let warm = Layout::build(&fonts, &rope, MARGIN, MARGIN, wrap, FONT_SIZE, (0, 0));
         let frame = build_display_list(&fonts, &warm, &rope, &params(0, None));
-        let mut glyphs = crate::render::gpu::GlyphCache::new();
+        let mut glyphs = crate::render::glyph_cache::GlyphCache::new();
         crate::render::gpu::build_frame(
             &fonts,
             &[&images],

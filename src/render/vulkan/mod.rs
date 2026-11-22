@@ -24,7 +24,7 @@ use core::ffi::{CStr, c_char};
 
 use crate::platform::error::{Error, Result};
 use crate::platform::ffi::DynLib;
-use crate::render::gpu::ImageId;
+use crate::render::glyph_cache::ImageId;
 use crate::render::vulkan::abi::*;
 use crate::render::vulkan::renderer::{Renderer, create_renderer};
 

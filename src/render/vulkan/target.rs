@@ -4,7 +4,9 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::time::Duration;
 
 use crate::platform::error::{Error, Result};
-use crate::render::gpu::{AtlasInfo, AtlasUploads, FrameData, ImageId};
+use crate::render::atlas::{AtlasInfo, AtlasUploads};
+use crate::render::glyph_cache::ImageId;
+use crate::render::gpu::FrameData;
 use crate::render::vulkan::Gpu;
 use crate::render::vulkan::abi::*;
 use crate::render::vulkan::renderer::{

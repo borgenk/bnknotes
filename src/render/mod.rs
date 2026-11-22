@@ -8,6 +8,9 @@
 //!   needs to know anything about the app driving it.
 //! - `gpu`: batching a `DisplayList` into vertices against the glyph/image
 //!   atlases (the CPU half of a frame).
+//! - `atlas` and `glyph_cache`: the shelf-packed atlases the batcher packs
+//!   glyph rasters into, and the placements and image ids it caches across
+//!   frames.
 //! - `vulkan`: the device backend — bring-up, the exported dmabuf render
 //!   targets, explicit sync, and the pipeline (the GPU half).
 //! - `image`: decoded images cached by (path, size) for upload as textures.
@@ -16,7 +19,9 @@
 //! `platform` and itself, never on the app above it (the test at the bottom
 //! enforces that). An app sits on top and hands it a `DisplayList`.
 
+pub(crate) mod atlas;
 pub(crate) mod display;
+pub(crate) mod glyph_cache;
 pub(crate) mod gpu;
 pub(crate) mod image;
 pub(crate) mod vulkan;

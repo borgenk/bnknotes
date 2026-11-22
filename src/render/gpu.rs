@@ -15,14 +15,14 @@
 //! then grapheme clusters routed to the emoji or per-character path), so the
 //! pixels the GPU composites land exactly where the caret and wrapping expect.
 
-use std::collections::HashMap;
-
 use crate::platform::emoji::wants_emoji;
 use crate::platform::freetype::{CodeInk, Face, FaceKey, Fonts};
 use crate::platform::geom::Rect;
 use crate::platform::grapheme;
+use crate::render::atlas::{AtlasInfo, AtlasUploads};
 use crate::render::display::DrawCmd;
 use crate::render::display::RoundedCorners;
+use crate::render::glyph_cache::{GlyphCache, ImageId, PackedGlyph};
 use crate::render::image::ImageStore;
 
 /// Vertex modes, matching shaders/quad.frag.
@@ -35,17 +35,6 @@ pub const MODE_CHECK: u32 = 5;
 pub const MODE_CHEVRON: u32 = 6;
 pub const MODE_HATCH: u32 = 7;
 pub const MODE_PIN: u32 = 8;
-
-/// Atlases start here and double when full, up to [`ATLAS_MAX`]; growth wipes
-/// the atlas (sources are cached in `Fonts`, so re-inserting is cheap) and the
-/// frame build restarts so no stale coordinates survive.
-const ATLAS_START: u32 = 1024;
-const ATLAS_MAX: u32 = 8192;
-
-/// Most records either slot map holds. Inkless glyphs and clusters that are not
-/// emoji take no atlas room, so a full atlas alone would not bound the maps; at
-/// this many the atlas is wiped as if full, and its map starts over with it.
-const MAX_SLOT_RECORDS: usize = 1 << 16;
 
 /// One vertex, laid out exactly as the pipeline's vertex input expects
 /// (`repr(C)`: pos, uv, color, extra, mode). Six of these make a quad.
@@ -69,12 +58,6 @@ pub struct Batch {
     pub image: Option<ImageId>,
 }
 
-/// One uploaded image texture, interned by [`GlyphCache`] per destination path and
-/// native size. A frame's quads carry the id rather than the path, so batching an
-/// image costs no string and binding one hashes four bytes.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
-pub struct ImageId(u32);
-
 /// An image bitmap the renderer does not hold yet: its id, its native size, and
 /// straight ARGB words (uploadable as B8G8R8A8 bytes verbatim).
 pub struct ImageUpload {
@@ -82,33 +65,6 @@ pub struct ImageUpload {
     pub width: u32,
     pub height: u32,
     pub pixels: Vec<u32>,
-}
-
-/// The rasters packed into an atlas since the last frame, for the renderer to
-/// copy into the atlas texture.
-#[derive(Default)]
-pub struct AtlasUploads {
-    pub regions: Vec<UploadRegion>,
-    /// Every region's texels, tight rows, at the region's offset.
-    pub bytes: Vec<u8>,
-}
-
-impl AtlasUploads {
-    fn clear(&mut self) {
-        self.regions.clear();
-        self.bytes.clear();
-    }
-}
-
-/// One packed raster: its slot in the atlas and where its texels start in
-/// AtlasUploads::bytes.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct UploadRegion {
-    pub x: u32,
-    pub y: u32,
-    pub w: u32,
-    pub h: u32,
-    pub offset: usize,
 }
 
 /// Everything the Vulkan renderer needs to draw one frame. Owned across frames by
@@ -137,353 +93,6 @@ impl FrameData {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct AtlasInfo {
-    pub width: u32,
-    pub height: u32,
-    /// Bumped whenever the atlas is wiped, as it grows or is reclaimed; the
-    /// renderer recreates the texture when it changes.
-    pub generation: u32,
-}
-
-/// Where a raster landed in an atlas.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct Slot {
-    x: u32,
-    y: u32,
-    w: u32,
-    h: u32,
-}
-
-/// One face's ASCII placements, indexed by the character's byte.
-type AsciiSlots = [Option<PackedGlyph>; 128];
-
-/// A glyph's atlas placement plus its pen metrics, cached beside the slot so a
-/// steady-state frame emits the quad without re-rasterizing the glyph. `slot` is
-/// `None` for an inkless glyph (a space, or an emoji that shaped to no ink) or
-/// one the atlas could not fit; the pen still advances by `advance`, so the
-/// caret and the glyphs after it land where layout measured.
-#[derive(Clone, Copy)]
-struct PackedGlyph {
-    slot: Option<Slot>,
-    left: i32,
-    top: i32,
-    advance: f32,
-}
-
-/// A shelf-packing texture atlas. Rasters are packed onto horizontal shelves
-/// (rows share a height class), and each one is queued for upload as it is
-/// packed. The texels live only in the GPU texture: a slot is written once and
-/// read only inside its own bounds (the shader fetches texels at integer
-/// coordinates), so the atlas keeps no copy.
-pub struct Atlas {
-    width: u32,
-    height: u32,
-    /// Bytes per texel: 1 (R8 coverage) or 4 (BGRA emoji).
-    bpp: u32,
-    /// Shelves as (y, height, x_used).
-    shelves: Vec<(u32, u32, u32)>,
-    next_y: u32,
-    generation: u32,
-    pending: AtlasUploads,
-    /// Whether a full atlas at ATLAS_MAX may be wiped to make room. Once per
-    /// frame build, so a frame whose own rasters overflow the cap cannot loop.
-    may_reclaim: bool,
-}
-
-/// The atlas is at its cap and full, and this frame build already wiped it once.
-#[derive(Debug, PartialEq, Eq)]
-struct AtlasFull;
-
-impl Atlas {
-    pub fn new(bpp: u32) -> Self {
-        Self {
-            width: ATLAS_START,
-            height: ATLAS_START,
-            bpp,
-            shelves: Vec::new(),
-            next_y: 0,
-            generation: 0,
-            pending: AtlasUploads::default(),
-            may_reclaim: true,
-        }
-    }
-
-    pub fn info(&self) -> AtlasInfo {
-        AtlasInfo {
-            width: self.width,
-            height: self.height,
-            generation: self.generation,
-        }
-    }
-
-    /// Reserve a w x h slot. Growing, or wiping a full atlas at its cap, forgets
-    /// every previous slot and bumps the generation, which the frame builder
-    /// answers by restarting the build. A raster larger than the cap gets no slot.
-    fn reserve(&mut self, w: u32, h: u32) -> Result<Option<Slot>, AtlasFull> {
-        if w == 0 || h == 0 || w > ATLAS_MAX || h > ATLAS_MAX {
-            return Ok(None);
-        }
-        loop {
-            // A shelf fits if the raster is no taller than the shelf and the
-            // remaining width holds it. Shelves are created at the raster's
-            // height, so height classes cluster and waste stays bounded.
-            if let Some(shelf) = self
-                .shelves
-                .iter_mut()
-                .find(|(_, sh, used)| h <= *sh && used + w <= self.width)
-            {
-                let slot = Slot {
-                    x: shelf.2,
-                    y: shelf.0,
-                    w,
-                    h,
-                };
-                shelf.2 += w;
-                return Ok(Some(slot));
-            }
-            if self.next_y + h <= self.height && w <= self.width {
-                self.shelves.push((self.next_y, h, w));
-                let slot = Slot {
-                    x: 0,
-                    y: self.next_y,
-                    w,
-                    h,
-                };
-                self.next_y += h;
-                return Ok(Some(slot));
-            }
-            if !self.grow() && !self.reclaim() {
-                return Err(AtlasFull);
-            }
-        }
-    }
-
-    /// Double the atlas (square), wiping every slot. Returns false at the cap.
-    fn grow(&mut self) -> bool {
-        let next = (self.width * 2).min(ATLAS_MAX);
-        if next == self.width {
-            return false;
-        }
-        self.width = next;
-        self.height = next;
-        self.wipe();
-        true
-    }
-
-    /// Wipe the atlas so the slots this frame draws can be packed again, when it
-    /// is full at its cap or its slot map is. Returns false once this frame build
-    /// has already done it.
-    fn reclaim(&mut self) -> bool {
-        if !self.may_reclaim {
-            return false;
-        }
-        self.may_reclaim = false;
-        self.wipe();
-        true
-    }
-
-    /// Forget every slot and start a new texture generation.
-    fn wipe(&mut self) {
-        self.clear();
-        self.generation += 1;
-    }
-
-    /// Forget every slot and every queued upload, keeping the generation.
-    fn clear(&mut self) {
-        self.shelves.clear();
-        self.next_y = 0;
-        self.pending.clear();
-    }
-
-    /// Reserve a slot for a w x h raster and queue src, its texels in tight rows,
-    /// for upload. Ok(None) for a zero-area raster, which takes no slot. A src of
-    /// the wrong length is cut or zero-filled to w * h texels.
-    fn pack(
-        &mut self,
-        w: u32,
-        h: u32,
-        src: impl IntoIterator<Item = u8>,
-    ) -> Result<Option<Slot>, AtlasFull> {
-        if w == 0 || h == 0 {
-            return Ok(None);
-        }
-        let Some(slot) = self.reserve(w, h)? else {
-            return Ok(None);
-        };
-        let offset = self.pending.bytes.len();
-        let len = (w * h * self.bpp) as usize;
-        self.pending.bytes.extend(src.into_iter().take(len));
-        self.pending.bytes.resize(offset + len, 0);
-        self.pending.regions.push(UploadRegion {
-            x: slot.x,
-            y: slot.y,
-            w,
-            h,
-            offset,
-        });
-        Ok(Some(slot))
-    }
-
-    /// Hand the queued uploads to into, taking back its consumed buffers so their
-    /// capacity is reused.
-    fn take_uploads(&mut self, into: &mut AtlasUploads) {
-        std::mem::swap(into, &mut self.pending);
-        self.pending.clear();
-    }
-}
-
-/// The persistent glyph caches the batcher packs into: slots by scalar and by
-/// cluster, over the two atlases. Owned by the app next to the display list;
-/// survives across frames so steady-state frames insert nothing.
-pub struct GlyphCache {
-    pub glyphs: Atlas,
-    pub emoji: Atlas,
-    /// ASCII placements, one table per raster key. A text run finds its table
-    /// once and indexes it per character, where scalar_slots, which holds every
-    /// other character, hashes each lookup. The tables are few (one per face and
-    /// size in use) and fixed in size, so they need no cap.
-    ascii_slots: Vec<AsciiSlots>,
-    ascii_tables: HashMap<FaceKey, usize>,
-    scalar_slots: HashMap<(FaceKey, char), PackedGlyph>,
-    /// Nested so lookups borrow the cluster as `&str` (no per-frame `String`).
-    /// A `None` value records a cluster that is not color emoji, so a
-    /// steady-state frame takes the per-character path without re-consulting
-    /// the `Face`.
-    cluster_slots: HashMap<FaceKey, HashMap<String, Option<PackedGlyph>>>,
-    /// Records across every map in cluster_slots.
-    cluster_records: usize,
-    /// Image texture ids, by native size then by path: the same nesting as
-    /// `cluster_slots` and for the same reason, so a frame's image lookup borrows
-    /// the path instead of building a key.
-    image_ids: HashMap<(u32, u32), HashMap<String, ImageId>>,
-    next_image_id: u32,
-    stats: CacheStats,
-}
-
-/// Slot lookups for glyphs and emoji clusters since the cache was made. Once the
-/// visible text is packed, a steady frame adds hits and no misses.
-#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
-pub struct CacheStats {
-    pub hits: u64,
-    pub misses: u64,
-}
-
-impl CacheStats {
-    pub fn lookups(self) -> u64 {
-        self.hits + self.misses
-    }
-
-    /// 0.0 when nothing was looked up.
-    pub fn hit_rate(self) -> f32 {
-        match self.lookups() {
-            0 => 0.0,
-            total => self.hits as f32 / total as f32,
-        }
-    }
-}
-
-impl GlyphCache {
-    pub fn new() -> Self {
-        Self {
-            glyphs: Atlas::new(1),
-            emoji: Atlas::new(4),
-            ascii_slots: Vec::new(),
-            ascii_tables: HashMap::new(),
-            scalar_slots: HashMap::new(),
-            cluster_slots: HashMap::new(),
-            cluster_records: 0,
-            image_ids: HashMap::new(),
-            next_image_id: 0,
-            stats: CacheStats::default(),
-        }
-    }
-
-    pub fn stats(&self) -> CacheStats {
-        self.stats
-    }
-
-    /// The id of `path`'s texture at its native size, minting one the first time
-    /// the pair is seen. Ids are permanent: the renderer's own texture map is what
-    /// says whether an id is uploaded right now, so an evicted image comes back
-    /// under the id it had.
-    fn image_id(&mut self, path: &str, width: u32, height: u32) -> ImageId {
-        let by_path = self.image_ids.entry((width, height)).or_default();
-        if let Some(&id) = by_path.get(path) {
-            return id;
-        }
-        let id = ImageId(self.next_image_id);
-        self.next_image_id += 1;
-        by_path.insert(path.to_string(), id);
-        id
-    }
-
-    /// The index of key's ASCII table, adding an empty one on first use.
-    fn ascii_table(&mut self, key: FaceKey) -> usize {
-        if let Some(&table) = self.ascii_tables.get(&key) {
-            return table;
-        }
-        let table = self.ascii_slots.len();
-        self.ascii_slots.push([None; 128]);
-        self.ascii_tables.insert(key, table);
-        table
-    }
-
-    /// A scalar's recorded placement: an ASCII character's from the run's table,
-    /// any other from the map.
-    fn scalar_slot(&self, ascii: usize, key: FaceKey, ch: char) -> Option<PackedGlyph> {
-        match self.ascii_slots.get(ascii).and_then(|t| t.get(ch as usize)) {
-            Some(slot) => *slot,
-            None => self.scalar_slots.get(&(key, ch)).copied(),
-        }
-    }
-
-    /// Record a scalar's placement. At the map's record cap the glyph atlas is
-    /// wiped instead, which restarts the build with an empty map; when this build
-    /// has wiped it already, the placement goes unrecorded and a later frame
-    /// retries.
-    fn record_scalar(&mut self, ascii: usize, key: FaceKey, ch: char, packed: PackedGlyph) {
-        let table = self.ascii_slots.get_mut(ascii);
-        if let Some(slot) = table.and_then(|t| t.get_mut(ch as usize)) {
-            *slot = Some(packed);
-        } else if self.scalar_slots.len() < MAX_SLOT_RECORDS {
-            self.scalar_slots.insert((key, ch), packed);
-        } else {
-            self.glyphs.reclaim();
-        }
-    }
-
-    /// Record a cluster's placement, or None for a cluster that does not draw as
-    /// emoji, under the same cap as record_scalar.
-    fn record_cluster(&mut self, key: FaceKey, cluster: &str, packed: Option<PackedGlyph>) {
-        if self.cluster_records < MAX_SLOT_RECORDS {
-            self.cluster_slots
-                .entry(key)
-                .or_default()
-                .insert(cluster.to_string(), packed);
-            self.cluster_records += 1;
-        } else {
-            self.emoji.reclaim();
-        }
-    }
-
-    /// Forget an atlas that started a new generation mid-build: its slot records,
-    /// and what the build packed into it before restarting, which nothing refers to.
-    fn reset_for(&mut self, glyphs_gen: u32, emoji_gen: u32) {
-        if self.glyphs.generation != glyphs_gen {
-            self.ascii_slots.clear();
-            self.ascii_tables.clear();
-            self.scalar_slots.clear();
-            self.glyphs.clear();
-        }
-        if self.emoji.generation != emoji_gen {
-            self.cluster_slots.clear();
-            self.cluster_records = 0;
-            self.emoji.clear();
-        }
-    }
-}
-
 /// Build one frame's GPU data from the display list into `out`, whose buffers are
 /// cleared and refilled (the caller keeps it across frames, so a steady-state frame
 /// allocates nothing). `known_images` is the set of image textures the renderer
@@ -499,11 +108,11 @@ pub fn build_frame(
     code_glyph_gamma: f32,
     out: &mut FrameData,
 ) {
-    cache.glyphs.may_reclaim = true;
-    cache.emoji.may_reclaim = true;
+    cache.glyphs.allow_reclaim();
+    cache.emoji.allow_reclaim();
     loop {
-        let glyphs_gen = cache.glyphs.generation;
-        let emoji_gen = cache.emoji.generation;
+        let glyphs_gen = cache.glyphs.generation();
+        let emoji_gen = cache.emoji.generation();
         out.clear();
         {
             let mut b = Batcher {
@@ -523,7 +132,7 @@ pub fn build_frame(
         // An atlas grew, or was wiped at its cap, during the build: earlier quads
         // reference dead coordinates, so rebuild. A wipe happens once per build,
         // so a frame whose own rasters overflow the cap draws what fits.
-        if cache.glyphs.generation != glyphs_gen || cache.emoji.generation != emoji_gen {
+        if cache.glyphs.generation() != glyphs_gen || cache.emoji.generation() != emoji_gen {
             cache.reset_for(glyphs_gen, emoji_gen);
             continue;
         }
@@ -988,6 +597,10 @@ fn color_f32(color: u32) -> [f32; 4] {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
+    use crate::render::atlas::ATLAS_MAX;
+    use crate::render::glyph_cache::{CacheStats, MAX_SLOT_RECORDS};
     use crate::render::gpu::*;
 
     /// Build one frame into a fresh buffer. The app keeps one across frames; a test
@@ -1035,77 +648,6 @@ mod tests {
     }
 
     #[test]
-    fn atlas_packs_onto_shelves_and_queues_each_raster() {
-        let mut a = Atlas::new(1);
-        let s1 = a.pack(10, 8, [7u8; 80]).unwrap().expect("fits");
-        let s2 = a
-            .pack(6, 8, [8u8; 48])
-            .unwrap()
-            .expect("fits on the same shelf");
-        assert_eq!((s1.x, s1.y), (0, 0));
-        assert_eq!((s2.x, s2.y), (10, 0), "same shelf, packed rightward");
-        let s3 = a
-            .pack(10, 20, [9u8; 200])
-            .unwrap()
-            .expect("taller: a new shelf");
-        assert_eq!(s3.y, 8, "new shelf below the first");
-
-        // Each raster uploads on its own, not as the box spanning all three.
-        let mut up = AtlasUploads::default();
-        a.take_uploads(&mut up);
-        let regions: Vec<_> = up.regions.iter().map(|r| (r.x, r.y, r.w, r.h)).collect();
-        assert_eq!(regions, [(0, 0, 10, 8), (10, 0, 6, 8), (0, 8, 10, 20)]);
-        assert_eq!(up.bytes.len(), 80 + 48 + 200);
-        let last = up.regions[2];
-        assert!(up.bytes[last.offset..].iter().all(|&b| b == 9));
-
-        a.take_uploads(&mut up);
-        assert!(up.regions.is_empty() && up.bytes.is_empty(), "taken once");
-    }
-
-    #[test]
-    fn atlas_grows_by_wiping_and_bumping_generation() {
-        let mut a = Atlas::new(1);
-        let g0 = a.generation;
-        a.pack(4, 4, [1u8; 16]).unwrap();
-        // A raster wider than the atlas forces growth.
-        let s = a
-            .reserve(ATLAS_START + 1, 4)
-            .unwrap()
-            .expect("grows to fit");
-        assert!(a.generation > g0);
-        assert_eq!(a.width, ATLAS_START * 2);
-        assert_eq!((s.x, s.y), (0, 0), "the grown atlas starts empty");
-        assert!(
-            a.pending.regions.is_empty(),
-            "the wiped raster is not uploaded"
-        );
-        // Beyond the cap is no slot at all.
-        assert_eq!(a.reserve(ATLAS_MAX + 1, 1), Ok(None));
-    }
-
-    #[test]
-    fn a_full_atlas_at_its_cap_is_wiped_once_per_build() {
-        let mut a = Atlas::new(1);
-        a.reserve(ATLAS_MAX, ATLAS_MAX)
-            .unwrap()
-            .expect("grows to the cap");
-        let full = a.generation;
-        let slot = a.reserve(4, 4).unwrap().expect("a wipe makes room");
-        assert_eq!((slot.x, slot.y), (0, 0));
-        assert_eq!(a.generation, full + 1, "a wiped atlas is a new texture");
-
-        a.reserve(ATLAS_MAX, ATLAS_MAX - 4)
-            .unwrap()
-            .expect("fills the rest");
-        assert_eq!(
-            a.reserve(8, 8),
-            Err(AtlasFull),
-            "a second wipe in one build would loop"
-        );
-    }
-
-    #[test]
     fn text_still_draws_once_the_atlas_fills_at_its_cap() {
         let fonts = Fonts::new(&[16]).expect("default font");
         let images = ImageStore::new(None);
@@ -1150,7 +692,7 @@ mod tests {
                 .insert(format!("{i}"), None);
         }
         cache.cluster_records = MAX_SLOT_RECORDS;
-        let (glyphs, emoji) = (cache.glyphs.generation, cache.emoji.generation);
+        let (glyphs, emoji) = (cache.glyphs.generation(), cache.emoji.generation());
 
         built(
             &fonts,
@@ -1161,11 +703,11 @@ mod tests {
             1.0,
         );
         assert_eq!(
-            cache.glyphs.generation,
+            cache.glyphs.generation(),
             glyphs + 1,
             "the cap wipes the atlas"
         );
-        assert_eq!(cache.emoji.generation, emoji + 1);
+        assert_eq!(cache.emoji.generation(), emoji + 1);
         // Without an emoji font the smiley draws per character, so it is a
         // scalar record too.
         let drawn = ['é', '😀'];

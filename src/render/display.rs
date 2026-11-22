@@ -51,7 +51,7 @@ pub enum RoundedCorners {
 /// One drawing primitive in screen (post-scroll) pixels. The set is deliberately
 /// small and low level so a future GPU backend can execute the same list; the
 /// painter decomposes higher-level chrome (an image's selection border, a button)
-/// into these. Every variant is `Eq + Hash` so [`damage`] can diff two frames by
+/// into these. Every variant is `Eq + Hash` so [`Damage`] can diff two frames by
 /// value, which is why text runs carry an owned [`String`] and a borrow-free
 /// [`FaceKey`] rather than a `&str`/`&Face` tied to the rope and fonts.
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]

@@ -1,7 +1,8 @@
 use core::mem::offset_of;
 
 use crate::platform::error::{Error, Result};
-use crate::render::gpu::{ImageId, Vertex};
+use crate::render::glyph_cache::ImageId;
+use crate::render::gpu::Vertex;
 use crate::render::vulkan::abi::*;
 
 /// One sampled texture (an atlas, an image, or the 1x1 dummy) and whether its

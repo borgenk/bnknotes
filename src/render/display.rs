@@ -2,7 +2,7 @@
 //! backend consumes. This is the display list, and two things hang off it:
 //!
 //! - **Damage tracking**: because a frame is now a value, two frames can be
-//!   compared. [`damage`] diffs the previous frame against the new one and
+//!   compared. [`Damage`] diffs the previous frame against the new one and
 //!   returns just the screen rectangles that changed, so an idle caret blink
 //!   presents a caret-sized damaged region instead of the whole surface, and a
 //!   keystroke reports the edited line rather than the screen.
@@ -16,10 +16,10 @@
 //!
 //! ```text
 //!   layout + params ──build_display_list──▶ DisplayList ──┬─ gpu::build_frame ─▶ vertices
-//!                                                         └─ damage(old,new) ─▶ [Rect]
+//!                                                         └─ Damage::diff ─────▶ [Rect]
 //! ```
 
-use std::collections::HashMap;
+use std::hash::{BuildHasher, RandomState};
 
 use crate::platform::freetype::FaceKey;
 use crate::platform::geom::Rect;
@@ -31,6 +31,10 @@ pub type DisplayList = Vec<DrawCmd>;
 /// Beyond this many distinct changed regions, repainting the whole surface is
 /// cheaper than tracking and clipping each one.
 const MAX_DAMAGE_RECTS: usize = 16;
+
+/// Past this many changed commands the damage is the whole surface, unmerged.
+/// Merging costs up to the cube of the count, so the cap bounds it.
+const MAX_MERGED_RECTS: usize = 4 * MAX_DAMAGE_RECTS;
 
 /// Which corners a [`DrawCmd::RoundRect`] rounds. A fenced code block's panel is
 /// drawn as one rounded rectangle: the GPU shader rounds whichever corners this
@@ -134,51 +138,102 @@ impl DrawCmd {
 /// A frame that changed most of the surface (a scroll, a resize, a large edit)
 /// returns a single full-surface rectangle, since repainting whole then beats
 /// clipping many regions. An empty result means the two frames are identical.
-pub fn damage(old: &[DrawCmd], new: &[DrawCmd], width: i32, height: i32) -> Vec<Rect> {
-    // Dropping an equal pair (one command from each frame) never changes the
-    // multiset difference, so strip the common prefix and suffix first. Lists are
-    // built in document order, so a blink or a small edit differs only in a
-    // handful of commands and the hash work below shrinks to just those;
-    // equality bails on the first differing field, cheaper than hashing.
-    let prefix = old.iter().zip(new).take_while(|(a, b)| a == b).count();
-    let (old, new) = (&old[prefix..], &new[prefix..]);
-    let suffix = old
-        .iter()
-        .rev()
-        .zip(new.iter().rev())
-        .take_while(|(a, b)| a == b)
-        .count();
-    let (old, new) = (&old[..old.len() - suffix], &new[..new.len() - suffix]);
+/// The screen regions that changed between two frames. It keeps its buffers
+/// across frames, so a frame that changed allocates nothing once they have
+/// grown, a caret blink included.
+#[derive(Default)]
+pub struct Damage {
+    hasher: RandomState,
+    /// The changed commands as (hash, index): an index below the old span's
+    /// length names an old command, the rest a new one.
+    keys: Vec<(u64, usize)>,
+    /// Which of a hash group's new commands an old one already cancelled.
+    matched: Vec<bool>,
+    rects: Vec<Rect>,
+}
 
-    let mut counts: HashMap<&DrawCmd, i32> = HashMap::new();
-    for c in old {
-        *counts.entry(c).or_insert(0) += 1;
-    }
-    for c in new {
-        *counts.entry(c).or_insert(0) -= 1;
-    }
-    let surface = Rect {
-        x: 0,
-        y: 0,
-        w: width.max(0),
-        h: height.max(0),
-    };
-    let mut rects: Vec<Rect> = counts
-        .into_iter()
-        .filter(|&(_, n)| n != 0)
-        .filter_map(|(c, _)| intersection(c.bounds(), surface))
-        .collect();
-    coalesce(&mut rects);
-    let area: i64 = rects.iter().map(|r| r.w as i64 * r.h as i64).sum();
-    let surface_area = surface.w as i64 * surface.h as i64;
-    if rects.len() > MAX_DAMAGE_RECTS || area * 2 > surface_area {
-        return if surface_area > 0 {
-            vec![surface]
-        } else {
-            Vec::new()
+impl Damage {
+    /// Diff old against new on a width x height surface: the regions to repaint,
+    /// none when the frames draw the same. A command present in both frames
+    /// cancels wherever it sits in the lists, so only what appeared, vanished
+    /// or moved is damage.
+    pub fn diff(&mut self, old: &[DrawCmd], new: &[DrawCmd], width: i32, height: i32) -> &[Rect] {
+        // Dropping an equal pair never changes the difference, so strip the
+        // common prefix and suffix first. Lists are built in document order, so
+        // a blink or a small edit leaves a handful of commands to hash; equality
+        // bails on the first differing field, cheaper than hashing.
+        let prefix = old.iter().zip(new).take_while(|(a, b)| a == b).count();
+        let (old, new) = (&old[prefix..], &new[prefix..]);
+        let suffix = old
+            .iter()
+            .rev()
+            .zip(new.iter().rev())
+            .take_while(|(a, b)| a == b)
+            .count();
+        let (old, new) = (&old[..old.len() - suffix], &new[..new.len() - suffix]);
+
+        let Damage {
+            hasher,
+            keys,
+            matched,
+            rects,
+        } = self;
+        let surface = Rect {
+            x: 0,
+            y: 0,
+            w: width.max(0),
+            h: height.max(0),
         };
+        let mut push = |c: &DrawCmd| rects.extend(intersection(c.bounds(), surface));
+
+        // Sorting by hash puts equal commands side by side, old ones first in
+        // each group. Within a group each old command cancels one equal new one,
+        // and whatever is left over changed.
+        keys.clear();
+        keys.extend(old.iter().map(|c| hasher.hash_one(c)).zip(0..));
+        keys.extend(new.iter().map(|c| hasher.hash_one(c)).zip(old.len()..));
+        keys.sort_unstable();
+        for group in keys.chunk_by(|a, b| a.0 == b.0) {
+            let (olds, news) = group.split_at(group.partition_point(|&(_, i)| i < old.len()));
+            let new_at = |i: usize| new.get(i - old.len());
+            matched.clear();
+            matched.resize(news.len(), false);
+            for &(_, i) in olds {
+                let Some(gone) = old.get(i) else { continue };
+                let twin = news
+                    .iter()
+                    .zip(matched.iter_mut())
+                    .find(|((_, j), done)| !**done && new_at(*j) == Some(gone));
+                match twin {
+                    Some((_, done)) => *done = true,
+                    None => push(gone),
+                }
+            }
+            for (&(_, j), done) in news.iter().zip(matched.iter()) {
+                if let (false, Some(came)) = (*done, new_at(j)) {
+                    push(came);
+                }
+            }
+        }
+
+        let surface_area = surface.w as i64 * surface.h as i64;
+        if rects.len() <= MAX_MERGED_RECTS {
+            coalesce(rects);
+        }
+        let area: i64 = rects.iter().map(|r| r.w as i64 * r.h as i64).sum();
+        if rects.len() > MAX_DAMAGE_RECTS || area * 2 > surface_area {
+            rects.clear();
+            if surface_area > 0 {
+                rects.push(surface);
+            }
+        }
+        rects
     }
-    rects
+
+    /// The regions the last diff found.
+    pub fn rects(&self) -> &[Rect] {
+        &self.rects
+    }
 }
 
 /// Merge any two overlapping rectangles into their bounding box, repeated until
@@ -238,6 +293,11 @@ fn intersection(a: Rect, b: Rect) -> Option<Rect> {
 #[cfg(test)]
 mod tests {
     use crate::render::display::*;
+
+    /// One diff on fresh buffers.
+    fn damage(old: &[DrawCmd], new: &[DrawCmd], width: i32, height: i32) -> Vec<Rect> {
+        Damage::default().diff(old, new, width, height).to_vec()
+    }
 
     fn fill(x: i32, y: i32, w: i32, h: i32, color: u32) -> DrawCmd {
         DrawCmd::Fill {
@@ -300,6 +360,44 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn a_repeated_command_cancels_one_copy_at_a_time() {
+        // Two identical fills where one remains: the copy that vanished still
+        // needs repainting. The changed ends keep both copies out of the common
+        // prefix and suffix.
+        let bg = fill(0, 0, W, H, 0x010101);
+        let dot = fill(40, 40, 6, 6, 0xffffff);
+        let (first, last) = ((0, 0, 1, 1), (300, 300, 2, 2));
+        let cmd = |(x, y, w, h), color| fill(x, y, w, h, color);
+        let old = vec![
+            bg.clone(),
+            cmd(first, 1),
+            dot.clone(),
+            dot.clone(),
+            cmd(last, 1),
+        ];
+        let new = vec![bg, cmd(first, 2), dot, cmd(last, 2)];
+        let mut d = damage(&old, &new, W, H);
+        d.sort_by_key(|r| r.x);
+        let rect = |(x, y, w, h)| Rect { x, y, w, h };
+        assert_eq!(d, vec![rect(first), rect((40, 40, 6, 6)), rect(last)]);
+    }
+
+    #[test]
+    fn a_command_that_only_moved_in_the_list_is_no_damage() {
+        // The same commands in another order draw the same pixels where they do
+        // not overlap.
+        let bg = fill(0, 0, W, H, 0x010101);
+        let (a, b, c) = (
+            fill(10, 10, 4, 4, 1),
+            fill(100, 10, 4, 4, 2),
+            fill(200, 10, 4, 4, 3),
+        );
+        let old = vec![bg.clone(), a.clone(), b.clone(), c.clone()];
+        let new = vec![bg, c, b, a];
+        assert!(damage(&old, &new, W, H).is_empty());
     }
 
     #[test]

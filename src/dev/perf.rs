@@ -333,6 +333,21 @@ fn measure() -> Result<Vec<Sample>> {
         gpu_frame.vertices.len()
     }));
 
+    // The damage diff of a caret blink (the frame with and without its caret,
+    // which is drawn last) and of a one-line scroll, which moves every command.
+    let mut blink = frame_list.clone();
+    blink.pop();
+    let scrolled = build_display_list(&fonts, &layout, &rope, &params(FONT_SIZE as i32, None));
+    // One Damage across the runs, as the presentation keeps one.
+    let mut damage = crate::render::display::Damage::default();
+    damage.diff(&frame_list, &scrolled, WIDTH, HEIGHT);
+    out.push(sample("damage_blink", 500, || {
+        damage.diff(&frame_list, &blink, WIDTH, HEIGHT).len()
+    }));
+    out.push(sample("damage_scroll", 50, || {
+        damage.diff(&frame_list, &scrolled, WIDTH, HEIGHT).len()
+    }));
+
     // Image resampling: the area/bilinear pass that scales a source bitmap to a
     // display size. It is cached per (source, size), so it runs off the frame path;
     // this guards the resampler itself (now used for color-emoji glyph strikes).

@@ -187,6 +187,8 @@ pub(super) struct GpuPresentation {
     pub(super) busy: [bool; 2],
     pub(super) buffer_size: (u32, u32),
     pub(super) present_list: Rc<DisplayList>,
+    /// The regions the frame being presented changed.
+    pub(super) damage: display::Damage,
     pub(super) frame_count: u64,
     pub(super) last_present: Option<Instant>,
     pub(super) explicit_fence_frames: u64,
@@ -211,6 +213,7 @@ impl GpuPresentation {
             busy: [false, false],
             buffer_size: (0, 0),
             present_list: Rc::default(),
+            damage: display::Damage::default(),
             frame_count: 0,
             last_present: None,
             explicit_fence_frames: 0,
@@ -500,13 +503,17 @@ impl State {
 
         // Nothing changed since the on-screen frame: nothing to present (the
         // common idle case).
-        let screen_dmg = display::damage(&self.presentation.present_list, &new_list, sw, sh);
+        let changed = !self
+            .presentation
+            .damage
+            .diff(&self.presentation.present_list, &new_list, sw, sh)
+            .is_empty();
         // Acknowledge the latest configure paired with this commit, so the buffer
         // the compositor sees is always the one sized to the configure it just
         // acked; that is what keeps an anchored (left/top) resize edge from
         // jumping. Taken here so it rides the same flush as the commit below.
         let ack = self.pending_configure.take();
-        if screen_dmg.is_empty() {
+        if !changed {
             // Nothing new to draw, but a pending configure must still be acked so
             // the compositor can finalize a state-only change (e.g. a maximize
             // that altered no pixels); a bare commit applies it against the
@@ -598,7 +605,7 @@ impl State {
         // The GPU repainted everything, but the screen change is still just the
         // diff, so report those regions and let the compositor recomposite only
         // what moved. The diff is in buffer pixels, hence damage_buffer.
-        for r in &screen_dmg {
+        for r in self.presentation.damage.rects() {
             self.conn.request(
                 self.surface,
                 wl_surface::DAMAGE_BUFFER,

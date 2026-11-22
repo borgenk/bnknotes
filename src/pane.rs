@@ -590,7 +590,7 @@ const LINES_PER_WORKER: usize = 50_000;
 
 /// Which region holds keyboard focus. Editing keys go to the focused editor;
 /// the file tree takes navigation keys when it is focused.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum Focus {
     Tree,
     /// Content pane 0 (left/A) or 1 (right/B).

@@ -284,9 +284,15 @@ impl State {
     /// last-hovered tree row, filter toggle, tab, or scrollbar stays lit with no
     /// pointer on it.
     fn pointer_left(&mut self) {
-        let lit =
-            self.tree.hovered.is_some() || self.tree.filter_hovered || self.hovered_tab.is_some();
+        // No button release follows for a drag the pointer was carrying; it
+        // comes to whatever surface the pointer is over next, if any.
+        self.end_left_drags(false);
+        let lit = self.tree.hovered.is_some()
+            || self.tree.filter_hovered
+            || self.hovered_tab.is_some()
+            || self.hovered_vault.is_some();
         self.tree.hovered = None;
+        self.hovered_vault = None;
         self.tree.filter_hovered = false;
         self.hovered_tab = None;
         let mut bars = false;
@@ -296,6 +302,26 @@ impl State {
         if lit || bars {
             self.dirty = true;
         }
+    }
+
+    /// The seat's global went away: let go of everything made from it, so a seat
+    /// announced later is bound from scratch. A seat below version 5 cannot be
+    /// released and stays an inert object.
+    pub(super) fn drop_seat(&mut self) {
+        if self.keyboard != 0 {
+            self.release_keyboard();
+        }
+        if self.pointer != 0 {
+            self.release_pointer();
+        }
+        self.release_data_device();
+        if let Some(seat) = self.seat.take()
+            && self.seat_version >= wl_seat::VERSION_SEAT_RELEASE
+        {
+            self.conn.request(seat, wl_seat::RELEASE, &[]);
+        }
+        self.seat_global = None;
+        self.seat_version = 0;
     }
 
     /// The seat lost its keyboard: release the inert object and forget it,
@@ -841,13 +867,13 @@ impl State {
                 self.pointer_x = scale.scale_f32(r.fixed()?);
                 self.pointer_y = scale.scale_f32(r.fixed()?);
                 let (px, py) = (self.pointer_x, self.pointer_y);
-                if let Some(s) = self.drag_splitter {
+                if let Some(s) = self.drags.splitter {
                     self.drag_splitter_to(s, px);
-                } else if self.drag_scroll.is_some() {
+                } else if self.drags.scroll.is_some() {
                     self.drag_scroll_to(py);
-                } else if self.drag_tab.is_some() {
+                } else if self.drags.tab.is_some() {
                     self.drag_tab_to(px);
-                } else if self.drag_vault.is_some() {
+                } else if self.drags.vault.is_some() {
                     self.drag_vault_to(py);
                 } else {
                     let i = self.active_editor();
@@ -891,39 +917,7 @@ impl State {
                     if state == wl_pointer::BUTTON_STATE_PRESSED {
                         self.on_left_press();
                     } else {
-                        // A splitter drag just ended: persist the new column sizes.
-                        if self.drag_splitter.take().is_some() {
-                            self.save_session();
-                        }
-                        // A scrollbar drag just ended: let go of the thumb, and let the
-                        // bar fade unless the pointer stayed on it.
-                        if let Some(region) = self.drag_scroll.take() {
-                            self.scrollbar_mut(region).release();
-                            self.update_scrollbar_hover();
-                            self.dirty = true;
-                        }
-                        // A tab reorder just ended: persist the new order and let the
-                        // lifted tab settle back into its slot. A press that never
-                        // grew into a drag was a plain click, already handled.
-                        if let Some(drag) = self.drag_tab.take()
-                            && drag.moved
-                        {
-                            self.save_session();
-                            self.dirty = true;
-                        }
-                        // A chip is let go of here rather than at press: this is where
-                        // a rail reorder is remembered, and where a chip that never
-                        // moved finally switches vault.
-                        self.release_vault();
-                        let i = self.active_editor();
-                        let was_selecting = self.editors[i].release_drag();
-                        self.editors[i].disarm_autoscroll();
-                        if was_selecting {
-                            // The drag is over: image sources under the selection
-                            // ends were held collapsed while dragging and can now
-                            // expand, so force a redraw.
-                            self.dirty = true;
-                        }
+                        self.end_left_drags(true);
                     }
                 }
             }
@@ -1136,16 +1130,16 @@ impl State {
         self.dirty = true;
     }
 
-    /// Take hold of vault chip `i`, pressed at `py`, without acting on it yet: the
-    /// press becomes a reorder if the pointer moves and a vault switch if it does not
-    /// (see [`Self::release_vault`]).
+    /// Take hold of vault chip i, pressed at py, without acting on it yet: the
+    /// press becomes a reorder if the pointer moves, and a vault switch if the button
+    /// comes up first (end_left_drags).
     fn press_vault(&mut self, i: usize, py: f32) {
         let grab_dy =
             crate::paint::rail_buttons(self.columns().rail_chips, self.vaults.len(), self.scale())
                 .find(|(k, _)| *k == i)
                 .map(|(_, chip)| py as i32 - chip.y)
                 .unwrap_or(0);
-        self.drag_vault = Some(VaultDrag {
+        self.drags.vault = Some(VaultDrag {
             vault: i,
             grab_y: py,
             grab_dy,
@@ -1157,7 +1151,7 @@ impl State {
     /// The rail is reordered as the drag goes rather than at the drop, so the chips
     /// show where the drop will land.
     pub(super) fn drag_vault_to(&mut self, py: f32) {
-        let Some(mut drag) = self.drag_vault else {
+        let Some(mut drag) = self.drags.vault else {
             return;
         };
         if !drag.moved {
@@ -1184,25 +1178,40 @@ impl State {
             self.vaults.insert(target, vault);
             drag.vault = target;
         }
-        self.drag_vault = Some(drag);
+        self.drags.vault = Some(drag);
         self.dirty = true;
     }
 
-    /// Let go of a held chip: a chip that moved leaves the rail in its new order (and
-    /// is remembered there), and one that never moved was a click, so it switches the
-    /// window to its vault.
-    pub(super) fn release_vault(&mut self) {
-        let Some(drag) = self.drag_vault.take() else {
-            return;
-        };
-        if drag.moved {
+    /// End what the left button was carrying: released when it came up, false when
+    /// the pointer went away with it held. A splitter, tab or chip that moved stays
+    /// where it was left and the session remembers it; a chip that never moved was a
+    /// click, which only a release completes.
+    fn end_left_drags(&mut self, released: bool) {
+        let end = self.drags.end(released);
+        if end.save {
             self.save_session();
+        }
+        // Let go of a held thumb, and let the bar fade unless the pointer stayed on it.
+        if let Some(region) = end.scrollbar {
+            self.scrollbar_mut(region).release();
+            self.update_scrollbar_hover();
+            self.dirty = true;
+        }
+        if end.settle {
             // The pointer is free again, so whatever it came to rest over lights up.
             self.update_rail_hover();
             self.dirty = true;
-        } else {
-            self.switch_vault(drag.vault);
         }
+        if let Some(vault) = end.switch_vault {
+            self.switch_vault(vault);
+        }
+        let i = self.active_editor();
+        if self.editors[i].release_drag() {
+            // Image sources under the selection ends were held collapsed while
+            // dragging and can now expand.
+            self.dirty = true;
+        }
+        self.editors[i].disarm_autoscroll();
     }
 
     /// Move the open palette's selection to the row the pointer is over, repainting if
@@ -1543,7 +1552,7 @@ impl State {
     /// entered grows into a slider, every other bar shrinks back. Repaints when one
     /// changed. A live drag owns its bar and ignores this.
     pub(super) fn update_scrollbar_hover(&mut self) {
-        if self.drag_scroll.is_some() {
+        if self.drags.scroll.is_some() {
             return;
         }
         let (px, py) = (self.pointer_x, self.pointer_y);
@@ -1598,7 +1607,7 @@ impl State {
             thumb.h / 2
         };
         self.scrollbar_mut(region).press(grab);
-        self.drag_scroll = Some(region);
+        self.drags.scroll = Some(region);
         self.drag_scroll_to(py);
         true
     }
@@ -1606,7 +1615,7 @@ impl State {
     /// Track a scrollbar drag: put the thumb's top where the pointer holds it and scroll
     /// the column to match.
     pub(super) fn drag_scroll_to(&mut self, py: f32) {
-        let Some(region) = self.drag_scroll else {
+        let Some(region) = self.drags.scroll else {
             return;
         };
         let scale = self.scale();
@@ -1694,7 +1703,7 @@ impl State {
             // The rail around its chips: a click there acts on nothing, but it must
             // not reach the column beside it.
             Hit::Rail => {}
-            Hit::Splitter(s) => self.drag_splitter = Some(s),
+            Hit::Splitter(s) => self.drags.splitter = Some(s),
             Hit::Tree(rect) => self.tree_press(rect, py),
             Hit::TreeFilter => self.toggle_empty_dirs(),
             // The footer beside the toggle: a click there acts on nothing, but it must
@@ -1803,7 +1812,7 @@ impl State {
             .tab_strip_rects(g)
             .and_then(|(_, tabs)| tabs.get(i).map(|t| (px - t.rect.x as f32) as i32))
             .unwrap_or(0);
-        self.drag_tab = Some(TabDrag {
+        self.drags.tab = Some(TabDrag {
             pane: g,
             tab: i,
             grab_x: px,
@@ -1818,7 +1827,7 @@ impl State {
     /// leaving its old pane and re-homing in the one under the pointer. The frame
     /// keeps repainting so the lifted tab tracks the cursor.
     fn drag_tab_to(&mut self, px: f32) {
-        let Some(mut drag) = self.drag_tab else {
+        let Some(mut drag) = self.drags.tab else {
             return;
         };
         if !drag.moved {
@@ -1851,7 +1860,7 @@ impl State {
                 drag.tab = target;
             }
         }
-        self.drag_tab = Some(drag);
+        self.drags.tab = Some(drag);
         self.dirty = true;
     }
 

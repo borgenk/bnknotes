@@ -37,9 +37,9 @@ use crate::platform::ffi;
 use crate::platform::freetype::{FontConfig, Fonts};
 use crate::platform::geom::Rect;
 use crate::platform::protocol::{
-    self, wl_buffer, wl_callback, wl_compositor, wl_data_device_manager, wl_data_offer, wl_display,
-    wl_output, wl_registry, wl_seat, wl_surface, wp_fractional_scale_manager_v1,
-    wp_fractional_scale_v1, wp_viewporter, xdg_surface, xdg_toplevel, xdg_wm_base,
+    self, wl_buffer, wl_callback, wl_compositor, wl_data_offer, wl_display, wl_output, wl_registry,
+    wl_seat, wl_surface, wp_fractional_scale_manager_v1, wp_fractional_scale_v1, wp_viewporter,
+    xdg_surface, xdg_toplevel, xdg_wm_base,
 };
 use crate::platform::scroll::{self, Scrollbar};
 use crate::platform::wire::{self, Arg, Message, Reader};
@@ -305,6 +305,62 @@ struct VaultDrag {
     moved: bool,
 }
 
+/// The drags the left button can carry, each None while it is not. They all end
+/// together, when the button comes up or the pointer goes away with it held.
+#[derive(Default)]
+struct Drags {
+    /// Which splitter: 0 = tree|A edge, 1 = A|B edge.
+    splitter: Option<usize>,
+    /// Whose scrollbar thumb is held. The grab's offset inside the thumb lives on
+    /// that Scrollbar. Focus names the region because the scrollable regions are
+    /// exactly the focusable ones: the sidebar and the two content panes.
+    scroll: Option<Focus>,
+    /// A tab being moved: which pane and tab, and the grab state.
+    tab: Option<TabDrag>,
+    /// A chip being moved to a new place in the rail.
+    vault: Option<VaultDrag>,
+}
+
+/// What ending the drags leaves to do.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct DragEnd {
+    /// A splitter, tab or chip moved, so the session's layout changed.
+    save: bool,
+    /// The region whose scrollbar thumb was let go of.
+    scrollbar: Option<Focus>,
+    /// A tab or chip moved, and settles into its slot.
+    settle: bool,
+    /// The vault of a chip pressed and released without moving.
+    switch_vault: Option<usize>,
+}
+
+impl Drags {
+    /// End every drag, keeping where each got to. released is true when the
+    /// button came up and false when the pointer went away with it held: only a
+    /// release completes a click, so only then does a chip that never moved
+    /// switch vault.
+    fn end(&mut self, released: bool) -> DragEnd {
+        let mut end = DragEnd {
+            save: self.splitter.take().is_some(),
+            scrollbar: self.scroll.take(),
+            ..DragEnd::default()
+        };
+        if self.tab.take().is_some_and(|tab| tab.moved) {
+            end.save = true;
+            end.settle = true;
+        }
+        if let Some(chip) = self.vault.take() {
+            if chip.moved {
+                end.save = true;
+                end.settle = true;
+            } else if released {
+                end.switch_vault = Some(chip.vault);
+            }
+        }
+        end
+    }
+}
+
 impl TabHover {
     /// The hovered tab index in pane `g` (its body highlight), if any.
     fn tab_in(self, g: usize) -> Option<usize> {
@@ -390,8 +446,6 @@ struct State {
     /// Which vault chip the pointer is over, for the rail's hover lift; `None` when
     /// off every chip.
     hovered_vault: Option<usize>,
-    /// A chip being dragged to a new place in the rail, `None` when none is.
-    drag_vault: Option<VaultDrag>,
     /// The chips' baked icons, keyed by each vault's IconKeys: a crop of a vault
     /// picture, resampled to the chip, tinted and rounded, ready for the renderer to
     /// blit like any other image. Baked by [`Self::sync_icons`].
@@ -451,15 +505,7 @@ struct State {
     /// so a tab switch or an open/close reveals the active tab while free wheeling
     /// leaves the offset alone.
     tab_anchor: [(usize, usize); 2],
-    /// While a splitter is dragged, which one: 0 = tree|A edge, 1 = A|B edge.
-    drag_splitter: Option<usize>,
-    /// While a scrollbar thumb is dragged, whose bar it is. The grab's offset inside
-    /// the thumb lives on that [`Scrollbar`]. [`Focus`] names the region here because
-    /// the scrollable regions are exactly the focusable ones: the sidebar and the two
-    /// content panes.
-    drag_scroll: Option<Focus>,
-    /// While a tab is dragged to reorder it: which pane and tab, and the grab state.
-    drag_tab: Option<TabDrag>,
+    drags: Drags,
     /// The toplevel title last sent, so it is only re-set when it changes.
     title: String,
     /// Where the next title is formatted before the compare, so the check that runs
@@ -490,6 +536,8 @@ struct State {
     /// The version seat is bound at, which decides whether its keyboard and
     /// pointer can be released.
     seat_version: u32,
+    /// The bound seat's global name, to notice the seat going away.
+    seat_global: Option<u32>,
     /// Objects released or destroyed whose events may still be in flight.
     retired: RetiredObjects,
     surface: u32,
@@ -498,6 +546,8 @@ struct State {
     keyboard: u32,
     pointer: u32,
     data_device_manager: Option<u32>,
+    /// The bound data device manager's version, which its data devices share.
+    data_device_version: u32,
     data_device: u32,
     /// GPU/dmabuf presentation resources: feedback, backend, swap buffers,
     /// explicit sync, and per-frame presentation counters.
@@ -976,7 +1026,6 @@ impl State {
             tree,
             vaults,
             hovered_vault: None,
-            drag_vault: None,
             icons: ImageStore::new(None),
             icon_size: 0,
             icon_seq: 0,
@@ -999,9 +1048,7 @@ impl State {
             hovered_tab: None,
             tab_scroll: [0, 0],
             tab_anchor: [(0, 0); 2],
-            drag_splitter: None,
-            drag_scroll: None,
-            drag_tab: None,
+            drags: Drags::default(),
             title: String::new(),
             title_scratch: String::new(),
             width: session.window.0,
@@ -1015,6 +1062,7 @@ impl State {
             wm_base: None,
             seat: None,
             seat_version: 0,
+            seat_global: None,
             retired: RetiredObjects::default(),
             surface: 0,
             xdg_surface: 0,
@@ -1022,6 +1070,7 @@ impl State {
             keyboard: 0,
             pointer: 0,
             data_device_manager: None,
+            data_device_version: 0,
             data_device: 0,
             presentation: GpuPresentation::new(),
             cursor_shape_manager: None,
@@ -1312,17 +1361,7 @@ impl State {
             self.scaling.viewport = viewport;
         }
 
-        // The data device drives the clipboard; skip it if the compositor has no
-        // wl_data_device_manager (editing still works, just no copy/paste).
-        if let (Some(manager), Some(seat)) = (self.data_device_manager, self.seat) {
-            let device = self.alloc_id();
-            self.conn.request(
-                manager,
-                wl_data_device_manager::GET_DATA_DEVICE,
-                &[Arg::NewId(device), Arg::Object(seat)],
-            );
-            self.data_device = device;
-        }
+        self.bind_data_device();
 
         self.create_buffers()?;
         // With buffers and a surface in place, negotiate explicit sync if the
@@ -1451,8 +1490,8 @@ impl State {
         self.close_image_view();
         self.tab_scroll = [0, 0];
         self.tab_anchor = [(0, 0); 2];
-        self.drag_tab = None;
-        self.drag_scroll = None;
+        self.drags.tab = None;
+        self.drags.scroll = None;
         self.hovered_tab = None;
         self.focus = Focus::Editor(0);
         self.last_editor = 0;
@@ -2314,7 +2353,7 @@ impl State {
                 hovered: self.hovered_vault,
                 // A press that never crossed the threshold is a click, not a drag, so
                 // it lifts nothing.
-                drag: self.drag_vault.filter(|d| d.moved).map(|d| RailDragView {
+                drag: self.drags.vault.filter(|d| d.moved).map(|d| RailDragView {
                     vault: d.vault,
                     top: (self.pointer_y - d.grab_dy as f32).round() as i32,
                 }),
@@ -2392,7 +2431,7 @@ impl State {
                 && px < (rect.x + rect.w) as f32
                 && py >= rect.y as f32
                 && py < (rect.y + rect.h) as f32;
-            let hovering = over && !ed.dragging() && self.drag_splitter.is_none();
+            let hovering = over && !ed.dragging() && self.drags.splitter.is_none();
             let table_hover = if hovering {
                 ed.layout_cache.as_ref().and_then(|l| {
                     l.table_button_at(&self.fonts, ed.text.rope(), px, ed.content_y(py))
@@ -2462,7 +2501,7 @@ impl State {
                     scroll_x: self.tab_scroll[g],
                     // A tab reorder in progress lifts its tab to follow the pointer,
                     // but only once the press has grown into an actual drag.
-                    drag: self.drag_tab.filter(|d| d.pane == g && d.moved).map(|d| {
+                    drag: self.drags.tab.filter(|d| d.pane == g && d.moved).map(|d| {
                         crate::paint::TabDragView {
                             tab: d.tab,
                             left: (self.pointer_x - d.grab_dx as f32).round() as i32,
@@ -2683,6 +2722,12 @@ impl State {
         if msg.object == self.registry && msg.opcode == wl_registry::EV_GLOBAL {
             return self.on_global(&mut r);
         }
+        if msg.object == self.registry && msg.opcode == wl_registry::EV_GLOBAL_REMOVE {
+            if Some(r.u32()?) == self.seat_global {
+                self.drop_seat();
+            }
+            return Ok(());
+        }
 
         if Some(msg.object) == self.pending_sync && msg.opcode == wl_callback::EV_DONE {
             self.pending_sync = None;
@@ -2893,13 +2938,16 @@ impl State {
                 let id = self.bind_capped(name, interface, version, protocol::VERSION_WM_BASE);
                 self.wm_base = Some(id);
             }
-            // The first seat only. The keyboard and pointer belong to the seat that
+            // One seat at a time. The keyboard and pointer belong to the seat that
             // created them, so a second seat whose capabilities lack a keyboard must
-            // not release the first seat's.
+            // not release the first seat's. Once the bound seat goes away, the next
+            // one announced takes its place.
             protocol::IFACE_SEAT if self.seat.is_none() => {
                 let id = self.bind_capped(name, interface, version, protocol::VERSION_SEAT);
                 self.seat = Some(id);
                 self.seat_version = version.min(protocol::VERSION_SEAT);
+                self.seat_global = Some(name);
+                self.bind_data_device();
             }
             protocol::IFACE_DATA_DEVICE_MANAGER => {
                 let id = self.bind_capped(
@@ -2909,6 +2957,7 @@ impl State {
                     protocol::VERSION_DATA_DEVICE_MANAGER,
                 );
                 self.data_device_manager = Some(id);
+                self.data_device_version = version.min(protocol::VERSION_DATA_DEVICE_MANAGER);
             }
             protocol::IFACE_CURSOR_SHAPE_MANAGER => {
                 let id = self.bind_capped(
@@ -3215,6 +3264,81 @@ mod tests {
             "a {}-byte request",
             request.len()
         );
+    }
+
+    fn chip(moved: bool) -> VaultDrag {
+        VaultDrag {
+            vault: 2,
+            grab_y: 0.0,
+            grab_dy: 0,
+            moved,
+        }
+    }
+
+    fn tab(moved: bool) -> TabDrag {
+        TabDrag {
+            pane: 0,
+            tab: 1,
+            grab_x: 0.0,
+            grab_dx: 0,
+            moved,
+        }
+    }
+
+    #[test]
+    fn a_release_completes_a_chip_click_and_a_lost_pointer_does_not() {
+        let mut drags = Drags {
+            vault: Some(chip(false)),
+            ..Drags::default()
+        };
+        assert_eq!(
+            drags.end(false),
+            DragEnd::default(),
+            "no click without a release"
+        );
+        assert!(drags.vault.is_none(), "the press is over either way");
+
+        let mut drags = Drags {
+            vault: Some(chip(false)),
+            ..Drags::default()
+        };
+        let clicked = DragEnd {
+            switch_vault: Some(2),
+            ..DragEnd::default()
+        };
+        assert_eq!(drags.end(true), clicked);
+    }
+
+    #[test]
+    fn a_lost_pointer_ends_every_drag_and_keeps_what_moved() {
+        let mut drags = Drags {
+            splitter: Some(1),
+            scroll: Some(Focus::Editor(0)),
+            tab: Some(tab(true)),
+            vault: Some(chip(true)),
+        };
+        let ended = DragEnd {
+            save: true,
+            scrollbar: Some(Focus::Editor(0)),
+            settle: true,
+            switch_vault: None,
+        };
+        assert_eq!(drags.end(false), ended);
+        assert_eq!(
+            drags.end(false),
+            DragEnd::default(),
+            "nothing is left running"
+        );
+    }
+
+    #[test]
+    fn a_tab_click_that_never_moved_leaves_nothing_to_save() {
+        let mut drags = Drags {
+            tab: Some(tab(false)),
+            ..Drags::default()
+        };
+        assert_eq!(drags.end(true), DragEnd::default());
+        assert!(drags.tab.is_none());
     }
 
     #[test]

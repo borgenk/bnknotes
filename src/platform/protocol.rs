@@ -15,6 +15,8 @@ pub mod wl_display {
 pub mod wl_registry {
     pub const BIND: u16 = 0;
     pub const EV_GLOBAL: u16 = 0;
+    /// A global went away; carries its name.
+    pub const EV_GLOBAL_REMOVE: u16 = 1;
 }
 
 pub mod wl_callback {
@@ -94,6 +96,9 @@ pub mod wl_seat {
     pub const CAP_KEYBOARD: u32 = 2;
     /// The seat version that added wl_pointer.release and wl_keyboard.release.
     pub const VERSION_RELEASE: u32 = 3;
+    /// Release the seat object (seat version 5 and later).
+    pub const RELEASE: u16 = 3;
+    pub const VERSION_SEAT_RELEASE: u32 = 5;
 }
 
 pub mod wl_pointer {
@@ -136,6 +141,9 @@ pub mod wl_data_device_manager {
 
 pub mod wl_data_device {
     pub const SET_SELECTION: u16 = 1;
+    /// Release the data device (data device manager version 2 and later).
+    pub const RELEASE: u16 = 2;
+    pub const VERSION_RELEASE: u32 = 2;
     /// The compositor introduces a new wl_data_offer (carries its new id).
     pub const EV_DATA_OFFER: u16 = 0;
     /// The clipboard selection changed to an offer (or null = cleared).

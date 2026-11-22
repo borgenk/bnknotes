@@ -82,6 +82,43 @@ impl ClipboardState {
 }
 
 impl State {
+    /// Create the data device that drives the clipboard, once both the seat and
+    /// the data device manager are bound. Without a manager editing still works,
+    /// just with no copy and paste.
+    pub(super) fn bind_data_device(&mut self) {
+        let (Some(manager), Some(seat), 0) =
+            (self.data_device_manager, self.seat, self.data_device)
+        else {
+            return;
+        };
+        let device = self.alloc_id();
+        self.conn.request(
+            manager,
+            wl_data_device_manager::GET_DATA_DEVICE,
+            &[Arg::NewId(device), Arg::Object(seat)],
+        );
+        self.data_device = device;
+    }
+
+    /// Let go of the data device with its seat, and of the selection it offered.
+    /// Our own selection stays, for pasting within the editor.
+    pub(super) fn release_data_device(&mut self) {
+        if self.clipboard.selection_offer != 0 {
+            self.conn
+                .request(self.clipboard.selection_offer, wl_data_offer::DESTROY, &[]);
+        }
+        self.clipboard.selection_offer = 0;
+        self.clipboard.selection_text_mime = None;
+        self.clipboard.selection_image_mime = None;
+        self.clipboard.incoming_offer = 0;
+        self.clipboard.incoming_text_mime = None;
+        self.clipboard.incoming_image_mime = None;
+        let device = std::mem::take(&mut self.data_device);
+        if device != 0 && self.data_device_version >= wl_data_device::VERSION_RELEASE {
+            self.conn.request(device, wl_data_device::RELEASE, &[]);
+        }
+    }
+
     pub(super) fn on_data_device(&mut self, opcode: u16, r: &mut Reader) -> Result<()> {
         match opcode {
             wl_data_device::EV_DATA_OFFER => {

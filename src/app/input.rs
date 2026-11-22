@@ -15,6 +15,7 @@ use crate::platform::freetype::{Fonts, Metrics};
 use crate::platform::geom::Rect;
 use crate::platform::protocol::{
     wl_keyboard, wl_pointer, wl_seat, wp_cursor_shape_device_v1, wp_cursor_shape_manager_v1,
+    xdg_activation_token_v1, xdg_activation_v1,
 };
 use crate::platform::scroll::{self, Scrollbar};
 use crate::platform::wire::{Arg, Reader};
@@ -321,6 +322,39 @@ impl State {
             self.conn.request(seat, wl_seat::RELEASE, &[]);
         }
         self.seat_version = 0;
+    }
+
+    /// Open a vetted link target. With xdg-activation, the browser launches once
+    /// the compositor answers with a token for this click, so its window comes to
+    /// the front; without it, or with too many links waiting, it launches now.
+    fn open_link(&mut self, target: String) {
+        if let (Some(activation), Some(seat), false) =
+            (self.activation, self.seat, self.link_tokens.is_full())
+        {
+            let token = self.alloc_id();
+            self.conn.request(
+                activation,
+                xdg_activation_v1::GET_ACTIVATION_TOKEN,
+                &[Arg::NewId(token)],
+            );
+            self.conn.request(
+                token,
+                xdg_activation_token_v1::SET_SERIAL,
+                &[Arg::Uint(self.last_serial), Arg::Object(seat)],
+            );
+            self.conn.request(
+                token,
+                xdg_activation_token_v1::SET_SURFACE,
+                &[Arg::Object(self.surface)],
+            );
+            self.conn
+                .request(token, xdg_activation_token_v1::COMMIT, &[]);
+            self.link_tokens.wait(token, target);
+            return;
+        }
+        if let Err(e) = crate::platform::browser::launch(&target, None) {
+            eprintln!("bnknotes: {e}");
+        }
     }
 
     /// The seat lost its keyboard: release the inert object and forget it,
@@ -2042,8 +2076,9 @@ impl State {
             && !shift
             && let Some(dest) = self.editors[i].link_under_pointer(&self.fonts, rect, px, py)
         {
-            match crate::platform::browser::open_url(&dest) {
-                Ok(()) => {
+            match crate::platform::browser::vet(&dest) {
+                Ok(target) => {
+                    self.open_link(target);
                     self.editors[i].end_drag();
                     return;
                 }

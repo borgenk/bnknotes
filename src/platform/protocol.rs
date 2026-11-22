@@ -220,6 +220,23 @@ pub mod zwp_linux_dmabuf_feedback_v1 {
     pub const EV_TRANCHE_FLAGS: u16 = 6;
 }
 
+pub mod xdg_activation_v1 {
+    /// Mint a token object: `new_id`.
+    pub const GET_ACTIVATION_TOKEN: u16 = 1;
+    /// Ask for a surface to be activated with a token: the token, then the surface.
+    pub const ACTIVATE: u16 = 2;
+}
+
+pub mod xdg_activation_token_v1 {
+    /// The input event the request answers: its serial, then the seat.
+    pub const SET_SERIAL: u16 = 0;
+    pub const SET_SURFACE: u16 = 2;
+    pub const COMMIT: u16 = 3;
+    pub const DESTROY: u16 = 4;
+    /// The token, as a string.
+    pub const EV_DONE: u16 = 0;
+}
+
 pub mod wp_cursor_shape_manager_v1 {
     /// Create a shape device for a `wl_pointer`: `new_id` then the pointer.
     pub const GET_POINTER: u16 = 1;
@@ -265,6 +282,7 @@ pub const IFACE_WM_BASE: &str = "xdg_wm_base";
 pub const IFACE_SEAT: &str = "wl_seat";
 pub const IFACE_DATA_DEVICE_MANAGER: &str = "wl_data_device_manager";
 pub const IFACE_CURSOR_SHAPE_MANAGER: &str = "wp_cursor_shape_manager_v1";
+pub const IFACE_ACTIVATION: &str = "xdg_activation_v1";
 pub const IFACE_DMABUF: &str = "zwp_linux_dmabuf_v1";
 pub const IFACE_DRM_SYNCOBJ: &str = "wp_linux_drm_syncobj_manager_v1";
 pub const IFACE_OUTPUT: &str = "wl_output";
@@ -278,6 +296,7 @@ pub const VERSION_SEAT: u32 = 5;
 pub const VERSION_DATA_DEVICE_MANAGER: u32 = 3;
 /// We only need the `text` shape, which exists in version 1.
 pub const VERSION_CURSOR_SHAPE_MANAGER: u32 = 1;
+pub const VERSION_ACTIVATION: u32 = 1;
 /// Version 4 introduced the feedback object (format table, main device,
 /// tranches), which the GPU path requires; an older advertisement is not bound.
 pub const VERSION_DMABUF: u32 = 4;

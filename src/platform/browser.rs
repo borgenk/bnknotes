@@ -381,35 +381,53 @@ fn percent_decoded(text: &str) -> impl Iterator<Item = Option<u8>> + '_ {
     })
 }
 
-/// Open `url` in the default browser via `xdg-open`, detached from the app.
+/// The target to hand `xdg-open` for a clicked `url`, or why it is refused.
 ///
 /// `xdg-open` is a thin shell wrapper, so the URL is judged first: a clicked link
 /// can only ever open a web, file or mail target that is what it reads as, never a
-/// `javascript:`/`data:`-style payload. `xdg-open` launches the handler and exits
-/// almost immediately; it is reaped on a short-lived detached thread so it never
-/// lingers as a zombie and the launch never blocks the event loop.
-pub fn open_url(url: &str) -> Result<()> {
+/// `javascript:`/`data:`-style payload.
+pub fn vet(url: &str) -> Result<String> {
     let refused =
         |refusal: Refusal| Error::msg(format!("refusing to open {url:?}: {}", refusal.reason()));
     judge(url).map_err(refused)?;
-    let target = if url.starts_with("file://") {
-        judge_file(url).map_err(refused)?
+    if url.starts_with("file://") {
+        judge_file(url).map_err(refused)
     } else {
-        url.to_string()
-    };
-    let mut child = Command::new("xdg-open")
-        .arg(target)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()?;
+        Ok(url.to_string())
+    }
+}
+
+/// Open a vetted target in the default browser via `xdg-open`, detached from the
+/// app. `xdg-open` launches the handler and exits almost immediately; it is reaped
+/// on a short-lived detached thread so it never lingers as a zombie and the launch
+/// never blocks the event loop.
+pub fn launch(target: &str, token: Option<&str>) -> Result<()> {
+    let mut child = opener(target, token).spawn()?;
     std::thread::spawn(move || {
         let _ = child.wait();
     });
     Ok(())
 }
 
-/// Whether [`open_url`] would launch `url`. The app checks this before offering a
+/// The xdg-open command for target. The activation token, when the compositor
+/// gave one for the click, lets the browser's window come to the front; with none
+/// the variable is cleared, so no stale token reaches it.
+fn opener(target: &str, token: Option<&str>) -> Command {
+    let mut command = Command::new("xdg-open");
+    command
+        .arg(target)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .env_remove("DESKTOP_STARTUP_ID");
+    match token {
+        Some(token) => command.env("XDG_ACTIVATION_TOKEN", token),
+        None => command.env_remove("XDG_ACTIVATION_TOKEN"),
+    };
+    command
+}
+
+/// Whether [`vet`] would pass `url`. The app checks this before offering a
 /// link to the pointer, so a target it would refuse never presents itself as
 /// clickable in the first place.
 pub fn can_open(url: &str) -> bool {
@@ -711,10 +729,52 @@ mod tests {
     }
 
     #[test]
-    fn open_url_refuses_unvetted_targets_without_spawning() {
+    fn vet_refuses_what_xdg_open_must_never_see() {
         // A disallowed scheme or a leading dash never reaches xdg-open.
-        assert!(open_url("javascript:alert(1)").is_err());
-        assert!(open_url("-flag").is_err());
-        assert!(open_url("page.md").is_err());
+        assert!(vet("javascript:alert(1)").is_err());
+        assert!(vet("-flag").is_err());
+        assert!(vet("page.md").is_err());
+        assert_eq!(
+            vet("https://example.com/").ok().as_deref(),
+            Some("https://example.com/")
+        );
+    }
+
+    #[test]
+    fn the_opener_passes_the_clicks_token_and_never_an_inherited_one() {
+        let envs = |command: &Command| -> Vec<(String, Option<String>)> {
+            let mut envs: Vec<_> = command
+                .get_envs()
+                .map(|(key, value)| {
+                    let text = |s: &std::ffi::OsStr| s.to_string_lossy().into_owned();
+                    (text(key), value.map(text))
+                })
+                .collect();
+            envs.sort();
+            envs
+        };
+        let with = opener("https://example.com/", Some("tok-1"));
+        assert_eq!(
+            envs(&with),
+            [
+                ("DESKTOP_STARTUP_ID".to_string(), None),
+                (
+                    "XDG_ACTIVATION_TOKEN".to_string(),
+                    Some("tok-1".to_string())
+                ),
+            ]
+        );
+        let without = opener("https://example.com/", None);
+        assert_eq!(
+            envs(&without),
+            [
+                ("DESKTOP_STARTUP_ID".to_string(), None),
+                ("XDG_ACTIVATION_TOKEN".to_string(), None),
+            ],
+            "cleared, not inherited"
+        );
+        assert_eq!(with.get_program(), "xdg-open");
+        let args: Vec<_> = with.get_args().collect();
+        assert_eq!(args, ["https://example.com/"]);
     }
 }

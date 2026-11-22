@@ -39,7 +39,7 @@ use crate::platform::geom::Rect;
 use crate::platform::protocol::{
     self, wl_buffer, wl_callback, wl_compositor, wl_data_offer, wl_display, wl_output, wl_registry,
     wl_seat, wl_surface, wp_fractional_scale_manager_v1, wp_fractional_scale_v1, wp_viewporter,
-    xdg_surface, xdg_toplevel, xdg_wm_base,
+    xdg_activation_token_v1, xdg_activation_v1, xdg_surface, xdg_toplevel, xdg_wm_base,
 };
 use crate::platform::scroll::{self, Scrollbar};
 use crate::platform::wire::{self, Arg, Message, Reader};
@@ -187,11 +187,29 @@ fn report(result: Result<()>) -> ExitCode {
 }
 
 fn run(path: Option<PathBuf>, demo_diff: bool) -> Result<()> {
+    let launch_token = take_launch_token();
     let mut state = State::new(path)?;
+    state.launch_token = launch_token;
     if demo_diff {
         state.open_demo_diff();
     }
     state.bring_up()
+}
+
+/// The activation token a launcher handed the editor, taken out of the environment
+/// so that no process the editor starts (a browser for a link, an AI command)
+/// inherits it and claims activation it was not given.
+fn take_launch_token() -> Option<String> {
+    let token = std::env::var("XDG_ACTIVATION_TOKEN")
+        .ok()
+        .filter(|token| !token.is_empty());
+    // SAFETY: run calls this before anything starts a thread, so nothing reads the
+    // environment while it changes.
+    unsafe {
+        std::env::remove_var("XDG_ACTIVATION_TOKEN");
+        std::env::remove_var("DESKTOP_STARTUP_ID");
+    }
+    token
 }
 
 /// Runs the startup negotiation without opening a window, so a successful probe
@@ -356,6 +374,40 @@ impl SeatGlobals {
         let (name, version) = self.spare.remove(0);
         self.bound = Some(name);
         SeatRemoval::Replaced { name, version }
+    }
+}
+
+/// Clicked links waiting for the activation token that lets the browser come to
+/// the front, by token object.
+#[derive(Default)]
+struct LinkTokens {
+    waiting: Vec<(u32, String)>,
+}
+
+/// Most links waiting for a token at once; past it a link opens without one.
+const MAX_LINK_TOKENS: usize = 8;
+
+impl LinkTokens {
+    fn is_full(&self) -> bool {
+        self.waiting.len() >= MAX_LINK_TOKENS
+    }
+
+    /// Hold target until token's done event. Ignored once full: the caller checks
+    /// is_full first and opens the link without a token instead.
+    fn wait(&mut self, token: u32, target: String) {
+        if !self.is_full() {
+            self.waiting.push((token, target));
+        }
+    }
+
+    fn waits_on(&self, token: u32) -> bool {
+        self.waiting.iter().any(|(id, _)| *id == token)
+    }
+
+    /// The target waiting on token, now that its token arrived.
+    fn done(&mut self, token: u32) -> Option<String> {
+        let at = self.waiting.iter().position(|(id, _)| *id == token)?;
+        Some(self.waiting.remove(at).1)
     }
 }
 
@@ -611,6 +663,12 @@ struct State {
     /// I-beam over text.
     cursor_shape_manager: Option<u32>,
     cursor_shape_device: u32,
+    /// xdg_activation_v1, which mints the tokens that let a window come to the
+    /// front: the browser's for a clicked link, and this window's own at launch.
+    activation: Option<u32>,
+    /// The token the launcher handed this window, until the window uses it.
+    launch_token: Option<String>,
+    link_tokens: LinkTokens,
     /// The most recent pointer `enter` serial (cursor-shape requests need it) and
     /// the shape currently set, so motion only re-requests when the shape changes.
     pointer_serial: u32,
@@ -1127,6 +1185,9 @@ impl State {
             data_device: 0,
             presentation: GpuPresentation::new(),
             cursor_shape_manager: None,
+            activation: None,
+            launch_token: None,
+            link_tokens: LinkTokens::default(),
             cursor_shape_device: 0,
             pointer_serial: 0,
             cursor_shape: 0,
@@ -1426,6 +1487,14 @@ impl State {
         // by the loop once `configured` is set.
         self.conn.request(self.surface, wl_surface::COMMIT, &[]);
         self.run_until(|s| s.configured)?;
+        // With the window up, the launcher's token brings it to the front.
+        if let (Some(activation), Some(token)) = (self.activation, self.launch_token.take()) {
+            self.conn.request(
+                activation,
+                xdg_activation_v1::ACTIVATE,
+                &[Arg::Str(&token), Arg::Object(self.surface)],
+            );
+        }
 
         // Name the GPU device under BNKNOTES_STATS, beside the per-frame stats it
         // belongs with. `--gpu-probe` reports the same thing without a window, so a
@@ -2980,6 +3049,20 @@ impl State {
             return self.on_dmabuf_feedback(msg.opcode, &mut r);
         }
 
+        if self.link_tokens.waits_on(msg.object) {
+            if msg.opcode == xdg_activation_token_v1::EV_DONE {
+                let token = r.string()?;
+                if let Some(target) = self.link_tokens.done(msg.object) {
+                    if let Err(e) = crate::platform::browser::launch(&target, Some(token)) {
+                        eprintln!("bnknotes: {e}");
+                    }
+                    self.conn
+                        .request(msg.object, xdg_activation_token_v1::DESTROY, &[]);
+                }
+            }
+            return Ok(());
+        }
+
         if msg.opcode == wl_buffer::EV_RELEASE {
             if msg.object == self.presentation.buffers[0] {
                 self.presentation.busy[0] = false;
@@ -3017,6 +3100,10 @@ impl State {
                 );
                 self.data_device_manager = Some(id);
                 self.data_device_version = version.min(protocol::VERSION_DATA_DEVICE_MANAGER);
+            }
+            protocol::IFACE_ACTIVATION => {
+                let id = self.bind_capped(name, interface, version, protocol::VERSION_ACTIVATION);
+                self.activation = Some(id);
             }
             protocol::IFACE_CURSOR_SHAPE_MANAGER => {
                 let id = self.bind_capped(
@@ -3338,6 +3425,28 @@ mod tests {
             "a {}-byte request",
             request.len()
         );
+    }
+
+    #[test]
+    fn a_clicked_link_waits_for_its_own_token() {
+        let mut links = LinkTokens::default();
+        links.wait(40, "https://a.example/".to_string());
+        links.wait(41, "https://b.example/".to_string());
+        assert!(links.waits_on(41) && !links.waits_on(42));
+        assert_eq!(links.done(41).as_deref(), Some("https://b.example/"));
+        assert!(!links.waits_on(41), "a token answers once");
+        assert_eq!(links.done(40).as_deref(), Some("https://a.example/"));
+    }
+
+    #[test]
+    fn the_links_waiting_for_tokens_stay_bounded() {
+        let mut links = LinkTokens::default();
+        for id in 0..MAX_LINK_TOKENS as u32 {
+            links.wait(id, format!("https://{id}.example/"));
+        }
+        assert!(links.is_full());
+        links.wait(99, "https://late.example/".to_string());
+        assert!(!links.waits_on(99), "the caller opens it without a token");
     }
 
     #[test]

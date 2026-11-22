@@ -39,6 +39,8 @@ const SEEK_END: c_int = 2;
 const SOL_SOCKET: c_int = 1;
 const SCM_RIGHTS: c_int = 1;
 const MSG_NOSIGNAL: c_int = 0x4000;
+/// Send without waiting for room.
+const MSG_DONTWAIT: c_int = 0x40;
 const MSG_CMSG_CLOEXEC: c_int = 0x4000_0000;
 /// Set in `msg_flags` by `recvmsg` when the control buffer was too small to hold
 /// all the ancillary data, so some passed fds were dropped.
@@ -239,21 +241,31 @@ struct PollFd {
     revents: c_short,
 }
 
-/// Block until one of `fds` is readable (or errored / hung up), or `timeout`
-/// elapses; `None` waits indefinitely. Returns a bitmask whose bit `i` is set
-/// when `fds[i]` is ready, so the caller drains exactly the ready ones. An
-/// interrupting signal returns an empty mask (bit none set), which the event
-/// loop treats as a timeout: it services its timers and polls again.
+/// poll_io waiting on reading alone.
+#[cfg(test)]
 pub fn poll_readable(fds: &[RawFd], timeout: Option<Duration>) -> Result<u32> {
-    assert!(fds.len() <= 32, "poll_readable handles at most 32 fds");
+    poll_io(fds, 0, timeout).map(|(readable, _)| readable)
+}
+
+/// Block until one of fds is readable (or errored or hung up), one whose bit is
+/// set in writable has room to write, or timeout elapses; None waits
+/// indefinitely. Returns two bitmasks, readable and then writable, whose bit i is
+/// set when fds[i] is, so the caller handles exactly the ready ones. An
+/// interrupting signal returns empty masks, which the event loop treats as a
+/// timeout: it services its timers and polls again.
+pub fn poll_io(fds: &[RawFd], writable: u32, timeout: Option<Duration>) -> Result<(u32, u32)> {
+    assert!(fds.len() <= 32, "poll_io handles at most 32 fds");
     let mut pollfds = [PollFd {
         fd: -1,
         events: 0,
         revents: 0,
     }; 32];
-    for (slot, &fd) in pollfds.iter_mut().zip(fds) {
+    for (i, (slot, &fd)) in pollfds.iter_mut().zip(fds).enumerate() {
         slot.fd = fd;
         slot.events = POLLIN;
+        if writable & (1 << i) != 0 {
+            slot.events |= POLLOUT;
+        }
     }
     let ms = match timeout {
         None => -1,
@@ -264,17 +276,20 @@ pub fn poll_readable(fds: &[RawFd], timeout: Option<Duration>) -> Result<u32> {
     let n = unsafe { poll(pollfds.as_mut_ptr(), fds.len() as c_ulong, ms) };
     if n < 0 {
         if errno() == EINTR {
-            return Ok(0);
+            return Ok((0, 0));
         }
         return Err(Error::msg(format!("poll failed: errno {}", errno())));
     }
-    let mut ready = 0u32;
+    let (mut readable, mut room) = (0u32, 0u32);
     for (i, slot) in pollfds.iter().take(fds.len()).enumerate() {
         if slot.revents & (POLLIN | POLLERR | POLLHUP) != 0 {
-            ready |= 1 << i;
+            readable |= 1 << i;
+        }
+        if slot.revents & POLLOUT != 0 {
+            room |= 1 << i;
         }
     }
-    Ok(ready)
+    Ok((readable, room))
 }
 
 /// A poll timeout in milliseconds, rounded up so the wait never ends early, and
@@ -383,82 +398,68 @@ const fn cmsg_len(data_len: usize) -> usize {
     cmsg_align(mem::size_of::<CmsgHdr>()) + data_len
 }
 
-/// Send `bytes` on `sock`, attaching `fds` as SCM_RIGHTS ancillary data on the
-/// first segment. Handles short writes (the kernel may not take everything at
-/// once) and EINTR. The fds ride only on the first `sendmsg`, which is where
-/// the bytes that reference them begin.
-pub fn send_with_fds(sock: RawFd, bytes: &[u8], fds: &[RawFd]) -> Result<()> {
-    // The fds ride on the first segment's sendmsg; with no payload the send loop
-    // below never runs and they would be dropped. Wayland always pairs an fd
-    // with the (non-empty) request that references it, so assert rather than leak.
+/// Send as much of bytes on sock as it takes without waiting, attaching fds as
+/// SCM_RIGHTS ancillary data to the first byte: the count sent, or None when the
+/// socket has no room. Wayland always pairs an fd with the (non-empty) request
+/// that references it, so fds with no bytes would be dropped.
+pub fn send_some(sock: RawFd, bytes: &[u8], fds: &[RawFd]) -> Result<Option<usize>> {
     debug_assert!(
         fds.is_empty() || !bytes.is_empty(),
-        "send_with_fds called with fds but no bytes; the fds would be dropped"
+        "send_some called with fds but no bytes; the fds would be dropped"
     );
     let data_len = mem::size_of_val(fds);
     if cmsg_space(data_len) > CMSG_CAP {
         return Err(Error::msg("too many fds for one control message"));
     }
-
-    let mut sent = 0usize;
-    let mut first = true;
-    while sent < bytes.len() {
-        let iov = IoVec {
-            iov_base: bytes[sent..].as_ptr() as *mut c_void,
-            iov_len: bytes.len() - sent,
+    let iov = IoVec {
+        iov_base: bytes.as_ptr() as *mut c_void,
+        iov_len: bytes.len(),
+    };
+    let mut cbuf = CmsgBuf::zeroed();
+    let (control, controllen) = if fds.is_empty() {
+        (core::ptr::null_mut(), 0)
+    } else {
+        let hdr = CmsgHdr {
+            cmsg_len: cmsg_len(data_len),
+            cmsg_level: SOL_SOCKET,
+            cmsg_type: SCM_RIGHTS,
         };
-
-        let mut cbuf = CmsgBuf::zeroed();
-        let (control, controllen) = if first && !fds.is_empty() {
-            let hdr = CmsgHdr {
-                cmsg_len: cmsg_len(data_len),
-                cmsg_level: SOL_SOCKET,
-                cmsg_type: SCM_RIGHTS,
-            };
-            // SAFETY: cbuf is 8-aligned and large enough (checked above); we
-            // write the header then each fd into the data area.
-            unsafe {
-                core::ptr::write(cbuf.0.as_mut_ptr() as *mut CmsgHdr, hdr);
-                let data = cbuf
-                    .0
-                    .as_mut_ptr()
-                    .add(cmsg_align(mem::size_of::<CmsgHdr>()));
-                for (i, &fd) in fds.iter().enumerate() {
-                    core::ptr::write_unaligned(
-                        data.add(i * mem::size_of::<RawFd>()) as *mut RawFd,
-                        fd,
-                    );
-                }
+        // SAFETY: cbuf is 8-aligned and large enough (checked above); the header
+        // and then each fd are written into it.
+        unsafe {
+            core::ptr::write(cbuf.0.as_mut_ptr() as *mut CmsgHdr, hdr);
+            let data = cbuf
+                .0
+                .as_mut_ptr()
+                .add(cmsg_align(mem::size_of::<CmsgHdr>()));
+            for (i, &fd) in fds.iter().enumerate() {
+                core::ptr::write_unaligned(data.add(i * mem::size_of::<RawFd>()) as *mut RawFd, fd);
             }
-            (cbuf.0.as_mut_ptr() as *mut c_void, cmsg_space(data_len))
-        } else {
-            (core::ptr::null_mut(), 0)
-        };
-
-        let msg = MsgHdr {
-            msg_name: core::ptr::null_mut(),
-            msg_namelen: 0,
-            msg_iov: &iov as *const IoVec as *mut IoVec,
-            msg_iovlen: 1,
-            msg_control: control,
-            msg_controllen: controllen,
-            msg_flags: 0,
-        };
-
-        // SAFETY: msg points at a fully initialized header whose iov/control
-        // buffers outlive the call.
-        let n = unsafe { sendmsg(sock, &msg, MSG_NOSIGNAL) };
-        if n < 0 {
-            let e = errno();
-            if e == EINTR {
-                continue;
-            }
-            return Err(Error::msg(format!("sendmsg failed: errno {e}")));
         }
-        sent += n as usize;
-        first = false;
+        (cbuf.0.as_mut_ptr() as *mut c_void, cmsg_space(data_len))
+    };
+    let msg = MsgHdr {
+        msg_name: core::ptr::null_mut(),
+        msg_namelen: 0,
+        msg_iov: &iov as *const IoVec as *mut IoVec,
+        msg_iovlen: 1,
+        msg_control: control,
+        msg_controllen: controllen,
+        msg_flags: 0,
+    };
+    loop {
+        // SAFETY: msg points at a fully initialized header whose iov and control
+        // buffers outlive the call.
+        let n = unsafe { sendmsg(sock, &msg, MSG_NOSIGNAL | MSG_DONTWAIT) };
+        if n >= 0 {
+            return Ok(Some(n as usize));
+        }
+        match errno() {
+            EINTR => continue,
+            EAGAIN => return Ok(None),
+            e => return Err(Error::msg(format!("sendmsg failed: errno {e}"))),
+        }
     }
-    Ok(())
 }
 
 /// Receive into `buf`, appending any fds carried as SCM_RIGHTS ancillary data
@@ -669,6 +670,11 @@ pub fn dmabuf_export_sync_file(dmabuf: RawFd) -> Result<Option<OwnedFd>> {
 /// Wait until the fence in sync_file signals, or timeout passes; whether it did.
 pub fn wait_sync_file(sync_file: RawFd, timeout: Duration) -> bool {
     wait_for_events(sync_file, POLLIN, timeout)
+}
+
+/// Wait until fd has room to write, or timeout passes; whether it does.
+pub fn wait_writable(fd: RawFd, timeout: Duration) -> bool {
+    wait_for_events(fd, POLLOUT, timeout)
 }
 
 /// Wait until every fence on dmabuf (the compositor's reads and writes) signals,
@@ -1134,6 +1140,27 @@ mod tests {
             started.elapsed() < Duration::from_secs(1),
             "a ready fd returns at once"
         );
+    }
+
+    #[test]
+    fn a_socket_with_no_room_wakes_the_poll_once_its_peer_reads() {
+        use std::io::Read;
+        use std::os::unix::net::UnixStream;
+        let (ours, mut theirs) = UnixStream::pair().expect("a socket pair");
+        let fd = ours.as_raw_fd();
+        let chunk = [0u8; 4096];
+        while send_some(fd, &chunk, &[]).expect("send").is_some() {}
+        let quick = Some(Duration::from_millis(10));
+        assert_eq!(
+            poll_io(&[fd], 0b1, quick).expect("poll"),
+            (0, 0),
+            "no room yet"
+        );
+        theirs.set_nonblocking(true).expect("non-blocking peer");
+        let mut buf = [0u8; 65536];
+        while theirs.read(&mut buf).is_ok_and(|n| n > 0) {}
+        let (_, room) = poll_io(&[fd], 0b1, Some(Duration::from_secs(5))).expect("poll");
+        assert_eq!(room, 0b1, "room again once the peer read");
     }
 
     #[test]

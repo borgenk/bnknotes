@@ -82,6 +82,30 @@ impl ClipboardState {
 }
 
 impl State {
+    /// Ask the selection's offer for mime and read what its source sends, to the
+    /// end. The read waits on the source, so the request has to have gone first.
+    fn receive_offer(&mut self, mime: &str) -> Result<Vec<u8>> {
+        let (read_end, write_end) = ffi::pipe()?;
+        self.conn.request_with_fd(
+            self.clipboard.selection_offer,
+            wl_data_offer::RECEIVE,
+            &[Arg::Str(mime)],
+            write_end.as_raw_fd(),
+        )?;
+        drop(write_end);
+        if !self.conn.flush_within(PASTE_IDLE)? {
+            return Err(Error::msg(
+                "the compositor is not reading, so the paste could not be asked for",
+            ));
+        }
+        ffi::read_to_end(
+            read_end.as_raw_fd(),
+            MAX_PASTE_BYTES,
+            PASTE_IDLE,
+            PASTE_TOTAL,
+        )
+    }
+
     /// Create the data device that drives the clipboard, once both the seat and
     /// the data device manager are bound. Without a manager editing still works,
     /// just with no copy and paste.
@@ -324,20 +348,7 @@ impl State {
         ) else {
             return Ok(None);
         };
-        let (read_end, write_end) = ffi::pipe()?;
-        self.conn.request_with_fd(
-            self.clipboard.selection_offer,
-            wl_data_offer::RECEIVE,
-            &[Arg::Str(&mime)],
-            write_end.as_raw_fd(),
-        )?;
-        drop(write_end);
-        Ok(Some(ffi::read_to_end(
-            read_end.as_raw_fd(),
-            MAX_PASTE_BYTES,
-            PASTE_IDLE,
-            PASTE_TOTAL,
-        )?))
+        Ok(Some(self.receive_offer(&mime)?))
     }
 
     /// Write `bytes` into the active vault's attachment folder, under a fresh name,
@@ -412,20 +423,7 @@ impl State {
         ) else {
             return Ok(None);
         };
-        let (read_end, write_end) = ffi::pipe()?;
-        self.conn.request_with_fd(
-            self.clipboard.selection_offer,
-            wl_data_offer::RECEIVE,
-            &[Arg::Str(&mime)],
-            write_end.as_raw_fd(),
-        )?;
-        drop(write_end);
-        let bytes = ffi::read_to_end(
-            read_end.as_raw_fd(),
-            MAX_PASTE_BYTES,
-            PASTE_IDLE,
-            PASTE_TOTAL,
-        )?;
+        let bytes = self.receive_offer(&mime)?;
         // Text that is not UTF-8 pastes lossily, as our own selection does.
         Ok(Some(String::from_utf8(bytes).unwrap_or_else(|e| {
             String::from_utf8_lossy(e.as_bytes()).into_owned()

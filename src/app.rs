@@ -2335,7 +2335,14 @@ impl State {
             }
             None => 2,
         };
-        let ready = ffi::poll_readable(&fds[..n], timeout)?;
+        // While requests wait for room, the socket having room wakes the loop too,
+        // and its next pass flushes them.
+        let write = if self.conn.has_pending_output() {
+            0b001
+        } else {
+            0
+        };
+        let (ready, _) = ffi::poll_io(&fds[..n], write, timeout)?;
         if ready & 0b001 != 0 {
             self.pull_socket()?;
         }

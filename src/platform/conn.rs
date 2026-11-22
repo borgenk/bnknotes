@@ -2,10 +2,10 @@
 //! parses framed messages out of the incoming byte stream.
 
 use std::collections::VecDeque;
-use std::os::fd::{AsRawFd, OwnedFd, RawFd};
+use std::os::fd::{AsRawFd, BorrowedFd, OwnedFd, RawFd};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::platform::error::{Error, Result};
 use crate::platform::ffi;
@@ -70,9 +70,24 @@ pub fn protocol_error(body: &[u8]) -> Error {
     }
 }
 
+/// Most bytes of requests the socket has not taken. Only a compositor that stops
+/// reading fills it; the request that does not fit is lost, so every flush after
+/// it fails and the editor ends rather than send a stream with a gap in it.
+const OUT_CAP: usize = 64 * 1024;
+
 pub struct Connection {
     stream: UnixStream,
+    /// Requests not yet written. The bytes before out_pos have gone; the rest wait
+    /// for the socket to take them, whole and in order.
     out: Vec<u8>,
+    out_pos: usize,
+    /// Fds waiting to go, each with the offset in out of the request that carries
+    /// it. An fd goes with the first byte of its request, so a write starts at one
+    /// fd's request and stops short of the next one's.
+    out_fds: VecDeque<(usize, OwnedFd)>,
+    /// Why the stream lost a request (the queue was full, or a send failed), after
+    /// which every flush fails: what follows would reach the compositor with a gap.
+    failed: Option<&'static str>,
     in_buf: Vec<u8>,
     /// How many bytes at the front of `in_buf` have already been consumed by
     /// [`Connection::next_message`]. Each parsed message advances this cursor
@@ -100,6 +115,9 @@ impl Connection {
         Ok(Self {
             stream,
             out: Vec::new(),
+            out_pos: 0,
+            out_fds: VecDeque::new(),
+            failed: None,
             in_buf: Vec::new(),
             in_pos: 0,
             fds: VecDeque::new(),
@@ -114,12 +132,11 @@ impl Connection {
 
     /// Queue a request for the next flush.
     pub fn request(&mut self, object: u32, opcode: u16, args: &[Arg]) {
-        wire::encode(&mut self.out, object, opcode, args);
+        self.queue(object, opcode, args);
     }
 
-    /// Send everything queued so far, then send one request carrying `fd` as
-    /// ancillary data. Flushing first keeps the fd attached to the request that
-    /// references it, with no earlier bytes riding along.
+    /// Queue a request carrying fd and start sending. The queue holds its own copy
+    /// of fd until the request goes, so the caller may close theirs on return.
     pub fn request_with_fd(
         &mut self,
         object: u32,
@@ -127,25 +144,108 @@ impl Connection {
         args: &[Arg],
         fd: RawFd,
     ) -> Result<()> {
-        self.flush()?;
-        let mut msg = Vec::new();
-        wire::encode(&mut msg, object, opcode, args);
-        if let Err(e) = ffi::send_with_fds(self.stream.as_raw_fd(), &msg, &[fd]) {
-            return Err(self.diagnose_send_error(e));
+        // SAFETY: the caller's fd is open for this call; it is only duplicated.
+        let copy = unsafe { BorrowedFd::borrow_raw(fd) }
+            .try_clone_to_owned()
+            .map_err(|e| Error::msg(format!("duplicate an fd to send: {e}")))?;
+        if let Some(at) = self.queue(object, opcode, args) {
+            self.out_fds.push_back((at, copy));
         }
+        self.flush()
+    }
+
+    /// Append a request to the queue, returning its offset, or None once the queue
+    /// is full.
+    fn queue(&mut self, object: u32, opcode: u16, args: &[Arg]) -> Option<usize> {
+        if self.failed.is_some() {
+            return None;
+        }
+        self.compact_out();
+        let at = self.out.len();
+        wire::encode(&mut self.out, object, opcode, args);
+        if self.out.len() > OUT_CAP {
+            self.out.truncate(at);
+            self.failed = Some("wayland send buffer full: the compositor stopped reading");
+            return None;
+        }
+        Some(at)
+    }
+
+    /// Whether requests are waiting for the socket to take them.
+    pub fn has_pending_output(&self) -> bool {
+        self.out_pos < self.out.len()
+    }
+
+    /// Write as much of the queue as the socket takes without waiting. What it
+    /// cannot take stays queued, and the next flush picks up where this one
+    /// stopped; the event loop flushes again once the socket has room.
+    pub fn flush(&mut self) -> Result<()> {
+        if let Some(why) = self.failed {
+            return Err(Error::msg(why));
+        }
+        while self.out_pos < self.out.len() {
+            let pos = self.out_pos;
+            let riding = (self.out_fds.front())
+                .filter(|(at, _)| *at == pos)
+                .map(|(_, fd)| fd.as_raw_fd());
+            let end = (self.out_fds.iter())
+                .map(|(at, _)| *at)
+                .find(|&at| at > pos)
+                .unwrap_or(self.out.len());
+            let bytes = self.out.get(pos..end).unwrap_or_default();
+            match ffi::send_some(self.stream.as_raw_fd(), bytes, riding.as_slice()) {
+                Ok(Some(n)) if n > 0 => {
+                    self.out_pos += n;
+                    // The fd went with the first byte; the queue's copy closes.
+                    if riding.is_some() {
+                        self.out_fds.pop_front();
+                    }
+                }
+                Ok(_) => return Ok(()),
+                Err(e) => {
+                    // What was queued is lost, perhaps a request cut short, so
+                    // nothing more may follow it.
+                    self.out.clear();
+                    self.out_pos = 0;
+                    self.out_fds.clear();
+                    self.failed = Some("an earlier wayland send failed");
+                    return Err(self.diagnose_send_error(e));
+                }
+            }
+        }
+        self.out.clear();
+        self.out_pos = 0;
         Ok(())
     }
 
-    /// Write all queued requests to the socket.
-    pub fn flush(&mut self) -> Result<()> {
-        if self.out.is_empty() {
-            return Ok(());
+    /// Flush, waiting up to limit for the socket to take everything queued: for a
+    /// request whose answer the caller waits on next. Whether all of it went.
+    pub fn flush_within(&mut self, limit: Duration) -> Result<bool> {
+        let deadline = Instant::now() + limit;
+        loop {
+            self.flush()?;
+            if !self.has_pending_output() {
+                return Ok(true);
+            }
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() || !ffi::wait_writable(self.fd(), left) {
+                return Ok(false);
+            }
         }
-        if let Err(e) = ffi::send_with_fds(self.stream.as_raw_fd(), &self.out, &[]) {
-            return Err(self.diagnose_send_error(e));
+    }
+
+    /// Move the unsent tail of the queue to the front, reclaiming the room the
+    /// sent part took.
+    fn compact_out(&mut self) {
+        let pos = self.out_pos;
+        if pos == 0 {
+            return;
         }
-        self.out.clear();
-        Ok(())
+        self.out.drain(..pos);
+        for (at, _) in &mut self.out_fds {
+            *at -= pos;
+        }
+        self.out_pos = 0;
     }
 
     /// A send failed (typically `EPIPE`): the compositor closed the socket. On a
@@ -234,15 +334,159 @@ impl Connection {
 
 #[cfg(test)]
 mod tests {
-    use std::io::Write;
+    use std::io::{Read, Write};
 
     use crate::platform::conn::*;
+
+    /// Queue numbered requests one at a time, flushing after each, until a flush
+    /// leaves some queued: the socket is full. Returns the bytes queued.
+    fn fill_socket(conn: &mut Connection) -> Vec<u8> {
+        let mut expected = Vec::new();
+        // A kilobyte each, so the socket fills quickly.
+        let pad = "x".repeat(1000);
+        for i in 0u32.. {
+            let args = [Arg::Uint(i), Arg::Str(&pad)];
+            conn.request(7, 1, &args);
+            wire::encode(&mut expected, 7, 1, &args);
+            conn.flush().expect("a flush that does not wait");
+            if conn.has_pending_output() {
+                break;
+            }
+            assert!(i < 100_000, "the socket never filled");
+        }
+        expected
+    }
+
+    /// Read what the peer has now, without waiting and up to limit bytes in all,
+    /// with any fds it carried and the byte offset each chunk started at.
+    fn read_now(
+        peer: &UnixStream,
+        limit: usize,
+        got: &mut Vec<u8>,
+        fds: &mut Vec<(usize, OwnedFd)>,
+    ) {
+        peer.set_nonblocking(true).expect("non-blocking peer");
+        let mut buf = [0u8; 65536];
+        loop {
+            let room = limit.saturating_sub(got.len()).min(buf.len());
+            if room == 0 {
+                return;
+            }
+            let mut arrived = Vec::new();
+            let start = got.len();
+            match ffi::recv_with_fds(peer.as_raw_fd(), &mut buf[..room], &mut arrived) {
+                Ok(Some(n)) if n > 0 => {
+                    got.extend_from_slice(&buf[..n]);
+                    fds.extend(arrived.into_iter().map(|fd| (start, fd)));
+                }
+                _ => return,
+            }
+        }
+    }
+
+    #[test]
+    fn a_full_socket_keeps_the_rest_queued_and_sends_it_in_order() {
+        let (mut conn, peer) = connected();
+        let expected = fill_socket(&mut conn);
+        let (mut got, mut fds) = (Vec::new(), Vec::new());
+        while conn.has_pending_output() {
+            read_now(&peer, usize::MAX, &mut got, &mut fds);
+            conn.flush().expect("flush the rest");
+        }
+        read_now(&peer, usize::MAX, &mut got, &mut fds);
+        assert_eq!(got.len(), expected.len());
+        assert!(got == expected, "every request, whole and in order");
+    }
+
+    #[test]
+    fn an_fd_goes_with_its_own_request_behind_a_backlog() {
+        let (mut conn, peer) = connected();
+        let mut expected = fill_socket(&mut conn);
+        let (read_end, write_end) = ffi::pipe().expect("a pipe");
+        let at = expected.len();
+        conn.request_with_fd(9, 2, &[Arg::Uint(42)], write_end.as_raw_fd())
+            .expect("queued behind the backlog");
+        wire::encode(&mut expected, 9, 2, &[Arg::Uint(42)]);
+        let its_end = expected.len();
+        conn.request(9, 3, &[]);
+        wire::encode(&mut expected, 9, 3, &[]);
+        // The queue holds its own copy, so the caller's can close at once.
+        drop(write_end);
+
+        // Read exactly to the end of the fd's own request: the fd must be here by
+        // then, not with a later one.
+        let (mut got, mut fds) = (Vec::new(), Vec::new());
+        while got.len() < its_end {
+            read_now(&peer, its_end, &mut got, &mut fds);
+            conn.flush().expect("flush the rest");
+        }
+        let [(start, fd)] = <[_; 1]>::try_from(fds).expect("the fd came with its request");
+        assert!(start <= at, "with its request's first byte or before");
+        let mut rest = Vec::new();
+        while conn.has_pending_output() {
+            read_now(&peer, usize::MAX, &mut got, &mut rest);
+            conn.flush().expect("flush the rest");
+        }
+        read_now(&peer, usize::MAX, &mut got, &mut rest);
+        assert!(rest.is_empty(), "and no other fd");
+        assert!(got == expected, "every request, whole and in order");
+
+        // It is the pipe's write end, and with the peer's copy closed the pipe
+        // ends: the queue let go of its own once sent.
+        let mut sent = std::fs::File::from(fd);
+        sent.write_all(b"hi")
+            .expect("write through the received fd");
+        drop(sent);
+        let mut text = String::new();
+        std::fs::File::from(read_end)
+            .read_to_string(&mut text)
+            .expect("read to the end");
+        assert_eq!(text, "hi");
+    }
+
+    #[test]
+    fn a_flush_within_a_limit_gives_up_on_a_socket_with_no_room() {
+        let (mut conn, peer) = connected();
+        fill_socket(&mut conn);
+        let limit = Duration::from_millis(20);
+        let started = Instant::now();
+        assert!(!conn.flush_within(limit).expect("no error, just no room"));
+        assert!(started.elapsed() >= limit, "it waited out the limit");
+        let (mut got, mut fds) = (Vec::new(), Vec::new());
+        read_now(&peer, usize::MAX, &mut got, &mut fds);
+        assert!(
+            conn.flush_within(Duration::from_secs(5)).expect("flushes"),
+            "a peer that reads makes room"
+        );
+    }
+
+    #[test]
+    fn a_queue_past_its_cap_fails_every_flush_after() {
+        let (mut conn, peer) = connected();
+        fill_socket(&mut conn);
+        let pad = "x".repeat(1000);
+        for i in 0..(OUT_CAP / 1000 + 2) as u32 {
+            conn.request(7, 1, &[Arg::Uint(i), Arg::Str(&pad)]);
+        }
+        let err = conn.flush().expect_err("a request was dropped");
+        assert!(err.to_string().contains("stopped reading"), "{err}");
+        let (mut got, mut fds) = (Vec::new(), Vec::new());
+        read_now(&peer, usize::MAX, &mut got, &mut fds);
+        assert!(
+            conn.flush().is_err(),
+            "the stream has a gap, so it stays failed"
+        );
+        assert!(conn.request_with_fd(9, 2, &[], peer.as_raw_fd()).is_err());
+    }
 
     fn connected() -> (Connection, UnixStream) {
         let (ours, theirs) = UnixStream::pair().expect("socket pair");
         let conn = Connection {
             stream: ours,
             out: Vec::new(),
+            out_pos: 0,
+            out_fds: VecDeque::new(),
+            failed: None,
             in_buf: Vec::new(),
             in_pos: 0,
             fds: VecDeque::new(),

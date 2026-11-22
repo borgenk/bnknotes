@@ -339,8 +339,8 @@ impl State {
     }
 
     /// Export `syncobj` as a DRM syncobj fd and import it into the compositor as
-    /// a timeline object; returns the protocol object id. The fd is sent inline,
-    /// so the local `OwnedFd` can drop on return.
+    /// a timeline object; returns the protocol object id. The connection sends a
+    /// copy of the fd, so the local `OwnedFd` can drop on return.
     pub(super) fn import_timeline(
         &mut self,
         manager: u32,

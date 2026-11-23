@@ -218,7 +218,7 @@ fn judge_file(url: &str) -> core::result::Result<String, Refusal> {
     if has_suffix(&LAUNCHER_SUFFIXES) {
         return Err(Refusal::Launcher);
     }
-    if has_suffix(&WINDOWS_SUFFIXES) {
+    if has_suffix(&WINDOWS_SUFFIXES) || has_suffix(&RUNTIME_SUFFIXES) {
         return Err(Refusal::Executable);
     }
     let meta = std::fs::metadata(resolved).map_err(|_| Refusal::Missing)?;
@@ -252,6 +252,11 @@ const LAUNCHER_SUFFIXES: [&str; 2] = ["desktop", "kdelnk"];
 
 /// Names wine runs as a Windows program, with or without an exec bit.
 const WINDOWS_SUFFIXES: [&str; 7] = ["exe", "dll", "cpl", "drv", "scr", "msi", "lnk"];
+
+/// Names a language runtime runs as a program when opened, with or without an exec
+/// bit: a Java archive, which a desktop with Java opens with java -jar. Its content
+/// is a zip, as a document's can be, so only the name tells.
+const RUNTIME_SUFFIXES: [&str; 1] = ["jar"];
 
 /// Whether head, a file's first bytes, begins the way a desktop entry does, which
 /// is how an opener that types files by content recognizes one whatever its name.
@@ -616,6 +621,8 @@ mod tests {
         write("EVIL.DESKTOP", 0o644);
         write("setup.EXE", 0o644);
         write("shortcut.lnk", 0o644);
+        write("tool.jar", 0o644);
+        write("Tool.JAR", 0o644);
         let with = |name: &str, content: &[u8], mode: u32| {
             let path = write(name, mode);
             std::fs::write(&path, content).expect("write content");
@@ -641,6 +648,8 @@ mod tests {
         assert_eq!(judge_file(&url("absent.txt")), Err(Refusal::Missing));
         assert_eq!(judge_file(&url("setup.EXE")), Err(Refusal::Executable));
         assert_eq!(judge_file(&url("shortcut.lnk")), Err(Refusal::Executable));
+        assert_eq!(judge_file(&url("tool.jar")), Err(Refusal::Executable));
+        assert_eq!(judge_file(&url("Tool.JAR")), Err(Refusal::Executable));
         assert_eq!(
             judge_file(&url("plain")),
             Err(Refusal::Executable),

@@ -2652,9 +2652,17 @@ impl<'a> Painter<'a> {
                     });
                     // A selected image gets an accent border (four thin edge fills)
                     // and a corner toggle button: a rounded panel with a centered
-                    // `</>` "source" glyph, the affordance to reveal its markdown.
-                    if img.selected {
-                        push_image_chrome(self.list, fonts, &pic, self.scale, self.body_size);
+                    // source glyph, the affordance to reveal its markdown. A picture
+                    // whose source is pinned open keeps the button to close it.
+                    if img.selected || img.pinned {
+                        push_image_chrome(
+                            self.list,
+                            fonts,
+                            &pic,
+                            img.selected,
+                            self.scale,
+                            self.body_size,
+                        );
                     }
                 }
                 continue;
@@ -3392,17 +3400,19 @@ fn push_checkbox(list: &mut DisplayList, rect: Rect, checked: bool, behind: u32)
     }
 }
 
-/// Append the selection chrome for a selected image at picture rect `pic` (screen
-/// space): a four-edge accent border and the corner `</>` toggle button.
+/// Append the chrome for a picture at rect pic (screen space): the corner source
+/// toggle button, and with border (the picture is selected) a four-edge accent
+/// border.
 fn push_image_chrome(
     list: &mut DisplayList,
     fonts: &Fonts,
     pic: &Rect,
+    border: bool,
     scale: Scale,
     body_size: u32,
 ) {
     let t = scale.px(IMAGE_BORDER_THICKNESS);
-    for rect in [
+    let edges = [
         Rect {
             x: pic.x,
             y: pic.y,
@@ -3427,11 +3437,14 @@ fn push_image_chrome(
             w: t,
             h: pic.h,
         },
-    ] {
-        list.push(DrawCmd::Fill {
-            rect,
-            color: IMAGE_BORDER_COLOR,
-        });
+    ];
+    if border {
+        for rect in edges {
+            list.push(DrawCmd::Fill {
+                rect,
+                color: IMAGE_BORDER_COLOR,
+            });
+        }
     }
 
     let btn = image_button_rect(pic, scale);

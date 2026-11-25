@@ -8,7 +8,9 @@ use crate::keymap::{self, KeyAction};
 use crate::menu::{Menu, MenuLayout};
 use crate::paint::{BannerButton, conflict_banner_layout};
 use crate::palette::{Palette, PaletteLayout, Rows, Submit};
-use crate::pane::{CaretAnim, Columns, DiskConflict, EditorPane, Focus, Hit, ImagePress, SPLITTER};
+use crate::pane::{
+    CaretAnim, Columns, DeleteKey, DiskConflict, EditorPane, Focus, Hit, ImagePress, SPLITTER,
+};
 use crate::platform::error::{Error, Result};
 use crate::platform::ffi;
 use crate::platform::freetype::{Fonts, Metrics};
@@ -86,7 +88,7 @@ fn apply_editor_action(
         }
         KeyAction::Char(c) => {
             let mut encoded = [0u8; 4];
-            ed.text.insert_str(c.encode_utf8(&mut encoded));
+            ed.insert_text(fonts, rect, c.encode_utf8(&mut encoded));
             true
         }
         // In a table cell, Shift+Enter is a line break within the cell (`<br>`) and
@@ -98,7 +100,7 @@ fn apply_editor_action(
         // On a list item, Shift+Enter adds a continuation line indented under the
         // item's text (no bullet), so a wrapped thought stays part of the item.
         KeyAction::Enter if extend && ed.text.cursor_on_list_item() => ed.text.list_continuation(),
-        KeyAction::Enter => ed.text.enter(),
+        KeyAction::Enter => ed.enter(fonts, rect),
         // In a table, Tab moves to the next cell and Shift+Tab to the previous.
         // Over a selection spanning lines, Tab shifts the whole block one unit
         // right and Shift+Tab one left. On a list item, Tab nests it one level
@@ -114,12 +116,12 @@ fn apply_editor_action(
             } else if extend {
                 ed.text.indent_block(true)
             } else {
-                ed.text.insert_str(SOFT_TAB);
+                ed.insert_text(fonts, rect, SOFT_TAB);
                 true
             }
         }
-        KeyAction::Backspace => ed.text.backspace(),
-        KeyAction::Delete => ed.text.delete_forward(),
+        KeyAction::Backspace => ed.delete(fonts, rect, DeleteKey::Back),
+        KeyAction::Delete => ed.delete(fonts, rect, DeleteKey::Forward),
         // In a table, Ctrl+Shift+Backspace removes the current row and
         // Ctrl+Shift+Delete the current column (the shift distinguishes them from
         // the plain Ctrl word-deletes); outside a table they stay word-deletes.
@@ -129,21 +131,22 @@ fn apply_editor_action(
         KeyAction::DeleteWordForward if extend && ed.text.cursor_in_table() => {
             ed.text.remove_table_column()
         }
-        KeyAction::DeleteWordBack => ed.text.delete_word_back(),
-        KeyAction::DeleteWordForward => ed.text.delete_word_forward(),
+        KeyAction::DeleteWordBack => ed.delete(fonts, rect, DeleteKey::WordBack),
+        KeyAction::DeleteWordForward => ed.delete(fonts, rect, DeleteKey::WordForward),
         KeyAction::DeleteLine => ed.text.delete_line(),
-        // A horizontal step is a pure buffer move, so it can walk into a folded
-        // section; stepping clear of one afterwards makes the arrow cross the whole
-        // section, which is what the collapsed heading implies on screen.
-        KeyAction::Left => ed.text.move_left(extend) | ed.step_over_folds(false, extend),
-        KeyAction::Right => ed.text.move_right(extend) | ed.step_over_folds(true, extend),
-        KeyAction::WordLeft => ed.text.move_word_left(extend),
-        KeyAction::WordRight => ed.text.move_word_right(extend),
+        // A horizontal step crosses a folded section whole and stops on a picture
+        // once, never inside its hidden source.
+        KeyAction::Left => ed.move_horizontal(fonts, rect, false, false, extend),
+        KeyAction::Right => ed.move_horizontal(fonts, rect, true, false, extend),
+        KeyAction::WordLeft => ed.move_horizontal(fonts, rect, false, true, extend),
+        KeyAction::WordRight => ed.move_horizontal(fonts, rect, true, true, extend),
         KeyAction::Up => ed.move_vertical(fonts, rect, -1, extend),
         KeyAction::Down => ed.move_vertical(fonts, rect, 1, extend),
         KeyAction::PageUp => ed.move_page(fonts, rect, -1, extend),
         KeyAction::PageDown => ed.move_page(fonts, rect, 1, extend),
-        KeyAction::Home => ed.move_line_edge(fonts, rect, false, extend),
+        KeyAction::Home => {
+            ed.move_line_edge(fonts, rect, false, extend) | ed.land_on_picture(false, extend)
+        }
         KeyAction::End => ed.move_line_edge(fonts, rect, true, extend),
         KeyAction::DocStart => ed.text.move_doc_start(extend),
         KeyAction::DocEnd => ed.text.move_doc_end(extend),
@@ -187,6 +190,8 @@ fn apply_editor_action(
         | KeyAction::CloseTab
         | KeyAction::None => false,
     };
+    // A source the corner button pinned open closes once the caret leaves its line.
+    let changed = changed | ed.settle_raw_pin();
     // The vertical motions read `goal_x` (the remembered column). SelectAll and
     // Escape leave it untouched (they do not move by column). Every other action
     // invalidates it, so the next vertical motion recomputes from the new column.
@@ -514,13 +519,8 @@ impl State {
             self.tree_key(action);
             return Ok(());
         }
-        // Any keyboard action but Copy drops an image selection and its pinned raw
-        // source (using the keyboard means the user has left the image widget). A
-        // revealed source the caret sits in stays shown via the cursor-on-line
-        // reveal. Copy must see the selection to choose image-vs-text, so it is
-        // exempt. Repaint so the border and button disappear immediately.
-        // Keyboard input goes to the focused editor; `rect` is its column, for
-        // the motion methods that need the viewport.
+        // Keyboard input goes to the focused editor; rect is its column, for the
+        // motion methods that need the viewport.
         let i = self.active_editor();
         // A diff review holds this pane's keyboard: Enter keeps the change, Escape
         // discards it, the navigation keys scroll the two columns, and everything else
@@ -537,11 +537,8 @@ impl State {
             self.dirty = true;
         }
         let rect = self.editor_rect(i);
-        if !matches!(action, KeyAction::Copy)
-            && (self.editors[i].selected_image.is_some() || self.editors[i].raw_image.is_some())
-        {
-            self.editors[i].selected_image = None;
-            self.editors[i].raw_image = None;
+        // A key closes a pinned source unless the caret is on its line editing it.
+        if self.editors[i].settle_raw_pin() {
             self.dirty = true;
         }
         let extend = self.xkb.shift_active();
@@ -571,7 +568,7 @@ impl State {
             // With an image selected, Copy puts the picture on the clipboard
             // instead of text.
             KeyAction::Copy => {
-                let result = if self.editors[i].selected_image.is_some() {
+                let result = if self.editors[i].selected_picture().is_some() {
                     self.copy_selected_image()
                 } else {
                     self.copy_selection()
@@ -2048,8 +2045,11 @@ impl State {
             }
             ImagePress::Missed => {}
         }
-        self.editors[i].selected_image = None;
-        self.editors[i].raw_image = None;
+        // A click into a pinned source edits it, and keeps it open; any other click
+        // closes it.
+        if !self.editors[i].pointer_on_pinned_source(&self.fonts, rect, px, py) {
+            self.editors[i].raw_image = None;
+        }
         // A plain click on a rendered task checkbox toggles it without moving the
         // caret. Shift-click falls through so it can extend a selection.
         if !shift
@@ -2195,5 +2195,304 @@ impl State {
             at.saturating_duration_since(Instant::now())
                 .max(Duration::from_millis(1)),
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::app::input::*;
+    use crate::markdown;
+    use crate::render::image::{Image, ImageStore};
+    use crate::scale::Scale;
+    use crate::text::TextBuffer;
+    use crate::theme::FONT_SIZE;
+
+    /// A pane over `text` with an 80px picture decoded under cat.png, laid out in an
+    /// 800x600 column with the caret at `cursor`.
+    fn pane(text: &str, cursor: usize) -> (EditorPane, Fonts, Rect) {
+        let fonts = Fonts::new(&markdown::all_sizes(FONT_SIZE)).expect("a default font");
+        let rect = Rect {
+            x: 0,
+            y: 0,
+            w: 800,
+            h: 600,
+        };
+        let mut ed = EditorPane::empty();
+        ed.text = TextBuffer::from_text(text.to_string());
+        ed.set_scale(Scale::ONE, FONT_SIZE);
+        ed.images = ImageStore::from_decoded(vec![(
+            "cat.png".to_string(),
+            Image {
+                pixels: vec![0; 80 * 80 * 4],
+                width: 80,
+                height: 80,
+            },
+        )]);
+        ed.text.set_cursor(cursor, false);
+        ed.ensure_layout(&fonts, rect);
+        (ed, fonts, rect)
+    }
+
+    /// Press each key in turn, Shift held when `extend`.
+    fn press(ed: &mut EditorPane, fonts: &Fonts, rect: Rect, extend: bool, keys: &[KeyAction]) {
+        for key in keys {
+            apply_editor_action(ed, fonts, rect, extend, key.clone());
+        }
+    }
+
+    /// Whether the picture whose line starts at `ls` draws alone, its source
+    /// collapsed, in the pane's current layout.
+    fn shows_alone(ed: &mut EditorPane, fonts: &Fonts, rect: Rect, ls: usize) -> bool {
+        ed.ensure_layout(fonts, rect);
+        let layout = ed.layout_cache.as_ref().expect("a built layout");
+        let rows: Vec<_> = layout.lines().iter().filter(|l| l.start == ls).collect();
+        rows.len() == 1 && rows[0].image.is_some()
+    }
+
+    #[test]
+    fn up_onto_a_picture_at_the_top_then_typing_writes_above_it() {
+        // "![x](cat.png)" is 0..13 and "after" starts at 14.
+        let (mut ed, fonts, rect) = pane("![x](cat.png)\nafter\n", 14);
+        press(&mut ed, &fonts, rect, false, &[KeyAction::Up]);
+        assert_eq!(ed.selected_picture(), Some(0), "the picture is selected");
+        assert_eq!(ed.text.cursor(), 0, "holding its side above");
+        assert!(
+            shows_alone(&mut ed, &fonts, rect, 0),
+            "with its source collapsed"
+        );
+
+        press(
+            &mut ed,
+            &fonts,
+            rect,
+            false,
+            &[KeyAction::Char('h'), KeyAction::Char('i')],
+        );
+        assert_eq!(ed.text.text(), "hi\n![x](cat.png)\nafter\n");
+        assert_eq!(
+            ed.text.cursor(),
+            2,
+            "the caret follows the text, above the picture"
+        );
+        assert_eq!(ed.selected_picture(), None);
+        assert!(
+            shows_alone(&mut ed, &fonts, rect, 3),
+            "the picture is still a picture"
+        );
+
+        // One undo takes the whole line back out.
+        press(&mut ed, &fonts, rect, false, &[KeyAction::Undo]);
+        assert_eq!(ed.text.text(), "![x](cat.png)\nafter\n");
+    }
+
+    #[test]
+    fn left_and_right_take_a_picture_in_one_step() {
+        // "top" is 0..3, the picture's line 4..17, and "bottom" starts at 18.
+        let doc = "top\n![x](cat.png)\nbottom";
+        let (mut ed, fonts, rect) = pane(doc, 3);
+        // Right arrives on its side below, the next Right leaves it.
+        press(&mut ed, &fonts, rect, false, &[KeyAction::Right]);
+        assert_eq!((ed.text.cursor(), ed.selected_picture()), (17, Some(4)));
+        assert!(
+            shows_alone(&mut ed, &fonts, rect, 4),
+            "nothing reveals the source"
+        );
+        press(&mut ed, &fonts, rect, false, &[KeyAction::Right]);
+        assert_eq!((ed.text.cursor(), ed.selected_picture()), (18, None));
+        // Left arrives on its side above, the next Left leaves it.
+        press(&mut ed, &fonts, rect, false, &[KeyAction::Left]);
+        assert_eq!((ed.text.cursor(), ed.selected_picture()), (4, Some(4)));
+        press(&mut ed, &fonts, rect, false, &[KeyAction::Left]);
+        assert_eq!((ed.text.cursor(), ed.selected_picture()), (3, None));
+
+        // A word step lands on it the same way, and Shift selects across it.
+        press(&mut ed, &fonts, rect, false, &[KeyAction::WordRight]);
+        assert_eq!(ed.text.cursor(), 17);
+        ed.text.set_cursor(3, false);
+        press(&mut ed, &fonts, rect, true, &[KeyAction::Right]);
+        assert_eq!(ed.text.selection(), Some((3, 17)));
+
+        // A picture that opens the note has nothing before it to step to.
+        let (mut ed, fonts, rect) = pane("![x](cat.png)\nafter", 0);
+        assert!(!apply_editor_action(
+            &mut ed,
+            &fonts,
+            rect,
+            false,
+            KeyAction::Left
+        ));
+        assert_eq!(ed.text.cursor(), 0);
+    }
+
+    #[test]
+    fn typing_and_enter_on_a_picture_open_lines_by_its_side() {
+        let doc = "top\n![x](cat.png)\nbottom";
+        // On its side below, typing goes on a line below it.
+        let (mut ed, fonts, rect) = pane(doc, 17);
+        press(&mut ed, &fonts, rect, false, &[KeyAction::Char('x')]);
+        assert_eq!(ed.text.text(), "top\n![x](cat.png)\nx\nbottom");
+        assert_eq!(ed.text.cursor(), 19);
+
+        // On its side above, Enter opens an empty line above and moves onto it.
+        let (mut ed, fonts, rect) = pane(doc, 4);
+        press(&mut ed, &fonts, rect, false, &[KeyAction::Enter]);
+        assert_eq!(ed.text.text(), "top\n\n![x](cat.png)\nbottom");
+        assert_eq!(ed.text.cursor(), 4, "on the new line");
+        press(&mut ed, &fonts, rect, false, &[KeyAction::Char('y')]);
+        assert_eq!(ed.text.text(), "top\ny\n![x](cat.png)\nbottom");
+    }
+
+    #[test]
+    fn backspace_or_delete_on_a_selected_picture_removes_it() {
+        let doc = "top\n![x](cat.png)\nbottom";
+        // Either side, any delete key: the picture goes with its line. Backspace
+        // leaves the caret at the end of the line above, Delete at the start of the
+        // line below.
+        for (at, key, to) in [
+            (17, KeyAction::Backspace, 3),
+            (4, KeyAction::Backspace, 3),
+            (4, KeyAction::Delete, 4),
+            (17, KeyAction::DeleteWordForward, 4),
+            (17, KeyAction::DeleteWordBack, 3),
+        ] {
+            let (mut ed, fonts, rect) = pane(doc, at);
+            press(&mut ed, &fonts, rect, false, std::slice::from_ref(&key));
+            assert_eq!(ed.text.text(), "top\nbottom", "{key:?} at {at}");
+            assert_eq!(ed.text.cursor(), to, "{key:?} at {at}");
+        }
+        // One undo brings it back, selected again.
+        let (mut ed, fonts, rect) = pane(doc, 17);
+        press(
+            &mut ed,
+            &fonts,
+            rect,
+            false,
+            &[KeyAction::Backspace, KeyAction::Undo],
+        );
+        assert_eq!(ed.text.text(), doc);
+        assert_eq!(ed.selected_picture(), Some(4));
+
+        // At the end of the note the line goes with the break before it.
+        let (mut ed, fonts, rect) = pane("top\n![x](cat.png)", 4);
+        press(&mut ed, &fonts, rect, false, &[KeyAction::Delete]);
+        assert_eq!((ed.text.text().as_str(), ed.text.cursor()), ("top", 3));
+        let (mut ed, fonts, rect) = pane("![x](cat.png)", 0);
+        press(&mut ed, &fonts, rect, false, &[KeyAction::Backspace]);
+        assert_eq!((ed.text.text().as_str(), ed.text.cursor()), ("", 0));
+
+        // Removing one of two pictures lands the caret on the other, selecting it.
+        let (mut ed, fonts, rect) = pane("![a](cat.png)\n![b](cat.png)", 27);
+        press(&mut ed, &fonts, rect, false, &[KeyAction::Backspace]);
+        assert_eq!(ed.text.text(), "![a](cat.png)");
+        assert_eq!(ed.selected_picture(), Some(0));
+    }
+
+    #[test]
+    fn moving_between_a_pictures_edge_and_its_source_redraws_it() {
+        // The picture's line is 4..17. A caret inside the source shows it, and End
+        // takes the caret to the edge on the same line, which must collapse it.
+        let doc = "top\n![x](cat.png)\nbottom";
+        let (mut ed, fonts, rect) = pane(doc, 10);
+        assert!(
+            !shows_alone(&mut ed, &fonts, rect, 4),
+            "inside, the source shows"
+        );
+        press(&mut ed, &fonts, rect, false, &[KeyAction::End]);
+        assert_eq!(ed.text.cursor(), 17);
+        assert!(
+            shows_alone(&mut ed, &fonts, rect, 4),
+            "at the edge, it collapses"
+        );
+        // A find match inside the source selects there and shows it again.
+        ed.text.select_range(9, 12);
+        assert!(!shows_alone(&mut ed, &fonts, rect, 4));
+    }
+
+    #[test]
+    fn deletes_from_a_neighboring_line_select_a_picture_before_removing_it() {
+        // "top" is 0..3, the picture's line 4..17, and "bottom" starts at 18.
+        let doc = "top\n![x](cat.png)\nbottom";
+        // With nothing short of the picture to delete, the caret goes onto it,
+        // selecting it on the side it came from.
+        for (at, key, to) in [
+            (18, KeyAction::Backspace, 17),
+            (18, KeyAction::DeleteWordBack, 17),
+            (3, KeyAction::Delete, 4),
+            (3, KeyAction::DeleteWordForward, 4),
+        ] {
+            let (mut ed, fonts, rect) = pane(doc, at);
+            press(&mut ed, &fonts, rect, false, std::slice::from_ref(&key));
+            assert_eq!(
+                ed.text.text(),
+                doc,
+                "{key:?} at {at} leaves the picture whole"
+            );
+            assert_eq!(ed.text.cursor(), to, "{key:?} at {at}");
+            assert_eq!(ed.selected_picture(), Some(4), "{key:?} at {at}");
+        }
+        // The second press removes it.
+        let (mut ed, fonts, rect) = pane(doc, 18);
+        press(
+            &mut ed,
+            &fonts,
+            rect,
+            false,
+            &[KeyAction::Backspace, KeyAction::Backspace],
+        );
+        assert_eq!(ed.text.text(), "top\nbottom");
+        // A word delete whose reach crosses into the picture stops at its line break.
+        let (mut ed, fonts, rect) = pane("top\n![x](cat.png)\n  bottom", 20);
+        press(&mut ed, &fonts, rect, false, &[KeyAction::DeleteWordBack]);
+        assert_eq!(ed.text.text(), "top\n![x](cat.png)\nbottom");
+        assert_eq!(ed.text.cursor(), 18);
+        // An empty line under the picture still goes.
+        let (mut ed, fonts, rect) = pane("![x](cat.png)\n\nbottom", 14);
+        press(&mut ed, &fonts, rect, false, &[KeyAction::Backspace]);
+        assert_eq!(ed.text.text(), "![x](cat.png)\nbottom");
+        assert_eq!(ed.selected_picture(), Some(0), "the caret on the picture");
+    }
+
+    #[test]
+    fn tab_before_a_picture_leaves_it_whole() {
+        let (mut ed, fonts, rect) = pane("![x](cat.png)\nafter", 0);
+        press(&mut ed, &fonts, rect, false, &[KeyAction::Tab]);
+        assert_eq!(ed.text.text(), format!("{SOFT_TAB}\n![x](cat.png)\nafter"));
+        let ls = SOFT_TAB.len() + 1;
+        assert!(
+            shows_alone(&mut ed, &fonts, rect, ls),
+            "the picture is still a picture"
+        );
+    }
+
+    #[test]
+    fn a_pinned_source_stays_open_while_its_line_is_edited() {
+        let doc = "top\n![x](cat.png)\nbottom";
+        let (mut ed, fonts, rect) = pane(doc, 6);
+        // The corner button pinned the source open, and the caret is in it.
+        ed.raw_image = Some(4);
+        press(&mut ed, &fonts, rect, false, &[KeyAction::Char('y')]);
+        assert_eq!(ed.text.text(), "top\n![yx](cat.png)\nbottom");
+        press(
+            &mut ed,
+            &fonts,
+            rect,
+            false,
+            &[KeyAction::Home, KeyAction::Right],
+        );
+        assert_eq!(
+            ed.text.cursor(),
+            5,
+            "the open source is ordinary text to move in"
+        );
+        assert_eq!(
+            ed.raw_image,
+            Some(4),
+            "and stays open while the caret is on it"
+        );
+        assert!(!shows_alone(&mut ed, &fonts, rect, 4));
+
+        press(&mut ed, &fonts, rect, false, &[KeyAction::Down]);
+        assert_eq!(ed.raw_image, None, "leaving the line closes it");
+        assert!(shows_alone(&mut ed, &fonts, rect, 4));
     }
 }

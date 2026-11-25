@@ -962,8 +962,7 @@ pub struct ImageLink {
 /// If `line` is, ignoring surrounding whitespace, a single image and nothing else,
 /// the byte ranges of its alt text and destination path. Both the CommonMark form
 /// `![alt](dest)` and the wikilink embed `![[target]]` (see [`wikilink_image`]) are
-/// recognized. Such a line renders its picture in place once the cursor leaves it
-/// (the same live-preview reveal a heading uses for its `#`); an image mixed with
+/// recognized. Such a line renders as its picture in place; an image mixed with
 /// other text on the line (an inline image) is not matched and stays source for now.
 ///
 /// `dest` may wrap its path in `<...>` (which lets the path hold spaces) and may

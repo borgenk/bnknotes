@@ -245,6 +245,32 @@ impl TextBuffer {
         self.touch();
     }
 
+    /// Insert s on a line of its own at the cursor, which stands at an edge of a
+    /// line's content: above that line when the cursor is at its start, below it
+    /// when at its end. The caret lands at the end of s, on the new line, and typing
+    /// on from there joins the same undo step.
+    pub fn insert_line(&mut self, s: &str, above: bool) {
+        let group = if coalescable_insert(s) {
+            Coalesce::Insert
+        } else {
+            Coalesce::None
+        };
+        self.checkpoint(group);
+        self.delete_selection();
+        let at = self.cursor;
+        if above {
+            self.text.insert(at, "\n");
+            self.text.insert(at, s);
+            self.cursor = at + s.len();
+        } else {
+            self.text.insert(at, s);
+            self.text.insert(at, "\n");
+            self.cursor = at + 1 + s.len();
+        }
+        self.anchor = None;
+        self.touch();
+    }
+
     /// Replace every `[start, end)` range in `ranges` (ascending, disjoint,
     /// in-bounds — the find machinery's match list) with `with`, as a single
     /// undo step. The cursor lands at the end of the last replacement.
@@ -680,11 +706,12 @@ impl TextBuffer {
         starts
     }
 
-    /// Delete the byte range `[start, end)` as one undo step, leaving the cursor
-    /// at `start` and no selection. The bounds must be cluster boundaries (line
-    /// and marker edges, which callers pass, always are). A collapsed range is a
-    /// no-op returning `false`.
-    fn delete_range(&mut self, start: usize, end: usize) -> bool {
+    /// Delete the byte range start..end as one undo step, leaving the cursor at
+    /// start and no selection; undo restores the cursor and selection as they were
+    /// before. The bounds must be cluster boundaries (line and marker edges, and
+    /// the delete keys' own reach, always are). A collapsed range is a no-op
+    /// returning false.
+    pub fn delete_range(&mut self, start: usize, end: usize) -> bool {
         if start >= end {
             return false;
         }
@@ -923,6 +950,18 @@ impl TextBuffer {
         }
         let target = next_word_rope(&self.text, self.cursor);
         self.delete_to(target, Coalesce::None)
+    }
+
+    /// Where a delete from the bare cursor reaches: back (Backspace) or forward
+    /// (Delete), by one grapheme cluster or, with word, to the word boundary. The
+    /// cursor itself at the buffer's edge.
+    pub fn delete_target(&self, forward: bool, word: bool) -> usize {
+        match (forward, word) {
+            (false, false) => self.prev_grapheme().unwrap_or(self.cursor),
+            (true, false) => self.next_grapheme().unwrap_or(self.cursor),
+            (false, true) => prev_word_rope(&self.text, self.cursor),
+            (true, true) => next_word_rope(&self.text, self.cursor),
+        }
     }
 
     /// Select the whole buffer (anchor at the start, cursor at the end).

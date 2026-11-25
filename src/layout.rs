@@ -197,8 +197,9 @@ pub struct VisualLine {
     /// picture always shows; its editable source, when revealed, is a separate
     /// text line stacked *above* this one (see [`Layout::build_with_images`]). The
     /// box is taller than a text line, so the few places that measure a line's
-    /// vertical extent consult this rather than the font metrics. A widget line is
-    /// never a keyboard caret target (the source line above it is).
+    /// vertical extent consult this rather than the font metrics. A picture-only
+    /// row holds the caret beside the picture, at the line's start or end; the
+    /// picture under a revealed source holds none, since its source line does.
     pub image: Option<ImageBox>,
     /// Set when this line renders one grid row of a markdown table (a header or a
     /// body row). Like [`Self::image`], it is a widget line: taller than text, with
@@ -259,9 +260,12 @@ pub struct ImageBox {
     /// ([`IMAGE_PAD_Y`] scaled by the display). Stored so [`Self::box_height`] needs
     /// no scale at paint time.
     pad_y: i32,
-    /// True while the user has this image selected: the painter draws a border
-    /// and the corner toggle button, and `Ctrl+C` copies the image.
+    /// True while the caret is on this picture, which selects it: the painter
+    /// draws a border and the corner toggle button, and Ctrl+C copies the image.
     pub selected: bool,
+    /// True while the corner button has this picture's source pinned open, so the
+    /// button stays drawn to close it again.
+    pub pinned: bool,
 }
 
 impl ImageBox {
@@ -361,8 +365,9 @@ impl TableRow {
 /// The per-image UI state the layout needs: which image (by its logical line's
 /// start offset) is selected, and which has its raw source pinned open by the
 /// corner button. Both are `None` by default (no image being interacted with).
-/// Offsets are valid for the document version being laid out; the app clears them
-/// on any edit, so they never go stale.
+/// Offsets are valid for the document version being laid out: the app clears the
+/// selection on any key, and the pin once the caret leaves its line, and an edit
+/// on the pinned line leaves that line's start where it was.
 #[derive(Clone, Copy, Default)]
 pub struct ImageUi {
     pub selected: Option<usize>,
@@ -668,8 +673,19 @@ impl<'a> LayoutCtx<'a> {
         self.frontmatter.is_some_and(|end| line < end)
     }
 
+    #[cfg(test)]
     fn with_active(self, active: (usize, usize)) -> Self {
         Self { active, ..self }
+    }
+
+    /// The same ctx with the picture on the line starting at ls pinned open, as the
+    /// corner button pins it.
+    fn with_pinned(self, ls: usize) -> Self {
+        let image_ui = ImageUi {
+            raw: Some(ls),
+            ..self.image_ui
+        };
+        Self { image_ui, ..self }
     }
 
     /// A ctx for base-geometry measurement (the [`LineIndex`] paths): reveal forced
@@ -818,12 +834,12 @@ impl Layout {
     /// Like Self::build, but resolves a standalone `![alt](path)` line to a
     /// rendered picture via `images`, scaled to fit the content column (aspect
     /// preserved, never upscaled). The picture always shows once decoded; its
-    /// editable `![alt](path)` source, when revealed, is laid out as a text line
-    /// *above* the picture, so editing happens with a live preview below. The
-    /// source is revealed when the cursor is on the line or `image_ui.raw` pins it
-    /// open (the corner button). A selected image (`image_ui.selected`) carries a
-    /// border and button. A missing or undecodable image falls back to plain
-    /// source, so a broken link stays visible and editable.
+    /// editable source, when revealed, is laid out as a text line above the
+    /// picture, so editing happens with a live preview below. The source is
+    /// revealed when the corner button pins it open (image_ui.raw) or an end of the
+    /// active range sits inside it. A selected picture (image_ui.selected, the one
+    /// the caret is on) carries a border and button. A missing or undecodable image
+    /// falls back to plain source, so a broken link stays visible and editable.
     pub fn build_with_images(ctx: &LayoutCtx, left: i32, top: i32) -> Self {
         let n = ctx.rope.len_lines();
         Self::build_range(ctx, left, top, 0, n, LineCarry::default())
@@ -978,6 +994,19 @@ impl Layout {
             return self.table_caret(fonts, rope, line, t, offset);
         }
         let m = fonts.metrics(line.size);
+        // The caret on a collapsed picture is not drawn: the picture shows selected
+        // instead. This rectangle, at the picture's left edge and level with its top
+        // on the side above or its bottom on the side below, still steers scrolling
+        // and the column a vertical move keeps.
+        if let Some(picture) = self.image_rect(fonts, line) {
+            let h = m.ascent + m.descent;
+            let y = if offset <= line.start {
+                picture.y
+            } else {
+                picture.y + picture.h - h
+            };
+            return (picture.x, y, h);
+        }
         let x = self.left as f32 + line.indent as f32 + self.advance_to(fonts, rope, line, offset);
         (
             x.round() as i32,
@@ -1013,10 +1042,17 @@ impl Layout {
     /// table row to its cell-aware hit-test and any other line to the run-walk. A
     /// non-table line ignores `y` (its band already picked the line).
     fn hit(&self, fonts: &Fonts, rope: &Rope, line: &VisualLine, x: f32, y: f32) -> usize {
-        match &line.table {
-            Some(t) => self.table_hit(fonts, rope, line, t, x, y),
-            None => self.hit_line(fonts, rope, line, x),
+        if let Some(t) = &line.table {
+            return self.table_hit(fonts, rope, line, t, x, y);
         }
+        // A picture holds no text, only the caret's two places on it: the upper half
+        // of its row lands on its side above (the line's start), the lower half on
+        // its side below (the line's end).
+        if let Some(picture) = self.image_rect(fonts, line) {
+            let middle = picture.y as f32 + picture.h as f32 / 2.0;
+            return if y < middle { line.start } else { line.end };
+        }
+        self.hit_line(fonts, rope, line, x)
     }
 
     /// If the visual line at content-space `y` is a rendered horizontal rule (a
@@ -1265,14 +1301,16 @@ impl Layout {
         })
     }
 
-    /// The logical-line start of the selected image whose corner toggle button
-    /// contains content-space `(x, y)`. Only a selected image draws a button.
+    /// The logical-line start of the image whose corner toggle button contains
+    /// content-space (x, y). A picture draws its button while selected, and while
+    /// its source is pinned open so the button can close it.
     pub fn image_button_at(&self, fonts: &Fonts, x: f32, y: f32) -> Option<usize> {
         self.lines.iter().find_map(|line| {
             let img = line.image?;
             let rect = self.image_rect(fonts, line)?;
-            (img.selected && rect_contains(&image_button_rect(&rect, self.scale), x, y))
-                .then_some(line.start)
+            ((img.selected || img.pinned)
+                && rect_contains(&image_button_rect(&rect, self.scale), x, y))
+            .then_some(line.start)
         })
     }
 
@@ -1288,10 +1326,11 @@ impl Layout {
     ) -> usize {
         let idx = self.line_index_for(offset) as i32;
         let mut target = idx + dir;
-        // Step over the picture half of a revealed image (its source line is the
-        // caret target). A picture-only line is not skipped, so the caret can land
-        // on it (at its start), revealing the source on the next build. Table rows
-        // are caret targets and are not skipped: motion lands in a cell at goal_x.
+        // Step over the picture half of a revealed image: its source line holds the
+        // caret. A picture-only row is a target that selects the picture, keeping the
+        // side the motion came from: moving up lands on its side above, moving down
+        // on its side below. Table rows are caret targets too: motion lands in a
+        // cell at goal_x.
         while target >= 0
             && (target as usize) < self.lines.len()
             && self.is_stacked_widget(target as usize)
@@ -1301,9 +1340,12 @@ impl Layout {
         if target < 0 || target as usize >= self.lines.len() {
             return offset;
         }
+        let line = &self.lines[target as usize];
+        if line.image.is_some() {
+            return if dir < 0 { line.start } else { line.end };
+        }
         // A table row needs a y to pick the wrapped line within a cell; entering it
         // from above/below lands on its first row of text (the box top).
-        let line = &self.lines[target as usize];
         let y = (line.baseline - fonts.metrics(line.size).ascent) as f32;
         self.hit(fonts, rope, line, goal_x, y)
     }
@@ -1383,9 +1425,10 @@ impl Layout {
             // selection spanning a picture-only image). When its editable source is
             // stacked above it (the reveal), that source line already carries the
             // highlight, so the picture is not boxed too: selecting the raw text
-            // must not read as selecting the image.
+            // must not read as selecting the image. A selection that only begins
+            // after the picture, taking its line break, does not cover it either.
             if let Some(img) = line.image {
-                if !self.is_stacked_widget(i) {
+                if !self.is_stacked_widget(i) && sel_start < sel_end {
                     rects.push(Rect {
                         x: self.left + line.indent,
                         y: line.baseline - m.ascent,
@@ -1552,11 +1595,16 @@ impl Layout {
         &self.lines[self.line_index_for(offset)]
     }
 
+    /// The visual line the caret at offset stands on. A picture-only row is one,
+    /// with the caret beside the picture; the picture half of a revealed image is
+    /// not, since its source line above it holds the same range.
     fn line_index_for(&self, offset: usize) -> usize {
+        let holds_caret = |i: usize| !self.is_stacked_widget(i);
         self.lines
             .iter()
-            .position(|l| l.image.is_none() && (offset < l.end || (offset == l.end && l.hard)))
-            .or_else(|| self.lines.iter().rposition(|l| l.image.is_none()))
+            .enumerate()
+            .position(|(i, l)| holds_caret(i) && (offset < l.end || (offset == l.end && l.hard)))
+            .or_else(|| (0..self.lines.len()).rposition(holds_caret))
             .unwrap_or(self.lines.len().saturating_sub(1))
     }
 
@@ -1625,9 +1673,7 @@ impl Layout {
         // Past every glyph: a line that drew text ends at its logical end, which
         // sits *after* any trailing collapsed marker (the closing `*` of `*word*`);
         // the last visible run's end would land the caret before that hidden marker.
-        // A line with no visible glyphs (an empty line, or a picture row whose
-        // source is collapsed) instead lands at its start, so arrowing onto a
-        // picture reveals its source on the next build.
+        // A line that drew no glyphs (an empty one) instead lands at its start.
         if drew_text { line.end } else { line.start }
     }
 
@@ -1947,11 +1993,9 @@ impl Layout {
         None
     }
 
-    /// Whether the visual line at `idx` is the picture half of a revealed image,
-    /// i.e. its editable source line sits immediately above it (same logical line,
-    /// so same `end`). Such a widget is stepped over by vertical caret motion; a
-    /// picture-only line (no source above) is not, so the caret can land on it and
-    /// reveal the source.
+    /// Whether the visual line at idx is the picture half of a revealed image: its
+    /// editable source line sits immediately above it (same logical line, so same
+    /// end).
     fn is_stacked_widget(&self, idx: usize) -> bool {
         idx > 0
             && self.lines[idx].image.is_some()
@@ -2173,6 +2217,14 @@ fn classify_line(
     }
 }
 
+/// Whether an end of active sits inside the source of the picture on the line
+/// ls..le, which is what reveals that source to the caret. Its two edges are where
+/// a caret on the picture sits, and reveal nothing.
+pub(crate) fn active_reveals_image_source(active: (usize, usize), ls: usize, le: usize) -> bool {
+    let inside = |offset: usize| ls < offset && offset < le;
+    inside(active.0) || inside(active.1)
+}
+
 /// Whether `active` reaches a bullet or task line's block marker, the finer
 /// live-preview test those lists use for revealing their raw `- `/`- [ ] `. A
 /// heading reveals its `#` across the whole line, but a list keeps its disc or
@@ -2252,16 +2304,16 @@ fn lay_line(
     // Whether the cursor/selection touches this logical line: the same reveal test
     // headings use, applied to fence lines too.
     let on_line = ctx.active.0 <= le && ctx.active.1 >= ls;
-    // A standalone `![alt](path)` line whose image has decoded renders as a picture
-    // box. The picture always shows; when its source is revealed (cursor on the
-    // line, or the corner button pinned it open) the editable `![alt](path)` is laid
-    // out as a text line *above* the picture. Inside a code fence the syntax is
-    // literal, not an image; a missing or undecodable image falls through to plain
-    // source so a broken link stays visible and editable.
+    // A standalone image line whose image has decoded renders as a picture box. The
+    // picture always shows; when its source is revealed (the corner button pinned it
+    // open, or the caret is inside it) the editable source is laid out as a text line
+    // above the picture. Inside a code fence the syntax is literal, not an image; a
+    // missing or undecodable image falls through to plain source so a broken link
+    // stays visible and editable.
     //
-    // `pending_image`, when set, is the widget to append after this line's source
-    // text (the reveal case). The no-reveal case pushes its widget and returns,
-    // never reaching the text path.
+    // pending_image, when set, is the widget to append after this line's source text
+    // (the reveal case). The no-reveal case pushes its widget and returns, never
+    // reaching the text path.
     let mut pending_image: Option<ImageBox> = None;
     // A frontmatter line is metadata, not markdown, so none of the block widgets
     // may claim it: a YAML value carrying a `|` is not a table row, and one shaped
@@ -2304,11 +2356,13 @@ fn lay_line(
                 height,
                 pad_y: ctx.scale.px(IMAGE_PAD_Y),
                 selected: ctx.image_ui.selected == Some(ls),
+                pinned: ctx.image_ui.raw == Some(ls),
             };
-            if (on_line && !ctx.image_ui.dragging) || ctx.image_ui.raw == Some(ls) {
+            let inside = active_reveals_image_source(ctx.active, ls, le);
+            if (inside && !ctx.image_ui.dragging) || ctx.image_ui.raw == Some(ls) {
                 // Source revealed: emit it (fall through), then the widget. A live
                 // drag holds it collapsed so the geometry under the pointer is
-                // stable, matching the index's `reveal_adjust`.
+                // stable, matching the index's reveal_adjust.
                 pending_image = Some(image);
             } else {
                 // Picture only: one widget line, no source text.
@@ -2550,12 +2604,12 @@ struct LineRec {
 }
 
 /// What is revealed right now, on top of the base [`LineIndex`] geometry: the
-/// image sources shown (the cursor's image line and a raw-pinned one, never more
-/// than two), and the logical lines whose markup shows raw. Empty is the base
-/// geometry.
+/// image sources shown (one each for an end of the active range inside a source and
+/// for the pinned one, so never more than three), and the logical lines whose markup
+/// shows raw. Empty is the base geometry.
 #[derive(Clone, Copy, Default)]
 pub struct RevealAdjust {
-    entries: [(usize, i32); 2],
+    entries: [(usize, i32); 3],
     len: usize,
     /// The logical lines the cursor or selection touches, inclusive. Their markup
     /// draws raw, so each is as tall as the index recorded it would re-wrap to.
@@ -2564,7 +2618,7 @@ pub struct RevealAdjust {
 
 impl RevealAdjust {
     /// Record that logical line `line` reveals `extra` pixels of image source.
-    /// Ignores zero deltas and duplicates, and never grows past two entries.
+    /// Ignores zero deltas and duplicates, and never grows past three entries.
     pub fn push(&mut self, line: usize, extra: i32) {
         if extra == 0 || self.entries[..self.len].iter().any(|&(l, _)| l == line) {
             return;
@@ -2661,7 +2715,7 @@ impl LineIndex {
         // already priced.
         let image_extra = if scratch.iter().any(|v| v.image.is_some()) {
             let mut revealed_carry = carry_in;
-            let revealed_ctx = ctx.with_active((logical.start, logical.end));
+            let revealed_ctx = ctx.with_pinned(logical.start);
             scratch.clear();
             let revealed = lay_line(
                 &revealed_ctx,
@@ -4953,16 +5007,15 @@ mod tests {
             base.text_height()
         );
 
-        // With the image's source revealed, the overlay height matches a full build
-        // that reveals the same line.
-        let ls = r.line_to_byte(img_line);
-        let le = r.line_to_byte(img_line + 1) - 1;
+        // With the image's source revealed by a caret inside it, the overlay height
+        // matches a full build that reveals the same line.
+        let inside = r.line_to_byte(img_line) + 1;
         let revealed_ctx = LayoutCtx::new(
             &f,
             &r,
             w,
             BODY,
-            (ls, le),
+            (inside, inside),
             &s,
             ImageUi::default(),
             FoldMap::NONE,
@@ -7375,12 +7428,12 @@ mod tests {
     }
 
     #[test]
-    fn the_cursor_stacks_the_source_above_the_still_shown_picture() {
+    fn a_caret_inside_the_source_stacks_it_above_the_still_shown_picture() {
         let f = fonts();
         let r = rope("![cat](cat.png)\nafter");
         let s = store("cat.png", 80, 40);
-        // Cursor on the image line: source text on top, picture still below it.
-        let l = layout_img(&f, &r, (0, 0), &s, ImageUi::default());
+        // Caret inside the source: source text on top, picture still below it.
+        let l = layout_img(&f, &r, (2, 2), &s, ImageUi::default());
         assert!(l.lines()[0].image.is_none(), "row 0 is the editable source");
         assert!(
             !l.run_slice(&l.lines()[0]).is_empty(),
@@ -7390,6 +7443,29 @@ mod tests {
             l.lines()[1].image.is_some(),
             "the picture still shows below it"
         );
+    }
+
+    #[test]
+    fn a_caret_on_a_picture_keeps_its_source_collapsed() {
+        let f = fonts();
+        // The picture's line is 0..13; 0 and 13 are the caret's two places on it.
+        let r = rope("![x](cat.png)\nafter");
+        let s = store("cat.png", 80, 80);
+        for on in [0, 13] {
+            let l = layout_img(&f, &r, (on, on), &s, ImageUi::default());
+            assert!(
+                l.lines()[0].image.is_some() && l.run_slice(&l.lines()[0]).is_empty(),
+                "at {on} the picture shows alone, its source collapsed"
+            );
+            // The undrawn caret sits at the picture's left edge, level with its top
+            // on the side above and its bottom on the side below, for scrolling and
+            // the column a vertical move keeps.
+            let pic = l.image_rect(&f, &l.lines()[0]).expect("the picture");
+            let (x, y, h) = l.caret(&f, &r, on);
+            assert_eq!(x, pic.x);
+            let level = if on == 0 { y } else { y + h };
+            assert_eq!(level, if on == 0 { pic.y } else { pic.y + pic.h });
+        }
     }
 
     #[test]
@@ -7404,7 +7480,7 @@ mod tests {
             dragging: true,
             ..ImageUi::default()
         };
-        let l = layout_img(&f, &r, (0, 15), &s, ui);
+        let l = layout_img(&f, &r, (3, 18), &s, ui);
         assert!(
             l.lines()[0].image.is_some(),
             "the image stays a picture-only row while dragging"
@@ -7534,9 +7610,10 @@ mod tests {
         let f = fonts();
         let r = rope("![x](cat.png)\nafter");
         let s = store("cat.png", 80, 80);
-        // Source revealed (cursor on the image line): rows are [source, picture,
-        // after]. "![x](cat.png)" is 13 bytes, so "after" starts at byte 14.
-        let l = layout_img(&f, &r, (0, 0), &s, ImageUi::default());
+        // Source revealed (caret inside it): rows are [source, picture, after].
+        // "![x](cat.png)" is 13 bytes, so "after" starts at byte 14.
+        let l = layout_img(&f, &r, (2, 2), &s, ImageUi::default());
+        assert!(l.lines()[0].image.is_none(), "row 0 is the revealed source");
         // Down from the source skips the picture row and lands in "after" (>= 14).
         assert!(
             l.offset_vertical(&f, &r, 0, 1, 0.0) >= 14,
@@ -7550,14 +7627,28 @@ mod tests {
     }
 
     #[test]
-    fn arrowing_onto_a_picture_only_image_lands_at_its_start() {
+    fn arrowing_onto_a_picture_keeps_the_side_it_came_from() {
         let f = fonts();
-        let r = rope("top\n![x](cat.png)");
         let s = store("cat.png", 80, 80);
-        // Cursor on "top"; the image below is a picture-only row (not revealed).
+        // "top" is 0..3, the picture's line 4..17, and "bottom" starts at 18.
+        let r = rope("top\n![x](cat.png)\nbottom");
         let l = layout_img(&f, &r, (0, 0), &s, ImageUi::default());
-        // Down lands on the image's logical start (4), so the next build reveals it.
-        assert_eq!(l.offset_vertical(&f, &r, 0, 1, 0.0), 4);
+        let pic = l
+            .image_rect(&f, &l.lines()[1])
+            .expect("row 1 is the picture alone");
+        // Down lands on its side below and Up on its side above, whatever the
+        // column; the next step leaves it either way.
+        for goal in [0.0, (pic.x + pic.w - 5) as f32] {
+            assert_eq!(l.offset_vertical(&f, &r, 0, 1, goal), 17, "down from top");
+            assert_eq!(l.offset_vertical(&f, &r, 20, -1, goal), 4, "up from bottom");
+        }
+        for on in [4, 17] {
+            assert!(
+                l.offset_vertical(&f, &r, on, 1, 0.0) >= 18,
+                "on down to bottom"
+            );
+            assert!(l.offset_vertical(&f, &r, on, -1, 0.0) <= 3, "on up to top");
+        }
     }
 
     #[test]
@@ -7576,6 +7667,14 @@ mod tests {
                 .any(|rc| rc.h == img.box_height() && rc.w == img.width),
             "the image's selection rect matches its box"
         );
+        // A selection from after the picture (13) into "after" takes the picture's
+        // line break but not the picture, so the box is not drawn.
+        let rects = l.selection_rects(&f, &r, 13, 18);
+        assert!(
+            !rects.iter().any(|rc| rc.h == img.box_height()),
+            "a selection beginning after the picture does not box it"
+        );
+        assert!(!rects.is_empty(), "the text it covers is still highlighted");
     }
 
     #[test]
@@ -7583,8 +7682,8 @@ mod tests {
         let f = fonts();
         let r = rope("![x](cat.png)\nafter");
         let s = store("cat.png", 80, 60);
-        // Raw revealed (cursor on the image line): rows are [source, picture, after].
-        let l = layout_img(&f, &r, (0, 0), &s, ImageUi::default());
+        // Raw revealed (caret inside the source): rows are [source, picture, after].
+        let l = layout_img(&f, &r, (2, 2), &s, ImageUi::default());
         let picture = l.lines()[1].image.expect("row 1 is the picture");
         // Select the source line. The picture row must not add its box: that would
         // make highlighting the raw text look like selecting the image.

@@ -1786,7 +1786,7 @@ impl State {
     /// on it. A line that is no longer a picture (the source changed under the
     /// pointer) opens nothing.
     pub(super) fn open_image_view(&mut self, i: usize) {
-        let Some(ls) = self.editors[i].selected_image else {
+        let Some(ls) = self.editors[i].selected_picture() else {
             return;
         };
         let Some(raw) = self.image_path_at(i, ls) else {
@@ -2722,6 +2722,12 @@ impl State {
             ed.request_caret_snap();
             return None;
         }
+        // A selected picture stands in for the caret on it, so no bar is drawn; snap
+        // so the caret appears where it moves next rather than easing in from there.
+        if ed.selected_picture().is_some() {
+            ed.request_caret_snap();
+            return None;
+        }
         let cursor = ed.text.cursor();
         let (cx, cy, ch) = ed
             .layout_cache
@@ -2769,7 +2775,8 @@ impl State {
             return None;
         };
         let ed = &self.editors[i];
-        (ed.has_tabs() && ed.cursor_in_window()).then(|| ed.caret_anim())
+        (ed.has_tabs() && ed.cursor_in_window() && ed.selected_picture().is_none())
+            .then(|| ed.caret_anim())
     }
 
     /// When the loop should next tick the caret while it eases, or `None` when it is

@@ -568,7 +568,7 @@ type LayoutKey = (
     u32,
     usize,
     usize,
-    (bool, bool),
+    ((bool, bool), (bool, bool)),
     Option<usize>,
     Option<usize>,
     bool,
@@ -905,10 +905,28 @@ struct DragSelect {
     anchor: (usize, usize),
     /// The unit the sweep extends by, from the press that started it.
     grain: DragGrain,
-    /// The logical-line start of the picture the press selected, if it landed on
-    /// one. The picture's border holds while the pointer stays within [`Self::anchor`]
-    /// and gives way to a text selection once the sweep leaves the image's line.
+    /// The caret's place on the picture the press selected, if it landed on one
+    /// (its line's start or end). The picture stays selected while the pointer
+    /// stays within the anchor and gives way to a text selection once the sweep
+    /// leaves the image's line.
     image: Option<usize>,
+}
+
+/// The side of a selected picture the caret holds, which decides where typing
+/// goes: Above is the picture line's start, Below its end.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum PictureSide {
+    Above,
+    Below,
+}
+
+/// The four delete keys: Backspace and Delete, by grapheme or by word.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum DeleteKey {
+    Back,
+    Forward,
+    WordBack,
+    WordForward,
 }
 
 impl DragSelect {
@@ -921,7 +939,8 @@ impl DragSelect {
         }
     }
 
-    /// A drag off the picture on the logical line `[start, end)`.
+    /// A drag off the picture on the logical line start..end, with the caret at
+    /// image on it.
     fn image(image: usize, (start, end): (usize, usize)) -> Self {
         Self {
             anchor: (start, end),
@@ -956,7 +975,8 @@ pub(crate) enum DiskConflict {
 /// treat the picture and its raw-source button differently.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum ImagePress {
-    /// Neither: the press is the text's to deal with.
+    /// Neither: the press is the text's to deal with. In the space around a
+    /// picture that puts the caret on the picture, selecting it.
     Missed,
     /// The corner button that pins the picture's raw source open. Toggled.
     Button,
@@ -1020,7 +1040,6 @@ pub(crate) struct EditorPane {
     /// banner over the pane. `None` when the buffer and the file are in sync.
     pub(crate) conflict: Option<DiskConflict>,
     pub(crate) images: ImageStore,
-    pub(crate) selected_image: Option<usize>,
     pub(crate) raw_image: Option<usize>,
     pub(crate) find: FindState,
     pub(crate) scroll_y: i32,
@@ -1078,7 +1097,6 @@ impl EditorPane {
             disk: None,
             conflict: None,
             images: ImageStore::new(None),
-            selected_image: None,
             raw_image: None,
             find: FindState::new(),
             scroll_y: 0,
@@ -1317,11 +1335,31 @@ impl EditorPane {
         (reaches(active.0), reaches(active.1))
     }
 
+    /// Whether each end of the active range sits inside the source of a picture,
+    /// which reveals that source; the edges of a picture's line are where a caret
+    /// on the picture sits, and reveal nothing. Folded into the layout cache key, since
+    /// stepping between a picture's edge and its inside flips the reveal without
+    /// changing which lines the range touches. Reads the index for which lines are
+    /// pictures, so a caret leaving a text line's start rebuilds nothing.
+    fn image_reveal(&self, active: (usize, usize)) -> (bool, bool) {
+        let Some(index) = self.line_index.as_ref() else {
+            return (false, false);
+        };
+        let rope = self.text.rope();
+        let inside = |off: usize| {
+            let line = rope.byte_to_line(off);
+            let (ls, le) = rope.line_content_range(line);
+            index.image_extra(line) > 0
+                && crate::layout::active_reveals_image_source((off, off), ls, le)
+        };
+        (inside(active.0), inside(active.1))
+    }
+
     /// The per-image UI state (selected border, pinned raw source, drag-freeze) for
     /// the layout.
     pub(crate) fn image_ui(&self) -> ImageUi {
         ImageUi {
-            selected: self.selected_image,
+            selected: self.selected_picture(),
             raw: self.raw_image,
             dragging: self.dragging(),
         }
@@ -1349,8 +1387,8 @@ impl EditorPane {
 
     /// What the index's geometry queries must add for the current reveal: the lines
     /// the cursor or selection touches (whose markup draws raw, so their rows wrap
-    /// wider), and the ≤2 image sources shown (the reveal range's ends and the
-    /// raw-pinned line). A source inside a folded section is skipped: it is not on
+    /// wider), and the image sources shown (one an end of the range sits inside, and
+    /// the pinned one). A source inside a folded section is skipped: it is not on
     /// screen to reveal.
     fn reveal_adjust(&self) -> RevealAdjust {
         let mut adjust = RevealAdjust::default();
@@ -1363,21 +1401,25 @@ impl EditorPane {
         // of them re-wraps.
         adjust.reveal_lines(rope.byte_to_line(lo), rope.byte_to_line(hi));
         // A drag holds every image source collapsed so the geometry under the
-        // pointer stays put (matching the window build's `image_ui.dragging`); only
-        // a corner-pinned source below still expands. Off a drag the reveal range's
-        // ends expand their image sources.
-        let mut expand = |off: usize| {
-            let line = rope.byte_to_line(off);
+        // pointer stays put (matching the window build's image_ui.dragging); only a
+        // corner-pinned source still expands. Off a drag an end of the range inside
+        // an image source expands it, as the window build's reveal test does.
+        let mut expand = |line: usize| {
             if !self.fold_map.hides(line) {
                 adjust.push(line, index.image_extra(line));
             }
         };
         if !self.dragging() {
-            expand(lo);
-            expand(hi);
+            let (lo_inside, hi_inside) = self.image_reveal((lo, hi));
+            if lo_inside {
+                expand(rope.byte_to_line(lo));
+            }
+            if hi_inside {
+                expand(rope.byte_to_line(hi));
+            }
         }
         if let Some(raw) = self.raw_image {
-            expand(raw);
+            expand(rope.byte_to_line(raw));
         }
         adjust
     }
@@ -1517,9 +1559,10 @@ impl EditorPane {
         // A heading or fence reveal depends only on which lines the active range
         // touches, so the key coarsens those to lines. A bullet or task reveal is
         // finer (it turns on where the range reaches the marker, not just the line),
-        // so its two-ended state rides the key on its own. The live drag rides the
-        // key because it holds image sources and list markers collapsed, so
-        // releasing a drag must rebuild to let those reveal.
+        // so its two-ended state rides the key on its own, and so does a picture's,
+        // which turns on whether an end sits inside its source or at its edges. The
+        // live drag rides the key because it holds image sources and list markers
+        // collapsed, so releasing a drag must rebuild to let those reveal.
         let active_lines = {
             let rope = self.text.rope();
             (rope.byte_to_line(active.0), rope.byte_to_line(active.1))
@@ -1532,8 +1575,8 @@ impl EditorPane {
             self.scale.factor_120(),
             active_lines.0,
             active_lines.1,
-            self.marker_reveal(active),
-            self.selected_image,
+            (self.marker_reveal(active), self.image_reveal(active)),
+            self.selected_picture(),
             self.raw_image,
             self.dragging(),
             self.folds.revision(),
@@ -1975,10 +2018,19 @@ impl EditorPane {
     }
 
     /// A double-click press: select the word under the pointer and drag on by whole
-    /// words, so a sweep keeps snapping to word bounds.
+    /// words, so a sweep keeps snapping to word bounds. Around a collapsed picture
+    /// it selects the picture as a single click does, since a word of its hidden
+    /// source would reveal it.
     pub(crate) fn press_word(&mut self, fonts: &Fonts, rect: Rect, px: f32, py: f32) {
         let offset = self.pointer_offset(fonts, rect, px, py);
-        let word = self.text.select_word_at(offset);
+        self.ensure_index(fonts, rect);
+        let word = match self.collapsed_picture(self.text.rope().byte_to_line(offset)) {
+            Some(_) => {
+                self.text.set_cursor(offset, false);
+                (offset, offset)
+            }
+            None => self.text.select_word_at(offset),
+        };
         self.drag = Some(DragSelect::text(word, DragGrain::Word));
     }
 
@@ -2021,15 +2073,14 @@ impl EditorPane {
             };
             layout.offset_at(fonts, rope, px, y)
         };
-        // A picture the press selected keeps its border while the pointer stays on
-        // its line: a drag has to leave the image before the text selection takes
-        // over, so a jitter during the click does not turn a selected picture into a
-        // selected line of collapsed source.
-        if let Some(image) = drag.image {
-            if drag.holds(offset) {
-                return self.select_image(image);
-            }
-            self.selected_image = None;
+        // A picture the press selected stays selected while the pointer stays on
+        // its line: a drag has to leave the line before the text selection takes
+        // over, so a jitter during the click does not turn the selected picture into
+        // a selected line of collapsed source.
+        if let Some(at) = drag.image
+            && drag.holds(offset)
+        {
+            return self.text.set_cursor_changed(at, false);
         }
         self.text.drag_to(drag.anchor, offset, drag.grain)
     }
@@ -2123,11 +2174,14 @@ impl EditorPane {
         layout.checkbox_at(fonts, rope, px, y)
     }
 
-    /// Handle a press on an image button (toggles its raw source) or picture
-    /// (selects it, and anchors a drag on its line so a sweep off the picture
-    /// selects it along with the text it reaches), and report which it was: a caller
-    /// counting clicks has to know a second one on the picture from a second one on
-    /// its button, since only the picture opens.
+    /// Handle a press on a picture's corner button or on the picture, and report
+    /// which it was. The button toggles the raw source open, and closing it from
+    /// inside puts the caret back on the picture. The picture is selected: the caret
+    /// goes onto it, on its side above from the upper half and below from the lower,
+    /// which also takes the caret out of any source it was editing; and a drag is
+    /// anchored on its line so a sweep off the picture selects it along with the
+    /// text it reaches. A caller counting clicks needs to know which it was, since
+    /// only a second click on the picture opens it.
     pub(crate) fn image_press(
         &mut self,
         fonts: &Fonts,
@@ -2135,43 +2189,278 @@ impl EditorPane {
         px: f32,
         py: f32,
     ) -> ImagePress {
-        let (button, image) = {
-            let Some((layout, _, y)) = self.layout_at(fonts, rect, py) else {
+        let (button, picture, on) = {
+            let Some((layout, rope, y)) = self.layout_at(fonts, rect, py) else {
                 return ImagePress::Missed;
             };
             (
                 layout.image_button_at(fonts, px, y),
                 layout.image_at(fonts, px, y),
+                layout.offset_at(fonts, rope, px, y),
             )
         };
         if let Some(ls) = button {
-            self.raw_image = if self.raw_image == Some(ls) {
-                None
-            } else {
-                Some(ls)
-            };
+            self.toggle_raw_pin(ls);
             return ImagePress::Button;
         }
-        let Some(ls) = image else {
+        let Some(ls) = picture else {
             return ImagePress::Missed;
         };
         let rope = self.text.rope();
         let line = rope.line_content_range(rope.byte_to_line(ls));
         self.raw_image = None;
-        self.select_image(ls);
-        self.drag = Some(DragSelect::image(ls, line));
+        self.text.set_cursor(on, false);
+        self.drag = Some(DragSelect::image(on, line));
         ImagePress::Picture
     }
 
-    /// Select the picture on the logical line starting at `ls`, dropping any text
-    /// selection: what the pointer holds is the image, not a range of source.
-    /// Returns whether anything changed.
-    fn select_image(&mut self, ls: usize) -> bool {
-        let changed = self.selected_image != Some(ls) || self.text.selection().is_some();
-        self.selected_image = Some(ls);
+    /// Open or close the source of the picture on the line starting at ls. Closing
+    /// it with the caret in it puts the caret back on the picture, keeping the side
+    /// above when the caret was at the source's start, so the picture shows
+    /// selected again rather than the source staying open around the caret.
+    fn toggle_raw_pin(&mut self, ls: usize) {
+        if self.raw_image != Some(ls) {
+            self.raw_image = Some(ls);
+            return;
+        }
+        self.raw_image = None;
+        let rope = self.text.rope();
         let cursor = self.text.cursor();
-        self.text.set_cursor(cursor, false);
-        changed
+        let (start, end) = rope.line_content_range(rope.byte_to_line(ls));
+        if (start..=end).contains(&cursor) {
+            let on = if cursor == start { start } else { end };
+            self.text.set_cursor(on, false);
+        }
+    }
+
+    /// The logical-line start of the picture the caret is on, which selects it: a
+    /// bare caret at the start or end of a collapsed picture's line. The caret there
+    /// is not drawn; the picture shows a border and its corner button instead. Reads
+    /// the index, which the caller has brought current.
+    pub(crate) fn selected_picture(&self) -> Option<usize> {
+        if self.text.selection().is_some() {
+            return None;
+        }
+        let cursor = self.text.cursor();
+        let (ls, le) = self.collapsed_picture(self.text.rope().byte_to_line(cursor))?;
+        (cursor == ls || cursor == le).then_some(ls)
+    }
+
+    /// The content range ls..le of a logical line when it draws as a picture
+    /// with its source collapsed, so the caret's only places on it are the line's
+    /// start and end, the picture selected at either. Reads the index, which the
+    /// caller has brought current.
+    fn collapsed_picture(&self, line: usize) -> Option<(usize, usize)> {
+        let index = self.line_index.as_ref()?;
+        if index.image_extra(line) == 0 {
+            return None;
+        }
+        let (ls, le) = self.text.rope().line_content_range(line);
+        (self.raw_image != Some(ls)).then_some((ls, le))
+    }
+
+    /// The side the caret holds on the selected picture, if one is selected.
+    fn picture_side(&mut self, fonts: &Fonts, rect: Rect) -> Option<PictureSide> {
+        self.ensure_index(fonts, rect);
+        let ls = self.selected_picture()?;
+        Some(if self.text.cursor() == ls {
+            PictureSide::Above
+        } else {
+            PictureSide::Below
+        })
+    }
+
+    /// Insert typed or pasted text at the caret. On a selected picture the text
+    /// goes on a line of its own, above or below the picture by the side the caret
+    /// holds, so the picture's line stays a picture.
+    pub(crate) fn insert_text(&mut self, fonts: &Fonts, rect: Rect, s: &str) {
+        match self.picture_side(fonts, rect) {
+            Some(side) => self.text.insert_line(s, side == PictureSide::Above),
+            None => self.text.insert_str(s),
+        }
+    }
+
+    /// The Enter key. On a selected picture holding its side above, it opens an
+    /// empty line above the picture and moves onto it, ready to type there.
+    pub(crate) fn enter(&mut self, fonts: &Fonts, rect: Rect) -> bool {
+        if self.picture_side(fonts, rect) == Some(PictureSide::Above) {
+            self.text.insert_line("", true);
+            return true;
+        }
+        self.text.enter()
+    }
+
+    /// One of the delete keys. On a selected picture any of them removes the
+    /// picture with its line. From a neighboring line, a delete that would reach a
+    /// collapsed picture's line stops at the line break, and with nothing left to
+    /// delete the caret goes onto the picture, selecting it; a second press then
+    /// removes it. A partial delete would break the picture unseen and a join would
+    /// turn it back into markdown. An empty line between still goes, since removing
+    /// it leaves the picture's line as it was. Otherwise the plain delete runs.
+    pub(crate) fn delete(&mut self, fonts: &Fonts, rect: Rect, key: DeleteKey) -> bool {
+        let forward = matches!(key, DeleteKey::Forward | DeleteKey::WordForward);
+        if self.picture_side(fonts, rect).is_some() {
+            return self.delete_selected_picture(forward);
+        }
+        if let Some(changed) = self.delete_short_of_picture(fonts, rect, key) {
+            return changed;
+        }
+        match key {
+            DeleteKey::Back => self.text.backspace(),
+            DeleteKey::Forward => self.text.delete_forward(),
+            DeleteKey::WordBack => self.text.delete_word_back(),
+            DeleteKey::WordForward => self.text.delete_word_forward(),
+        }
+    }
+
+    /// Remove the selected picture and its line as one undo step. Backspace leaves
+    /// the caret at the end of the line above, Delete at the start of the line
+    /// below, each falling back to the other side at the document's edge.
+    fn delete_selected_picture(&mut self, forward: bool) -> bool {
+        let Some(ls) = self.selected_picture() else {
+            return false;
+        };
+        let rope = self.text.rope();
+        let le = rope.line_content_range(rope.byte_to_line(ls)).1;
+        // The line goes with its own line break, or the one before it when it is
+        // the last line.
+        let (lo, hi) = if le < rope.len() {
+            (ls, le + 1)
+        } else {
+            (ls.saturating_sub(1), le)
+        };
+        self.text.delete_range(lo, hi);
+        let caret = if forward { lo } else { ls.saturating_sub(1) };
+        self.text.set_cursor(caret, false);
+        true
+    }
+
+    /// A delete from a bare caret on another line whose reach crosses into a
+    /// collapsed picture's line: cut short at that line's break, or the caret onto
+    /// the picture when nothing is left. None when the delete reaches no picture,
+    /// or only removes the empty line the caret is on.
+    fn delete_short_of_picture(
+        &mut self,
+        fonts: &Fonts,
+        rect: Rect,
+        key: DeleteKey,
+    ) -> Option<bool> {
+        if self.text.selection().is_some() {
+            return None;
+        }
+        self.ensure_index(fonts, rect);
+        let forward = matches!(key, DeleteKey::Forward | DeleteKey::WordForward);
+        let word = matches!(key, DeleteKey::WordBack | DeleteKey::WordForward);
+        let cursor = self.text.cursor();
+        let reach = self.text.delete_target(forward, word);
+        let rope = self.text.rope();
+        let line = rope.byte_to_line(cursor);
+        let (cs, ce) = rope.line_content_range(line);
+        // The nearest collapsed picture between the caret's line and the reach.
+        let picture = if forward {
+            (line + 1..=rope.byte_to_line(reach)).find_map(|l| self.collapsed_picture(l))
+        } else {
+            (rope.byte_to_line(reach)..line)
+                .rev()
+                .find_map(|l| self.collapsed_picture(l))
+        }?;
+        if !word && cs == ce {
+            return None;
+        }
+        let (ls, le) = picture;
+        let (lo, hi) = if forward {
+            (cursor, reach.min(ls - 1))
+        } else {
+            (reach.max(le + 1), cursor)
+        };
+        if lo >= hi {
+            return Some(
+                self.text
+                    .set_cursor_changed(if forward { ls } else { le }, false),
+            );
+        }
+        Some(self.text.delete_range(lo, hi))
+    }
+
+    /// A Left or Right step, by grapheme or by word, that treats a collapsed
+    /// picture as one stop. A step onto the picture, or into its hidden source,
+    /// selects it on the side it came from: Right arrives on its side below and
+    /// Left on its side above, which is where typing then goes. The next step
+    /// leaves it. Returns whether the cursor or selection changed.
+    pub(crate) fn move_horizontal(
+        &mut self,
+        fonts: &Fonts,
+        rect: Rect,
+        forward: bool,
+        word: bool,
+        extend: bool,
+    ) -> bool {
+        self.ensure_index(fonts, rect);
+        let from = self.text.cursor();
+        let rope = self.text.rope();
+        if let Some((ls, le)) = self
+            .collapsed_picture(rope.byte_to_line(from))
+            .filter(|&(ls, le)| from == ls || from == le)
+        {
+            let past = if forward {
+                (le < rope.len()).then_some(le + 1)
+            } else {
+                ls.checked_sub(1)
+            };
+            return self.text.set_cursor_changed(past.unwrap_or(from), extend);
+        }
+        let moved = match (forward, word) {
+            (false, false) => self.text.move_left(extend),
+            (true, false) => self.text.move_right(extend),
+            (false, true) => self.text.move_word_left(extend),
+            (true, true) => self.text.move_word_right(extend),
+        };
+        moved | self.step_over_folds(forward, extend) | self.land_on_picture(forward, extend)
+    }
+
+    /// Settle a caret that came to rest on a collapsed picture's line onto the
+    /// picture: on its side below when moving forward, above when moving back.
+    /// Reads the index, which the caller has brought current. Returns whether the
+    /// cursor or selection changed.
+    pub(crate) fn land_on_picture(&mut self, forward: bool, extend: bool) -> bool {
+        let cursor = self.text.cursor();
+        let Some((ls, le)) = self.collapsed_picture(self.text.rope().byte_to_line(cursor)) else {
+            return false;
+        };
+        self.text
+            .set_cursor_changed(if forward { le } else { ls }, extend)
+    }
+
+    /// Close the source the corner button pinned open unless the caret is on its
+    /// line: the pin holds while that source is being edited and closes once the
+    /// caret leaves it. Returns whether it closed.
+    pub(crate) fn settle_raw_pin(&mut self) -> bool {
+        let Some(raw) = self.raw_image else {
+            return false;
+        };
+        let rope = self.text.rope();
+        if rope.line_to_byte(rope.byte_to_line(self.text.cursor())) == raw {
+            return false;
+        }
+        self.raw_image = None;
+        true
+    }
+
+    /// Whether a window position lands on the line whose source is pinned open, so
+    /// a click there edits that source and keeps it open.
+    pub(crate) fn pointer_on_pinned_source(
+        &mut self,
+        fonts: &Fonts,
+        rect: Rect,
+        px: f32,
+        py: f32,
+    ) -> bool {
+        let Some(raw) = self.raw_image else {
+            return false;
+        };
+        let offset = self.pointer_offset(fonts, rect, px, py);
+        let rope = self.text.rope();
+        rope.line_to_byte(rope.byte_to_line(offset)) == raw
     }
 
     /// Handle a press on a table's add-row / add-column hover strip: grow the table
@@ -2199,7 +2488,7 @@ impl EditorPane {
     }
 
     /// The pointer shape for a window position within this pane: a hand over a
-    /// link/checkbox/image-button or a table add-row/add-column strip, the arrow
+    /// link, checkbox, image button, or table add-row/add-column strip, the arrow
     /// over a picture, the I-beam elsewhere.
     pub(crate) fn cursor_shape_at(&mut self, fonts: &Fonts, rect: Rect, px: f32, py: f32) -> u32 {
         use wp_cursor_shape_device_v1::{SHAPE_DEFAULT, SHAPE_POINTER, SHAPE_TEXT};
@@ -4540,6 +4829,18 @@ ran the numbers
         );
     }
 
+    /// An image store holding one decoded 80x80 picture under cat.png.
+    fn cat_store() -> ImageStore {
+        ImageStore::from_decoded(vec![(
+            "cat.png".to_string(),
+            crate::render::image::Image {
+                pixels: vec![0; 80 * 80 * 4],
+                width: 80,
+                height: 80,
+            },
+        )])
+    }
+
     #[test]
     fn a_drag_off_a_pressed_picture_hands_the_selection_to_the_text() {
         let fonts = Fonts::new(&markdown::all_sizes(FONT_SIZE)).expect("a default font");
@@ -4550,14 +4851,7 @@ ran the numbers
             h: 600,
         };
         let mut pane = pane_of("![x](cat.png)\nafter\n");
-        pane.images = ImageStore::from_decoded(vec![(
-            "cat.png".to_string(),
-            crate::render::image::Image {
-                pixels: vec![0; 80 * 80 * 4],
-                width: 80,
-                height: 80,
-            },
-        )]);
+        pane.images = cat_store();
         pane.ensure_layout(&fonts, rect);
         // A point on the picture itself, found the way the pointer finds it.
         let (ix, iy) = {
@@ -4574,27 +4868,233 @@ ran the numbers
             ImagePress::Picture,
             "the press lands on the picture"
         );
-        assert_eq!(pane.selected_image, Some(0), "which the press selects");
+        assert_eq!(pane.selected_picture(), Some(0), "which the press selects");
         assert!(pane.text.selection().is_none(), "with no text selected yet");
         assert!(pane.dragging(), "and a drag anchored on the image's line");
 
         // A jitter that stays on the picture leaves it selected, rather than
         // text-selecting the collapsed source line under it.
         assert!(!pane.drag_to(&fonts, rect, ix + 1.0, iy + 1.0));
-        assert_eq!(pane.selected_image, Some(0));
+        assert_eq!(pane.selected_picture(), Some(0));
         assert!(pane.text.selection().is_none());
 
         // Sweeping into the text below hands over to a text selection, which carries
         // the image line with it.
         let (tx, ty) = over(&pane, &fonts, 19);
         assert!(pane.drag_to(&fonts, rect, tx, ty));
-        assert_eq!(pane.selected_image, None, "the picture's border gives way");
+        assert_eq!(
+            pane.selected_picture(),
+            None,
+            "the picture's border gives way"
+        );
         assert_eq!(pane.text.selection(), Some((0, 19)));
 
         // Sweeping back onto the picture takes it as a picture again.
         assert!(pane.drag_to(&fonts, rect, ix, iy));
-        assert_eq!(pane.selected_image, Some(0));
+        assert_eq!(pane.selected_picture(), Some(0));
         assert!(pane.text.selection().is_none());
+    }
+
+    /// A note that opens with an 80px picture over a line of text, laid out in an
+    /// 800x600 column with the caret parked in that text at byte 16, so the picture
+    /// shows alone with its source collapsed. Also returns the picture's rectangle.
+    fn picture_note() -> (EditorPane, Fonts, Rect, Rect) {
+        let fonts = Fonts::new(&markdown::all_sizes(FONT_SIZE)).expect("a default font");
+        let rect = Rect {
+            x: 0,
+            y: 0,
+            w: 800,
+            h: 600,
+        };
+        let mut pane = pane_of("![x](cat.png)\nafter\n");
+        pane.images = cat_store();
+        pane.text.set_cursor(16, false);
+        pane.ensure_layout(&fonts, rect);
+        let layout = pane.layout_cache.as_ref().expect("a built layout");
+        let picture = layout
+            .image_rect(&fonts, &layout.lines()[0])
+            .expect("the note opens with a picture alone");
+        (pane, fonts, rect, picture)
+    }
+
+    #[test]
+    fn a_press_around_a_picture_selects_it() {
+        // Above the picture or level with its upper half selects it on its side
+        // above (0); below it or level with its lower half on its side below (13).
+        // Neither reveals the source.
+        let (_, _, _, pic) = picture_note();
+        let (upper, lower) = ((pic.y + 5) as f32, (pic.y + pic.h - 5) as f32);
+        let probes = [
+            ("the margin above the note", ((pic.x + 10) as f32, 1.0), 0),
+            (
+                "the padding above it",
+                ((pic.x + pic.w - 5) as f32, (pic.y - 2) as f32),
+                0,
+            ),
+            (
+                "the margin left of its upper half",
+                ((pic.x - 10) as f32, upper),
+                0,
+            ),
+            (
+                "the space right of its lower half",
+                ((pic.x + pic.w + 40) as f32, lower),
+                13,
+            ),
+            (
+                "the padding below it",
+                ((pic.x + 5) as f32, (pic.y + pic.h + 2) as f32),
+                13,
+            ),
+        ];
+        for (place, (px, py), on) in probes {
+            let (mut pane, fonts, rect, _) = picture_note();
+            assert_eq!(
+                pane.image_press(&fonts, rect, px, py),
+                ImagePress::Missed,
+                "{place}: off the picture, so the press is the text's"
+            );
+            assert_eq!(
+                pane.cursor_shape_at(&fonts, rect, px, py),
+                wp_cursor_shape_device_v1::SHAPE_TEXT,
+                "{place}: the I-beam, since a click there places the caret"
+            );
+            pane.press_at(&fonts, rect, px, py, false);
+            pane.release_drag();
+            assert_eq!(pane.text.cursor(), on, "{place}");
+            assert_eq!(pane.selected_picture(), Some(0), "{place}: selected");
+            pane.ensure_layout(&fonts, rect);
+            let layout = pane.layout_cache.as_ref().expect("a built layout");
+            assert!(
+                layout.lines()[0].image.is_some_and(|img| img.selected),
+                "{place}: the picture shows alone and selected, its source collapsed"
+            );
+        }
+    }
+
+    #[test]
+    fn a_double_click_around_a_picture_selects_it_as_a_click_does() {
+        // A word of the hidden source would reveal it.
+        let (mut pane, fonts, rect, pic) = picture_note();
+        let (px, py) = ((pic.x + pic.w + 40) as f32, (pic.y + pic.h - 5) as f32);
+        pane.press_word(&fonts, rect, px, py);
+        pane.release_drag();
+        assert_eq!(pane.text.selection(), None);
+        assert_eq!((pane.text.cursor(), pane.selected_picture()), (13, Some(0)));
+    }
+
+    #[test]
+    fn clicking_a_picture_closes_the_source_the_caret_was_editing() {
+        // Two pictures, a on 0..13 and b on 14..27. The caret inside b's source shows
+        // it. A click on a moves the caret onto a, so b's source closes and stays
+        // closed through the clicks that follow.
+        let fonts = Fonts::new(&markdown::all_sizes(FONT_SIZE)).expect("a default font");
+        let rect = Rect {
+            x: 0,
+            y: 0,
+            w: 800,
+            h: 600,
+        };
+        let mut pane = pane_of("![a](cat.png)\n![b](cat.png)\n");
+        pane.images = cat_store();
+        pane.text.set_cursor(18, false);
+        let b_open = |pane: &mut EditorPane| {
+            pane.ensure_layout(&fonts, rect);
+            let layout = pane.layout_cache.as_ref().expect("a built layout");
+            layout
+                .lines()
+                .iter()
+                .any(|l| l.start == 14 && l.image.is_none())
+        };
+        assert!(
+            b_open(&mut pane),
+            "b's source shows while the caret is in it"
+        );
+        for (click, height, on) in [(0, 0.25, 0), (1, 0.25, 0), (2, 0.75, 13)] {
+            let a = {
+                let layout = pane.layout_cache.as_ref().expect("a built layout");
+                layout
+                    .image_rect(&fonts, &layout.lines()[0])
+                    .expect("a is the first row")
+            };
+            // Clear of the corner button, which a selected picture draws.
+            let (px, py) = ((a.x + 10) as f32, a.y as f32 + a.h as f32 * height);
+            assert_eq!(pane.image_press(&fonts, rect, px, py), ImagePress::Picture);
+            pane.release_drag();
+            assert_eq!(pane.selected_picture(), Some(0), "click {click} selects a");
+            assert_eq!(
+                pane.text.cursor(),
+                on,
+                "click {click}: the side by the half"
+            );
+            assert!(!b_open(&mut pane), "click {click}: b's source stays closed");
+        }
+    }
+
+    #[test]
+    fn the_button_opens_a_selected_pictures_source_and_closes_it_again() {
+        let (mut pane, fonts, rect, pic) = picture_note();
+        let button = |pane: &mut EditorPane| {
+            pane.ensure_layout(&fonts, rect);
+            let layout = pane.layout_cache.as_ref().expect("a built layout");
+            let row = layout
+                .lines()
+                .iter()
+                .find(|l| l.image.is_some())
+                .expect("the picture's row");
+            let pic = layout.image_rect(&fonts, row).expect("the picture");
+            let b = crate::layout::image_button_rect(&pic, Scale::ONE);
+            ((b.x + 2) as f32, (b.y + 2) as f32)
+        };
+        // A click on the upper half selects the picture, which draws the button.
+        let (px, py) = ((pic.x + 10) as f32, (pic.y + 10) as f32);
+        assert_eq!(pane.image_press(&fonts, rect, px, py), ImagePress::Picture);
+        pane.release_drag();
+        assert_eq!(pane.selected_picture(), Some(0));
+
+        // The button opens the source: the caret is now at its start, as text.
+        let (bx, by) = button(&mut pane);
+        assert_eq!(pane.image_press(&fonts, rect, bx, by), ImagePress::Button);
+        assert_eq!(pane.raw_image, Some(0));
+        assert_eq!(pane.selected_picture(), None, "the caret is in the source");
+
+        // The button stays drawn while the source is open, and closes it from
+        // inside, putting the caret back on the picture.
+        pane.text.set_cursor(5, false);
+        let (bx, by) = button(&mut pane);
+        assert_eq!(pane.image_press(&fonts, rect, bx, by), ImagePress::Button);
+        assert_eq!(pane.raw_image, None);
+        assert_eq!((pane.text.cursor(), pane.selected_picture()), (13, Some(0)));
+        pane.ensure_layout(&fonts, rect);
+        let layout = pane.layout_cache.as_ref().expect("a built layout");
+        assert!(
+            layout.lines()[0].image.is_some(),
+            "the source is collapsed again"
+        );
+    }
+
+    #[test]
+    fn a_press_below_a_note_ending_on_a_picture_goes_to_the_end() {
+        // The page under the note belongs to the text: a press there lands at the
+        // document's end, after the picture, which reveals nothing.
+        let fonts = Fonts::new(&markdown::all_sizes(FONT_SIZE)).expect("a default font");
+        let rect = Rect {
+            x: 0,
+            y: 0,
+            w: 800,
+            h: 600,
+        };
+        let mut pane = pane_of("top\n![x](cat.png)");
+        pane.images = cat_store();
+        pane.ensure_layout(&fonts, rect);
+        let (px, py) = (60.0, 560.0);
+        assert_eq!(pane.image_press(&fonts, rect, px, py), ImagePress::Missed);
+        pane.press_at(&fonts, rect, px, py, false);
+        pane.release_drag();
+        assert_eq!(pane.text.cursor(), 17, "after the picture");
+        pane.ensure_layout(&fonts, rect);
+        let layout = pane.layout_cache.as_ref().expect("a built layout");
+        assert!(layout.lines()[1].image.is_some() && layout.lines().len() == 2);
     }
 
     /// A group of `n` tabs, each stamped with a distinct `scroll_y` so a test can

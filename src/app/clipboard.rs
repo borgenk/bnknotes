@@ -222,7 +222,7 @@ impl State {
     /// if nothing is selected or the file can no longer be read.
     pub(super) fn copy_selected_image(&mut self) -> Result<()> {
         let i = self.active_editor();
-        let Some(ls) = self.editors[i].selected_image else {
+        let Some(ls) = self.editors[i].selected_picture() else {
             return Ok(());
         };
         let Some(raw) = self.image_path_at(i, ls) else {
@@ -470,7 +470,8 @@ impl State {
         // normalize here too rather than let a stray '\r' into the rope.
         let text = file::normalize_newlines(text);
         let i = self.active_editor();
-        self.editors[i].text.insert_str(&text);
+        let rect = self.editor_rect(i);
+        self.editors[i].insert_text(&self.fonts, rect, &text);
         // A paste is an edit like any other: the same settling every keystroke gets,
         // so the title's modified marker is not left reading clean over pasted text.
         self.after_edit();

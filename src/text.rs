@@ -1075,14 +1075,12 @@ impl TextBuffer {
         }
     }
 
-    /// Pull the low end of a mouse-driven selection back over a block marker, so
-    /// selecting an item from the start of its visible text takes the marker with
-    /// it. A heading's `#` is zero-width when collapsed, so a far-left click lands
-    /// at its text start with no way to aim before the marker; a bullet or task
-    /// marker is a disc or checkbox in the gutter, so a drag that starts just past
-    /// it (or over it) should still grab the whole `- `/`- [ ] `. A no-op unless a
-    /// selection's low end sits within its line's marker (past the start, up to the
-    /// marker's end) on a heading, bullet, or task line.
+    /// Pull the low end of a mouse-driven selection back to the line start when it
+    /// sits in a heading, bullet, or task marker, so the marker is taken whole. A
+    /// collapsed heading marker is zero-width, so a press at the left edge lands on
+    /// the text start, and that position grabs it too. A bullet or task marker keeps
+    /// its width under the disc or checkbox, so only a press on that side of the
+    /// text grabs it, and a sweep from the label's first letter selects the label.
     pub fn include_block_marker(&mut self) {
         let Some(anchor) = self.anchor else {
             return;
@@ -1094,15 +1092,13 @@ impl TextBuffer {
         let line = self.text.byte_to_line(lo);
         let (ls, le) = self.text.line_content_range(line);
         let (style, marker_len) = markdown::classify(&self.text.byte_slice(ls..le));
-        let has_marker = matches!(
-            style,
-            markdown::LineStyle::Heading(_)
-                | markdown::LineStyle::Bullet
-                | markdown::LineStyle::Task { .. }
-        );
-        // Grab only when the low end is inside the marker (past the start, at or
-        // before its end), not when it is out in the words.
-        if !has_marker || lo <= ls || lo > ls + marker_len {
+        let marker_end = ls + marker_len;
+        let in_marker = match style {
+            markdown::LineStyle::Heading(_) => lo <= marker_end,
+            markdown::LineStyle::Bullet | markdown::LineStyle::Task { .. } => lo < marker_end,
+            _ => false,
+        };
+        if lo <= ls || !in_marker {
             return;
         }
         if self.cursor < anchor {
@@ -2529,15 +2525,16 @@ mod tests {
     }
 
     #[test]
-    fn selecting_a_bullet_from_its_text_start_takes_the_marker() {
-        // "- item": marker is "- " (2 bytes), content "item" at 2..6.
+    fn selecting_a_bullet_from_its_text_start_keeps_the_marker_out() {
+        // "- item": marker is "- " (2 bytes), content "item" at 2..6. A sweep from
+        // the label's first letter copies the label, not the "- " before it.
         let mut b = TextBuffer::new();
         b.insert_str("- item");
         b.set_cursor(2, false);
         b.set_cursor(6, true);
         b.include_block_marker();
-        assert_eq!(b.selection(), Some((0, 6)));
-        assert_eq!(b.selected_text().as_deref(), Some("- item"));
+        assert_eq!(b.selection(), Some((2, 6)));
+        assert_eq!(b.selected_text().as_deref(), Some("item"));
     }
 
     #[test]
@@ -2553,11 +2550,24 @@ mod tests {
     }
 
     #[test]
-    fn selecting_a_task_item_from_its_text_start_takes_the_whole_marker() {
+    fn selecting_a_task_item_from_its_text_start_keeps_the_marker_out() {
         // "- [ ] do": marker is "- [ ] " (6 bytes), content "do" at 6..8.
         let mut b = TextBuffer::new();
         b.insert_str("- [ ] do");
         b.set_cursor(6, false);
+        b.set_cursor(8, true);
+        b.include_block_marker();
+        assert_eq!(b.selection(), Some((6, 8)));
+        assert_eq!(b.selected_text().as_deref(), Some("do"));
+    }
+
+    #[test]
+    fn selecting_a_task_item_from_inside_its_marker_takes_the_whole_marker() {
+        // Low end at byte 5, the space between "]" and the label: past the bullet's
+        // own two bytes, so the grab has to measure the whole "- [ ] ".
+        let mut b = TextBuffer::new();
+        b.insert_str("- [ ] do");
+        b.set_cursor(5, false);
         b.set_cursor(8, true);
         b.include_block_marker();
         assert_eq!(b.selection(), Some((0, 8)));

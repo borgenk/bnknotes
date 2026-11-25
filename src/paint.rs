@@ -4898,6 +4898,46 @@ mod tests {
     }
 
     #[test]
+    fn a_press_on_a_bullets_disc_lands_inside_its_marker() {
+        // A drag only takes a list item's marker when its press lands inside the
+        // marker, so the disc has to sit over the marker's bytes and not over the
+        // label's first letter, for a top-level item and a nested one alike.
+        let fonts = Fonts::new(&markdown::all_sizes(FONT_SIZE)).expect("a default font");
+        let src = "- item\n  - sub\nx";
+        let rope = Rope::from_str(src);
+        let (w, h) = (600i32, 200i32);
+        let off = src.len() - 1;
+        let layout = Layout::build(
+            &fonts,
+            &rope,
+            MARGIN,
+            MARGIN,
+            w - 2 * MARGIN,
+            FONT_SIZE,
+            (off, off),
+        );
+        let list = build_display_list(&fonts, &layout, &rope, &paint_params(w, h));
+        let discs: Vec<Rect> = list
+            .iter()
+            .filter_map(|c| match c {
+                DrawCmd::RoundRect { rect, color, .. } if *color == MARKER_COLOR => Some(*rect),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(discs.len(), 2, "both items draw a disc");
+        // (line start, marker end) of "- item" and "  - sub".
+        for (disc, (ls, marker_end)) in discs.iter().zip([(0, 2), (7, 11)]) {
+            let cx = (disc.x + disc.w / 2) as f32;
+            let cy = (disc.y + disc.h / 2) as f32;
+            let at = layout.offset_at(&fonts, &rope, cx, cy);
+            assert!(
+                (ls..marker_end).contains(&at),
+                "a press on the disc lands at byte {at}, outside the marker {ls}..{marker_end}"
+            );
+        }
+    }
+
+    #[test]
     fn find_bar_and_match_highlights_reach_the_display_list() {
         let fonts = Fonts::new(&markdown::all_sizes(FONT_SIZE)).expect("a default font");
         let rope = Rope::from_str("one two one two one\n");

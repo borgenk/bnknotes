@@ -2099,13 +2099,9 @@ impl EditorPane {
     /// Let go of a drag-selection because the button came up, reporting whether one
     /// was in flight.
     ///
-    /// A sweep that reached a heading's text start, or a list item's, takes the
-    /// block marker with it. That only applies to a sweep by character: a heading's
-    /// marker is zero-width once collapsed, so a press at the line's left edge lands
-    /// past it with no way to aim before it, and pulling the selection back is the
-    /// only way to express "from the start of this item". A double or triple click
-    /// carries no such intent, having asked for a word or a line, so it keeps the
-    /// marker out.
+    /// A sweep by character that starts in a block marker takes the whole marker
+    /// with it (see TextBuffer::include_block_marker). A double or triple click has
+    /// asked for a word or a line, so it keeps the marker out.
     pub(crate) fn release_drag(&mut self) -> bool {
         let Some(drag) = self.drag.take() else {
             return false;
@@ -3863,20 +3859,31 @@ mod tests {
     }
 
     #[test]
-    fn sweeping_from_a_list_items_text_start_takes_its_marker() {
-        // The list analog of the heading rule: a char sweep that began at an
-        // item's label pulls the "- " back in on release, so a multi-item selection
-        // ends with the first item's marker grabbed (the covered items' markers are
-        // already inside the range).
-        let mut pane = pane_of("- one\n- two\n- three\n");
-        // Press at the first item's label ("one" starts at byte 2), sweep into the
-        // third item.
-        pane.text.set_cursor(2, false);
-        pane.drag = Some(DragSelect::text((2, 2), DragGrain::Char));
-        pane.text.set_cursor(15, true);
+    fn sweeping_a_list_items_label_selects_only_the_label() {
+        // A link at the start of a bullet, swept from its first letter to past the
+        // line's end, copies the link and not the "- " the disc stands in for.
+        let (mut pane, fonts, rect) = laid_out("- example.com/a\nafter\n", 21);
+        let (px, py) = over(&pane, &fonts, 2);
+        pane.press_at(&fonts, rect, px, py, false);
+        assert!(pane.drag_to(&fonts, rect, 700.0, py));
         assert!(pane.release_drag());
-        let (lo, _) = pane.text.selection().expect("a selection");
-        assert_eq!(lo, 0, "the sweep reaches back over the first item's '- '");
+        assert_eq!(pane.text.selected_text().as_deref(), Some("example.com/a"));
+    }
+
+    #[test]
+    fn sweeping_from_before_a_list_items_label_takes_whole_items() {
+        // A press in the marker, short of the label, pulls the selection back over
+        // the first "- " on release, so a multi-item sweep copies whole items.
+        let (mut pane, fonts, rect) = laid_out("- one\n- two\n- three\nafter\n", 24);
+        let (px, py) = over(&pane, &fonts, 1);
+        pane.press_at(&fonts, rect, px, py, false);
+        let (_, ty) = over(&pane, &fonts, 15);
+        assert!(pane.drag_to(&fonts, rect, 700.0, ty));
+        assert!(pane.release_drag());
+        assert_eq!(
+            pane.text.selected_text().as_deref(),
+            Some("- one\n- two\n- three")
+        );
     }
 
     #[test]

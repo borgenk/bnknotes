@@ -57,6 +57,8 @@ const XKB_MOD_NAME_CTRL: &[u8] = b"Control\0";
 /// The plain Alt key. AltGr is a different modifier (Level3), so this stays
 /// false while typing AltGr characters.
 const XKB_MOD_NAME_ALT: &[u8] = b"Mod1\0";
+/// The real modifier the standard keymaps put Super on.
+const XKB_MOD_NAME_LOGO: &[u8] = b"Mod4\0";
 
 /// Compose-sequence status after feeding a keysym. The fourth state, "nothing"
 /// (`0`, the keysym is part of no sequence), is the catch-all in the match below.
@@ -153,6 +155,12 @@ impl Xkb {
         NonNull::new(state)
     }
 
+    /// Install MINIMAL_KEYMAP, for tests that need key and modifier state.
+    #[cfg(test)]
+    pub(crate) fn load_minimal_keymap(&mut self) -> Result<()> {
+        self.load_keymap(MINIMAL_KEYMAP.as_bytes(), XKB_KEYMAP_FORMAT_TEXT_V1)
+    }
+
     /// Install the keymap the compositor sent (its raw, NUL-terminated bytes).
     pub fn load_keymap(&mut self, bytes: &[u8], format: u32) -> Result<()> {
         if format != XKB_KEYMAP_FORMAT_TEXT_V1 {
@@ -228,6 +236,11 @@ impl Xkb {
     /// Whether (plain) Alt is currently active; the find bar's mode toggles.
     pub fn alt_active(&self) -> bool {
         self.mod_active(XKB_MOD_NAME_ALT)
+    }
+
+    /// Whether Super is currently active.
+    pub fn super_active(&self) -> bool {
+        self.mod_active(XKB_MOD_NAME_LOGO)
     }
 
     fn mod_active(&self, name: &[u8]) -> bool {
@@ -390,6 +403,28 @@ fn compose_locale(var: impl Fn(&str) -> Option<String>) -> String {
         .unwrap_or_else(|| "C".to_string())
 }
 
+/// The smallest keymap that can answer "is Ctrl held" and type a letter: one key
+/// bound to Control_L and mapped into the real Control modifier, and the a key.
+/// Written out in full so the tests depend on nothing outside the process. The
+/// keycodes carry the evdev offset of 8, so <AC01> = 38 is evdev 30.
+#[cfg(test)]
+pub(crate) const MINIMAL_KEYMAP: &str = r#"
+xkb_keymap {
+  xkb_keycodes "min" { minimum = 8; maximum = 255; <LCTL> = 37; <AC01> = 38; };
+  xkb_types "min" {
+    type "ONE_LEVEL" { modifiers = none; map[none] = Level1; level_name[Level1] = "Any"; };
+  };
+  xkb_compatibility "min" {
+    interpret Control_L { action = SetMods(modifiers = Control); };
+  };
+  xkb_symbols "min" {
+    key <LCTL> { type = "ONE_LEVEL", [ Control_L ] };
+    key <AC01> { type = "ONE_LEVEL", [ a ] };
+    modifier_map Control { <LCTL> };
+  };
+};
+"#;
+
 #[cfg(test)]
 mod tests {
     use crate::platform::xkb::*;
@@ -399,7 +434,7 @@ mod tests {
     #[test]
     fn losing_focus_clears_a_held_modifier() {
         let mut xkb = Xkb::new().expect("xkb context");
-        xkb.load_keymap(MINIMAL_KEYMAP.as_bytes(), XKB_KEYMAP_FORMAT_TEXT_V1)
+        xkb.load_minimal_keymap()
             .expect("the minimal keymap compiles");
         // Control is real modifier index 2 in every keymap, so its mask is 1 << 2,
         // the bits a compositor sends in wl_keyboard.modifiers.
@@ -460,27 +495,30 @@ mod tests {
         assert!(!xkb.shift_active());
         assert!(!xkb.ctrl_active());
         assert!(!xkb.alt_active());
+        assert!(!xkb.super_active());
     }
 
-    /// The smallest keymap that can answer "is Ctrl held": one key bound to
-    /// `Control_L` and mapped into the real `Control` modifier. Written out here
-    /// rather than read from the system's xkb data so the test depends on nothing
-    /// outside the process.
-    const MINIMAL_KEYMAP: &str = r#"
-xkb_keymap {
-  xkb_keycodes "min" { minimum = 8; maximum = 255; <LCTL> = 37; };
-  xkb_types "min" {
-    type "ONE_LEVEL" { modifiers = none; map[none] = Level1; level_name[Level1] = "Any"; };
-  };
-  xkb_compatibility "min" {
-    interpret Control_L { action = SetMods(modifiers = Control); };
-  };
-  xkb_symbols "min" {
-    key <LCTL> { type = "ONE_LEVEL", [ Control_L ] };
-    modifier_map Control { <LCTL> };
-  };
-};
-"#;
+    #[test]
+    fn each_modifier_reads_from_its_own_real_modifier() {
+        // Real modifier indices are fixed in every keymap: Shift 0, Control 2, Mod1 3,
+        // Mod4 6. A compositor sends these bits in wl_keyboard.modifiers.
+        let mut xkb = Xkb::new().expect("xkb context");
+        xkb.load_minimal_keymap()
+            .expect("the minimal keymap compiles");
+        type Query = fn(&Xkb) -> bool;
+        let queries: [(&str, Query); 4] = [
+            ("shift", Xkb::shift_active),
+            ("ctrl", Xkb::ctrl_active),
+            ("alt", Xkb::alt_active),
+            ("super", Xkb::super_active),
+        ];
+        for (held, bit) in [("shift", 0), ("ctrl", 2), ("alt", 3), ("super", 6)] {
+            xkb.update_modifiers(1 << bit, 0, 0, 0);
+            for (name, query) in queries {
+                assert_eq!(query(&xkb), name == held, "{name} with {held} held");
+            }
+        }
+    }
 
     #[test]
     fn a_latched_or_locked_modifier_counts_as_active() {
@@ -491,10 +529,10 @@ xkb_keymap {
         // chord in the editor quietly does nothing. Locked modifiers (Caps Lock, or a
         // layout that locks Shift) have the same shape. Effective state is the union.
         let mut xkb = Xkb::new().expect("xkb context");
-        xkb.load_keymap(MINIMAL_KEYMAP.as_bytes(), XKB_KEYMAP_FORMAT_TEXT_V1)
+        xkb.load_minimal_keymap()
             .expect("the minimal keymap compiles");
 
-        // `Control` is real modifier index 2 in every keymap, so its mask is 1 << 2 —
+        // Control is real modifier index 2 in every keymap, so its mask is 1 << 2,
         // the same bits a compositor puts in wl_keyboard.modifiers.
         xkb.update_modifiers(1 << 2, 0, 0, 0);
         assert!(xkb.ctrl_active(), "a depressed Ctrl is active");

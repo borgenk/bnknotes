@@ -1,22 +1,20 @@
 //! What a key press means to the editor: the binding table, and nothing else.
 //!
-//! [`crate::platform::xkb`] answers only what the machine knows about a key (the
-//! keysym it resolves to, the text it types, which modifiers are held). Turning that
-//! into an editor action is a decision about *this* app, so it lives here, at the app
-//! layer, where you would look for it to rebind something.
+//! The platform xkb layer answers only what the machine knows about a key (the keysym
+//! it resolves to, the text it types, which modifiers are held). Turning that into an
+//! editor action is a decision about this app, so it lives here, at the app layer.
 //!
-//! Two dispatches, in order:
+//! A key held with Super does nothing. Super shortcuts belong to the compositor and the
+//! editor binds none, so the key neither types nor fires the binding it has without
+//! Super.
 //!
-//!   1. **Physical keys** (Backspace, Enter, the arrows, Home/End, Page Up/Down)
-//!      dispatch on the evdev keycode, because their meaning does not move with the
-//!      layout: the Left arrow is the Left arrow on every keyboard. Most of them jump
-//!      further when Ctrl is held, so Ctrl+Left moves a word and Ctrl+Home reaches the
-//!      document start.
-//!   2. **Ctrl combos** dispatch on the *keysym* ([`ctrl_action_for_sym`]), so a
-//!      shortcut follows the letter the user sees rather than the key's position: Ctrl+W
-//!      closes the tab on QWERTY and on Dvorak alike.
-//!
-//! Anything else is text, and goes through the compose machine as a [`KeyAction::Char`].
+//! Every other key dispatches in two steps. Physical keys (Backspace, Enter, the
+//! arrows, Home/End, Page Up/Down) dispatch on the evdev keycode, because their meaning
+//! does not move with the layout, and most of them jump further with Ctrl held:
+//! Ctrl+Left moves a word and Ctrl+Home reaches the document start. Ctrl combos
+//! dispatch on the keysym, so a shortcut follows the letter the user sees: Ctrl+W
+//! closes the tab on QWERTY and on Dvorak alike. Anything else is text, and goes
+//! through the compose machine.
 
 use crate::platform::xkb::{Xkb, keycode};
 
@@ -97,6 +95,9 @@ pub enum KeyAction {
 /// The editor action for a Wayland (evdev) keycode, read against `xkb`'s current
 /// layout and modifier state.
 pub fn action(xkb: &Xkb, keycode: u32) -> KeyAction {
+    if xkb.super_active() {
+        return KeyAction::None;
+    }
     // The navigation and deletion keys do bigger jumps when Ctrl is held: Ctrl+Arrow
     // moves by word, Ctrl+Home/End to the document ends, and Ctrl+Backspace/Delete
     // remove a whole word.
@@ -219,6 +220,37 @@ mod tests {
         // 'a' is evdev keycode 30; with no keymap there is no state to type from.
         let xkb = Xkb::new().expect("xkb context");
         assert_eq!(action(&xkb, 30), KeyAction::None);
+    }
+
+    #[test]
+    fn a_key_held_with_super_does_nothing() {
+        // Real modifier masks, as wl_keyboard.modifiers carries them: Control is
+        // index 2 and Mod4, where keymaps put Super, is index 6.
+        const CTRL: u32 = 1 << 2;
+        const SUPER: u32 = 1 << 6;
+        const KEY_A: u32 = 30;
+        let mut xkb = Xkb::new().expect("xkb context");
+        xkb.load_minimal_keymap()
+            .expect("the minimal keymap compiles");
+        for (key, mods, plain) in [
+            (KEY_A, 0, KeyAction::Char('a')),
+            (KEY_A, CTRL, KeyAction::SelectAll),
+            (keycode::LEFT, 0, KeyAction::Left),
+            (keycode::LEFT, CTRL, KeyAction::WordLeft),
+            (keycode::BACKSPACE, 0, KeyAction::Backspace),
+            (keycode::ENTER, 0, KeyAction::Enter),
+            (keycode::TAB, 0, KeyAction::Tab),
+            (keycode::ESC, 0, KeyAction::Escape),
+        ] {
+            xkb.update_modifiers(mods, 0, 0, 0);
+            assert_eq!(action(&xkb, key), plain, "key {key} with mods {mods:#x}");
+            xkb.update_modifiers(mods | SUPER, 0, 0, 0);
+            assert_eq!(
+                action(&xkb, key),
+                KeyAction::None,
+                "key {key} with mods {mods:#x} and Super"
+            );
+        }
     }
 
     #[test]

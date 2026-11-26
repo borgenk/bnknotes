@@ -11,7 +11,7 @@
 //! above that as a hard backstop, so an absurd size is refused even sooner.
 
 use std::collections::{HashMap, VecDeque};
-use std::io::Cursor;
+use std::io::{Cursor, Read};
 use std::path::{Path, PathBuf};
 
 use zune_core::options::DecoderOptions;
@@ -162,12 +162,15 @@ enum Format {
 }
 
 impl Format {
+    const PNG: &[u8] = &[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
+    const JPEG: &[u8] = &[0xFF, 0xD8, 0xFF];
+    /// The most leading bytes sniff needs to see: the longer signature.
+    const SNIFF_LEN: usize = Self::PNG.len();
+
     fn sniff(bytes: &[u8]) -> Option<Format> {
-        const PNG: &[u8] = &[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
-        const JPEG: &[u8] = &[0xFF, 0xD8, 0xFF];
-        if bytes.starts_with(PNG) {
+        if bytes.starts_with(Self::PNG) {
             Some(Format::Png)
-        } else if bytes.starts_with(JPEG) {
+        } else if bytes.starts_with(Self::JPEG) {
             Some(Format::Jpeg)
         } else {
             None
@@ -513,6 +516,23 @@ impl ImageStore {
                 Format::Jpeg => "image/jpeg",
             };
             Some((bytes, mime))
+        })
+    }
+
+    /// The canonical filesystem path of `raw_path`'s source file, the same file
+    /// [`Self::read_source`] reads, for putting the path on the clipboard. Only the
+    /// head of each candidate is read, enough to tell a picture from another file of
+    /// the same name. `None` if no candidate is a PNG or JPEG.
+    pub fn source_path(&self, raw_path: &str) -> Option<PathBuf> {
+        self.candidates(raw_path).into_iter().find_map(|cand| {
+            let mut head = Vec::with_capacity(Format::SNIFF_LEN);
+            std::fs::File::open(&cand)
+                .ok()?
+                .take(Format::SNIFF_LEN as u64)
+                .read_to_end(&mut head)
+                .ok()?;
+            Format::sniff(&head)?;
+            std::fs::canonicalize(&cand).ok()
         })
     }
 
@@ -936,6 +956,34 @@ mod tests {
         assert_eq!(bytes, TINY_JPEG);
         assert_eq!(mime, "image/jpeg");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn source_path_names_the_picture_file_canonically() {
+        let vault = temp_dir("source-path");
+        let notes = vault.join("notes");
+        std::fs::create_dir_all(&notes).unwrap();
+        std::fs::create_dir_all(vault.join("attachments")).unwrap();
+        std::fs::create_dir_all(vault.join("img")).unwrap();
+        // The file beside the note comes first in the search order but is not a
+        // picture, so the path is the attachment's, the file the editor draws.
+        std::fs::write(notes.join("cat.png"), b"not an image").unwrap();
+        std::fs::write(vault.join("attachments/cat.png"), TINY_PNG).unwrap();
+        std::fs::write(vault.join("img/dog.jpg"), TINY_JPEG).unwrap();
+        let mut store = ImageStore::new(Some(notes));
+        store.set_vault(Some(vault.clone()));
+        let root = std::fs::canonicalize(&vault).unwrap();
+        assert_eq!(
+            store.source_path("cat.png"),
+            Some(root.join("attachments/cat.png"))
+        );
+        // A path that climbs out of the note's folder comes back without the climb.
+        assert_eq!(
+            store.source_path("../img/dog.jpg"),
+            Some(root.join("img/dog.jpg"))
+        );
+        assert_eq!(store.source_path("missing.png"), None);
+        let _ = std::fs::remove_dir_all(&vault);
     }
 
     #[test]

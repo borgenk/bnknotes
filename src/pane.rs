@@ -2170,6 +2170,19 @@ impl EditorPane {
         layout.checkbox_at(fonts, rope, px, y)
     }
 
+    /// The logical-line start of the picture drawn under a window position, if
+    /// any. Its corner button counts as the picture, since it sits on top of it.
+    pub(crate) fn picture_under_pointer(
+        &mut self,
+        fonts: &Fonts,
+        rect: Rect,
+        px: f32,
+        py: f32,
+    ) -> Option<usize> {
+        let (layout, _, y) = self.layout_at(fonts, rect, py)?;
+        layout.image_at(fonts, px, y)
+    }
+
     /// Handle a press on a picture's corner button or on the picture, and report
     /// which it was. The button toggles the raw source open, and closing it from
     /// inside puts the caret back on the picture. The picture is selected: the caret
@@ -4922,6 +4935,26 @@ ran the numbers
             .image_rect(&fonts, &layout.lines()[0])
             .expect("the note opens with a picture alone");
         (pane, fonts, rect, picture)
+    }
+
+    #[test]
+    fn only_a_point_on_the_picture_is_under_the_pointer() {
+        let (mut pane, fonts, rect, pic) = picture_note();
+        let mid_y = (pic.y + pic.h / 2) as f32;
+        let mid = ((pic.x + pic.w / 2) as f32, mid_y);
+        assert_eq!(
+            pane.picture_under_pointer(&fonts, rect, mid.0, mid.1),
+            Some(0)
+        );
+        // Beside the picture on its own line, and on the text below it, the right
+        // click is on the note, not on the picture.
+        let beside = ((pic.x + pic.w + 40) as f32, mid_y);
+        assert_eq!(
+            pane.picture_under_pointer(&fonts, rect, beside.0, beside.1),
+            None
+        );
+        let (tx, ty) = over(&pane, &fonts, 16);
+        assert_eq!(pane.picture_under_pointer(&fonts, rect, tx, ty), None);
     }
 
     #[test]

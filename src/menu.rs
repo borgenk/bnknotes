@@ -37,6 +37,11 @@ pub enum MenuAction {
     AiCustomPrompt,
     /// Pin or unpin tab `tab` of pane `pane`: the right-click on a tab toggles it.
     TogglePin { pane: usize, tab: usize },
+    /// Put the picture whose logical line starts at byte `line` of pane `pane` on
+    /// the clipboard, as its file's bytes.
+    CopyImage { pane: usize, line: usize },
+    /// Put the filesystem path of that picture's file on the clipboard, as text.
+    CopyImagePath { pane: usize, line: usize },
 }
 
 /// One row of a menu: what it says, and what it does. The label is owned because a

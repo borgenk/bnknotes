@@ -1,4 +1,5 @@
 use std::os::fd::{AsRawFd, OwnedFd};
+use std::os::unix::ffi::OsStringExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -217,28 +218,49 @@ impl State {
         Ok(())
     }
 
-    /// Put the selected image's file bytes on the clipboard, advertised as its real
-    /// type (`image/png`/`image/jpeg`), so it can be pasted into other apps. No-op
-    /// if nothing is selected or the file can no longer be read.
+    /// Put the selected image on the clipboard. No-op if nothing is selected.
     pub(super) fn copy_selected_image(&mut self) -> Result<()> {
         let i = self.active_editor();
-        let Some(ls) = self.editors[i].selected_picture() else {
-            return Ok(());
-        };
-        let Some(raw) = self.image_path_at(i, ls) else {
-            return Ok(());
-        };
-        if let Some((bytes, mime)) = self.editors[i].images.read_source(&raw) {
-            self.set_clipboard(bytes, vec![mime]);
+        if let Some(ls) = self.editors[i].selected_picture() {
+            self.copy_image(i, ls);
         }
         Ok(())
     }
 
+    /// Put the file bytes of the image whose logical line starts at `ls` in editor
+    /// `i` on the clipboard, advertised as its real type (`image/png`/`image/jpeg`),
+    /// so it can be pasted into other apps. No-op if that line is no longer an
+    /// image or the file can no longer be read.
+    pub(super) fn copy_image(&mut self, i: usize, ls: usize) {
+        let Some(raw) = self.image_path_at(i, ls) else {
+            return;
+        };
+        if let Some((bytes, mime)) = self.editors[i].images.read_source(&raw) {
+            self.set_clipboard(bytes, vec![mime]);
+        }
+    }
+
+    /// Put the path of that same image's file on the clipboard as text, absolute
+    /// and with symlinks resolved, however the note names it. No-op under the same
+    /// conditions as [`Self::copy_image`].
+    pub(super) fn copy_image_path(&mut self, i: usize, ls: usize) {
+        let Some(raw) = self.image_path_at(i, ls) else {
+            return;
+        };
+        if let Some(path) = self.editors[i].images.source_path(&raw) {
+            self.set_clipboard(path.into_os_string().into_vec(), CLIPBOARD_MIMES.to_vec());
+        }
+    }
+
     /// The raw destination path of the image whose logical line starts at `ls` in
-    /// editor `i`, or `None` if that line is no longer a standalone image.
+    /// editor `i`, or `None` if that line is no longer a standalone image. An offset
+    /// held across an edit (an open menu's) can land mid-line, which names no image.
     pub(super) fn image_path_at(&self, i: usize, ls: usize) -> Option<String> {
         let rope = self.editors[i].text.rope();
-        let (_, le) = rope.line_content_range(rope.byte_to_line(ls));
+        let (start, le) = rope.line_content_range(rope.byte_to_line(ls));
+        if start != ls {
+            return None;
+        }
         let line = rope.slice(ls..le).as_cow();
         let link = markdown::standalone_image(&line)?;
         Some(line[link.path.0..link.path.1].to_string())

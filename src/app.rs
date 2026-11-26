@@ -1637,15 +1637,41 @@ impl State {
     }
 
     /// What a right-click at `(px, py)` offers: a rail chip's icon actions, a tab's
-    /// pin toggle, or an editor pane's editing commands and (when on) AI transforms.
-    /// Anywhere else offers nothing, and so opens no menu.
-    fn menu_items_at(&self, px: f32, py: f32) -> Vec<MenuItem> {
+    /// pin toggle, a picture's copy actions, or an editor pane's editing commands
+    /// and (when on) AI transforms. Anywhere else offers nothing, and so opens no
+    /// menu.
+    fn menu_items_at(&mut self, px: f32, py: f32) -> Vec<MenuItem> {
         match self.hit_test(px, py) {
             Hit::Vault(i) => self.vault_menu_items(i),
-            Hit::Editor(pane, _) => self.editor_menu_items(pane),
+            Hit::Editor(pane, rect) => {
+                let picture = if self.editors[pane].active_is_diff() {
+                    None
+                } else {
+                    self.editors[pane].picture_under_pointer(&self.fonts, rect, px, py)
+                };
+                match picture {
+                    Some(line) => Self::image_menu_items(pane, line),
+                    None => self.editor_menu_items(pane),
+                }
+            }
             Hit::Tab(g, i) | Hit::TabClose(g, i) => self.tab_menu_items(g, i),
             _ => Vec::new(),
         }
+    }
+
+    /// What a right-click on the picture whose line starts at `line` in pane `pane`
+    /// offers. The picture is the subject, so the text commands stay off.
+    fn image_menu_items(pane: usize, line: usize) -> Vec<MenuItem> {
+        vec![
+            MenuItem {
+                label: "Copy image".to_string(),
+                action: MenuAction::CopyImage { pane, line },
+            },
+            MenuItem {
+                label: "Copy image path".to_string(),
+                action: MenuAction::CopyImagePath { pane, line },
+            },
+        ]
     }
 
     /// The menu a right-click on tab `i` of pane `g` offers: pin it, or unpin it if
@@ -1952,6 +1978,8 @@ impl State {
             MenuAction::Ai(i) => self.start_ai_action(i),
             MenuAction::AiCustomPrompt => self.open_ai_prompt(),
             MenuAction::TogglePin { pane, tab } => self.toggle_pin_tab(pane, tab),
+            MenuAction::CopyImage { pane, line } => self.copy_image(pane, line),
+            MenuAction::CopyImagePath { pane, line } => self.copy_image_path(pane, line),
         }
     }
 

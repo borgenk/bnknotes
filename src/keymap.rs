@@ -54,7 +54,10 @@ pub enum KeyAction {
     SelectAll,
     Copy,
     Cut,
+    /// Paste, fitted to the caret's line (Ctrl+V).
     Paste,
+    /// Paste exactly as copied (Ctrl+Shift+V).
+    PastePlain,
     Undo,
     Redo,
     Save,
@@ -85,6 +88,9 @@ pub enum KeyAction {
     /// Format the cursor's line, or every line the selection touches, as a task
     /// item; a line already a task toggles its checkbox (Ctrl+L).
     ToggleTaskList,
+    /// Quote the cursor's line, or every line the selection touches, or unquote them
+    /// when all are quoted already (Ctrl+Shift+Q).
+    ToggleQuote,
     None,
 }
 
@@ -148,8 +154,10 @@ fn ctrl_action_for_sym(sym: u32, shift: bool) -> KeyAction {
         0x66 => KeyAction::Find,                 // f
         0x68 => KeyAction::Replace,              // h
         0x6C => KeyAction::ToggleTaskList,       // l: format the line(s) as a task
+        0x71 if shift => KeyAction::ToggleQuote, // Ctrl+Shift+Q: quote the line(s)
         0x73 => KeyAction::Save,                 // s
         0x78 => KeyAction::Cut,                  // x
+        0x76 if shift => KeyAction::PastePlain,  // Ctrl+Shift+V: paste as copied
         0x76 => KeyAction::Paste,                // v
         0x6B if shift => KeyAction::DeleteLine,  // Ctrl+Shift+K
         0x6B => KeyAction::Palette,              // k: open the palette
@@ -245,6 +253,12 @@ mod tests {
         // comes first, since the shifted key would otherwise fall through to the find bar.
         assert_eq!(ctrl_action_for_sym(sym('f'), false), KeyAction::Find);
         assert_eq!(ctrl_action_for_sym(sym('F'), true), KeyAction::SearchVault);
+        // Ctrl+Shift+V pastes as copied, Ctrl+V fits the paste to a quote.
+        assert_eq!(ctrl_action_for_sym(sym('v'), false), KeyAction::Paste);
+        assert_eq!(ctrl_action_for_sym(sym('V'), true), KeyAction::PastePlain);
+        // Only the shifted Q quotes; a bare Ctrl+Q stays unbound.
+        assert_eq!(ctrl_action_for_sym(sym('Q'), true), KeyAction::ToggleQuote);
+        assert_eq!(ctrl_action_for_sym(sym('q'), false), KeyAction::None);
     }
 
     #[test]

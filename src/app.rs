@@ -49,6 +49,7 @@ use crate::render::image::{Image, ImageStore, Limits};
 use crate::scale::Scale;
 use crate::search;
 use crate::store;
+use crate::text::TextBuffer;
 use crate::theme::{BACKGROUND, CARET_WIDTH, FONT_SIZE, ICON_HOVER_ZOOM, RAIL_RADIUS};
 use crate::tree;
 use crate::watch::FileWatcher;
@@ -1759,13 +1760,20 @@ impl State {
     }
 
     /// The plain editing commands the editor context menu offers on pane `i`,
-    /// independent of the AI feature. Today just formatting the caret's line, or a
-    /// whole selection, as a task list (the menu twin of Ctrl+L).
+    /// independent of the AI feature: formatting the caret's line, or a whole
+    /// selection, as a task list or a quote (the menu twins of Ctrl+L and
+    /// Ctrl+Shift+Q).
     fn edit_command_items(i: usize) -> Vec<MenuItem> {
-        vec![MenuItem {
-            label: "Toggle task list".to_string(),
-            action: MenuAction::ToggleTaskList { pane: i },
-        }]
+        vec![
+            MenuItem {
+                label: "Toggle task list".to_string(),
+                action: MenuAction::ToggleTaskList { pane: i },
+            },
+            MenuItem {
+                label: "Toggle quote".to_string(),
+                action: MenuAction::ToggleQuote { pane: i },
+            },
+        ]
     }
 
     /// The icon actions a right-click offers on rail vault `i`: a picture for the
@@ -1974,7 +1982,12 @@ impl State {
             MenuAction::SaveVault(i) => self.save_vault(i),
             MenuAction::PasteIcon(i) => self.paste_icon(i),
             MenuAction::ClearIcon(i) => self.clear_icon(i),
-            MenuAction::ToggleTaskList { pane } => self.toggle_task_list_in_pane(pane),
+            MenuAction::ToggleTaskList { pane } => {
+                self.edit_lines_in_pane(pane, TextBuffer::toggle_task_list);
+            }
+            MenuAction::ToggleQuote { pane } => {
+                self.edit_lines_in_pane(pane, TextBuffer::toggle_quote);
+            }
             MenuAction::Ai(i) => self.start_ai_action(i),
             MenuAction::AiCustomPrompt => self.open_ai_prompt(),
             MenuAction::TogglePin { pane, tab } => self.toggle_pin_tab(pane, tab),
@@ -1983,13 +1996,14 @@ impl State {
         }
     }
 
-    /// Format pane `pane`'s caret line, or its whole selection, as a task list, the
-    /// context-menu twin of Ctrl+L. Focus the pane first so the caret revealed after
-    /// the edit is the one that changed, then run the after-edit bookkeeping only
-    /// when the buffer actually moved (an all-blank selection is a no-op).
-    fn toggle_task_list_in_pane(&mut self, pane: usize) {
+    /// Run a line-formatting command from the context menu (a task list or quote
+    /// toggle) on the given pane's caret line or selection. Focus the pane first so the
+    /// caret revealed after the edit is the one that changed, then run the
+    /// after-edit bookkeeping only when the buffer actually moved (an all-blank
+    /// selection is a no-op).
+    fn edit_lines_in_pane(&mut self, pane: usize, edit: fn(&mut TextBuffer) -> bool) {
         self.focus_pane(pane);
-        if self.editors[pane].text.toggle_task_list() {
+        if edit(&mut self.editors[pane].text) {
             self.after_edit();
         }
     }
@@ -3661,13 +3675,21 @@ mod tests {
     }
 
     #[test]
-    fn the_editor_menu_offers_the_task_list_command_per_pane() {
-        // The editing command is independent of AI, names its pane, and reads as an
-        // action, so a right-click over a pane always has at least this to click.
+    fn the_editor_menu_offers_the_line_commands_per_pane() {
+        // The editing commands are independent of AI, name their pane, and read as
+        // actions, so a right-click over a pane always has these to click.
         let items = State::edit_command_items(1);
-        assert_eq!(items.len(), 1);
-        assert_eq!(items[0].label, "Toggle task list");
-        assert_eq!(items[0].action, MenuAction::ToggleTaskList { pane: 1 });
+        let rows: Vec<(&str, MenuAction)> = items
+            .iter()
+            .map(|item| (item.label.as_str(), item.action))
+            .collect();
+        assert_eq!(
+            rows,
+            [
+                ("Toggle task list", MenuAction::ToggleTaskList { pane: 1 }),
+                ("Toggle quote", MenuAction::ToggleQuote { pane: 1 }),
+            ]
+        );
     }
 
     #[test]

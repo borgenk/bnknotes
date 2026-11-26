@@ -168,6 +168,47 @@ pub fn next_item_marker(line: &str) -> Option<String> {
     }
 }
 
+/// The text a paste inserts on a quote line, so the pasted block stays inside the
+/// quote. The marker is the line's own, and at_content_start says the caret sits
+/// right after it. Every line the paste adds becomes a quote line: one already
+/// quoted stays as it is, a blank one takes the bare marker, and any other takes
+/// the marker in front. The last line always takes the full marker, since the caret
+/// and the rest of the caret's line land on it. At the content start, a first line
+/// that is already a quote drops its own marker, because the caret's line supplies
+/// one. None when a single line has no marker to drop and goes in as it is.
+pub fn quote_paste(marker: &str, at_content_start: bool, pasted: &str) -> Option<String> {
+    let (first, rest) = match pasted.split_once('\n') {
+        Some((first, rest)) => (first, Some(rest)),
+        None => (pasted, None),
+    };
+    let first = match quote_marker(first) {
+        Some(len) if at_content_start => &first[len..],
+        _ => first,
+    };
+    let Some(rest) = rest else {
+        return (first.len() < pasted.len()).then(|| first.to_string());
+    };
+    // Each added line grows by at most one marker, so this is the most the paste
+    // can come to.
+    let added = rest.bytes().filter(|&b| b == b'\n').count() + 1;
+    let mut out = String::with_capacity(pasted.len() + added * marker.len());
+    out.push_str(first);
+    let mut lines = rest.split('\n').peekable();
+    while let Some(line) = lines.next() {
+        out.push('\n');
+        let last = lines.peek().is_none();
+        if quote_marker(line).is_some() {
+            out.push_str(line);
+        } else if !last && line.trim().is_empty() {
+            out.push_str(marker.trim_end());
+        } else {
+            out.push_str(marker);
+            out.push_str(line);
+        }
+    }
+    Some(out)
+}
+
 /// If `line` opens a fenced code block, the number of backticks in its fence
 /// (at least three). The info string after the fence must contain no backtick,
 /// per CommonMark, so a one-line `` ``` x ``` `` is not taken for an opener. The

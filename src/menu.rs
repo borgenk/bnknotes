@@ -31,6 +31,9 @@ pub enum MenuAction {
     /// Format the line(s) pane `pane` has under its caret or selection as task
     /// items, toggling the box on lines already tasks: the menu twin of Ctrl+L.
     ToggleTaskList { pane: usize },
+    /// Quote the line(s) under the pane's caret or selection, or unquote them
+    /// when they are all quoted: the menu twin of Ctrl+Shift+Q.
+    ToggleQuote { pane: usize },
     /// Run AI action `i` (an index into [`crate::ai::ACTIONS`]) over the focused pane.
     Ai(usize),
     /// Open the palette to type a free-form AI instruction for the focused pane.

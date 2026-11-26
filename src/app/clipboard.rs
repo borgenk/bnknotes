@@ -16,6 +16,16 @@ use crate::platform::protocol::{
 use crate::platform::wire::{Arg, Reader};
 use crate::render::image;
 
+/// How pasted text meets the line it lands on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum PasteMode {
+    /// Fitted to the caret's line: on a quote line every pasted line joins the
+    /// quote (Ctrl+V).
+    Fit,
+    /// Exactly as copied (Ctrl+Shift+V).
+    Verbatim,
+}
+
 /// MIME types we advertise when putting text on the clipboard, and accept when
 /// pasting. The charset variant is listed first as the preferred form.
 pub(super) const CLIPBOARD_MIMES: &[&str] = &["text/plain;charset=utf-8", "text/plain"];
@@ -293,8 +303,8 @@ impl State {
         self.clipboard.mimes = mimes;
     }
 
-    /// Insert the clipboard at the cursor: its text, or an image filed into the
-    /// vault and embedded.
+    /// Insert the clipboard at the cursor: its text, fitted to the line or exactly
+    /// as copied by the paste mode, or an image filed into the vault and embedded.
     ///
     /// Which one is not simply "an image if there is one". A source offers every
     /// flavor it can produce, so the flavors together say what was copied better
@@ -303,7 +313,7 @@ impl State {
     /// image alongside only markup means the image was copied and the markup is a tag
     /// pointing at it (a browser's "Copy Image"). So plain text wins over an image,
     /// and an image wins over rich text alone.
-    pub(super) fn paste(&mut self) -> Result<()> {
+    pub(super) fn paste(&mut self, mode: PasteMode) -> Result<()> {
         if self.clipboard_offers_image() && !self.clipboard_offers_plain_text() {
             // A paste that cannot be filed says so and stops, rather than quietly
             // pasting an <img> tag's markup instead of the picture it names.
@@ -313,7 +323,7 @@ impl State {
             return Ok(());
         }
         if let Some(text) = self.clipboard_text()? {
-            self.insert_clipboard(&text);
+            self.insert_clipboard(&text, mode);
         }
         Ok(())
     }
@@ -483,7 +493,7 @@ impl State {
         );
     }
 
-    pub(super) fn insert_clipboard(&mut self, text: &str) {
+    fn insert_clipboard(&mut self, text: &str, mode: PasteMode) {
         if text.is_empty() {
             return;
         }
@@ -493,7 +503,10 @@ impl State {
         let text = file::normalize_newlines(text);
         let i = self.active_editor();
         let rect = self.editor_rect(i);
-        self.editors[i].insert_text(&self.fonts, rect, &text);
+        match mode {
+            PasteMode::Fit => self.editors[i].paste_text(&self.fonts, rect, &text),
+            PasteMode::Verbatim => self.editors[i].insert_text(&self.fonts, rect, &text),
+        }
         // A paste is an edit like any other: the same settling every keystroke gets,
         // so the title's modified marker is not left reading clean over pasted text.
         self.after_edit();

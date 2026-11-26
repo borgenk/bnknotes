@@ -245,6 +245,40 @@ impl TextBuffer {
         self.touch();
     }
 
+    /// Insert pasted text at the cursor as its own undo step, first replacing any
+    /// selection. With the caret in a quote's content the paste stays in the quote:
+    /// each line it adds carries the quote marker. Before or within the marker, or
+    /// off a quote, the text goes in unchanged.
+    pub fn paste_str(&mut self, s: &str) {
+        // The line is read once the selection is gone, since the paste lands on what
+        // is left of it.
+        let replacing = self.selection().is_some();
+        if replacing {
+            self.checkpoint(Coalesce::None);
+            self.delete_selection();
+        }
+        let (ls, _, line) = self.content_line_at(self.cursor);
+        let quoted = match markdown::classify(&line) {
+            (markdown::LineStyle::Quote, len) if self.cursor >= ls + len => {
+                markdown::quote_paste(&line[..len], self.cursor == ls + len, s)
+            }
+            _ => None,
+        };
+        let s = quoted.as_deref().unwrap_or(s);
+        if !replacing {
+            // A pasted marker that gave way to the line's own can leave nothing to
+            // insert, and an edit that changes nothing takes no undo step.
+            if s.is_empty() {
+                return;
+            }
+            self.checkpoint(Coalesce::None);
+        }
+        self.text.insert(self.cursor, s);
+        self.cursor += s.len();
+        self.anchor = None;
+        self.touch();
+    }
+
     /// Insert s on a line of its own at the cursor, which stands at an edge of a
     /// line's content: above that line when the cursor is at its start, below it
     /// when at its end. The caret lands at the end of s, on the new line, and typing
@@ -506,6 +540,67 @@ impl TextBuffer {
             self.touch();
         }
         changed
+    }
+
+    /// Quote the line(s) the cursor or selection touches, or unquote them when
+    /// every one holding text is already a quote, the Ctrl+Shift+Q gesture. The
+    /// marker goes at the line start in front of what the line holds, so a list item
+    /// or heading becomes one inside the quote, and a line already quoted is left
+    /// alone. A blank line between quoted lines takes a bare > so the quote stays one
+    /// block; blank lines at the edges of a sweep stay blank, and a single targeted
+    /// blank line takes "> " to start a quote. Unquoting removes one marker per line.
+    /// The whole sweep is one undo step, and the cursor and selection ride the
+    /// edits. Returns whether the buffer changed.
+    pub fn toggle_quote(&mut self) -> bool {
+        let (first, last) = self.block_lines();
+        let has_text = |line| !matches!(self.quote_line(line), QuoteLine::Blank);
+        let top = (first..=last).find(|&line| has_text(line));
+        let bottom = (first..=last).rev().find(|&line| has_text(line));
+        let (top, bottom) = match top.zip(bottom) {
+            Some(span) => span,
+            None if first == last => (first, last),
+            None => return false,
+        };
+        let unquote = has_text(top)
+            && (top..=bottom).all(|line| !matches!(self.quote_line(line), QuoteLine::Other));
+        // Every path here edits at least one line: an unquote has a quote at the top,
+        // a quote has a line without one, and a lone blank line takes a marker.
+        self.checkpoint(Coalesce::None);
+        // Bottom-up, so a line start above the one being edited stays valid as the
+        // lines below it change length.
+        for line in (top..=bottom).rev() {
+            let ls = self.text.line_to_byte(line);
+            let delta = match (unquote, self.quote_line(line)) {
+                (true, QuoteLine::Quote(len)) => {
+                    self.text.remove(ls..ls + len);
+                    -(len as i64)
+                }
+                (false, QuoteLine::Blank) if top != bottom => {
+                    self.text.insert(ls, ">");
+                    1
+                }
+                (false, QuoteLine::Blank | QuoteLine::Other) => {
+                    self.text.insert(ls, "> ");
+                    2
+                }
+                _ => continue,
+            };
+            self.cursor = shift_past(self.cursor, ls, delta);
+            self.anchor = self.anchor.map(|a| shift_past(a, ls, delta));
+        }
+        self.touch();
+        true
+    }
+
+    /// How a line stands for a quote toggle.
+    fn quote_line(&self, line: usize) -> QuoteLine {
+        let (ls, le) = self.text.line_content_range(line);
+        let content = self.text.slice(ls..le).as_cow();
+        match markdown::classify(&content) {
+            (markdown::LineStyle::Quote, len) => QuoteLine::Quote(len),
+            _ if content.trim().is_empty() => QuoteLine::Blank,
+            _ => QuoteLine::Other,
+        }
     }
 
     /// The content of the logical line containing `byte` (excluding any trailing
@@ -1355,6 +1450,15 @@ impl TextBuffer {
         let (ls, s) = self.full_line_at(self.cursor);
         Some(ls + grapheme::next_boundary(&s, self.cursor - ls))
     }
+}
+
+/// A line as a quote toggle sees it. A bare > is a quote with no content, never
+/// blank.
+enum QuoteLine {
+    Blank,
+    /// A quote, with its marker's length.
+    Quote(usize),
+    Other,
 }
 
 /// Move a position along with a `delta`-byte indentation change made at line
@@ -2225,6 +2329,189 @@ mod tests {
         b.set_cursor(2, true);
         assert!(!b.toggle_task_list(), "all-blank selection changes nothing");
         assert_eq!(b.text(), "\n\n");
+    }
+
+    // --- Ctrl+Shift+Q: quote line(s) -----------------------------------------
+
+    #[test]
+    fn toggle_quote_quotes_a_line_and_unquotes_it_again() {
+        let mut b = TextBuffer::from_text("note".to_string());
+        b.set_cursor(4, false);
+        assert!(b.toggle_quote());
+        assert_eq!(b.text(), "> note");
+        assert_eq!(b.cursor(), 6, "the caret rides past the marker");
+        assert!(b.toggle_quote());
+        assert_eq!(b.text(), "note");
+        assert_eq!(b.cursor(), 4);
+        // A tight marker and a bare marker unquote too.
+        let mut b = TextBuffer::from_text(">tight\n>".to_string());
+        b.set_cursor(0, false);
+        b.set_cursor(8, true);
+        assert!(b.toggle_quote());
+        assert_eq!(b.text(), "tight\n");
+    }
+
+    #[test]
+    fn toggle_quote_bridges_the_blank_lines_inside_a_block_only() {
+        // Blank lines between paragraphs take a bare marker so the quote stays one
+        // block; the blank lines the selection ran over at its edges stay blank.
+        let mut b = TextBuffer::from_text("x\n\na\n\nb\n\ny".to_string());
+        b.set_cursor(2, false); // the blank line under x
+        b.set_cursor(8, true); // the blank line above y
+        assert!(b.toggle_quote());
+        assert_eq!(b.text(), "x\n\n> a\n>\n> b\n\ny");
+        assert!(b.toggle_quote(), "the selection still spans the block");
+        assert_eq!(b.text(), "x\n\na\n\nb\n\ny", "and unquoting round-trips");
+    }
+
+    #[test]
+    fn toggle_quote_puts_block_markers_inside_the_quote() {
+        // A quote is a container: the line's own marker stays, behind the quote's.
+        let mut b = TextBuffer::from_text("- item\n# head\n  1. one".to_string());
+        b.set_cursor(0, false);
+        b.set_cursor(b.rope().len(), true);
+        assert!(b.toggle_quote());
+        assert_eq!(b.text(), "> - item\n> # head\n>   1. one");
+    }
+
+    #[test]
+    fn toggle_quote_over_a_partly_quoted_block_quotes_the_rest() {
+        // Unquoting needs every line with text quoted; otherwise the lines missing a
+        // marker gain one and the quoted lines are not quoted twice.
+        let mut b = TextBuffer::from_text("> a\nb".to_string());
+        b.set_cursor(0, false);
+        b.set_cursor(5, true);
+        assert!(b.toggle_quote());
+        assert_eq!(b.text(), "> a\n> b");
+    }
+
+    #[test]
+    fn toggle_quote_starts_a_quote_on_a_lone_blank_line() {
+        let mut b = TextBuffer::from_text("x\n\ny".to_string());
+        b.set_cursor(2, false);
+        assert!(b.toggle_quote());
+        assert_eq!(b.text(), "x\n> \ny");
+        assert_eq!(b.cursor(), 4, "the caret waits after the marker");
+        // A selection of only blank lines has nothing to quote.
+        let mut b = TextBuffer::from_text("\n\n".to_string());
+        b.set_cursor(0, false);
+        b.set_cursor(2, true);
+        assert!(!b.toggle_quote());
+        assert_eq!(b.text(), "\n\n");
+    }
+
+    #[test]
+    fn toggle_quote_is_one_undo_step() {
+        let mut b = TextBuffer::from_text("a\n\nb".to_string());
+        b.set_cursor(0, false);
+        b.set_cursor(4, true);
+        assert!(b.toggle_quote());
+        assert!(b.undo());
+        assert_eq!(b.text(), "a\n\nb", "the whole sweep reverts at once");
+        assert!(b.redo());
+        assert_eq!(b.text(), "> a\n>\n> b");
+    }
+
+    #[test]
+    fn unquoting_clamps_a_caret_inside_the_marker() {
+        let mut b = TextBuffer::from_text("> a".to_string());
+        b.set_cursor(1, false); // between > and the space
+        assert!(b.toggle_quote());
+        assert_eq!(b.text(), "a");
+        assert_eq!(b.cursor(), 0, "the caret is not left past a deleted byte");
+    }
+
+    // --- Paste into a quote ---------------------------------------------------
+
+    #[test]
+    fn a_paste_on_a_quote_line_quotes_every_line_it_adds() {
+        let mut b = TextBuffer::from_text("> ".to_string());
+        b.set_cursor(2, false);
+        b.paste_str("one\n\ntwo");
+        assert_eq!(
+            b.text(),
+            "> one\n>\n> two",
+            "a blank line takes the bare marker"
+        );
+        assert_eq!(b.cursor(), b.rope().len());
+        // A tight marker carries over as it is.
+        let mut b = TextBuffer::from_text(">".to_string());
+        b.set_cursor(1, false);
+        b.paste_str("a\nb");
+        assert_eq!(b.text(), ">a\n>b");
+    }
+
+    #[test]
+    fn a_paste_in_a_quote_keeps_the_rest_of_the_line_in_the_quote() {
+        // The last pasted line joins the text after the caret, so it takes the full
+        // marker even when the paste ends in a newline.
+        let mut b = TextBuffer::from_text("> foobar".to_string());
+        b.set_cursor(5, false); // after "foo"
+        b.paste_str("x\ny");
+        assert_eq!(b.text(), "> foox\n> ybar");
+        assert_eq!(b.cursor(), 10, "the caret lands after the pasted y");
+        let mut b = TextBuffer::from_text("> ".to_string());
+        b.set_cursor(2, false);
+        b.paste_str("a\n");
+        assert_eq!(b.text(), "> a\n> ", "the caret waits on a fresh quote line");
+        assert_eq!(b.cursor(), 6);
+    }
+
+    #[test]
+    fn a_quoted_paste_is_not_quoted_twice() {
+        // Right after the marker, a pasted line's own marker gives way to the one
+        // the caret's line already has; later lines keep theirs.
+        for (pasted, after) in [
+            ("> a\n> b", "> a\n> b"),
+            ("> a\nb", "> a\n> b"),
+            ("> a", "> a"),
+        ] {
+            let mut b = TextBuffer::from_text("> ".to_string());
+            b.set_cursor(2, false);
+            b.paste_str(pasted);
+            assert_eq!(b.text(), after, "{pasted:?}");
+        }
+        // Past other text the first line goes in as it is.
+        let mut b = TextBuffer::from_text("> x".to_string());
+        b.set_cursor(3, false);
+        b.paste_str("> a");
+        assert_eq!(b.text(), "> x> a");
+    }
+
+    #[test]
+    fn a_paste_of_only_a_quote_marker_into_a_quote_is_no_edit() {
+        // The pasted marker gives way to the line's own, leaving nothing to insert,
+        // so the paste leaves no undo step and the note stays unmodified.
+        let mut b = TextBuffer::from_text("> ".to_string());
+        b.set_cursor(2, false);
+        let version = b.version();
+        b.paste_str("> ");
+        assert_eq!(b.text(), "> ");
+        assert_eq!(b.version(), version, "nothing changed");
+        assert!(!b.undo(), "and there is no step to undo");
+    }
+
+    #[test]
+    fn a_paste_before_the_quote_marker_or_off_a_quote_goes_in_unchanged() {
+        let mut b = TextBuffer::from_text("> q".to_string());
+        b.set_cursor(0, false);
+        b.paste_str("a\n\nb");
+        assert_eq!(b.text(), "a\n\nb> q");
+        let mut b = TextBuffer::from_text("- item".to_string());
+        b.set_cursor(6, false);
+        b.paste_str("a\n\nb");
+        assert_eq!(b.text(), "- itema\n\nb");
+    }
+
+    #[test]
+    fn a_paste_over_a_selection_in_a_quote_is_one_undo_step() {
+        let mut b = TextBuffer::from_text("> old".to_string());
+        b.set_cursor(2, false);
+        b.set_cursor(5, true); // select "old"
+        b.paste_str("a\nb");
+        assert_eq!(b.text(), "> a\n> b");
+        assert!(b.undo());
+        assert_eq!(b.text(), "> old", "one undo puts the selected text back");
     }
 
     // --- Ordered renumbering on Enter ---------------------------------------

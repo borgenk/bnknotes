@@ -2,6 +2,7 @@ use std::os::fd::AsRawFd;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
+use crate::app::clipboard::PasteMode;
 use crate::app::{State, TabDrag, TabHover, VaultDrag};
 use crate::find;
 use crate::keymap::{self, KeyAction};
@@ -63,7 +64,11 @@ impl KeyRepeat {
 fn opens_a_tab(action: &KeyAction) -> bool {
     matches!(
         action,
-        KeyAction::Char(_) | KeyAction::Enter | KeyAction::Tab | KeyAction::Paste
+        KeyAction::Char(_)
+            | KeyAction::Enter
+            | KeyAction::Tab
+            | KeyAction::Paste
+            | KeyAction::PastePlain
     )
 }
 
@@ -161,6 +166,9 @@ fn apply_editor_action(
         // Ctrl+L: convert the cursor's line, or every line the selection touches,
         // into a task item, toggling the box on lines already tasks.
         KeyAction::ToggleTaskList => ed.text.toggle_task_list(),
+        // Ctrl+Shift+Q: quote the cursor's line or the selection's lines, or
+        // unquote them when they are all quoted already.
+        KeyAction::ToggleQuote => ed.text.toggle_quote(),
         // With no find bar, Escape collapses a selection to a bare cursor; with
         // nothing selected there is nothing to leave.
         KeyAction::Escape => {
@@ -177,6 +185,7 @@ fn apply_editor_action(
         KeyAction::Copy
         | KeyAction::Cut
         | KeyAction::Paste
+        | KeyAction::PastePlain
         | KeyAction::Save
         | KeyAction::Find
         | KeyAction::Palette
@@ -584,8 +593,13 @@ impl State {
                 }
                 false
             }
-            KeyAction::Paste => {
-                if let Err(e) = self.paste() {
+            KeyAction::Paste | KeyAction::PastePlain => {
+                let mode = if action == KeyAction::Paste {
+                    PasteMode::Fit
+                } else {
+                    PasteMode::Verbatim
+                };
+                if let Err(e) = self.paste(mode) {
                     eprintln!("bnknotes: paste failed: {e}");
                 }
                 false
@@ -684,7 +698,7 @@ impl State {
                 self.close_palette();
                 return;
             }
-            KeyAction::Paste => {
+            KeyAction::Paste | KeyAction::PastePlain => {
                 let pasted = match self.clipboard_text() {
                     Ok(Some(pasted)) => pasted,
                     Ok(None) => return,
@@ -789,7 +803,7 @@ impl State {
                 self.editors[i].find.select_all();
                 None
             }
-            KeyAction::Paste => match self.clipboard_text() {
+            KeyAction::Paste | KeyAction::PastePlain => match self.clipboard_text() {
                 Ok(Some(pasted)) => {
                     let ed = self.editors[i].active_doc_mut();
                     ed.find.push_str(&pasted, &ed.text)

@@ -2289,6 +2289,15 @@ impl EditorPane {
         }
     }
 
+    /// Insert pasted text at the caret, placed as typed text is on a selected
+    /// picture. On a quote line the paste stays in the quote.
+    pub(crate) fn paste_text(&mut self, fonts: &Fonts, rect: Rect, s: &str) {
+        match self.picture_side(fonts, rect) {
+            Some(side) => self.text.insert_line(s, side == PictureSide::Above),
+            None => self.text.paste_str(s),
+        }
+    }
+
     /// The Enter key. On a selected picture holding its side above, it opens an
     /// empty line above the picture and moves onto it, ready to type there.
     pub(crate) fn enter(&mut self, fonts: &Fonts, rect: Rect) -> bool {

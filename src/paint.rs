@@ -497,9 +497,9 @@ pub(crate) fn push_rail(
     }
 }
 
-/// Draw one vault chip at `chip`: its color, its initials, and, for the active
-/// vault, the marker at the rail's left edge. Shared by the chips at rest and the
-/// one in flight, so a dragged chip is the same chip, moved.
+/// Draw one vault chip at `chip`: its picture, or its color and initials, and, for
+/// the active vault, the marker at the rail's left edge. Shared by the chips at rest
+/// and the one in flight, so a dragged chip is the same chip, moved.
 fn push_chip(
     list: &mut DisplayList,
     ctx: &BarCtx,
@@ -532,44 +532,41 @@ fn push_chip(
         w: (chip.w - 2 * ring).max(0),
         h: (chip.h - 2 * ring).max(0),
     };
-    list.push(DrawCmd::RoundRect {
-        rect: chip,
-        color: fill,
-        radius,
-        corners: display::RoundedCorners::Both,
-    });
-    // A chip wearing a picture is the picture: it goes where the fill would be, corners
-    // already rounded into it, and nothing is drawn over it. A picture chosen for a
-    // chip is what the chip is for, and a color washed through it or two letters sat
-    // on it would be the editor talking over it. The color is still the vault's, and
-    // still says so: on the marker beside it, on a temporary chip's ring, and on the
-    // chip again the moment the picture is cleared.
+    // A chip wearing a picture is the picture, corners already rounded into it, with no
+    // fill under it and nothing drawn over it: where the picture is transparent, the
+    // rail shows through. Under the pointer it swaps to the same picture taken closer
+    // in, so the picture pushes forward while the chip stays where it is.
     //
-    // Under the pointer it swaps to the same picture taken closer in, which is the
-    // thumbnail's answer to a hover: the picture pushes forward while the chip stays
-    // exactly where it is, so a rail of them never wobbles under the pointer.
-    //
-    // A chip with no picture (or one whose bake has not landed, which lasts a frame)
-    // keeps the flat fill and its initials, and a temporary one has the rail's own
-    // background punched back out of it, leaving its color as the outline.
-    match &vault.icon_keys {
-        Some(keys) => list.push(DrawCmd::Image {
+    // A chip with no picture (or one whose bake has not landed, which lasts a frame) is
+    // the flat fill with its initials. A temporary chip has the rail's background
+    // punched out of its middle either way, leaving its color as the outline.
+    let pictured = vault.icon_keys.is_some();
+    if !pictured || temporary {
+        list.push(DrawCmd::RoundRect {
+            rect: chip,
+            color: fill,
+            radius,
+            corners: display::RoundedCorners::Both,
+        });
+    }
+    if temporary {
+        list.push(DrawCmd::RoundRect {
+            rect: inner,
+            color: RAIL_BG,
+            radius: (radius - ring).max(0),
+            corners: display::RoundedCorners::Both,
+        });
+    }
+    if let Some(keys) = &vault.icon_keys {
+        list.push(DrawCmd::Image {
             rect: inner,
             path: if hovered {
                 keys.hover.clone()
             } else {
                 keys.rest.clone()
             },
-        }),
-        None if temporary => list.push(DrawCmd::RoundRect {
-            rect: inner,
-            color: RAIL_BG,
-            radius: (radius - ring).max(0),
-            corners: display::RoundedCorners::Both,
-        }),
-        None => {}
-    }
-    if vault.icon_keys.is_none() {
+        });
+    } else {
         // The initials read against the vault's color behind them. A hollow temporary
         // chip is the exception, since what is behind them there is the rail.
         let ink = if temporary {
@@ -4371,6 +4368,79 @@ mod tests {
                 expect_within,
                 "a chip dragged to {top} stays in the rail"
             );
+        }
+    }
+
+    #[test]
+    fn a_pictured_chip_shows_the_rail_through_its_picture() {
+        // A picture with transparent corners or padding shows the rail there, not the
+        // vault's color: a saved chip draws the picture alone, and a temporary one
+        // keeps its colored ring with the rail punched out from under the picture.
+        #[derive(Debug, PartialEq)]
+        enum Drawn {
+            Fill(u32),
+            Image(String),
+        }
+        let fonts = Fonts::new(&markdown::all_sizes(FONT_SIZE)).expect("a default font");
+        let ctx = BarCtx::new(&fonts, Scale::ONE, FONT_SIZE);
+        let chips = rail(700);
+        let mut vaults = rail_test_vaults();
+        vaults[1].kind = VaultKind::Temporary;
+        for vault in &mut vaults[..2] {
+            vault.icon_keys = Some(crate::config::IconKeys {
+                rest: "rest".to_string(),
+                hover: "hover".to_string(),
+            });
+        }
+        let slots: Vec<Rect> = rail_buttons(chips, 3, Scale::ONE).map(|(_, r)| r).collect();
+        for hovered in [None, Some(0), Some(1)] {
+            let mut list = Vec::new();
+            push_rail(
+                &mut list,
+                &ctx,
+                chips,
+                chips,
+                &RailView {
+                    vaults: &vaults,
+                    active: None,
+                    hovered,
+                    drag: None,
+                },
+            );
+            let within = |r: Rect, slot: Rect| {
+                r.x >= slot.x
+                    && r.y >= slot.y
+                    && r.x + r.w <= slot.x + slot.w
+                    && r.y + r.h <= slot.y + slot.h
+            };
+            let drawn = |slot: Rect| -> Vec<Drawn> {
+                list.iter()
+                    .filter_map(|cmd| match cmd {
+                        DrawCmd::RoundRect { rect, color, .. } if within(*rect, slot) => {
+                            Some(Drawn::Fill(*color))
+                        }
+                        DrawCmd::Image { rect, path } if within(*rect, slot) => {
+                            Some(Drawn::Image(path.clone()))
+                        }
+                        _ => None,
+                    })
+                    .collect()
+            };
+            let image = |i: usize| {
+                Drawn::Image(if hovered == Some(i) { "hover" } else { "rest" }.to_string())
+            };
+            assert_eq!(drawn(slots[0]), [image(0)], "hovered {hovered:?}");
+            let ring = if hovered == Some(1) {
+                pixel::tint(vaults[1].color, RAIL_HOVER_INK, RAIL_HOVER_LIFT)
+            } else {
+                vaults[1].color
+            };
+            assert_eq!(
+                drawn(slots[1]),
+                [Drawn::Fill(ring), Drawn::Fill(RAIL_BG), image(1)],
+                "hovered {hovered:?}"
+            );
+            assert_eq!(drawn(slots[2]), [Drawn::Fill(vaults[2].color)]);
         }
     }
 

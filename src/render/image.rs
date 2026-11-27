@@ -95,28 +95,33 @@ impl Image {
         })
     }
 
-    /// The mean of the pixels in `[x0, x1) x [y0, y1)`, per channel. The box filter's
-    /// inner loop: sums fit a `u32` because a band of one image is at most 8192 wide
-    /// (see [`Limits`]) and each channel is a byte.
+    /// The mean of the pixels in `[x0, x1) x [y0, y1)`, the box filter's inner loop.
+    /// Alpha is the plain mean; each color channel is weighted by its pixel's alpha,
+    /// so a transparent pixel's color (often black) does not bleed into the edge of
+    /// what is drawn beside it. A band is at most 8192 by 8192 (see [`Limits`]), so
+    /// the weighted sums need a `u64`.
     fn average(&self, x0: u32, y0: u32, x1: u32, y1: u32) -> u32 {
-        let (mut a, mut r, mut g, mut b, mut n) = (0u32, 0u32, 0u32, 0u32, 0u32);
+        let (mut a, mut r, mut g, mut b, mut n) = (0u64, 0u64, 0u64, 0u64, 0u64);
         for yy in y0..y1 {
             let row = (yy * self.width) as usize;
             for xx in x0..x1 {
-                let Some(px) = self.pixels.get(row + xx as usize) else {
+                let Some(&px) = self.pixels.get(row + xx as usize) else {
                     continue;
                 };
-                a += (px >> 24) & 0xff;
-                r += (px >> 16) & 0xff;
-                g += (px >> 8) & 0xff;
-                b += px & 0xff;
+                let px = u64::from(px);
+                let alpha = (px >> 24) & 0xff;
+                a += alpha;
+                r += ((px >> 16) & 0xff) * alpha;
+                g += ((px >> 8) & 0xff) * alpha;
+                b += (px & 0xff) * alpha;
                 n += 1;
             }
         }
-        if n == 0 {
+        if a == 0 {
             return 0;
         }
-        ((a / n) << 24) | ((r / n) << 16) | ((g / n) << 8) | (b / n)
+        let channel = |sum: u64| (sum / a) as u32;
+        (((a / n) as u32) << 24) | (channel(r) << 16) | (channel(g) << 8) | channel(b)
     }
 
     /// Clear the pixels outside a rounded rectangle of `radius` over the whole image,
@@ -658,6 +663,26 @@ mod tests {
                 "channel {shift} averaged to {channel:x}, not the midpoint"
             );
         }
+    }
+
+    #[test]
+    fn a_crop_keeps_transparent_pixels_out_of_the_color() {
+        // White beside transparent black, shrunk to one pixel: half covered, and still
+        // white. A plain per-channel mean gives a half-covered gray, a dark rim around
+        // a light picture with transparent surroundings.
+        let split = built(4, 4, |x, _| if x < 2 { 0x0000_0000 } else { 0xffff_ffff });
+        let out = split.crop_scaled(0, 0, 4, 1).expect("a crop");
+        let px = out.pixels[0];
+        assert_eq!(
+            px & 0x00ff_ffff,
+            0x00ff_ffff,
+            "the color is the opaque half's"
+        );
+        let alpha = px >> 24;
+        assert!(
+            (0x7e..=0x80).contains(&alpha),
+            "half covered, not {alpha:x}"
+        );
     }
 
     #[test]

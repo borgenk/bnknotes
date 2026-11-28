@@ -47,13 +47,14 @@
 //! source too.
 //!
 //! A list or quote item also hangs its wrapped continuations under the text: each
-//! visual line past the first is inset by the marker's width (`VisualLine::indent`)
-//! so the column aligns. The raw marker gives way to a [`Gutter`] decoration,
-//! always the same width as the source marker so the text never shifts: a bullet
-//! point `•` for a list and a drawn checkbox for a task item stand in while you
-//! edit the label, yielding to the raw marker only where the caret or selection
-//! reaches it ([`active_reveals_marker`]), while a quote's bar yields to its
-//! editable `>` on the cursor's own line.
+//! visual line past the first is inset by the marker's width (VisualLine::indent)
+//! so the column aligns, and an indented line continuing a list item hangs past its
+//! own leading spaces. The raw marker gives way to a Gutter decoration, always the
+//! same width as the source marker so the text never shifts: a bullet for a list
+//! and a drawn checkbox for a task item stand in while you edit the label, yielding
+//! to the raw marker only where the caret or selection reaches it
+//! (active_reveals_marker), while a quote's bar yields to its editable quote marker
+//! on the cursor's own line.
 //!
 //! Fenced code blocks are the one construct whose classification crosses line
 //! boundaries: a ``` line opens a block and a later ``` closes it, and every line
@@ -162,10 +163,10 @@ pub struct VisualLine {
     /// per visual row.
     pub runs: Range<u32>,
     /// Pixels the line's content (its runs, caret, and selection) is inset past
-    /// `left`, for the hanging indent of a wrapped list or quote item: `0` on the
-    /// marker-bearing first line (whose marker run fills the gutter inline) and on
-    /// non-list lines; the marker's width on continuation lines, so wrapped text
-    /// aligns under the first line's text rather than under the marker.
+    /// the layout's left edge: the list indent on a list line (a code block's padding on a fenced
+    /// one), plus on a wrapped row the hanging indent that puts its text under the
+    /// first row's text. That hang is the marker's width (a task's column pad
+    /// included), or a list continuation line's leading spaces.
     pub indent: i32,
     /// How this line's left gutter is decorated beyond its runs once the cursor
     /// leaves it: a bullet glyph for a list, a bar for a quote. [`Gutter::None`]
@@ -415,6 +416,21 @@ pub struct Run {
     pub kind: markdown::SpanKind,
     pub visible: bool,
     pub pads: PillPads,
+    /// Pixels a task item's block marker reserves past its glyphs, so the label
+    /// starts in the same column whether the box holds a space, x, or X. Zero on
+    /// every other run.
+    pub column_pad: u16,
+}
+
+impl Run {
+    /// The pixels the run reserves before and after its glyphs: an inline code
+    /// span's pill pads, plus a task marker's column pad on the trailing side.
+    /// Every walk over a row's runs reads this, so the caret, a click, and the
+    /// painter agree on where each glyph sits.
+    pub(crate) fn pads_px(&self, scale: Scale) -> (i32, i32) {
+        let (lead, trail) = self.pads.px(scale);
+        (lead, trail + i32::from(self.column_pad))
+    }
 }
 
 /// Which sides of a run reserve an inline code span's pill padding. The pad is
@@ -1141,7 +1157,7 @@ impl Layout {
                 continue;
             }
             let face = run_face(fonts, style.size, run.kind, style.heading);
-            let (lead, trail) = run.pads.px(self.scale);
+            let (lead, trail) = run.pads_px(self.scale);
             pen += lead as f32;
             let (s, e) = (span.0.max(run.start), span.1.min(run.end));
             if s < e {
@@ -1156,15 +1172,12 @@ impl Layout {
     }
 
     /// The drawn checkbox's rectangle in content space for a task line whose
-    /// gutter is [`Gutter::Checkbox`]: a square sized to the line's metrics, inset
-    /// within the marker region a gap short of the text so it crowds neither the
-    /// list indent nor the words. Its size and offset come from the canonical
-    /// `[ ] ` width, not the live `[x]`/`[ ]`, so a checked and an unchecked box in
-    /// a list line up in a column (the source `x` renders wider than a space in the
-    /// proportional face). The painter draws the box here and [`Self::checkbox_at`]
-    /// hit-tests clicks against it, so the two always agree. `None` for any other
-    /// line (a task item's box shows on every line it occupies, the cursor's own
-    /// line included).
+    /// gutter is a checkbox: a square sized to the line's metrics, right-anchored a
+    /// gap short of the label column so it crowds neither the list indent nor the
+    /// words. Every task in a list shares that column, so the boxes line up as the
+    /// labels do. The painter draws the box here and checkbox_at hit-tests clicks
+    /// against it, so the two always agree. None for any other line (a task item's
+    /// box shows on every line it occupies, the cursor's own line included).
     pub(crate) fn checkbox_rect(
         &self,
         fonts: &Fonts,
@@ -1178,26 +1191,16 @@ impl Layout {
         // narrow it splits the marker mid-way (degenerate) just draws no box.
         let run = self.run_slice(line).first()?;
         let marker = rope.slice(run.start..run.end).as_cow();
-        let indent = markdown::leading_indent(&marker);
-        // Guard: a well-formed task marker has `[c]` here; a marker split mid-way by a
-        // very narrow wrap draws no box.
-        marker.get(indent + 2..indent + 5)?;
         let face = fonts.face(line.size, FontStyle::Regular);
-        // `pre` is the marker up to the `[`; `tail_w` is the canonical `[ ] `
-        // (brackets plus the trailing space before the text). Measuring the
-        // canonical form, not the live `[x]`/`[ ]`, keeps checked and unchecked
-        // boxes aligned in a column (source `x` renders wider than a space).
-        let pre = shape::text_advance(face, marker.get(..indent + 2)?);
-        let tail_w = shape::text_advance(face, "[ ] ");
+        let text_x = task_label_column(face, &marker)?;
         let m = fonts.metrics(line.size);
         // A touch taller than the ascent, so the box reads at a comfortable
         // weight beside the text rather than shrinking into it.
         let side = (m.ascent * 13 / 12).max(11);
-        // The text begins at `pre + tail_w`. Right-anchor the box a gap short of it,
-        // so it sits inset from both the list indent and the words rather than
-        // crowding the text; clamp so it never runs off the marker's left.
+        // Right-anchor the box a gap short of the text, inset from both the list
+        // indent and the words; clamp so it never runs off the marker's left.
         let gap = (m.ascent as f32 * crate::theme::DECOR_TEXT_GAP).max(4.0);
-        let box_left = (pre + tail_w - gap - side as f32).max(0.0);
+        let box_left = (text_x - gap - side as f32).max(0.0);
         let x = self.left + line.indent + box_left.round() as i32;
         // Centered on the middle of the ascent band, where the glyphs' bulk sits.
         let y = line.baseline - (m.ascent + side) / 2;
@@ -1505,7 +1508,7 @@ impl Layout {
                 let x0 = self.left as f32
                     + line.indent as f32
                     + self.advance_to(fonts, rope, line, run.start)
-                    + run.pads.px(self.scale).0 as f32;
+                    + run.pads_px(self.scale).0 as f32;
                 let w = shape::text_advance(
                     run_face(fonts, line.size, run.kind, heading),
                     &rope.slice(run.start..run.end).as_cow(),
@@ -1560,7 +1563,7 @@ impl Layout {
                     // A run's glyphs sit its leading pad in from the pen, matching the
                     // draw walk; the pill (which paint then expands by the pad) starts
                     // at the glyphs and grows over any revealed backticks.
-                    let (lead, trail) = run.pads.px(self.scale);
+                    let (lead, trail) = run.pads_px(self.scale);
                     let glyph_x = pen + lead;
                     let face = run_face(fonts, line.size, run.kind, t.header);
                     let w = shape::text_advance(face, &rope.slice(run.start..run.end).as_cow());
@@ -1659,7 +1662,7 @@ impl Layout {
             // A pill pad sits before the run's glyphs, so a click in that gap lands at
             // the run start; the trailing pad pushes the pen past the glyphs so a click
             // there lands after the span.
-            let (lead, trail) = run.pads.px(self.scale);
+            let (lead, trail) = run.pads_px(self.scale);
             acc += lead as f32;
             for (off, cluster) in grapheme::graphemes(&text) {
                 let w = shape::text_advance(face, cluster);
@@ -1689,7 +1692,7 @@ impl Layout {
                 continue;
             }
             let face = run_face(fonts, line.size, run.kind, line.heading.is_some());
-            let (lead, trail) = run.pads.px(self.scale);
+            let (lead, trail) = run.pads_px(self.scale);
             // A run fully before the offset contributes its glyphs plus its pill pads;
             // one containing the offset contributes its leading pad plus the glyphs up
             // to the offset.
@@ -1775,7 +1778,7 @@ impl Layout {
             }
             // A run's glyphs sit its leading pill pad in from the pen; add that on
             // entry, and the trailing pad once the offset is past the run.
-            let (lead, trail) = run.pads.px(self.scale);
+            let (lead, trail) = run.pads_px(self.scale);
             let end = offset.min(run.end);
             let face = run_face(fonts, size, run.kind, header);
             adv += lead as f32 + shape::text_advance(face, &rope.slice(run.start..end).as_cow());
@@ -1909,7 +1912,7 @@ impl Layout {
             }
             // The pill pad frames a code span's glyphs; a click in the leading pad
             // falls to the run's first cluster, one in the trailing pad past it.
-            let (lead, trail) = run.pads.px(self.scale);
+            let (lead, trail) = run.pads_px(self.scale);
             acc += lead as f32;
             let face = run_face(fonts, line.size, run.kind, t.header);
             let text = rope.slice(run.start..run.end).as_cow();
@@ -2049,6 +2052,9 @@ struct LineClass {
     /// True for an indented plain line continuing a list item (a Shift+Enter
     /// continuation): it takes the list's left indent but draws no bullet.
     list_continuation: bool,
+    /// Pixels the block marker reserves past its glyphs: a task's column pad from
+    /// task_column_pad, zero on every other line.
+    column_pad: u16,
 }
 
 impl LineClass {
@@ -2119,19 +2125,60 @@ impl LineClass {
     }
 
     /// The hanging indent for wrapped continuations: the block marker's rendered
-    /// width, measured on the source marker in the regular face at this line's
-    /// size, so it matches the width the marker run itself advances.
-    fn block_indent(&self, fonts: &Fonts, line: &str) -> i32 {
+    /// width plus its column pad, measured in the regular face at this line's size,
+    /// so it matches what the marker run itself advances. A list continuation line
+    /// has no marker and hangs past its leading spaces, under its own text, while
+    /// that leaves at least half of wrap_width for the text. Its indentation is
+    /// unbounded, so a deeper one wraps at the list indent, where its rows keep
+    /// room for whole words.
+    fn block_indent(&self, fonts: &Fonts, line: &str, wrap_width: i32) -> i32 {
+        let face = fonts.face(self.size, FontStyle::Regular);
         if self.block_persists && self.block_marker > 0 {
-            shape::text_advance(
-                fonts.face(self.size, FontStyle::Regular),
-                &line[..self.block_marker],
-            )
-            .round() as i32
+            let marker = shape::text_advance(face, &line[..self.block_marker]).round() as i32;
+            marker + i32::from(self.column_pad)
+        } else if self.list_continuation {
+            let spaces = markdown::leading_indent(line);
+            let hang = shape::text_advance(face, &line[..spaces]).round() as i32;
+            if wrap_width > 0 && 2 * hang > wrap_width {
+                0
+            } else {
+                hang
+            }
         } else {
             0
         }
     }
+}
+
+/// Where a task item's label starts, in pixels from the start of its block marker:
+/// the marker up to its opening bracket, then the bracketed box and the space after
+/// it at the width of the widest box character. A space, an x, and an X differ in
+/// width in a proportional face, so the widest sets the one column every task in a
+/// list shares. None when the marker stops short of its box, as one split by a very
+/// narrow wrap does.
+fn task_label_column(face: &Face, marker: &str) -> Option<f32> {
+    let indent = markdown::leading_indent(marker);
+    marker.get(indent + 2..indent + 5)?;
+    let pre = shape::text_advance(face, marker.get(..indent + 2)?);
+    let tail = ["[ ] ", "[x] ", "[X] "]
+        .into_iter()
+        .map(|form| shape::text_advance(face, form))
+        .fold(0.0, f32::max);
+    Some(pre + tail)
+}
+
+/// Pixels a task's block marker, the first marker bytes of line, reserves past its
+/// glyphs so its label starts at task_label_column. Both are rounded the way the
+/// painter rounds a run's advance, so every label in a list lands on the same
+/// pixel. Zero for a line that does not open with a whole task marker.
+fn task_column_pad(face: &Face, line: &str, marker: usize) -> u16 {
+    let Some(marker) = line.get(..marker) else {
+        return 0;
+    };
+    let Some(column) = task_label_column(face, marker) else {
+        return 0;
+    };
+    (column.round() - shape::text_advance(face, marker).round()).max(0.0) as u16
 }
 
 /// Classify one logical `line` for [`lay_line`]: resolve its block style (raw
@@ -2164,6 +2211,7 @@ fn classify_line(
             code_block: true,
             list_depth: 0,
             list_continuation: false,
+            column_pad: 0,
         }
     } else if let Some(fence) = carry.fence {
         // Inside a fence: literal code, not markdown. Only a delimiter line has
@@ -2183,6 +2231,7 @@ fn classify_line(
             code_block: true,
             list_depth: 0,
             list_continuation: false,
+            column_pad: 0,
         }
     } else if let Some(ticks) = markdown::opens_code_fence(line) {
         carry.list_depth = None;
@@ -2198,21 +2247,30 @@ fn classify_line(
             code_block: true,
             list_depth: 0,
             list_continuation: false,
+            column_pad: 0,
         }
     } else {
         // Ordinary markdown. Resolve list nesting across lines: an item deeper than
         // one past the previous item has no parent and renders as body.
         let (style, marker, continuation) = resolve_list(line, &mut carry.list_depth);
         line_spans_into(line, marker, &mut pool.inline, &mut pool.spans);
+        let size = markdown::font_size(style, ctx.body_size);
+        let column_pad = match style {
+            markdown::LineStyle::Task { .. } => {
+                task_column_pad(ctx.fonts.face(size, FontStyle::Regular), line, marker)
+            }
+            _ => 0,
+        };
         LineClass {
             style,
-            size: markdown::font_size(style, ctx.body_size),
+            size,
             block_marker: marker,
             block_persists: markdown::block_marker_persists(line, style, marker),
             revealed: on_line,
             code_block: false,
             list_depth: carry.list_depth.unwrap_or(0),
             list_continuation: continuation,
+            column_pad,
         }
     }
 }
@@ -2428,13 +2486,13 @@ fn lay_line(
         .map(|_| ctx.folds.is_folded(line_no));
     let task = class.task();
     let rule = class.rule();
-    let block_indent = class.block_indent(ctx.fonts, &line);
     let (seg_pad, wrap_reduce) = class.seg_pad_and_wrap_reduce(ctx.scale);
     let line_wrap = if ctx.wrap_width > 0 {
         (ctx.wrap_width - wrap_reduce).max(1)
     } else {
         ctx.wrap_width
     };
+    let block_indent = class.block_indent(ctx.fonts, &line, line_wrap);
     // `wrap_segments` returns ranges relative to the line; offset them back to
     // absolute buffer positions. It measures what the line draws, so a collapsed
     // marker's width is not reserved and the rows hold the text the reader sees;
@@ -3290,12 +3348,16 @@ fn clip_runs_into(
         if s >= e {
             continue;
         }
+        // The pad goes on the run that ends the block marker, so it trails the
+        // marker even when a narrow wrap splits it.
+        let marker_end = span.end == class.block_marker && e == span.end;
         out.push(Run {
             start: ls + s,
             end: ls + e,
             kind: span.kind,
             visible: class.draws(span.kind, span.start),
             pads: PillPads::default(),
+            column_pad: if marker_end { class.column_pad } else { 0 },
         });
     }
     assign_pill_pads(&mut out[base..], line, ls, class.code_block);
@@ -3389,21 +3451,22 @@ enum WrapBasis {
     Source,
 }
 
-/// Greedily word-wrap the logical `line` to `wrap_width` pixels, filling `segments`
-/// with the byte ranges of its visual rows and returning how many rows the same line
-/// takes once its markup is revealed (equal to `segments.len()` on an already
-/// revealed line, and under [`WrapBasis::Source`]).
+/// Greedily word-wrap the logical line to wrap_width pixels, filling segments with
+/// the byte ranges of its visual rows and returning how many rows the same line
+/// takes once its markup is revealed (equal to the segment count on an already
+/// revealed line, and under WrapBasis::Source).
 ///
 /// Breaks after the last space that fits and has text before it; a word wider than
-/// `wrap_width` breaks after the last URL separator inside a link, else at a
-/// grapheme boundary, so every row holds at least one cluster and no row is markup
-/// alone. `wrap_width <= 0` disables wrapping. Each cluster is measured in its run's
-/// face (per `spans` and `size`), so bold/italic widths wrap correctly.
+/// wrap_width breaks after the last URL separator inside a link, else at a grapheme
+/// boundary, so every row holds at least one cluster and no row is markup alone. A
+/// wrap_width of zero or less disables wrapping. Each cluster is measured in its
+/// run's face (per spans and size), so bold/italic widths wrap correctly.
 ///
-/// `block_indent` is the hanging indent of a list or quote item: the first
-/// segment uses the full `wrap_width` (its marker sits in that width), and every
-/// continuation is wrapped `block_indent` pixels narrower, since it renders inset
-/// by that much. So the text column is the same width on every line of the item.
+/// block_indent is the hanging indent of a list or quote item, or of a line
+/// continuing a list item: the first segment uses the full wrap_width (its marker
+/// or leading spaces sit in that width), and every continuation is wrapped
+/// block_indent pixels narrower, since it renders inset by that much. So the text
+/// column is the same width on every line of the item.
 #[allow(clippy::too_many_arguments)]
 fn wrap_segments(
     fonts: &Fonts,
@@ -3461,6 +3524,18 @@ fn wrap_segments(
     if clusters.is_empty() {
         segments.push((0, line.len()));
         return 1;
+    }
+    // A task marker's column pad rides the cluster that ends the marker, as it
+    // rides the run that does. That is the last cluster starting inside the marker,
+    // since a combining mark on the label's first letter joins the marker's trailing
+    // space.
+    if class.column_pad > 0
+        && let Some(end) = clusters
+            .iter_mut()
+            .take_while(|c| c.off < class.block_marker)
+            .last()
+    {
+        end.w += f32::from(class.column_pad);
     }
     let rows = wrap_rows(
         clusters,
@@ -3992,6 +4067,7 @@ fn build_cell(
         code_block: false,
         list_depth: 0,
         list_continuation: false,
+        column_pad: 0,
     };
     let mut lines = Vec::new();
     for (ps, pe) in br_pieces(cell_text) {
@@ -4043,7 +4119,7 @@ fn cell_line_width(ctx: &LayoutCtx, size: u32, runs: &[Run], header: bool) -> i3
         if !run.visible {
             continue;
         }
-        let (lead, trail) = run.pads.px(ctx.scale);
+        let (lead, trail) = run.pads_px(ctx.scale);
         let face = run_face(ctx.fonts, size, run.kind, header);
         w += (lead + trail) as f32
             + shape::text_advance(face, &ctx.rope.slice(run.start..run.end).as_cow());
@@ -6485,6 +6561,45 @@ mod tests {
     }
 
     #[test]
+    fn a_wrapped_continuation_line_hangs_under_its_own_text() {
+        let f = fonts();
+        // The continuation's leading spaces put its text past the list indent, and
+        // a row it wraps onto starts under that text, not back at the list indent.
+        let src = "- item\n  aaaaa bbbbb";
+        let r = rope(src);
+        let wrap = wrap_after(&f, "  aaaaa ") + LIST_INDENT;
+        let l = Layout::build(&f, &r, LEFT, TOP, wrap, BODY, (0, 0));
+        assert_eq!(l.lines().len(), 3, "the continuation wraps into two rows");
+        let (first, _, _) = l.caret(&f, &r, src.find("aaaaa").unwrap());
+        let (wrapped, _, _) = l.caret(&f, &r, src.find("bbbbb").unwrap());
+        assert_eq!(
+            wrapped, first,
+            "the wrapped row starts under the first row's text"
+        );
+    }
+
+    #[test]
+    fn a_continuation_indented_past_half_the_column_wraps_at_the_list_indent() {
+        let f = fonts();
+        // Thirty spaces take more than the whole column, so hanging past them would
+        // leave the wrapped rows no width and split every word one letter a row.
+        let src = format!("- a\n{}aaaa bbbb cccc dddd eeee ffff gggg", " ".repeat(30));
+        let r = rope(&src);
+        let wrap = 200;
+        let l = Layout::build(&f, &r, LEFT, TOP, wrap, BODY, (0, 0));
+        let rows = &l.lines()[2..];
+        assert!(!rows.is_empty(), "the continuation wraps");
+        for row in rows {
+            assert!(row.indent < wrap, "a wrapped row starts inside the column");
+            assert_eq!(
+                src.as_bytes()[row.start - 1],
+                b' ',
+                "a wrapped row starts at a word, not inside one"
+            );
+        }
+    }
+
+    #[test]
     fn an_over_nested_item_without_a_parent_renders_as_body() {
         let f = fonts();
         // Depth 2 (four spaces) right after a depth-0 item: no depth-1 parent.
@@ -6759,12 +6874,11 @@ mod tests {
             Some(true),
             "the continuation still dims with the item"
         );
-        let marker_w =
-            shape::text_advance(f.face(BODY, FontStyle::Regular), "- [x] ").round() as i32;
+        let (label_x, _, _) = l.caret(&f, &r, src.find("aaaaa").unwrap());
+        let (wrapped_x, _, _) = l.caret(&f, &r, src.find("bbbbb").unwrap());
         assert_eq!(
-            lines[1].indent,
-            LIST_INDENT + marker_w,
-            "continuations hang under the text, past the whole task marker"
+            wrapped_x, label_x,
+            "continuations hang under the label, past the whole task marker"
         );
     }
 
@@ -6801,10 +6915,9 @@ mod tests {
         let rect = l
             .checkbox_rect(&f, &r, line)
             .expect("a non-revealed task line has a box");
-        let face = f.face(BODY, FontStyle::Regular);
-        // The text begins after the whole `  - [ ] ` marker; the box sits a gap
-        // short of it and stays within the item's content.
-        let text_x = LEFT as f32 + line.indent as f32 + shape::text_advance(face, "  - [ ] ");
+        // The text begins after the nested task marker, at byte 12; the box sits a
+        // gap short of it and stays within the item's content.
+        let text_x = l.caret(&f, &r, 12).0 as f32;
         assert!(
             rect.x as f32 >= LEFT as f32 + line.indent as f32,
             "the box stays within the item's content, not off the left"

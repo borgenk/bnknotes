@@ -2752,9 +2752,10 @@ impl<'a> Painter<'a> {
                 // The block marker (the first run on a list/quote line) gives way to
                 // its gutter decoration: a filled disc for a list, nothing for a
                 // quote (the bar above replaces it). Either keeps the source width,
-                // so text never shifts.
+                // pads included, so text never shifts.
                 if i == 0 && matches!(run.kind, markdown::SpanKind::Marker) {
-                    let advance = shape::text_advance(face, &slice).round() as i32;
+                    let (lead, trail) = run.pads_px(self.scale);
+                    let advance = lead + shape::text_advance(face, &slice).round() as i32 + trail;
                     match line.gutter {
                         Gutter::Bullet => {
                             // A filled disc stands in for the source marker
@@ -2834,7 +2835,7 @@ impl<'a> Painter<'a> {
                 // pad in from the pen, and the pen clears the trailing one after them,
                 // so the panel (drawn from the same geometry) frames the code without
                 // painting over the spaces around it.
-                let (lead, trail) = run.pads.px(self.scale);
+                let (lead, trail) = run.pads_px(self.scale);
                 let run_x = pen + lead;
                 let run_end = self.push_text(fk, run_x, baseline, color, slice.into_owned(), m);
                 pen = run_end + trail;
@@ -2963,7 +2964,7 @@ impl<'a> Painter<'a> {
             // A run's glyphs sit its leading pill pad in from the pen, and the pen
             // clears the trailing one after them, so the tint panel frames the code
             // without covering the text around it, the same as the body loop.
-            let (lead, trail) = run.pads.px(self.scale);
+            let (lead, trail) = run.pads_px(self.scale);
             let run_x = pen + lead;
             let run_end = self.push_text(
                 fk,
@@ -4914,6 +4915,47 @@ mod tests {
             }),
             "a done task is not struck through, only dimmed"
         );
+    }
+
+    #[test]
+    fn checked_and_unchecked_task_labels_start_in_one_column() {
+        let fonts = Fonts::new(&markdown::all_sizes(FONT_SIZE)).expect("a default font");
+        let src = "- [ ] open\n- [x] done\n- [X] Done\nz";
+        let rope = Rope::from_str(src);
+        let (w, h) = (600i32, 200i32);
+        let wrap = w - 2 * MARGIN;
+        let label_xs = |active: (usize, usize)| {
+            let layout = Layout::build(&fonts, &rope, MARGIN, MARGIN, wrap, FONT_SIZE, active);
+            let list = build_display_list(&fonts, &layout, &rope, &paint_params(w, h));
+            ["open", "done", "Done"].map(|label| {
+                let x = list
+                    .iter()
+                    .find_map(|c| match c {
+                        DrawCmd::Text { text, x, .. } if text == label => Some(*x),
+                        _ => None,
+                    })
+                    .expect("the label run");
+                let at = src.find(label).expect("the label");
+                let (caret_x, _, _) = layout.caret(&fonts, &rope, at);
+                assert_eq!(caret_x, x, "the caret before {label} sits on its glyphs");
+                x
+            })
+        };
+        // The caret on the last line: every box is drawn.
+        let collapsed = label_xs((src.len(), src.len()));
+        assert!(
+            collapsed.iter().all(|&x| x == collapsed[0]),
+            "the labels line up whatever the box holds: {collapsed:?}"
+        );
+        // A caret inside a marker shows its raw source, and the label stays put.
+        for (i, marker) in ["- [ ]", "- [x]", "- [X]"].into_iter().enumerate() {
+            let at = src.find(marker).expect("the marker") + 1;
+            assert_eq!(
+                label_xs((at, at))[i],
+                collapsed[i],
+                "revealing {marker} leaves its label in place"
+            );
+        }
     }
 
     #[test]

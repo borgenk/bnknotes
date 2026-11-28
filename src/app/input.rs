@@ -2142,16 +2142,10 @@ impl State {
     // --- Caret blink ------------------------------------------------------
 
     /// Advance the caret's blink clock, requesting a redraw when the caret changed
-    /// visibility.
+    /// visibility. The frame build rests the clock when it draws no caret, since
+    /// only that build has laid out the pane the caret is in.
     pub(super) fn fire_caret_blink(&mut self) {
-        // Nothing draws a caret right now: an unfocused window, focus on the tree or
-        // a diff tab, or a cursor scrolled out of the painted band. Rest the clock
-        // rather than toggle a caret nobody sees, or every toggle would rebuild a
-        // frame that comes out identical.
-        let Some(in_flight) = self.drawable_caret_anim().map(CaretAnim::in_flight) else {
-            self.caret.rest();
-            return;
-        };
+        let in_flight = self.drawable_caret_anim().is_some_and(CaretAnim::in_flight);
         self.dirty |= self.caret.tick(Instant::now(), in_flight);
     }
 

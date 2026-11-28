@@ -2640,6 +2640,15 @@ impl State {
                 push_conflict_banner(&mut list, &self.fonts, &banner, kind, hover, self.body_size);
             }
         }
+        // No caret in this frame (an unfocused window, focus on the tree or a diff
+        // tab, a cursor outside the painted band): rest the blink clock, so it does
+        // not toggle a caret nobody sees and rebuild identical frames. This is judged
+        // after the panes are laid out: before that, a tab that just took focus or a
+        // caret that just jumped is measured against the last frame's band and reads
+        // as having no caret.
+        if self.drawable_caret_anim().is_none() {
+            self.caret.rest();
+        }
         let scale = self.scale();
         // The column splitters, kept (Copy) so the top bar can continue their
         // divider lines up through the reserved strip.
@@ -2811,7 +2820,8 @@ impl State {
     /// The focused editor's caret animation when it is drawable this frame: the
     /// window has keyboard focus, an editor pane with tabs holds focus, and the
     /// cursor sits in its painted window. This is the caret whose in-flight motion
-    /// keeps the loop ticking; nothing else animates the caret.
+    /// keeps the loop ticking; nothing else animates the caret. The painted window
+    /// is the one the last frame built, so a tab not yet drawn reads as no caret.
     fn drawable_caret_anim(&self) -> Option<&CaretAnim> {
         if !self.caret.window_focused() {
             return None;

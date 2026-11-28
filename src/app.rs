@@ -1384,7 +1384,7 @@ impl State {
     /// screen to scroll to. Every way a caret arrives at an offset the view did not
     /// pick (an edit, a search hit, a find match, an applied revision) ends here, so
     /// this is where the "the caret is never on a line a fold hides" invariant is
-    /// restored.
+    /// restored. Select-all is the one arrival that opens folds without scrolling.
     fn reveal_active_caret(&mut self) {
         let i = self.active_editor();
         let rect = self.editor_rect(i);
@@ -3223,6 +3223,17 @@ impl State {
         self.bump_caret();
         self.reveal_active_caret();
         self.refresh_title();
+    }
+
+    /// Bookkeeping after select-all. The caret moves to the end of the note but the
+    /// user went nowhere, so the view stays where it is. A section folded over the
+    /// end still opens, so the caret is never on a hidden line.
+    fn after_select_all(&mut self) {
+        self.dirty = true;
+        self.bump_caret();
+        let i = self.active_editor();
+        let rect = self.editor_rect(i);
+        self.editors[i].open_folds_at_cursor(&self.fonts, rect);
     }
 
     /// Save the focused document now, the Ctrl+S. The autosave already writes it

@@ -571,6 +571,7 @@ impl State {
         // connection and swallow-and-report their own I/O errors (a peer closing
         // the pipe early, or a disk failure, must not bring the editor down and
         // lose unsaved work). Everything else is a pure edit on the focused pane.
+        let select_all = action == KeyAction::SelectAll;
         let changed = match action {
             // With an image selected, Copy puts the picture on the clipboard
             // instead of text.
@@ -610,7 +611,9 @@ impl State {
             }
             _ => apply_editor_action(&mut self.editors[i], &self.fonts, rect, extend, action),
         };
-        if changed {
+        if changed && select_all {
+            self.after_select_all();
+        } else if changed {
             self.after_edit();
         }
         Ok(())

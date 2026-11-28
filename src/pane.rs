@@ -237,76 +237,100 @@ const CARET_BLINK: Duration = Duration::from_millis(500);
 /// typing goes.
 const CARET_BLINK_TOGGLES: u32 = 20;
 
-/// The window's blink clock: whether the caret shows this frame, when it next
-/// toggles, and how many toggles the run has left. A run is spent by the toggles
-/// alone, so an untouched window ends up solid and timerless; any caret activity
-/// ([`Self::bump`]) starts a fresh one.
+/// The window's blink clock: whether the window holds keyboard focus, whether the
+/// caret shows this frame, when it next toggles, and how many toggles the run has
+/// left. A run is spent by the toggles alone, so an untouched window ends up solid
+/// and timerless; any caret activity starts a fresh one. A window without keyboard
+/// focus draws no caret and arms nothing, whatever else moves the clock meanwhile.
 ///
 /// ```text
-///   bump ──▶ blinking ──20 toggles──▶ rested (shown, no deadline)
-///     ▲                                   │
-///     └────────── caret activity ◀────────┘
+///   focus_in ──▶ blinking ──20 toggles──▶ rested (shown, no deadline)
+///                  ▲                          │
+///                  └───── caret activity ◀────┘
+///
+///   focus_out ──▶ unfocused (nothing drawn, nothing armed) ──focus_in──▶ blinking
 /// ```
 pub(crate) struct CaretBlink {
-    /// Whether the caret is drawn this frame.
-    visible: bool,
-    /// When the next toggle is due, or `None` while rested or hidden.
+    /// Whether the window holds keyboard focus, from wl_keyboard enter to leave.
+    window_focused: bool,
+    /// Whether the blink is on its shown half.
+    shown: bool,
+    /// When the next toggle is due, or None while rested or unfocused.
     at: Option<Instant>,
     /// Toggles left in this run; zero means rested, and nothing is armed.
     left: u32,
 }
 
 impl CaretBlink {
+    /// A window starts without keyboard focus until the compositor sends enter.
     pub(crate) fn new() -> Self {
         Self {
-            visible: true,
+            window_focused: false,
+            shown: true,
             at: None,
-            left: CARET_BLINK_TOGGLES,
+            left: 0,
         }
     }
 
     /// Whether the caret is drawn this frame.
     pub(crate) fn visible(&self) -> bool {
-        self.visible
+        self.window_focused && self.shown
     }
 
-    /// When the loop must come back to toggle, or `None` when nothing is armed (the
-    /// run is spent, or there is no caret to blink).
+    /// Whether the window holds keyboard focus.
+    pub(crate) fn window_focused(&self) -> bool {
+        self.window_focused
+    }
+
+    /// When the loop must come back to toggle, or None when nothing is armed (the
+    /// run is spent, the window is unfocused, or there is no caret to blink).
     pub(crate) fn wake_at(&self) -> Option<Instant> {
         self.at
     }
 
-    /// Activity moved the caret: show it and start a fresh run, so it is visible at
-    /// once rather than caught mid-blink.
-    pub(crate) fn bump(&mut self, now: Instant) {
-        self.visible = true;
-        self.at = Some(now + CARET_BLINK);
-        self.left = CARET_BLINK_TOGGLES;
+    /// The window took keyboard focus: show the caret at once and start a run.
+    pub(crate) fn focus_in(&mut self, now: Instant) {
+        self.window_focused = true;
+        self.bump(now);
     }
 
-    /// The window lost keyboard focus: no caret, no timer.
-    pub(crate) fn hide(&mut self) {
-        self.visible = false;
-        self.at = None;
-        self.left = 0;
+    /// The window lost keyboard focus: no caret and no timer until it returns.
+    pub(crate) fn focus_out(&mut self) {
+        self.window_focused = false;
+        self.rest();
+    }
+
+    /// Activity moved the caret: show it and start a fresh run, so it is visible at
+    /// once rather than caught mid-blink. An unfocused window arms nothing, so a
+    /// pointer event or a reload there leaves no deadline to wake the loop.
+    pub(crate) fn bump(&mut self, now: Instant) {
+        if !self.window_focused {
+            return;
+        }
+        self.shown = true;
+        self.at = Some(now + CARET_BLINK);
+        self.left = CARET_BLINK_TOGGLES;
     }
 
     /// Nothing draws the caret right now (focus is on the tree or a diff tab, or the
     /// cursor scrolled out of the painted band): rest it shown and armed for nothing,
     /// so no frame is rebuilt for a caret that is not there and it comes back solid.
     pub(crate) fn rest(&mut self) {
-        self.visible = true;
+        self.shown = true;
         self.at = None;
         self.left = 0;
     }
 
     /// Advance the clock, returning whether the caret's visibility changed (the only
-    /// reason a blink repaints). `in_flight` is the smooth caret still easing, which
+    /// reason a blink repaints). in_flight is the smooth caret still easing, which
     /// holds the caret shown and re-runs the cycle, so it never blinks out mid-motion
     /// and gets a full run once it settles.
     pub(crate) fn tick(&mut self, now: Instant, in_flight: bool) -> bool {
+        if !self.window_focused {
+            return false;
+        }
         if in_flight {
-            let changed = !self.visible;
+            let changed = !self.shown;
             self.bump(now);
             return changed;
         }
@@ -314,26 +338,21 @@ impl CaretBlink {
             return false;
         }
         match self.at {
-            // A run with no deadline yet: the first tick only arms it.
-            None => {
-                self.at = Some(now + CARET_BLINK);
-                false
-            }
             Some(at) if at <= now => {
                 self.left -= 1;
-                let was = self.visible;
+                let was = self.shown;
                 if self.left == 0 {
                     // The run is spent: rest shown, so the caret settles solid rather
                     // than on whichever half the last toggle landed.
-                    self.visible = true;
+                    self.shown = true;
                     self.at = None;
                 } else {
-                    self.visible = !self.visible;
+                    self.shown = !self.shown;
                     self.at = Some(now + CARET_BLINK);
                 }
-                self.visible != was
+                self.shown != was
             }
-            Some(_) => false,
+            _ => false,
         }
     }
 }
@@ -5837,7 +5856,7 @@ ran the numbers
     fn blink_toggles_on_the_interval() {
         let mut t = Instant::now();
         let mut b = CaretBlink::new();
-        b.bump(t);
+        b.focus_in(t);
         assert!(b.visible(), "activity shows the caret");
         // Short of the deadline nothing moves; past it the caret toggles and asks
         // for the repaint.
@@ -5854,7 +5873,7 @@ ran the numbers
     fn blink_holds_the_caret_shown_while_it_eases() {
         let mut t = Instant::now();
         let mut b = CaretBlink::new();
-        b.bump(t);
+        b.focus_in(t);
         // Long enough to be several toggles overdue: an easing caret must not blink
         // out mid-motion, and it comes out of the ease with a full run.
         t += CARET_BLINK * 3;
@@ -5871,7 +5890,7 @@ ran the numbers
     fn blink_rests_shown_and_timerless_after_its_run() {
         let mut t = Instant::now();
         let mut b = CaretBlink::new();
-        b.bump(t);
+        b.focus_in(t);
         for _ in 0..CARET_BLINK_TOGGLES {
             blink_step(&mut b, &mut t);
         }
@@ -5892,7 +5911,7 @@ ran the numbers
     fn blink_resumes_on_activity_after_resting() {
         let mut t = Instant::now();
         let mut b = CaretBlink::new();
-        b.bump(t);
+        b.focus_in(t);
         for _ in 0..CARET_BLINK_TOGGLES {
             blink_step(&mut b, &mut t);
         }
@@ -5904,25 +5923,44 @@ ran the numbers
     }
 
     #[test]
-    fn blink_hidden_by_a_lost_focus_shows_nothing_and_arms_nothing() {
+    fn blink_unfocused_window_shows_nothing_and_arms_nothing() {
         let mut t = Instant::now();
         let mut b = CaretBlink::new();
-        b.bump(t);
-        b.hide();
+        assert!(!b.visible(), "no caret before the compositor sends enter");
+        b.focus_in(t);
+        blink_step(&mut b, &mut t);
+        b.focus_out();
         assert!(!b.visible());
         assert_eq!(b.wake_at(), None);
+        // The loop rests the clock on every pass while nothing draws a caret, and
+        // pointer events or reloads bump it: neither brings the caret back or arms
+        // a deadline until focus returns.
+        b.rest();
+        b.bump(t);
+        assert!(
+            !b.visible(),
+            "a rested or bumped clock stays dark unfocused"
+        );
+        assert_eq!(b.wake_at(), None);
+        assert!(
+            !b.tick(t, true),
+            "an easing caret does not repaint unfocused"
+        );
         assert!(
             !blink_step(&mut b, &mut t),
             "an unfocused window never toggles"
         );
         assert!(!b.visible());
+        b.focus_in(t);
+        assert!(b.visible(), "focus back shows the caret at once");
+        assert_eq!(b.wake_at(), Some(t + CARET_BLINK));
     }
 
     #[test]
     fn blink_rest_brings_the_caret_back_shown() {
         let mut t = Instant::now();
         let mut b = CaretBlink::new();
-        b.bump(t);
+        b.focus_in(t);
         blink_step(&mut b, &mut t);
         assert!(!b.visible(), "caught on the blinked-off half");
         // Focus moves to the tree: the caret rests shown, so it is solid when the
@@ -5936,7 +5974,7 @@ ran the numbers
     fn blink_reports_a_repaint_only_when_the_caret_changed() {
         let mut t = Instant::now();
         let mut b = CaretBlink::new();
-        b.bump(t);
+        b.focus_in(t);
         // The tick that only arms, and every tick short of the deadline, changes
         // nothing: a blink must not rebuild a frame that comes out identical.
         assert!(!b.tick(t, false));
@@ -5947,7 +5985,7 @@ ran the numbers
         // caret was off.
         let mut spent = CaretBlink::new();
         let mut u = Instant::now();
-        spent.bump(u);
+        spent.focus_in(u);
         let changes = (0..CARET_BLINK_TOGGLES)
             .filter(|_| blink_step(&mut spent, &mut u))
             .count();

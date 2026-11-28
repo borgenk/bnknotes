@@ -266,11 +266,10 @@ impl State {
                 // Regained keyboard focus: show the caret and resume its blink. Snap
                 // the focused pane's caret so restored focus never resumes a stale,
                 // mid-flight smear.
-                self.focused = true;
+                self.caret.focus_in(Instant::now());
                 if let Focus::Editor(i) = self.focus {
                     self.editors[i].request_caret_snap();
                 }
-                self.bump_caret();
                 self.dirty = true;
             }
             wl_keyboard::EV_LEAVE => self.keyboard_left(),
@@ -285,8 +284,7 @@ impl State {
         self.xkb.reset_held_state();
         // Lost keyboard focus: hide the caret, stop blinking, and let the loop go
         // idle (no 500ms blink wake-ups while unfocused).
-        self.focused = false;
-        self.caret.hide();
+        self.caret.focus_out();
         self.dirty = true;
         // Turning to another window is the user done with this one for now, so it
         // does not wait out the idle window: what they typed is on disk by the time

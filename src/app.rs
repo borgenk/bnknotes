@@ -680,10 +680,11 @@ struct State {
     // the per-editor drag/selection transients live on `EditorPane`.
     pointer_x: f32,
     pointer_y: f32,
-    /// The caret's blink clock: whether it shows this frame, when it next toggles,
-    /// and how much of its run is left. Activity (`bump_caret`) resets it to shown
-    /// and restarts the run. Applies to the focused editor's caret; other panes draw
-    /// a dimmed, static caret.
+    /// The caret's blink clock: whether the window holds keyboard focus, whether the
+    /// caret shows this frame, when it next toggles, and how much of its run is
+    /// left. Activity (bump_caret) resets it to shown and restarts the run. Applies
+    /// to the focused editor's caret; other panes draw none. The caret only blinks,
+    /// and only wakes the loop on its timer, while the window is focused.
     caret: CaretBlink,
     /// Whether the last input that moved the caret came from the pointer. The smear
     /// is a keyboard-navigation affordance, so a pointer-driven move (click, drag)
@@ -691,10 +692,6 @@ struct State {
     /// pointer places the caret; only consulted when the caret's logical offset
     /// actually moved.
     caret_from_pointer: bool,
-    /// Whether the surface holds the keyboard focus (`wl_keyboard.enter` to
-    /// `leave`). The caret only blinks (and only wakes the loop on its timer)
-    /// while focused; an unfocused window hides the caret and stays idle.
-    focused: bool,
     /// When the idle autosave is due, `None` when no document has unsaved edits
     /// waiting on it. Pushed back by every edit (see [`Self::poll_autosave`]), so it
     /// comes due once the typing stops.
@@ -1197,7 +1194,6 @@ impl State {
             caret: CaretBlink::new(),
             autosave_at: None,
             caret_from_pointer: false,
-            focused: false,
             key_repeat: KeyRepeat::new(),
             last_serial: 0,
             clipboard: ClipboardState::new(),
@@ -2628,7 +2624,7 @@ impl State {
                 scrollbar: &ed.scrollbar,
                 selection: ed.text.selection(),
                 caret,
-                find: build_find_paint(&ed.find, &tick_tops),
+                find: build_find_paint(&ed.find, &tick_tops, self.caret.window_focused()),
                 table_hover,
                 fold_hover,
                 diff: None,
@@ -2718,7 +2714,14 @@ impl State {
         // cannot be open under it (opening one closes any that was up).
         if let Some(palette) = &self.palette {
             let ctx = BarCtx::new(&self.fonts, scale, self.body_size);
-            push_palette(&mut list, &ctx, palette, &self.palette_layout(palette));
+            let layout = self.palette_layout(palette);
+            push_palette(
+                &mut list,
+                &ctx,
+                palette,
+                &layout,
+                self.caret.window_focused(),
+            );
         }
         // The AI modal (still-working or failed) floats over everything and holds the
         // keyboard until dismissed. A successful answer is not here: it opened a diff
@@ -2810,7 +2813,7 @@ impl State {
     /// cursor sits in its painted window. This is the caret whose in-flight motion
     /// keeps the loop ticking; nothing else animates the caret.
     fn drawable_caret_anim(&self) -> Option<&CaretAnim> {
-        if !self.focused {
+        if !self.caret.window_focused() {
             return None;
         }
         let Focus::Editor(i) = self.focus else {
@@ -3341,14 +3344,7 @@ impl State {
             .then_some(ed.autoscroll_at)
             .flatten()
             .map(until);
-        // Only wake for the caret while focused, matching `fire_caret_blink`: a
-        // stray `bump_caret` off a pointer event on an unfocused window must not
-        // leave a past deadline that spins the loop.
-        let caret = self
-            .focused
-            .then(|| self.caret.wake_at())
-            .flatten()
-            .map(until);
+        let caret = self.caret.wake_at().map(until);
         // A caret still easing needs a follow-up tick, but only when no compositor
         // frame is pending: while a callback is outstanding, the frame-done event
         // paces the animation, so adding a deadline here would just wake early.

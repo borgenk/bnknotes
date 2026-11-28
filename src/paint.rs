@@ -117,6 +117,8 @@ pub(crate) struct FindPaint<'a> {
     /// Content-space top of each match's line, from the line index, so the tick
     /// strip places a match that sits outside the painted window correctly.
     pub tick_tops: &'a [i32],
+    /// Whether the bar draws its caret: only while the window holds keyboard focus.
+    pub caret: bool,
 }
 
 impl FindPaint<'_> {
@@ -191,16 +193,19 @@ fn code_token_color(token: markdown::CodeToken) -> u32 {
     }
 }
 
-/// The painter's view of an open find bar, or `None` when it is closed.
-/// `tick_tops` and `doc_height` come from the caller's line index, so the tick
-/// strip does not depend on which lines the windowed layout currently holds.
+/// The painter's view of an open find bar, or None when it is closed. tick_tops
+/// comes from the caller's line index, so the tick strip does not depend on which
+/// lines the windowed layout currently holds. caret is whether the window holds
+/// keyboard focus.
 pub(crate) fn build_find_paint<'a>(
     find: &'a FindState,
     tick_tops: &'a [i32],
+    caret: bool,
 ) -> Option<FindPaint<'a>> {
     find.is_open().then_some(FindPaint {
         state: find,
         tick_tops,
+        caret,
     })
 }
 
@@ -664,7 +669,8 @@ pub(crate) fn push_image_view(
 
 /// Draw the open palette: a bordered panel holding the query and the rows it matched,
 /// with the row Enter would take filled. Pushed after the rest of the frame, so the
-/// panel covers what it floats over.
+/// panel covers what it floats over. caret is whether the window holds keyboard
+/// focus; without it the query draws in the same place with no caret after it.
 ///
 /// The border is the panel drawn twice, the inner one inset by its thickness, the way
 /// the context menu's is.
@@ -673,6 +679,7 @@ pub(crate) fn push_palette(
     ctx: &BarCtx,
     palette: &Palette,
     layout: &PaletteLayout,
+    caret: bool,
 ) {
     let scale = ctx.scale;
     let radius = scale.px(PALETTE_RADIUS);
@@ -736,15 +743,17 @@ pub(crate) fn push_palette(
             right,
         ));
     }
-    list.push(DrawCmd::Fill {
-        rect: Rect {
-            x: caret_x - shift,
-            y: layout.field_baseline - m.ascent,
-            w: caret_w,
-            h: text_h,
-        },
-        color: CARET_COLOR,
-    });
+    if caret {
+        list.push(DrawCmd::Fill {
+            rect: Rect {
+                x: caret_x - shift,
+                y: layout.field_baseline - m.ascent,
+                w: caret_w,
+                h: text_h,
+            },
+            color: CARET_COLOR,
+        });
+    }
     if palette.query().is_empty() {
         let x = pen + caret_w + 1 + pad_x / 2;
         let w = shape::text_advance(face, palette.prompt()).ceil() as i32;
@@ -3237,8 +3246,12 @@ fn push_find_bar(
     });
 
     // A steady caret (no blink) after the focused field's text: it marks where
-    // typing goes while the bar holds the keyboard.
+    // typing goes while the bar holds the keyboard, so an unfocused window draws
+    // none.
     let caret_after = |list: &mut DisplayList, pen: i32, baseline: i32| {
+        if !find.caret {
+            return;
+        }
         list.push(DrawCmd::Fill {
             rect: Rect {
                 x: pen + 1,
@@ -3906,7 +3919,7 @@ mod tests {
         }
         let layout = p.layout(&fonts, FONT_SIZE, Scale::ONE, (600, 800));
         let mut list: DisplayList = Vec::new();
-        push_palette(&mut list, &ctx, &p, &layout);
+        push_palette(&mut list, &ctx, &p, &layout, true);
 
         // The steady caret is the one CARET_COLOR fill; it must stay within the field
         // rather than running off past the panel's edge with the text.
@@ -3927,6 +3940,29 @@ mod tests {
         assert!(list.iter().any(
             |c| matches!(c, DrawCmd::Text { clip_x: Some(_), color, .. } if *color == PALETTE_TEXT)
         ));
+    }
+
+    #[test]
+    fn an_unfocused_window_draws_the_palette_without_its_caret() {
+        use crate::palette::Palette;
+
+        let fonts = test_fonts();
+        let ctx = BarCtx::new(&fonts, Scale::ONE, FONT_SIZE);
+        let mut p = Palette::query_input("Describe the change");
+        p.push('x');
+        let layout = p.layout(&fonts, FONT_SIZE, Scale::ONE, (600, 800));
+        let mut focused: DisplayList = Vec::new();
+        push_palette(&mut focused, &ctx, &p, &layout, true);
+        let mut unfocused: DisplayList = Vec::new();
+        push_palette(&mut unfocused, &ctx, &p, &layout, false);
+
+        let is_caret =
+            |c: &DrawCmd| matches!(c, DrawCmd::Fill { color, .. } if *color == CARET_COLOR);
+        assert_eq!(focused.iter().filter(|c| is_caret(c)).count(), 1);
+        // The caret fill is the only difference: the query keeps its place, so the
+        // text does not shift when focus comes and goes.
+        let without_caret: DisplayList = focused.into_iter().filter(|c| !is_caret(c)).collect();
+        assert_eq!(without_caret, unfocused);
     }
 
     /// A rail column the width the theme asks for, at scale 1.0.
@@ -5067,7 +5103,7 @@ mod tests {
         let params = PaintParams {
             // The app mirrors the current match into the selection.
             selection: Some((8, 11)),
-            find: build_find_paint(&bar, &tops),
+            find: build_find_paint(&bar, &tops, true),
             ..paint_params(w, h)
         };
         let list = build_display_list(&fonts, &layout, &rope, &params);
@@ -5098,6 +5134,52 @@ mod tests {
     }
 
     #[test]
+    fn an_unfocused_window_draws_the_find_bar_without_its_caret() {
+        let fonts = Fonts::new(&markdown::all_sizes(FONT_SIZE)).expect("a default font");
+        let text = "one two one\n";
+        let rope = Rope::from_str(text);
+        let (w, h) = (600i32, 200i32);
+        let layout = Layout::build(
+            &fonts,
+            &rope,
+            MARGIN,
+            MARGIN,
+            w - 2 * MARGIN,
+            FONT_SIZE,
+            (0, 0),
+        );
+        let buf = crate::text::TextBuffer::from_text(text.to_string());
+        let mut bar = FindState::new();
+        bar.open_at(0, &buf);
+        bar.push_str("one", &buf);
+        let tops = tick_tops(&layout, bar.matches());
+        let list = |caret: bool| {
+            let params = PaintParams {
+                find: build_find_paint(&bar, &tops, caret),
+                ..paint_params(w, h)
+            };
+            build_display_list(&fonts, &layout, &rope, &params)
+        };
+        let mut focused = list(true);
+        let unfocused = list(false);
+
+        // One command apart, and that command is the bar's caret: the current match
+        // tick shares the caret color and must stay.
+        assert_eq!(focused.len(), unfocused.len() + 1);
+        let at = focused
+            .iter()
+            .zip(&unfocused)
+            .position(|(a, b)| a != b)
+            .unwrap_or(unfocused.len());
+        let extra = focused.remove(at);
+        assert!(
+            matches!(extra, DrawCmd::Fill { color, .. } if color == CARET_COLOR),
+            "the extra command is the caret, got {extra:?}"
+        );
+        assert_eq!(focused, unfocused);
+    }
+
+    #[test]
     fn the_replace_row_flags_and_ticks_reach_the_display_list() {
         let fonts = Fonts::new(&markdown::all_sizes(FONT_SIZE)).expect("a default font");
         let rope = Rope::from_str("one two one\nfiller\none more\n");
@@ -5116,7 +5198,7 @@ mod tests {
         let tops = tick_tops(&layout, bar.matches());
         let params = PaintParams {
             selection: Some((0, 3)),
-            find: build_find_paint(&bar, &tops),
+            find: build_find_paint(&bar, &tops, true),
             ..paint_params(w, h)
         };
         let list = build_display_list(&fonts, &layout, &rope, &params);
@@ -5724,7 +5806,7 @@ mod tests {
         let params = PaintParams {
             view,
             content_height: layout.text_height() + 2 * MARGIN,
-            find: build_find_paint(&find, &tops),
+            find: build_find_paint(&find, &tops, true),
             ..paint_params(view.w, view.h)
         };
         let list = build_display_list(&fonts, &layout, &rope, &params);

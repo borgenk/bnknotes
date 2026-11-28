@@ -38,26 +38,38 @@ vec3 srgb_to_linear(vec3 c) {
     return mix(lo, hs, hi);
 }
 
-// Replicates render.rs corner_coverage: full coverage everywhere except
-// inside an active corner cell, where the pixel center's distance to the
-// corner circle fades coverage across the one-pixel band at the radius.
-// v_uv already sits at the fragment (pixel) center, the CPU's dx + 0.5.
+// Full coverage everywhere except inside a rounded corner's cell, where the
+// pixel center's distance to the corner circle fades coverage across the
+// one-pixel band at the radius. v_uv already sits at the fragment (pixel)
+// center. The mask has one bit per corner: top-left, top-right, bottom-left,
+// bottom-right, lowest bit first.
 float round_coverage(vec2 p, vec2 size, float r, uint mask) {
-    bool top = (mask & 1u) != 0u;
-    bool bottom = (mask & 2u) != 0u;
+    bool left = p.x < r;
+    bool right = p.x >= size.x - r;
+    bool top = p.y < r;
+    bool bottom = p.y >= size.y - r;
     vec2 c;
-    if (top && p.x < r && p.y < r) {
+    if (top && left && (mask & 1u) != 0u) {
         c = vec2(r, r);
-    } else if (top && p.x >= size.x - r && p.y < r) {
+    } else if (top && right && (mask & 2u) != 0u) {
         c = vec2(size.x - r, r);
-    } else if (bottom && p.x < r && p.y >= size.y - r) {
+    } else if (bottom && left && (mask & 4u) != 0u) {
         c = vec2(r, size.y - r);
-    } else if (bottom && p.x >= size.x - r && p.y >= size.y - r) {
+    } else if (bottom && right && (mask & 8u) != 0u) {
         c = vec2(size.x - r, size.y - r);
     } else {
         return 1.0;
     }
     return clamp(r - length(p - c) + 0.5, 0.0, 1.0);
+}
+
+// An inside corner: the square box is filled outside the quarter circle of
+// radius size.x centered on the corner opposite the filled one, so the fill
+// hugs the filled corner and curves away from it. Corners count from zero:
+// top-left, top-right, bottom-left, bottom-right.
+float fillet_coverage(vec2 p, vec2 size, uint corner) {
+    vec2 c = vec2((corner & 1u) != 0u ? 0.0 : size.x, (corner & 2u) != 0u ? 0.0 : size.y);
+    return clamp(length(p - c) - size.x + 0.5, 0.0, 1.0);
 }
 
 // Distance from point p to the segment ab.
@@ -154,7 +166,7 @@ void main() {
         // space by the sampler, so its result is already linear.
         out_color = texture(image_tex, v_uv);
     } else if (v_mode == 4u) {
-        float cov = round_coverage(v_uv, v_extra.xy, v_extra.z, uint(v_extra.w));
+        float cov = round_coverage(v_uv, v_extra.xy, v_extra.z, uint(v_extra.w + 0.5));
         out_color = vec4(srgb_to_linear(v_color.rgb), v_color.a * cov);
     } else if (v_mode == 5u) {
         float cov = check_coverage(v_uv, v_extra.xy);
@@ -164,6 +176,9 @@ void main() {
         out_color = vec4(srgb_to_linear(v_color.rgb), v_color.a * cov);
     } else if (v_mode == 7u) {
         float cov = hatch_coverage(v_uv, v_extra.x, v_extra.y);
+        out_color = vec4(srgb_to_linear(v_color.rgb), v_color.a * cov);
+    } else if (v_mode == 9u) {
+        float cov = fillet_coverage(v_uv, v_extra.xy, uint(v_extra.z + 0.5));
         out_color = vec4(srgb_to_linear(v_color.rgb), v_color.a * cov);
     } else {
         float cov = pin_coverage(v_uv, v_extra.xy);

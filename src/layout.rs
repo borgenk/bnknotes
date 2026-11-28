@@ -78,10 +78,6 @@ use crate::render::image::ImageStore;
 use crate::rope::Rope;
 use crate::scale::Scale;
 
-/// Extra highlight width drawn past a line's text when the selection includes
-/// that line's trailing newline, hinting the break itself is selected.
-const NEWLINE_PAD: i32 = 8;
-
 /// Horizontal padding inside a fenced code block's panel: the code text (and the
 /// fence lines) is inset this many pixels from the panel's left edge, and wrapping
 /// keeps the same gap on the right, so the tinted background frames the code
@@ -1353,10 +1349,13 @@ impl Layout {
         self.hit(fonts, rope, line, goal_x, y)
     }
 
-    /// The highlight rectangles covering the byte range `[start, end)`, one per
-    /// visual line it touches. Each fills the full line box but centered on the
-    /// glyph box, splitting the leading above and below the text, so stacked lines
-    /// meet with no gap while a single line's highlight stays balanced around it.
+    /// The highlight rectangles covering the byte range start..end, one per visual
+    /// line it touches. A row the range runs into from the row above, or covers
+    /// whole, reaches the content-left edge, so the highlight keeps one straight
+    /// left side past list gutters and hanging indents; a word or match that only
+    /// starts a row begins at its text. A text row fills its line box centered on
+    /// the glyph box, and one directly under an overlapping text row starts where
+    /// that row ends, so stacked rows meet with no seam beside a heading.
     pub fn selection_rects(
         &self,
         fonts: &Fonts,
@@ -1364,38 +1363,12 @@ impl Layout {
         start: usize,
         end: usize,
     ) -> Vec<Rect> {
-        self.rects(fonts, rope, start, end, false)
-    }
-
-    /// The highlight rectangles for a diff word wash, like [`Self::selection_rects`] but
-    /// reaching the content-left edge on a line the range starts at or before. A change
-    /// that spans a whole line (a wholly added or removed line) then washes its list
-    /// bullet or quote marker too, rather than starting at the text past the collapsed
-    /// marker and leaving the decoration bare. A mid-line change (a single reworded word)
-    /// starts past the marker as before, so only a line-leading change reaches it.
-    pub fn diff_wash_rects(
-        &self,
-        fonts: &Fonts,
-        rope: &Rope,
-        start: usize,
-        end: usize,
-    ) -> Vec<Rect> {
-        self.rects(fonts, rope, start, end, true)
-    }
-
-    /// The highlight rectangles covering `[start, end)`. `cover_leading` reaches the
-    /// content-left edge on a line the range begins at or before (the diff wash uses it
-    /// to cover a line's marker); otherwise the left edge follows the text.
-    fn rects(
-        &self,
-        fonts: &Fonts,
-        rope: &Rope,
-        start: usize,
-        end: usize,
-        cover_leading: bool,
-    ) -> Vec<Rect> {
         let mut rects = Vec::new();
+        // The text row pushed for the previous visual line, which the next text row
+        // starts at when the two overlap. A widget row in between breaks the stack.
+        let mut stacked: Option<Rect> = None;
         for (i, line) in self.lines.iter().enumerate() {
+            let above = stacked.take();
             let m = fonts.metrics(line.size);
             let sel_start = start.max(line.start);
             let sel_end = end.min(line.end);
@@ -1443,34 +1416,34 @@ impl Layout {
             }
             // Measure the run-walked advance to each end of the selection; bytes
             // in a hidden marker collapse to the marker's edge, so a selection
-            // touching one (in practice a revealed line) measures sensibly. When
-            // covering the leading edge (a diff wash over a whole line), the left edge
-            // is the content-left rather than the text past the marker, so the line's
-            // bullet or quote decoration is washed too.
-            let x0 = if cover_leading && start <= line.start {
-                // The content-left edge, before the item's hanging indent, so the wash
-                // reaches the bullet or quote marker sitting in that gutter.
+            // touching one (in practice a revealed line) measures sensibly.
+            let text_left = self.left as f32 + line.indent as f32;
+            let reaches_left = start < line.start || (start == line.start && end >= line.end);
+            let x0 = if reaches_left {
                 self.left as f32
             } else {
-                self.left as f32
-                    + line.indent as f32
-                    + self.advance_to(fonts, rope, line, sel_start)
+                text_left + self.advance_to(fonts, rope, line, sel_start)
             };
-            let x1 =
-                self.left as f32 + line.indent as f32 + self.advance_to(fonts, rope, line, sel_end);
+            let x1 = text_left + self.advance_to(fonts, rope, line, sel_end);
             let mut w = (x1 - x0).round() as i32;
             if newline_selected {
-                w += self.scale.px(NEWLINE_PAD);
+                w += newline_pad(m);
             }
-            // The fill is the full line box centered on the glyph box: start a
-            // leading pad above the text so the surplus splits above and below,
-            // and stacked lines meet with no gap.
-            rects.push(Rect {
-                x: x0.round() as i32,
-                y: line.baseline - m.ascent - leading_pad(m),
-                w: w.max(1),
-                h: m.line_height,
-            });
+            let x = x0.round() as i32;
+            let w = w.max(1);
+            let natural_top = line.baseline - m.ascent - leading_pad(m);
+            let bottom = natural_top + m.line_height;
+            let top = above
+                .filter(|a| a.x < x + w && x < a.x + a.w)
+                .map_or(natural_top, |a| a.y + a.h);
+            let row = Rect {
+                x,
+                y: top,
+                w,
+                h: (bottom - top).max(1),
+            };
+            rects.push(row);
+            stacked = Some(row);
         }
         rects
     }
@@ -3860,6 +3833,12 @@ pub(crate) fn leading_pad(m: Metrics) -> i32 {
     (m.line_height - (m.ascent + m.descent)) / 2
 }
 
+/// The highlight width a selected line break adds past a row's text, 15% of the
+/// line height: enough to show the break is selected, and all an empty line shows.
+fn newline_pad(m: Metrics) -> i32 {
+    ((m.line_height * 3 + 10) / 20).max(1)
+}
+
 /// The count of the tallest cell's wrapped lines in a laid-out row, recovered from
 /// its box height (`max_lines * line_height + 2 * pad`).
 pub(crate) fn row_max_lines(height: i32, line_height: i32, scale: Scale) -> usize {
@@ -5494,7 +5473,94 @@ mod tests {
         let l = layout(&f, &rope("ab\ncd\nef"));
         let rects = l.selection_rects(&f, &rope("ab\ncd\nef"), 1, 7);
         assert_eq!(rects.len(), 3, "three lines touched");
-        assert!(rects[0].w >= NEWLINE_PAD, "hard newline adds the pad");
+        assert!(
+            rects[0].w >= newline_pad(f.metrics(BODY)),
+            "hard newline adds the pad"
+        );
+    }
+
+    #[test]
+    fn a_selection_covering_whole_rows_keeps_one_left_edge() {
+        // List rows sit past a gutter and a wrapped item's rows hang under its text,
+        // but a row the selection covers from its start reaches the content-left
+        // edge, so the highlight runs down one straight left side.
+        let f = fonts();
+        let item = "- one two three four five six seven eight";
+        let r = rope(&format!("plain\n{item}\n  - nested\n> quote\n"));
+        let face = f.face(BODY, FontStyle::Regular);
+        let wrap = shape::text_advance(face, "- one two three four") as i32;
+        let l = Layout::build(&f, &r, LEFT, TOP, wrap, BODY, (0, r.len()));
+        let item_row = l.lines()[1].indent;
+        assert!(item_row > 0, "the item sits past the gutter");
+        assert!(
+            l.lines().iter().any(|line| line.indent > item_row),
+            "a wrapped row hangs under the item's text"
+        );
+        let rects = l.selection_rects(&f, &r, 0, r.len());
+        assert_eq!(
+            rects.len(),
+            l.lines().len() - 1,
+            "every row but the empty last"
+        );
+        assert!(rects.iter().all(|rc| rc.x == LEFT), "{rects:?}");
+        // A selection that starts inside a row starts at the text.
+        let inside = "plain\n- one".len();
+        let rects = l.selection_rects(&f, &r, inside, r.len());
+        assert!(rects[0].x > LEFT + item_row, "{:?}", rects[0]);
+        // So does a word that starts a wrapped row and ends inside it, the way a
+        // double-click or a find match covers it: the hanging indent stays clear.
+        let wrapped = l
+            .lines()
+            .iter()
+            .find(|line| line.indent > item_row)
+            .expect("a wrapped row");
+        let word_end = wrapped.start + 3;
+        let rects = l.selection_rects(&f, &r, wrapped.start, word_end);
+        assert_eq!(rects.len(), 1);
+        assert!(rects[0].x >= LEFT + wrapped.indent, "{:?}", rects[0]);
+    }
+
+    #[test]
+    fn selected_rows_meet_beside_a_heading_and_the_space_above_it() {
+        // A heading's line box is taller than the body's and opens space above
+        // itself, so each row starts where the overlapping row above it ends.
+        let f = fonts_scaled(1.5);
+        let r = rope("body\n# Heading\nbody\n");
+        let l = layout(&f, &r);
+        let rects = l.selection_rects(&f, &r, 0, r.len());
+        assert_eq!(rects.len(), 3);
+        for pair in rects.windows(2) {
+            assert_eq!(pair[0].y + pair[0].h, pair[1].y, "{rects:?}");
+        }
+        // Taking only the line break at the end of a long line leaves a sliver far
+        // right of a short heading, so the heading keeps its own top rather than
+        // highlighting the blank space above it.
+        let body = "a long line of body text that runs wide";
+        let r = rope(&format!("{body}\n# H\n"));
+        let l = layout(&f, &r);
+        let rects = l.selection_rects(&f, &r, body.len(), r.len());
+        let heading = &l.lines()[1];
+        let m = f.metrics(heading.size);
+        assert!(rects[1].x + rects[1].w < rects[0].x, "{rects:?}");
+        assert_eq!(rects[1].y, heading.baseline - m.ascent - leading_pad(m));
+    }
+
+    #[test]
+    fn a_selected_empty_line_shows_a_sliver() {
+        // An empty line's highlight is only its selected line break, a sliver
+        // beside the line height, so a run of blank lines reads as blank.
+        let f = fonts();
+        let m = f.metrics(BODY);
+        let r = rope("a\n\nb");
+        let l = layout(&f, &r);
+        let rects = l.selection_rects(&f, &r, 0, r.len());
+        let empty = rects[1];
+        assert!(
+            empty.w >= 1 && empty.w * 6 <= m.line_height,
+            "{} wide at line height {}",
+            empty.w,
+            m.line_height
+        );
     }
 
     #[test]
@@ -7169,10 +7235,11 @@ mod tests {
     }
 
     #[test]
-    fn a_selection_over_a_code_line_yields_a_padded_rect() {
-        // The selection rect for a code line sits at the padded column and has
-        // width, so the highlight is visible inside the panel (the app paints the
-        // panel beneath it). Regression guard for the selection-in-code-block fix.
+    fn a_selection_over_a_code_line_has_width_inside_the_panel() {
+        // The highlight over a code line has width, so it shows inside the panel
+        // the app paints beneath it. Covering the line from its start it reaches
+        // the panel's left edge like any other row; a mid-line start begins at the
+        // text, past the padding.
         let f = fonts();
         let src = "```\nxyz\n```";
         let r = rope(src);
@@ -7181,11 +7248,15 @@ mod tests {
         let rects = l.selection_rects(&f, &r, start, start + 3);
         assert_eq!(rects.len(), 1, "one rect for the single code line");
         assert_eq!(
-            rects[0].x,
-            LEFT + CODE_PAD_X,
-            "rect starts past the padding"
+            rects[0].x, LEFT,
+            "a whole line reaches the content-left edge"
         );
-        assert!(rects[0].w > 0, "and has positive width");
+        assert!(rects[0].w > CODE_PAD_X, "and has width past the padding");
+        let rects = l.selection_rects(&f, &r, start + 1, start + 3);
+        assert!(
+            rects[0].x > LEFT + CODE_PAD_X,
+            "a mid-line start begins at the text"
+        );
     }
 
     #[test]

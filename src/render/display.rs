@@ -36,16 +36,38 @@ const MAX_DAMAGE_RECTS: usize = 16;
 /// Merging costs up to the cube of the count, so the cap bounds it.
 const MAX_MERGED_RECTS: usize = 4 * MAX_DAMAGE_RECTS;
 
-/// Which corners a [`DrawCmd::RoundRect`] rounds. A fenced code block's panel is
-/// drawn as one rounded rectangle: the GPU shader rounds whichever corners this
-/// selects, so a single-line block rounds both ends and a multi-line block rounds
-/// only its first and last rows.
+/// Which corners a rounded rectangle rounds; the rest stay square. A shape
+/// stacked from rows (a fenced code block's panel, a selection over several lines)
+/// rounds only the corners on its outline, so the rows join without a notch.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
-pub enum RoundedCorners {
-    None,
-    Top,
-    Bottom,
-    Both,
+pub struct RoundedCorners {
+    pub top_left: bool,
+    pub top_right: bool,
+    pub bottom_left: bool,
+    pub bottom_right: bool,
+}
+
+impl RoundedCorners {
+    pub const ALL: Self = Self::sides(true, true);
+
+    /// Round the top pair, the bottom pair, both, or neither.
+    pub const fn sides(top: bool, bottom: bool) -> Self {
+        Self {
+            top_left: top,
+            top_right: top,
+            bottom_left: bottom,
+            bottom_right: bottom,
+        }
+    }
+}
+
+/// A corner of a box, top-left first.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum Corner {
+    TopLeft,
+    TopRight,
+    BottomLeft,
+    BottomRight,
 }
 
 /// One drawing primitive in screen (post-scroll) pixels. The set is deliberately
@@ -56,14 +78,24 @@ pub enum RoundedCorners {
 /// [`FaceKey`] rather than a `&str`/`&Face` tied to the rope and fonts.
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
 pub enum DrawCmd {
-    /// A solid, opaque rectangle (background, selection, caret, quote bar, rule).
+    /// A solid, opaque rectangle (background, caret, quote bar, rule).
     Fill { rect: Rect, color: u32 },
-    /// A solid rectangle with anti-aliased rounded corners (a code panel).
+    /// A solid rectangle with anti-aliased rounded corners (a code panel, a
+    /// highlight row, a button).
     RoundRect {
         rect: Rect,
         color: u32,
         radius: i32,
         corners: RoundedCorners,
+    },
+    /// An inside corner of a shape stacked from rounded rows, where one row reaches
+    /// past the row above or below it. The square rect sits outside both rows with
+    /// `corner` touching them, and is filled outside the quarter circle centered on
+    /// the opposite corner, so the rows meet in a curve.
+    Fillet {
+        rect: Rect,
+        color: u32,
+        corner: Corner,
     },
     /// A task item's check mark, inked from a distance field over `rect` (the
     /// checked box). The tick is intrinsic to the shape, so the command carries
@@ -118,6 +150,7 @@ impl DrawCmd {
         match self {
             DrawCmd::Fill { rect, .. }
             | DrawCmd::RoundRect { rect, .. }
+            | DrawCmd::Fillet { rect, .. }
             | DrawCmd::CheckMark { rect, .. }
             | DrawCmd::Chevron { rect, .. }
             | DrawCmd::Pin { rect, .. }

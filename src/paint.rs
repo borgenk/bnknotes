@@ -34,15 +34,15 @@ use crate::theme::{
     MARKER_COLOR, MENU_BG, MENU_BORDER, MENU_BORDER_W, MENU_HOVER_BG, MENU_ITEM_PAD_X,
     MENU_ITEM_RADIUS, MENU_RADIUS, MENU_TEXT, PALETTE_BG, PALETTE_BORDER, PALETTE_BORDER_W,
     PALETTE_HINT, PALETTE_MATCH, PALETTE_RADIUS, PALETTE_ROW_PAD_X, PALETTE_ROW_RADIUS,
-    PALETTE_SELECTED_BG, PALETTE_TEXT, QUOTE_BAR_COLOR, QUOTE_BAR_WIDTH, RAIL_ACTIVE_COLOR,
-    RAIL_ACTIVE_SPAN, RAIL_ACTIVE_W, RAIL_BG, RAIL_GAP, RAIL_HOVER_INK, RAIL_HOVER_LIFT,
-    RAIL_INK_DARK, RAIL_INK_LIGHT, RAIL_PAD, RAIL_RADIUS, RAIL_TEMP_RING, RULE_COLOR,
-    RULE_THICKNESS, SCROLL_INK, SCROLL_INSET, SCROLL_MIN_THUMB, SCROLL_NEAR, SCROLL_THIN,
-    SCROLL_THUMB_COVER, SCROLL_THUMB_HOVER_COVER, SCROLL_TROUGH_COVER, SCROLL_WIDE,
-    SELECTION_COLOR, SPLITTER_COLOR, TAB_ACTIVE_BG, TAB_ACTIVE_TEXT, TAB_BUTTON_HOVER_BG,
-    TAB_BUTTON_RADIUS, TAB_CLOSE_GAP, TAB_CLOSE_W, TAB_DIRTY_COLOR, TAB_HOVER_BG,
-    TAB_INACTIVE_TEXT, TAB_MAX_W, TAB_MIN_W, TAB_NEW_W, TAB_PAD_X, TAB_PINNED_W, TAB_VPAD,
-    TABLE_BORDER_COLOR, TABLE_HEADER_BG, TICK_HEIGHT, TICK_WIDTH, TOP_BAR_BG, TREE_BG,
+    PALETTE_SELECTED_BG, PALETTE_TEXT, PANEL_SELECTION_COLOR, QUOTE_BAR_COLOR, QUOTE_BAR_WIDTH,
+    RAIL_ACTIVE_COLOR, RAIL_ACTIVE_SPAN, RAIL_ACTIVE_W, RAIL_BG, RAIL_GAP, RAIL_HOVER_INK,
+    RAIL_HOVER_LIFT, RAIL_INK_DARK, RAIL_INK_LIGHT, RAIL_PAD, RAIL_RADIUS, RAIL_TEMP_RING,
+    RULE_COLOR, RULE_THICKNESS, SCROLL_INK, SCROLL_INSET, SCROLL_MIN_THUMB, SCROLL_NEAR,
+    SCROLL_THIN, SCROLL_THUMB_COVER, SCROLL_THUMB_HOVER_COVER, SCROLL_TROUGH_COVER, SCROLL_WIDE,
+    SELECTION_COLOR, SELECTION_RADIUS, SPLITTER_COLOR, TAB_ACTIVE_BG, TAB_ACTIVE_TEXT,
+    TAB_BUTTON_HOVER_BG, TAB_BUTTON_RADIUS, TAB_CLOSE_GAP, TAB_CLOSE_W, TAB_DIRTY_COLOR,
+    TAB_HOVER_BG, TAB_INACTIVE_TEXT, TAB_MAX_W, TAB_MIN_W, TAB_NEW_W, TAB_PAD_X, TAB_PINNED_W,
+    TAB_VPAD, TABLE_BORDER_COLOR, TABLE_HEADER_BG, TICK_HEIGHT, TICK_WIDTH, TOP_BAR_BG, TREE_BG,
     TREE_FOOTER_GAP, TREE_FOOTER_VPAD, TREE_HOVER_BG, TREE_INDENT, TREE_MARKER_COLOR,
     TREE_MARKER_W, TREE_PAD, TREE_ROW_INSET_Y, TREE_ROW_PAD, TREE_ROW_RADIUS, TREE_TEXT_COLOR,
     VAULT_PAD_X,
@@ -181,6 +181,72 @@ fn clip_text_x(mut cmd: DrawCmd, left: i32, right: i32) -> DrawCmd {
     cmd
 }
 
+/// Which corners of a highlight row round: the ones on the outline of the shape
+/// the stacked rows make. A neighbor above or below counts when it shares an edge
+/// with the row, and against one a corner rounds only where the row reaches past
+/// it by at least the radius, so rows that line up, or nearly do, join square.
+fn highlight_corners(
+    row: Rect,
+    above: Option<Rect>,
+    below: Option<Rect>,
+    radius: i32,
+) -> display::RoundedCorners {
+    let overlaps = |n: &Rect| n.x < row.x + row.w && row.x < n.x + n.w;
+    let above = above.filter(|a| a.y + a.h == row.y && overlaps(a));
+    let below = below.filter(|b| row.y + row.h == b.y && overlaps(b));
+    let left_out = |n: Option<Rect>| n.is_none_or(|n| n.x - row.x >= radius);
+    let right_out = |n: Option<Rect>| n.is_none_or(|n| row.x + row.w - (n.x + n.w) >= radius);
+    display::RoundedCorners {
+        top_left: left_out(above),
+        top_right: right_out(above),
+        bottom_left: left_out(below),
+        bottom_right: right_out(below),
+    }
+}
+
+/// The inside corners where two stacked highlight rows join, as fillet squares and
+/// the corner each fills. On each side where one row reaches past the other by at
+/// least the radius, a square sits in the corner outside both rows, the same rule
+/// that rounds the outer corner on that side. Rows that do not share an edge make
+/// none.
+fn highlight_fillets(
+    upper: Rect,
+    lower: Rect,
+    radius: i32,
+) -> [Option<(Rect, display::Corner)>; 2] {
+    let joined =
+        upper.y + upper.h == lower.y && upper.x < lower.x + lower.w && lower.x < upper.x + upper.w;
+    if !joined || radius <= 0 {
+        return [None, None];
+    }
+    let y = lower.y;
+    let square = |x: i32, y: i32| Rect {
+        x,
+        y,
+        w: radius,
+        h: radius,
+    };
+    let left = if upper.x - lower.x >= radius {
+        Some((
+            square(upper.x - radius, y - radius),
+            display::Corner::BottomRight,
+        ))
+    } else if lower.x - upper.x >= radius {
+        Some((square(lower.x - radius, y), display::Corner::TopRight))
+    } else {
+        None
+    };
+    let (upper_right, lower_right) = (upper.x + upper.w, lower.x + lower.w);
+    let right = if lower_right - upper_right >= radius {
+        Some((square(upper_right, y - radius), display::Corner::BottomLeft))
+    } else if upper_right - lower_right >= radius {
+        Some((square(lower_right, y), display::Corner::TopLeft))
+    } else {
+        None
+    };
+    [left, right]
+}
+
 /// The color for a code-block token's class (see [`crate::syntax`]); plain code
 /// keeps the body [`CODE_COLOR`].
 fn code_token_color(token: markdown::CodeToken) -> u32 {
@@ -307,7 +373,7 @@ pub(crate) fn push_scrollbar(
         rect,
         color: pixel::tint(behind, SCROLL_INK, cover * lit),
         radius: w / 2,
-        corners: display::RoundedCorners::Both,
+        corners: display::RoundedCorners::ALL,
     });
 }
 
@@ -551,7 +617,7 @@ fn push_chip(
             rect: chip,
             color: fill,
             radius,
-            corners: display::RoundedCorners::Both,
+            corners: display::RoundedCorners::ALL,
         });
     }
     if temporary {
@@ -559,7 +625,7 @@ fn push_chip(
             rect: inner,
             color: RAIL_BG,
             radius: (radius - ring).max(0),
-            corners: display::RoundedCorners::Both,
+            corners: display::RoundedCorners::ALL,
         });
     }
     if let Some(keys) = &vault.icon_keys {
@@ -607,7 +673,7 @@ fn push_chip(
             },
             color: RAIL_ACTIVE_COLOR,
             radius: scale.px(RAIL_ACTIVE_W) / 2,
-            corners: display::RoundedCorners::Both,
+            corners: display::RoundedCorners::ALL,
         });
     }
 }
@@ -688,7 +754,7 @@ pub(crate) fn push_palette(
         rect: layout.panel,
         color: PALETTE_BORDER,
         radius,
-        corners: display::RoundedCorners::Both,
+        corners: display::RoundedCorners::ALL,
     });
     list.push(DrawCmd::RoundRect {
         rect: Rect {
@@ -699,7 +765,7 @@ pub(crate) fn push_palette(
         },
         color: PALETTE_BG,
         radius: (radius - border).max(0),
-        corners: display::RoundedCorners::Both,
+        corners: display::RoundedCorners::ALL,
     });
 
     let m = ctx.metrics();
@@ -802,7 +868,7 @@ pub(crate) fn push_palette(
                 rect,
                 color: PALETTE_SELECTED_BG,
                 radius: scale.px(PALETTE_ROW_RADIUS),
-                corners: display::RoundedCorners::Both,
+                corners: display::RoundedCorners::ALL,
             });
         }
         // A row's label is whatever it names: a search hit carries a path and the line
@@ -865,7 +931,7 @@ pub(crate) fn push_menu(list: &mut DisplayList, ctx: &BarCtx, menu: &Menu, layou
         rect: layout.panel,
         color: MENU_BORDER,
         radius,
-        corners: display::RoundedCorners::Both,
+        corners: display::RoundedCorners::ALL,
     });
     list.push(DrawCmd::RoundRect {
         rect: Rect {
@@ -876,7 +942,7 @@ pub(crate) fn push_menu(list: &mut DisplayList, ctx: &BarCtx, menu: &Menu, layou
         },
         color: MENU_BG,
         radius: (radius - border).max(0),
-        corners: display::RoundedCorners::Both,
+        corners: display::RoundedCorners::ALL,
     });
 
     let m = ctx.metrics();
@@ -888,7 +954,7 @@ pub(crate) fn push_menu(list: &mut DisplayList, ctx: &BarCtx, menu: &Menu, layou
                 rect: row,
                 color: MENU_HOVER_BG,
                 radius: scale.px(MENU_ITEM_RADIUS),
-                corners: display::RoundedCorners::Both,
+                corners: display::RoundedCorners::ALL,
             });
         }
         let x = row.x + scale.px(MENU_ITEM_PAD_X);
@@ -1035,7 +1101,7 @@ pub(crate) fn push_ai_preview(
         rect: Rect { x, y, w, h },
         color: AI_PANEL_BORDER,
         radius,
-        corners: display::RoundedCorners::Both,
+        corners: display::RoundedCorners::ALL,
     });
     list.push(DrawCmd::RoundRect {
         rect: Rect {
@@ -1046,7 +1112,7 @@ pub(crate) fn push_ai_preview(
         },
         color: AI_PANEL_BG,
         radius: (radius - border).max(0),
-        corners: display::RoundedCorners::Both,
+        corners: display::RoundedCorners::ALL,
     });
 
     let inner_x = x + pad;
@@ -1161,7 +1227,7 @@ fn push_diff_hint(list: &mut DisplayList, ctx: &BarCtx, rect: Rect) {
         rect: Rect { x, y, w, h },
         color: AI_PANEL_BORDER,
         radius,
-        corners: display::RoundedCorners::Both,
+        corners: display::RoundedCorners::ALL,
     });
     list.push(DrawCmd::RoundRect {
         rect: Rect {
@@ -1172,7 +1238,7 @@ fn push_diff_hint(list: &mut DisplayList, ctx: &BarCtx, rect: Rect) {
         },
         color: AI_PANEL_BG,
         radius: (radius - border).max(0),
-        corners: display::RoundedCorners::Both,
+        corners: display::RoundedCorners::ALL,
     });
     let tx = x + pad_x;
     let base = y + pad_y + m.ascent;
@@ -1651,7 +1717,7 @@ pub(crate) fn push_tree(
                 },
                 color: TREE_HOVER_BG,
                 radius: scale.px(TREE_ROW_RADIUS),
-                corners: display::RoundedCorners::Both,
+                corners: display::RoundedCorners::ALL,
             });
         }
         // Names share one column, `marker_w` in from the row start, whether or not
@@ -1744,7 +1810,7 @@ fn push_tree_footer(
             rect: col.button,
             color: TREE_HOVER_BG,
             radius: scale.px(TREE_ROW_RADIUS),
-            corners: display::RoundedCorners::Both,
+            corners: display::RoundedCorners::ALL,
         });
     }
     let side = (m.ascent * 13 / 12).max(scale.px(11));
@@ -2095,7 +2161,7 @@ fn push_glyph_button(list: &mut DisplayList, ctx: &BarCtx, box_: Rect, glyph: &s
             rect: box_,
             color: TAB_BUTTON_HOVER_BG,
             radius: ctx.scale.px(TAB_BUTTON_RADIUS),
-            corners: display::RoundedCorners::Both,
+            corners: display::RoundedCorners::ALL,
         });
     }
     let m = ctx.metrics();
@@ -2127,7 +2193,7 @@ fn push_pin_badge(list: &mut DisplayList, ctx: &BarCtx, box_: Rect, bright: bool
             rect: box_,
             color: TAB_BUTTON_HOVER_BG,
             radius: ctx.scale.px(TAB_BUTTON_RADIUS),
-            corners: display::RoundedCorners::Both,
+            corners: display::RoundedCorners::ALL,
         });
     }
     let inset = ctx.scale.px(3);
@@ -2328,7 +2394,7 @@ fn push_tab_body(
             },
             color: TAB_DIRTY_COLOR,
             radius: dot / 2,
-            corners: display::RoundedCorners::Both,
+            corners: display::RoundedCorners::ALL,
         });
     }
 }
@@ -2520,17 +2586,11 @@ impl<'a> Painter<'a> {
             };
             let first = i == 0 || !lines[i - 1].code_block;
             let last = i + 1 >= lines.len() || !lines[i + 1].code_block;
-            let corners = match (first, last) {
-                (true, true) => display::RoundedCorners::Both,
-                (true, false) => display::RoundedCorners::Top,
-                (false, true) => display::RoundedCorners::Bottom,
-                (false, false) => display::RoundedCorners::None,
-            };
             self.list.push(DrawCmd::RoundRect {
                 rect,
                 color: CODE_BG,
                 radius: self.scale.px(CODE_RADIUS),
-                corners,
+                corners: display::RoundedCorners::sides(first, last),
             });
         }
     }
@@ -2553,25 +2613,46 @@ impl<'a> Painter<'a> {
                     rect,
                     color: CODE_BG,
                     radius: self.scale.px(CODE_RADIUS),
-                    corners: display::RoundedCorners::Both,
+                    corners: display::RoundedCorners::ALL,
                 });
             }
         }
     }
 
-    /// The selection highlight. Everything is laid out in content space; the
-    /// viewport scroll shifts it up by `scroll_y`, and off-screen rectangles are
-    /// dropped from the list.
+    /// The selection highlight.
     fn selection(&mut self, start: usize, end: usize) {
-        for rect in self
+        let rows = self
             .layout
-            .selection_rects(self.fonts, self.rope, start, end)
-        {
-            if let Some(rect) = self.screen(rect) {
-                self.list.push(DrawCmd::Fill {
+            .selection_rects(self.fonts, self.rope, start, end);
+        self.highlight(&rows, SELECTION_COLOR);
+    }
+
+    /// Fill a highlight's rows, laid out in content space, as one rounded shape.
+    /// The scroll shifts them up, and off-screen rows are dropped.
+    fn highlight(&mut self, rows: &[Rect], color: u32) {
+        let radius = self.scale.px(SELECTION_RADIUS);
+        for (i, &row) in rows.iter().enumerate() {
+            let above = i.checked_sub(1).and_then(|j| rows.get(j)).copied();
+            let below = rows.get(i + 1).copied();
+            if let Some(rect) = self.screen(row) {
+                self.list.push(DrawCmd::RoundRect {
                     rect,
-                    color: SELECTION_COLOR,
+                    color,
+                    radius,
+                    corners: highlight_corners(row, above, below, radius),
                 });
+            }
+            let Some(below) = below else {
+                continue;
+            };
+            for (square, corner) in highlight_fillets(row, below, radius).into_iter().flatten() {
+                if let Some(rect) = self.screen(square) {
+                    self.list.push(DrawCmd::Fillet {
+                        rect,
+                        color,
+                        corner,
+                    });
+                }
             }
         }
     }
@@ -2585,7 +2666,7 @@ impl<'a> Painter<'a> {
             for &(start, end) in ranges {
                 for rect in self
                     .layout
-                    .diff_wash_rects(self.fonts, self.rope, start, end)
+                    .selection_rects(self.fonts, self.rope, start, end)
                 {
                     if let Some(rect) = self.screen(rect) {
                         self.list.push(DrawCmd::Fill { rect, color });
@@ -2610,17 +2691,10 @@ impl<'a> Painter<'a> {
             if i == find.state.current() {
                 continue;
             }
-            for rect in self
+            let rows = self
                 .layout
-                .selection_rects(self.fonts, self.rope, start, end)
-            {
-                if let Some(rect) = self.screen(rect) {
-                    self.list.push(DrawCmd::Fill {
-                        rect,
-                        color: FIND_MATCH_COLOR,
-                    });
-                }
-            }
+                .selection_rects(self.fonts, self.rope, start, end);
+            self.highlight(&rows, FIND_MATCH_COLOR);
         }
     }
 
@@ -2790,7 +2864,7 @@ impl<'a> Painter<'a> {
                                 },
                                 color: MARKER_COLOR,
                                 radius: d / 2,
-                                corners: display::RoundedCorners::Both,
+                                corners: display::RoundedCorners::ALL,
                             });
                             pen += advance;
                             continue;
@@ -3018,7 +3092,7 @@ impl<'a> Painter<'a> {
             rect,
             color: TABLE_HEADER_BG,
             radius: self.scale.px(CODE_RADIUS),
-            corners: display::RoundedCorners::Both,
+            corners: display::RoundedCorners::ALL,
         });
         let face = FaceKey::Prose {
             size: self.body_size,
@@ -3044,7 +3118,7 @@ impl<'a> Painter<'a> {
                 rect,
                 color: CARET_COLOR,
                 radius: caret.radius,
-                corners: display::RoundedCorners::Both,
+                corners: display::RoundedCorners::ALL,
             });
         } else {
             self.list.push(DrawCmd::Fill {
@@ -3242,7 +3316,7 @@ fn push_find_bar(
         rect: Rect { x, y, w, h },
         color: FIND_BG,
         radius: (pad / 2).max(2),
-        corners: display::RoundedCorners::Both,
+        corners: display::RoundedCorners::ALL,
     });
 
     // A steady caret (no blink) after the focused field's text: it marks where
@@ -3276,7 +3350,7 @@ fn push_find_bar(
                     w: query_w,
                     h: row_h,
                 },
-                color: SELECTION_COLOR,
+                color: PANEL_SELECTION_COLOR,
             });
         }
         let color = if find.state.error() {
@@ -3356,7 +3430,7 @@ fn push_find_bar(
                         w: replace_w,
                         h: row_h,
                     },
-                    color: SELECTION_COLOR,
+                    color: PANEL_SELECTION_COLOR,
                 });
             }
             list.push(text_cmd(
@@ -3388,7 +3462,7 @@ fn push_checkbox(list: &mut DisplayList, rect: Rect, checked: bool, behind: u32)
         rect,
         color: if checked { LINK_COLOR } else { MARKER_COLOR },
         radius,
-        corners: display::RoundedCorners::Both,
+        corners: display::RoundedCorners::ALL,
     });
     if checked {
         list.push(DrawCmd::CheckMark {
@@ -3406,7 +3480,7 @@ fn push_checkbox(list: &mut DisplayList, rect: Rect, checked: bool, behind: u32)
             },
             color: behind,
             radius: (radius - t).max(1),
-            corners: display::RoundedCorners::Both,
+            corners: display::RoundedCorners::ALL,
         });
     }
 }
@@ -3463,7 +3537,7 @@ fn push_image_chrome(
         rect: btn,
         color: IMAGE_BUTTON_BG,
         radius: scale.px(IMAGE_BUTTON_RADIUS),
-        corners: display::RoundedCorners::Both,
+        corners: display::RoundedCorners::ALL,
     });
     // Center the glyph in both axes from the code-face metrics.
     let fk = FaceKey::Code {
@@ -5086,6 +5160,119 @@ mod tests {
     }
 
     #[test]
+    fn a_selection_over_stacked_rows_rounds_its_outline_inside_and_out() {
+        // Long, short, long: the outline turns at the short row's right edge, and
+        // the left side runs straight down. The outer corners round on the rows,
+        // and the two inside corners beside the short row get fillets.
+        let fonts = Fonts::new(&markdown::all_sizes(FONT_SIZE)).expect("a default font");
+        let text = "a long first row\nshort\na long third row";
+        let rope = Rope::from_str(text);
+        let (w, h) = (600i32, 200i32);
+        let layout = Layout::build(&fonts, &rope, MARGIN, MARGIN, w, FONT_SIZE, (0, 0));
+        let params = PaintParams {
+            selection: Some((0, text.len())),
+            ..paint_params(w, h)
+        };
+        let list = build_display_list(&fonts, &layout, &rope, &params);
+        let corners: Vec<[bool; 4]> = list
+            .iter()
+            .filter_map(|c| match c {
+                DrawCmd::RoundRect { color, corners, .. } if *color == SELECTION_COLOR => Some([
+                    corners.top_left,
+                    corners.top_right,
+                    corners.bottom_left,
+                    corners.bottom_right,
+                ]),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            corners,
+            [
+                [true, true, false, true],
+                [false, false, false, false],
+                [false, true, true, true],
+            ],
+            "top-left, top-right, bottom-left, bottom-right per row"
+        );
+        let rows: Vec<Rect> = list
+            .iter()
+            .filter_map(|c| match c {
+                DrawCmd::RoundRect { rect, color, .. } if *color == SELECTION_COLOR => Some(*rect),
+                _ => None,
+            })
+            .collect();
+        let fillets: Vec<(Rect, display::Corner)> = list
+            .iter()
+            .filter_map(|c| match c {
+                DrawCmd::Fillet {
+                    rect,
+                    color,
+                    corner,
+                } if *color == SELECTION_COLOR => Some((*rect, *corner)),
+                _ => None,
+            })
+            .collect();
+        let r = SELECTION_RADIUS;
+        let short_right = rows[1].x + rows[1].w;
+        let square = |y: i32| Rect {
+            x: short_right,
+            y,
+            w: r,
+            h: r,
+        };
+        assert_eq!(
+            fillets,
+            [
+                (square(rows[1].y), display::Corner::TopLeft),
+                (square(rows[2].y - r), display::Corner::BottomLeft),
+            ],
+            "under the first row and over the third, right of the short one"
+        );
+    }
+
+    #[test]
+    fn highlight_rows_that_nearly_line_up_join_square() {
+        // Rounding the wider row's corner over a step narrower than the radius
+        // would cut a notch where the rows meet.
+        let upper = Rect {
+            x: 10,
+            y: 0,
+            w: 100,
+            h: 20,
+        };
+        let lower = Rect {
+            y: 20,
+            w: 98,
+            ..upper
+        };
+        assert!(!highlight_corners(upper, None, Some(lower), 3).bottom_right);
+        assert!(!highlight_corners(lower, Some(upper), None, 3).top_right);
+        assert_eq!(highlight_fillets(upper, lower, 3), [None, None]);
+        // A row that does not touch this one is no neighbor.
+        let apart = Rect { y: 25, ..lower };
+        assert!(highlight_corners(upper, None, Some(apart), 3).bottom_left);
+        assert_eq!(highlight_fillets(upper, apart, 3), [None, None]);
+        // A selection that starts mid-row steps out to the left below it: the
+        // fillet sits over the lower row, left of the upper one.
+        let started = Rect {
+            x: 60,
+            w: 50,
+            ..upper
+        };
+        let fillet = Rect {
+            x: 57,
+            y: 17,
+            w: 3,
+            h: 3,
+        };
+        assert_eq!(
+            highlight_fillets(started, lower, 3),
+            [Some((fillet, display::Corner::BottomRight)), None]
+        );
+    }
+
+    #[test]
     fn find_bar_and_match_highlights_reach_the_display_list() {
         let fonts = Fonts::new(&markdown::all_sizes(FONT_SIZE)).expect("a default font");
         let rope = Rope::from_str("one two one two one\n");
@@ -5109,12 +5296,13 @@ mod tests {
         let list = build_display_list(&fonts, &layout, &rope, &params);
         let match_fills = list
             .iter()
-            .filter(|c| matches!(c, DrawCmd::Fill { color, .. } if *color == FIND_MATCH_COLOR))
+            .filter(|c| matches!(c, DrawCmd::RoundRect { color, .. } if *color == FIND_MATCH_COLOR))
             .count();
         assert_eq!(match_fills, 2, "the two non-current matches highlight");
         assert!(
-            list.iter()
-                .any(|c| matches!(c, DrawCmd::Fill { color, .. } if *color == SELECTION_COLOR)),
+            list.iter().any(
+                |c| matches!(c, DrawCmd::RoundRect { color, .. } if *color == SELECTION_COLOR)
+            ),
             "the current match is painted as the selection"
         );
         assert!(

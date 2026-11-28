@@ -24,10 +24,16 @@ pub(crate) fn row_height(line_height: i32, scale: Scale) -> i32 {
 /// dark palette on base hue ~212.
 pub(crate) const BACKGROUND: u32 = 0x001c_2127;
 pub(crate) const FOREGROUND: u32 = 0x00da_dada;
-/// The accent blue (`hsl(215,75%,70%)`) pre-blended for selection: the fill is
-/// opaque, so this is the accent at a set opacity, high enough to stay legible
-/// over the darker code panel.
-pub(crate) const SELECTION_COLOR: u32 = 0x0041_5776;
+/// The selection fill over a note's text, a dark accent blue. It stays clear of the
+/// background and the code panel by its hue, and is dark enough that body text
+/// keeps about 8:1 contrast on it and the dim markers and done tasks about 2:1.
+pub(crate) const SELECTION_COLOR: u32 = 0x002d_3c5a;
+/// The selection fill on the floating panels (a selected query, a hovered menu
+/// item, the palette's selected row). The panels are lighter than the note, so
+/// their fill is a lighter step of the same accent.
+pub(crate) const PANEL_SELECTION_COLOR: u32 = 0x0041_5776;
+/// Corner radius of a highlight's outline (the selection and find matches).
+pub(crate) const SELECTION_RADIUS: i32 = 3;
 /// Fill behind find matches other than the current one; the current match is
 /// the live selection, so a muted gold keeps the two apart at a glance.
 pub(crate) const FIND_MATCH_COLOR: u32 = 0x005e_5128;
@@ -259,12 +265,12 @@ pub(crate) const VAULT_COLORS: [u32; 8] = [
 /// The context menu: the panel a right-click opens (today over a temporary vault's
 /// chip). It floats over the chrome in the find bar's panel tone, the editor's one
 /// other floating surface, lifted off what it covers by a hairline border a step
-/// lighter than the panel. A hovered item takes the accent the editor selects text
-/// with, so "this is what the click will act on" reads the same everywhere.
+/// lighter than the panel. A hovered item takes the panels' selection fill, so "this
+/// is what the click will act on" reads the same on every panel.
 pub(crate) const MENU_BG: u32 = FIND_BG;
 pub(crate) const MENU_BORDER: u32 = 0x0045_4a5e;
 pub(crate) const MENU_TEXT: u32 = FOREGROUND;
-pub(crate) const MENU_HOVER_BG: u32 = SELECTION_COLOR;
+pub(crate) const MENU_HOVER_BG: u32 = PANEL_SELECTION_COLOR;
 /// The panel's corner radius, its border thickness, and the padding between its
 /// edge and the items inside it.
 pub(crate) const MENU_RADIUS: i32 = 6;
@@ -279,13 +285,13 @@ pub(crate) const MENU_ITEM_RADIUS: i32 = TAB_BUTTON_RADIUS;
 
 /// The palette: the searchable panel Ctrl+K opens to jump between vaults. It is the
 /// context menu's surface at a larger size, so a panel floating over the window reads
-/// the same wherever it came from, and the selected row takes the accent the editor
-/// selects text with. A hairline divides the query from the matches, so the field
-/// reads as a field rather than as the first row.
+/// the same wherever it came from, and the selected row takes the panels' selection
+/// fill. A hairline divides the query from the matches, so the field reads as a
+/// field rather than as the first row.
 pub(crate) const PALETTE_BG: u32 = MENU_BG;
 pub(crate) const PALETTE_BORDER: u32 = MENU_BORDER;
 pub(crate) const PALETTE_TEXT: u32 = MENU_TEXT;
-pub(crate) const PALETTE_SELECTED_BG: u32 = SELECTION_COLOR;
+pub(crate) const PALETTE_SELECTED_BG: u32 = PANEL_SELECTION_COLOR;
 /// The prompt shown in place of an empty query, in the muted chrome tone an inactive
 /// tab's label takes: it is there to say what to type, not to be read.
 pub(crate) const PALETTE_HINT: u32 = TAB_INACTIVE_TEXT;

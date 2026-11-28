@@ -21,7 +21,7 @@ use crate::platform::geom::Rect;
 use crate::platform::grapheme;
 use crate::render::atlas::{AtlasInfo, AtlasUploads};
 use crate::render::display::DrawCmd;
-use crate::render::display::RoundedCorners;
+use crate::render::display::{Corner, RoundedCorners};
 use crate::render::glyph_cache::{GlyphCache, ImageId, PackedGlyph};
 use crate::render::image::ImageStore;
 
@@ -35,6 +35,7 @@ pub const MODE_CHECK: u32 = 5;
 pub const MODE_CHEVRON: u32 = 6;
 pub const MODE_HATCH: u32 = 7;
 pub const MODE_PIN: u32 = 8;
+pub const MODE_FILLET: u32 = 9;
 
 /// One vertex, laid out exactly as the pipeline's vertex input expects
 /// (`repr(C)`: pos, uv, color, extra, mode). Six of these make a quad.
@@ -183,6 +184,21 @@ impl Batcher<'_> {
                 radius,
                 corners,
             } => self.round_rect(*rect, *color, *radius, *corners),
+            DrawCmd::Fillet {
+                rect,
+                color,
+                corner,
+            } => {
+                // extra.z names the filled corner in quad.frag's fillet_coverage order.
+                let corner = match corner {
+                    Corner::TopLeft => 0.0,
+                    Corner::TopRight => 1.0,
+                    Corner::BottomLeft => 2.0,
+                    Corner::BottomRight => 3.0,
+                };
+                let extra = [rect.w as f32, rect.h as f32, corner, 0.0];
+                self.quad(*rect, MODE_FILLET, *color, [0.0; 2], extra);
+            }
             DrawCmd::CheckMark { rect, color } => {
                 // The tick is intrinsic to the mode: uv carries the pixel
                 // position within the box (like the rounded-rect mode) and extra
@@ -311,12 +327,11 @@ impl Batcher<'_> {
         // Clamp the radius to half the shorter side so opposite corners never
         // overlap; the shader's coverage function assumes this bound holds.
         let r = radius.clamp(0, (rect.w / 2).min(rect.h / 2).max(0));
-        let mask = match corners {
-            RoundedCorners::None => 0u32,
-            RoundedCorners::Top => 1,
-            RoundedCorners::Bottom => 2,
-            RoundedCorners::Both => 3,
-        };
+        // One bit per corner, in the order quad.frag's round_coverage tests them.
+        let mask = u32::from(corners.top_left)
+            | u32::from(corners.top_right) << 1
+            | u32::from(corners.bottom_left) << 2
+            | u32::from(corners.bottom_right) << 3;
         if r == 0 || mask == 0 {
             self.quad(rect, MODE_SOLID, color, [0.0; 2], [0.0; 4]);
             return;
@@ -958,15 +973,46 @@ mod tests {
             rect,
             color: 0x0011_2233,
             radius: 4,
-            corners: RoundedCorners::Top,
+            corners: RoundedCorners {
+                top_left: false,
+                top_right: true,
+                bottom_left: true,
+                bottom_right: false,
+            },
         }];
         let f = built(&fonts, &[&images], &list, &mut cache, &|_| false, 1.0);
         assert_eq!(f.vertices.len(), 6);
         let v = &f.vertices[0];
         assert_eq!(v.mode, MODE_ROUND);
-        assert_eq!(v.extra, [20.0, 10.0, 4.0, 1.0], "w, h, r, corner mask");
+        // The mask bits are the order the shader tests the corners in: top-left,
+        // top-right, bottom-left, bottom-right, lowest first.
+        assert_eq!(v.extra, [20.0, 10.0, 4.0, 6.0], "w, h, r, corner mask");
         assert_eq!(v.uv, [0.0, 0.0], "uv is rect-local pixels");
         assert_eq!(f.vertices[4].uv, [20.0, 10.0]);
+    }
+
+    #[test]
+    fn fillet_emits_sdf_quad_with_its_corner_in_extra() {
+        let fonts = Fonts::new(&[16]).expect("default font");
+        let images = ImageStore::new(None);
+        let mut cache = GlyphCache::new();
+        let list = vec![DrawCmd::Fillet {
+            rect: Rect {
+                x: 4,
+                y: 6,
+                w: 3,
+                h: 3,
+            },
+            color: 0x0011_2233,
+            corner: Corner::BottomLeft,
+        }];
+        let f = built(&fonts, &[&images], &list, &mut cache, &|_| false, 1.0);
+        assert_eq!(f.vertices.len(), 6);
+        let v = &f.vertices[0];
+        assert_eq!(v.mode, MODE_FILLET);
+        // The corner index is the order the shader counts them in: top-left,
+        // top-right, bottom-left, bottom-right from zero.
+        assert_eq!(v.extra, [3.0, 3.0, 2.0, 0.0], "w, h, corner, unused");
     }
 
     #[test]
@@ -1006,7 +1052,7 @@ mod tests {
             },
             color: 0,
             radius: 0,
-            corners: RoundedCorners::Both,
+            corners: RoundedCorners::ALL,
         }];
         let f = built(&fonts, &[&images], &list, &mut cache, &|_| false, 1.0);
         assert!(f.vertices.iter().all(|v| v.mode == MODE_SOLID));
